@@ -6,7 +6,7 @@ import {
   readlinkSync, symlinkSync
 } from 'node:fs';
 import { randomBytes, createHash, timingSafeEqual } from 'node:crypto';
-import { join, resolve, sep, basename, dirname } from 'node:path';
+import { join, resolve, sep, basename, dirname, isAbsolute } from 'node:path';
 import { homedir } from 'node:os';
 import { request as httpsRequest } from 'node:https';
 import { PtyManager, type SpawnOptions } from './pty';
@@ -14,7 +14,7 @@ import {
   DEV_ISOLATION, devDataRoot, devPaths, stableForbiddenPaths, checkIsolation,
   scrubInheritedEnv, devWindowTitle
 } from './devIsolation';
-import { resolveCommand as resolveCliCommand } from './shellEnv';
+import { resolveCommand as resolveCliCommand, isSafeCommandName } from './shellEnv';
 import { initAutoUpdater, abortPendingRestart } from './updater';
 import { RealtimeFloorWatcher } from './realtimeFloorWatcher';
 import {
@@ -4609,6 +4609,16 @@ async function processSpawnRequest(filePath: string): Promise<void> {
     autoMode: !!cfgSpawn.autoMode
   });
   const bin = launch.bin;
+  // Validate the executable name on the spawn path. A spawn-request file is
+  // untrusted input (authored by the orchestrator, reachable by anything that can
+  // write HIVE_ROOT/spawn-requests), so the bin must be a plain command token or
+  // an absolute path — never a string a downstream shell `which`/`where` could
+  // reinterpret. Rejected here, before any resolution; the resolver guards behind
+  // it validate the same thing in depth.
+  if (!isSafeCommandName(bin) && !isAbsolute(bin)) {
+    fail(`refusing spawn: engine command "${bin}" is not a plain command name or an absolute path`);
+    return;
+  }
   // Missing-CLI → FAIL FAST. A headless worker has no human to watch an installer,
   // so we never run the cc49e1e install banner here — we reject and tell god.
   if (!ptyManager.isCommandAvailable(bin)) { fail(`engine CLI "${bin}" is not installed`); return; }
