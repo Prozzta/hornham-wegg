@@ -2212,6 +2212,16 @@ if (DEV_ISOLATION) {
 const gotInstanceLock = app.requestSingleInstanceLock();
 if (!gotInstanceLock) {
   allowQuit = true;
+  // MUNDER_DEV=1: exit NOW. `app.quit()` is asynchronous and v0.4.5's
+  // `whenReady` bootstrap still runs before the quit completes — observed on
+  // 2026-09-10: a second DEV instance logged `app-start` into the DEV hive and
+  // tried to bind the DEV hook pipe (EADDRINUSE) before exiting. Harmless in
+  // DEV but noisy for validation; `app.exit` skips the bootstrap entirely.
+  // (Baseline behaviour is left as-is when MUNDER_DEV is unset.)
+  if (DEV_ISOLATION) {
+    console.error('[dev-isolation] another DEV instance already holds the single-instance lock — exiting (96)');
+    app.exit(96);
+  }
   app.quit();
 } else {
   app.on('second-instance', (_evt, argv) => {
