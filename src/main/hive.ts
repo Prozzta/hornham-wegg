@@ -26,7 +26,7 @@ import { join, dirname, isAbsolute } from 'node:path';
 import { homedir } from 'node:os';
 import { spawnSync, spawn, type ChildProcess } from 'node:child_process';
 import { randomBytes, createHash } from 'node:crypto';
-import { DEV_ISOLATION, sanitizeCodexConfigForDev } from './devIsolation';
+import { DEV_ISOLATION, sanitizeCodexConfigForDev, hookPipeId } from './devIsolation';
 import type { AgentUsageSample } from './usage';
 import { COMMAND_GROUPS } from '../shared/claudeCommands';
 import {
@@ -1945,11 +1945,9 @@ export class HiveManager {
       // ~/.codex) and the user's global project-trust list — strip both so the
       // DEV agent's home inherits settings but not Stable/user identity.
       if (DEV_ISOLATION && config) {
-        const s = sanitizeCodexConfigForDev(config);
+        const s = sanitizeCodexConfigForDev(config, { codexHome: home, pipeSuffix: `dev-${hookPipeId(home)}` });
         config = s.text;
-        if (s.droppedKeys || s.droppedTables) {
-          console.warn(`[dev-isolation] codex config seed: dropped ${s.droppedKeys} CODEX_HOME key(s) and ${s.droppedTables} [projects.*] trust table(s)`);
-        }
+        console.warn(`[dev-isolation] codex config seed for ${home}: rewrote ${s.rewrittenHomes} CODEX_HOME key(s) to the DEV home, made ${s.rewrittenPipes} named pipe(s) DEV-distinct, dropped ${s.droppedTables} [projects.*] trust table(s)`);
       }
       if (shim) {
         const events = ['PreToolUse', 'PostToolUse', 'Stop', 'SubagentStop',

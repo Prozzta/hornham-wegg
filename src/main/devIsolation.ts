@@ -283,22 +283,58 @@ export function scrubInheritedEnv(env: NodeJS.ProcessEnv): string[] {
 
 /**
  * Sanitise the user's global `~/.codex/config.toml` before it is seeded into a
- * DEV agent's isolated CODEX_HOME (Andy M4 finding on 0d1441db). Two things in
- * the global file point back at Stable/user state and must not be inherited:
- *   - any `CODEX_HOME = "…"` key (the global file carries one under an MCP
- *     server's `env` table, pointing at ~/.codex) — dropped wherever it occurs;
+ * DEV agent's isolated CODEX_HOME (Andy M4 finding on 0d1441db; Dwight re-audit
+ * of 00bd99bc). Three things in the global file point back at Stable/user state
+ * and must not be inherited verbatim:
+ *   - every `CODEX_HOME = '…'` key (the global file carries one under
+ *     `[mcp_servers.node_repl.env]`, pointing at ~/.codex, which would give the
+ *     helper a WRITABLE global home despite the process-env scrub) — rewritten
+ *     to the DEV agent's own CODEX_HOME;
+ *   - every named-pipe value (`SKY_CUA_NATIVE_PIPE_DIRECTORY = '\\.\pipe\codex-
+ *     computer-use-…'`), a shared named identity / cross-talk channel with
+ *     Stable's helpers — suffixed so it is DEV-distinct per agent;
  *   - every `[projects.'<path>']` / `[projects."<path>"]` trust table (the
  *     user's global folder-trust list) — dropped with its body. A DEV agent's
  *     trust gate is suppressed by the preset's CODEX_NON_INTERACTIVE anyway.
- * Line-based on purpose: the file is simple TOML written by Codex itself, and a
- * full parser would add a dependency. Everything else is passed through
- * verbatim so auth/model/MCP settings keep working.
+ * Left as-is, deliberately: NODE_REPL_TRUSTED_CODE_PATHS / NODE_REPL_TRUSTED_
+ * SERVICES / NODE_REPL_NODE_PATH etc. reference the user's installed Codex
+ * runtime and plugin cache — read-only inputs, documented as shared in
+ * DEV-ISOLATION.md §8. Line-based on purpose: the file is simple TOML written
+ * by Codex itself, and a full parser would add a dependency. Everything else
+ * passes through verbatim so auth/model/MCP settings keep working.
  */
-export function sanitizeCodexConfigForDev(toml: string): { text: string; droppedKeys: number; droppedTables: number } {
+export interface CodexSeedOptions {
+  /** The DEV agent's own CODEX_HOME — every nested `CODEX_HOME =` is REWRITTEN
+   *  to this (not dropped: an absent key would let the helper fall back to the
+   *  user's ~/.codex — Dwight re-audit of 00bd99bc). */
+  codexHome: string;
+  /** Suffix appended to every named-pipe value (`\\.\pipe\…`) so helper pipes
+   *  such as SKY_CUA_NATIVE_PIPE_DIRECTORY are DEV-distinct per agent instead of
+   *  the same named identity Stable's helpers use. */
+  pipeSuffix: string;
+}
+
+export interface CodexSeedResult {
+  text: string;
+  rewrittenHomes: number;
+  rewrittenPipes: number;
+  droppedTables: number;
+}
+
+/** TOML literal-string form for a Windows path (no escaping needed unless the
+ *  value contains a single quote, which no Windows path can). */
+function tomlLiteral(v: string): string {
+  return v.includes("'") ? `"${v.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"` : `'${v}'`;
+}
+
+export function sanitizeCodexConfigForDev(toml: string, opts: CodexSeedOptions): CodexSeedResult {
   const out: string[] = [];
-  let droppedKeys = 0;
+  let rewrittenHomes = 0;
+  let rewrittenPipes = 0;
   let droppedTables = 0;
   let skippingTable = false;
+  // key = 'value' | key = "value"  — captures indent/key, quote char, body.
+  const kv = /^(\s*[A-Za-z0-9_.-]+\s*=\s*)(['"])(.*)\2(\s*(?:#.*)?)$/;
   for (const line of toml.split(/\r?\n/)) {
     const header = /^\s*\[\[?([^\]]+)\]\]?\s*$/.exec(line);
     if (header) {
@@ -307,10 +343,25 @@ export function sanitizeCodexConfigForDev(toml: string): { text: string; dropped
     } else if (skippingTable) {
       continue; // body of a dropped [projects.…] table
     }
-    if (/^\s*CODEX_HOME\s*=/.test(line)) { droppedKeys++; continue; }
+    if (/^\s*CODEX_HOME\s*=/.test(line)) {
+      const indent = /^\s*/.exec(line)?.[0] ?? '';
+      out.push(`${indent}CODEX_HOME = ${tomlLiteral(opts.codexHome)}`);
+      rewrittenHomes++;
+      continue;
+    }
+    const m = kv.exec(line);
+    if (m) {
+      const body = m[3];
+      // A named pipe in either quoting style: literal `\\.\pipe\x` or basic `\\\\.\\pipe\\x`.
+      if (/^\\{2,4}\.\\{1,2}pipe\\{1,2}/.test(body) && !body.endsWith(opts.pipeSuffix)) {
+        out.push(`${m[1]}${m[2]}${body}-${opts.pipeSuffix}${m[2]}${m[4]}`);
+        rewrittenPipes++;
+        continue;
+      }
+    }
     out.push(line);
   }
-  return { text: out.join('\n'), droppedKeys, droppedTables };
+  return { text: out.join('\n'), rewrittenHomes, rewrittenPipes, droppedTables };
 }
 
 /** Window title for the dev build. Unchanged when isolation is off. */
