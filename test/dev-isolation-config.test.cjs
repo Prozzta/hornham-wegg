@@ -191,6 +191,20 @@ function f1External(root) {
   return file;
 }
 
+/** The identity of a reparse entry (junction or symlink): where it points, that it
+ *  is still a link, and when it was last touched. Compared before/after a refusal to
+ *  prove NON-MUTATION, which is the half of "refused, nothing touched" that a
+ *  result-only assertion leaves unproven. lstat, never stat — the entry, not its
+ *  target. */
+function f1Reparse(entry) {
+  const st = fs.lstatSync(entry);
+  return {
+    target: fs.readlinkSync(entry),
+    isSymbolicLink: st.isSymbolicLink(),
+    mtimeMs: st.mtimeMs
+  };
+}
+
 /** Create a symlink, or skip the calling test LOUDLY if this host cannot.
  *  A silently skipped fail-closed test is worse than no test. */
 function f1Link(t, target, linkPath, type) {
@@ -246,19 +260,67 @@ test('F1/5 the destination bound requires a STRICT descendant — the agents dir
 
 // ── 6. The guard that keeps the policy load-bearing ──────────────────────────
 
+/** Every EXECUTABLE line that names a credential file, anywhere in the relevant
+ *  source set, must be one of a very small set of known-good shapes. Anything else
+ *  is a candidate second seed path and is reported with its file and line.
+ *
+ *  An ALLOWLIST, not a blocklist, and deliberately not line-local: the earlier
+ *  version of this guard only rejected `homedir()` when it appeared on the SAME
+ *  line as the filename, so the original split construction —
+ *    const userHome = join(homedir(), '.codex');
+ *    const authSrc  = join(userHome, 'auth.json');
+ *  — would have sailed straight through it while the policy function sat unused
+ *  beside it. A guard that reformatting can side-step is not a guard. */
+function f1CredentialLineViolations(source, label) {
+  const ALLOWED = [
+    // The DESTINATION inside the agent's own Codex home. Not a source.
+    /^const authDest = join\(home, 'auth\.json'\);$/,
+    // The policy function's own body — the single legal construction of a source.
+    /^return join\(opts\.userCodexHome, 'auth\.json'\);$/,
+    // The basename check in the destination bound, and its refusal message.
+    /^if \(lib\.basename\(opts\.authDest\) !== 'auth\.json'\) \{$/,
+    /^return \{ ok: false, reason: `destination basename is not auth\.json: \$\{opts\.authDest\}` \};$/
+  ];
+  const out = [];
+  source.split(/\r?\n/).forEach((raw, i) => {
+    const line = raw.trim();
+    if (!/auth\.json/.test(line)) return;
+    if (!line || line.startsWith('*') || line.startsWith('//') || line.startsWith('/*')) return;
+    if (ALLOWED.some((re) => re.test(line))) return;
+    out.push(label + ':' + (i + 1) + ' ' + line);
+  });
+  return out;
+}
+
 test('F1/6 no second global-credential seed path bypasses codexAuthSeedSource', () => {
-  // In the spirit of B-02's "the allowlist is load-bearing": the policy only helps
-  // if it is the ONLY way a global credential source is produced. hive.ts must not
-  // rebuild `homedir()/.codex/auth.json` by hand anywhere.
-  const hive = fs.readFileSync(path.join(__dirname, '..', 'src', 'main', 'hive.ts'), 'utf8');
-  const seeds = hive.split('\n').filter((l) => /auth\.json/.test(l) && !/^\s*(\*|\/\/)/.test(l));
-  for (const line of seeds) {
-    assert.ok(
-      !/homedir\(\)/.test(line),
-      'a credential path is built from homedir() outside the policy function: ' + line.trim()
-    );
+  // B-02's "the allowlist is load-bearing", applied to credential SOURCES: the policy
+  // only helps if it is the ONLY way a global credential source is ever produced.
+  const files = ['hive.ts', 'devIsolation.ts', 'index.ts', 'config.ts'];
+  const violations = [];
+  for (const f of files) {
+    const src = fs.readFileSync(path.join(__dirname, '..', 'src', 'main', f), 'utf8');
+    violations.push(...f1CredentialLineViolations(src, f));
   }
-  assert.ok(/codexAuthSeedSource\(/.test(hive), 'hive.ts must obtain its credential source from the policy function');
+  assert.deepEqual(violations, [], 'unrecognised credential-path construction(s) outside the policy');
+
+  // The guard must be able to CATCH the bypass, not merely pass on today's source —
+  // otherwise it proves nothing. Feed it the exact split construction Dwight named.
+  const bypass = [
+    "const userHome = join(homedir(), '.codex');",
+    "const authSrc = join(userHome, 'auth.json');",
+    'const x = codexAuthSeedSource({ userCodexHome: userHome });'
+  ].join('\n');
+  const caught = f1CredentialLineViolations(bypass, 'synthetic');
+  assert.equal(caught.length, 1, 'the guard must reject a split bypass even with a policy call sitting beside it');
+  assert.match(caught[0], /join\(userHome, 'auth\.json'\)/);
+
+  // And the real assignment must FLOW THROUGH the policy, not merely coexist with it.
+  const hive = fs.readFileSync(path.join(__dirname, '..', 'src', 'main', 'hive.ts'), 'utf8');
+  assert.match(
+    hive,
+    /const\s+authSrc\s*=\s*codexAuthSeedSource\(/,
+    'the authSrc assignment itself must come from the policy function'
+  );
 });
 
 // ── 7-8. Effect: an external link is removed, its TARGET survives ────────────
@@ -338,10 +400,20 @@ test('F1/12 a parent reparse escape whose target EXISTS is refused, nothing touc
   const codexDir = path.join(agentHome, '.codex');
   if (!f1Link(t, outsideDir, codexDir, 'junction')) return;
 
+  // "Refused, nothing touched" is two claims. The refusal is the easy half; on the
+  // one destructive path in F1, NON-MUTATION is the half that matters, so capture the
+  // reparse entry itself before and compare after.
+  const before = f1Reparse(codexDir);
+  const targetBefore = fs.lstatSync(target);
+
   const r = iso.migrateCodexAuthLink({ authDest: path.join(codexDir, 'auth.json'), devDataRoot: root, devIsolation: true });
   assert.equal(r.ok, false, 'a parent that resolves outside the dev root must refuse');
   assert.match(r.reason, /not inside a DEV agent home/);
-  assert.equal(fs.readFileSync(target, 'utf8'), F1_SENTINEL, 'nothing may be touched on a refusal');
+
+  const after = f1Reparse(codexDir);
+  assert.deepEqual(after, before, 'the parent reparse entry must be untouched by a refusal');
+  assert.equal(fs.readFileSync(target, 'utf8'), F1_SENTINEL, 'the external target bytes must be unchanged');
+  assert.equal(fs.lstatSync(target).mtimeMs, targetBefore.mtimeMs, 'the external target must not even be rewritten');
 });
 
 test('F1/13 a DANGLING parent reparse point is refused — the lexical fallback must NOT rescue it', (t) => {
@@ -356,9 +428,17 @@ test('F1/13 a DANGLING parent reparse point is refused — the lexical fallback 
   const missing = path.join(os.tmpdir(), 'md-f1-does-not-exist-' + Date.now());
   if (!f1Link(t, missing, codexDir, 'junction')) return;
 
+  const before = f1Reparse(codexDir);
+  assert.equal(fs.existsSync(missing), false, 'the fixture must start with a genuinely dangling target');
+
   const r = iso.migrateCodexAuthLink({ authDest: path.join(codexDir, 'auth.json'), devDataRoot: root, devIsolation: true });
   assert.equal(r.ok, false, 'an unresolvable parent is ambiguity, and ambiguity must refuse');
   assert.match(r.reason, /could not resolve the credential directory/);
+
+  const after = f1Reparse(codexDir);
+  assert.deepEqual(after, before, 'the dangling reparse entry must be untouched by a refusal');
+  // It must refuse WITHOUT helpfully creating what was missing.
+  assert.equal(fs.existsSync(missing), false, 'the missing target must REMAIN absent');
 });
 
 // ── 14-15. Effect: fail-closed shape, and the postcondition ──────────────────
