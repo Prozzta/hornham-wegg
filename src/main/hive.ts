@@ -26,6 +26,7 @@ import { join, dirname, isAbsolute } from 'node:path';
 import { homedir } from 'node:os';
 import { spawnSync, spawn, type ChildProcess } from 'node:child_process';
 import { randomBytes, createHash } from 'node:crypto';
+import { DEV_ISOLATION } from './devIsolation';
 import type { AgentUsageSample } from './usage';
 import { COMMAND_GROUPS } from '../shared/claudeCommands';
 import {
@@ -360,7 +361,9 @@ export class HiveManager {
     if (!root) return null;
     if (process.platform === 'win32') {
       const id = createHash('sha1').update(root).digest('hex').slice(0, 12);
-      return `\\\\.\\pipe\\munder-difflin-${id}`;
+      // MUNDER_DEV=1 adds a `dev-` marker: the id already differs (it hashes the
+      // dev hive root) but the marker makes the pipe obviously not Stable's.
+      return `\\\\.\\pipe\\munder-difflin-${DEV_ISOLATION ? 'dev-' : ''}${id}`;
     }
     return join(root, 'hooks.sock');
   }
@@ -749,7 +752,16 @@ export class HiveManager {
         env.HIVE_SOCK = sock;
         try {
           if (desc.kind === 'hooks') {
-            if (desc.shim === 'agy') this.installAgyHooks();
+            // MUNDER_DEV=1: the agy and grok bridges write GLOBAL hook files
+            // (~/.gemini/…/hooks.json, ~/.grok/hooks/munder-hive.json) whose
+            // socket is THIS process's pipe — installing them from a dev build
+            // would silently re-point Stable's Antigravity/Grok agents at the
+            // dev hive. Skipped in dev; those two providers lose hive parity
+            // in dev only (the renderer's idle inbox nudge still delivers).
+            if (desc.shim === 'agy') {
+              if (DEV_ISOLATION) console.warn('[dev-isolation] skipping global Antigravity hook install (would re-point Stable agents)');
+              else this.installAgyHooks();
+            }
             else if (desc.shim === 'codex') {
               env.CODEX_HOME = this.installCodexHooks(dir);
               // Codex refuses to run hooks from a config dir without persisted
@@ -786,7 +798,10 @@ export class HiveManager {
               // the bridge is trusted and ~/.gemini/settings.json stays untouched.
               env.GEMINI_CLI_SYSTEM_SETTINGS_PATH = this.installGeminiHooks(dir);
             }
-            else if (desc.shim === 'grok') this.installGrokHooks();
+            else if (desc.shim === 'grok') {
+              if (DEV_ISOLATION) console.warn('[dev-isolation] skipping global Grok hook install (would re-point Stable agents)');
+              else this.installGrokHooks();
+            }
           } else if (desc.kind === 'proxy') {
             // Stable per-spawn session id, stamped on every synthesized payload so
             // recordSession (registry resume key) and the cost ledger persist.

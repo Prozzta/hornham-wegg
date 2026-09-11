@@ -42,6 +42,7 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import { randomBytes, timingSafeEqual } from 'node:crypto';
 import { validateAgainstSchema, type InboundKind } from '../shared/triggers';
+import { DEV_ISOLATION } from './devIsolation';
 // NOTE: `tunnelmole` is an ESM-only package. The Electron main process is bundled
 // as CommonJS, so a static `import` gets externalized into `require('tunnelmole')`
 // and throws ERR_REQUIRE_ESM at load. It is imported dynamically inside
@@ -250,6 +251,9 @@ export class WebhookServer {
   }
 
   private async openTunnel(): Promise<string> {
+    // MUNDER_DEV=1: never expose a dev build through a public tunnel (the local
+    // listener stays up; the caller surfaces this as "tunnel unavailable").
+    if (DEV_ISOLATION) throw new Error('dev build — public tunnels are disabled under MUNDER_DEV=1');
     // TODO: optional persistent domain — pass `domain` here when config carries one.
     // Dynamic import keeps the ESM-only `tunnelmole` out of the CJS require graph.
     const { tunnelmole } = await import('tunnelmole');

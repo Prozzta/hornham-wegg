@@ -10,6 +10,10 @@ import { join, resolve, sep, basename, dirname } from 'node:path';
 import { homedir } from 'node:os';
 import { request as httpsRequest } from 'node:https';
 import { PtyManager, type SpawnOptions } from './pty';
+import {
+  DEV_ISOLATION, devDataRoot, devPaths, stableForbiddenPaths, checkIsolation,
+  scrubInheritedEnv, devWindowTitle
+} from './devIsolation';
 import { resolveCommand as resolveCliCommand } from './shellEnv';
 import { initAutoUpdater, abortPendingRestart } from './updater';
 import { RealtimeFloorWatcher } from './realtimeFloorWatcher';
@@ -90,6 +94,50 @@ import {
 } from '../shared/codexRemote';
 
 const isDev = !!process.env.ELECTRON_RENDERER_URL;
+
+// ─── MUNDER_DEV=1: development isolation bootstrap (see devIsolation.ts) ──────
+// MUST run before `app.requestSingleInstanceLock()` below (Electron keys the
+// lock on userData) and before anything reads `app.getPath('userData')`, so it
+// sits here, immediately after the imports. Inert unless MUNDER_DEV=1.
+/** Stable-owned paths the ready-time guard re-checks against LIVE values. */
+let devStableForbidden: string[] = [];
+if (DEV_ISOLATION) {
+  // Electron's default userData is derived from the package name — i.e. it IS
+  // Stable's folder. Capture it (read-only) before overriding, both to forbid it
+  // and to learn Stable's harnessHome from its config.json if readable.
+  const stableUserData = app.getPath('userData');
+  let stableHome: string | null = null;
+  try {
+    const raw = JSON.parse(readFileSync(join(stableUserData, 'config.json'), 'utf8')) as { harnessHome?: unknown };
+    if (typeof raw.harnessHome === 'string') stableHome = raw.harnessHome;
+  } catch { /* no Stable config readable — the literal list still applies */ }
+  const root = devDataRoot();
+  const paths = devPaths(root);
+  devStableForbidden = stableForbiddenPaths({ defaultUserData: stableUserData, stableHarnessHome: stableHome });
+  const violations = checkIsolation(paths, devStableForbidden);
+  if (violations.length) {
+    console.error('[dev-isolation] REFUSING TO START — resolved dev paths overlap Stable:\n  ' + violations.join('\n  '));
+    process.exit(97);
+  }
+  mkdirSync(paths.userData, { recursive: true });
+  // Distinct app identity: anything Electron derives from the app name (default
+  // path roots, notification sender, crash-reporter product) reads as the dev
+  // build, not Stable. The explicit setPath calls below are the guarantee; the
+  // name is belt-and-braces plus the visible identity in OS notifications.
+  app.setName('munder-difflin-dev');
+  app.setPath('userData', paths.userData);
+  app.setPath('sessionData', paths.userData);
+  app.setPath('logs', join(paths.userData, 'logs'));
+  app.setPath('crashDumps', join(paths.userData, 'crashDumps'));
+  // `temp` feeds the paste-drop dir (join(app.getPath('temp'), 'cth-pastes'));
+  // keep even that out of the shared %TEMP% so Dev never touches a Stable file.
+  app.setPath('temp', join(paths.userData, 'temp'));
+  const scrubbed = scrubInheritedEnv(process.env);
+  console.warn(
+    `[dev-isolation] MUNDER_DEV=1 — userData=${paths.userData} harnessHome=${paths.harnessHome} pipe=${paths.pipeName}` +
+    (scrubbed.length ? ` (scrubbed inherited Stable env: ${scrubbed.join(', ')})` : '')
+  );
+}
 
 // Keep the main process alive on an unexpected throw/rejection. The harness is a
 // multi-agent supervisor — a single stray throw (e.g. node-pty's ConPTY console
@@ -2137,7 +2185,12 @@ async function handleHireLink(link: string): Promise<void> {
 
 // Register the protocol. In dev (electron .) Windows needs the explicit
 // exe+args form or the registration points at electron.exe with no entry.
-if (process.defaultApp) {
+// MUNDER_DEV=1 skips this entirely: the registration is a per-user registry
+// write that would re-point Stable's `munderdifflin://` links at the dev
+// electron.exe (a Stable-identity side effect the dev build must not have).
+if (DEV_ISOLATION) {
+  console.warn('[dev-isolation] not registering the munderdifflin:// protocol handler (would hijack Stable)');
+} else if (process.defaultApp) {
   if (process.argv.length >= 2) {
     app.setAsDefaultProtocolClient('munderdifflin', process.execPath, [resolve(process.argv[1])]);
   }
@@ -2219,7 +2272,7 @@ function createWindow(opts: { floor?: boolean } = {}): BrowserWindow {
     ...(geom && geom.x !== undefined && geom.y !== undefined ? { x: geom.x, y: geom.y } : {}),
     minWidth: MIN_WIN.width,
     minHeight: MIN_WIN.height,
-    title: isFloor ? 'Munder Difflin — Floor' : 'Munder Difflin',
+    title: devWindowTitle(isFloor ? 'Munder Difflin — Floor' : 'Munder Difflin'),
     backgroundColor: '#FFF8E7',
     titleBarStyle: 'hiddenInset',
     show: false,
@@ -2299,6 +2352,16 @@ function createWindow(opts: { floor?: boolean } = {}): BrowserWindow {
 
 
   win.once('ready-to-show', () => win.show());
+  // MUNDER_DEV=1: the renderer's <title> (index.html) replaces the BrowserWindow
+  // `title` option as soon as the page loads, so the DEV marker must be applied
+  // to every title the page sets — that is the whole point of the marker
+  // (mission item 4: the operator must be able to tell the instances apart).
+  if (DEV_ISOLATION) {
+    win.on('page-title-updated', (e, pageTitle) => {
+      e.preventDefault();
+      win.setTitle(devWindowTitle(pageTitle));
+    });
+  }
 
   // Never opens a window; hands the URL to the OS browser instead.
   //
@@ -2818,7 +2881,10 @@ async function spawnAgentCore(opts: AgentSpawnOptions, owner: Electron.WebConten
   // interactive prompt it can't answer and exit code 1. Best-effort, never blocks.
   // Claude-only — other CLIs handle their own permission UX.
   if (claudeProvider) {
-    try { ensureClaudePermissionsAccepted(opts.cwd); } catch { /* never block spawn */ }
+    // MUNDER_DEV=1: this writes the user's SHARED ~/.claude/settings.json and
+    // ~/.claude.json (bypass + folder-trust acceptance). Stable already keeps
+    // them accepted; a dev build must not write outside DevData, so skip.
+    if (!DEV_ISOLATION) { try { ensureClaudePermissionsAccepted(opts.cwd); } catch { /* never block spawn */ } }
   }
   // Suppress first-run interactive prompts for providers that need it (e.g. Codex
   // directory-trust gate via CODEX_NON_INTERACTIVE). Merges into any env already
@@ -3409,6 +3475,9 @@ ipcMain.handle('skills:catalog', async (_evt, force: unknown) => {
 /** Install one catalog skill into ~/.claude/skills. Structured refusals, never a
  *  throw: the UI distinguishes "not installable" from "install failed". */
 ipcMain.handle('skills:install', async (_evt, url: unknown, name: unknown) => {
+  // MUNDER_DEV=1: skill installs land in the user's GLOBAL ~/.claude/skills
+  // (shared with Stable's agents). A dev build must not write there.
+  if (DEV_ISOLATION) return { ok: false, error: 'dev build — global skill installs are disabled under MUNDER_DEV=1' };
   if (typeof url !== 'string' || typeof name !== 'string') {
     return { ok: false as const, error: 'bad request' };
   }
@@ -5074,6 +5143,33 @@ function onSystemResume(reason: string): void {
 }
 
 app.whenReady().then(() => {
+  // MUNDER_DEV=1 — second, LIVE isolation check. The bootstrap above checked the
+  // paths we intended to use; this checks the paths the app actually resolved
+  // (config clamp, hive root, palace, pipe) now that config/hive are wired. A
+  // violation here is a bug in the clamp — refuse loudly rather than run beside
+  // Stable on shared data.
+  if (DEV_ISOLATION) {
+    const cfgHome = readConfig().harnessHome ?? '';
+    const live = {
+      userData: app.getPath('userData'),
+      harnessHome: cfgHome,
+      hiveRoot: hive.root() ?? '',
+      palace: memory.palacePath() ?? '',
+      worktrees: cfgHome ? join(cfgHome, 'worktrees') : '',
+      pipeName: hive.sockPath() ?? ''
+    };
+    const violations = checkIsolation(live, devStableForbidden);
+    if (violations.length) {
+      const msg = 'Refusing to start: resolved DEV paths overlap the Stable installation.\n\n' + violations.join('\n');
+      console.error('[dev-isolation] ' + msg);
+      try { dialog.showErrorBox('Munder Difflin DEV — isolation guard', msg); } catch { /* headless */ }
+      allowQuit = true;
+      app.exit(97);
+      return;
+    }
+    console.warn(`[dev-isolation] live check OK — hive=${live.hiveRoot} palace=${live.palace} pipe=${live.pipeName}`);
+  }
+
   // Realtime Michael mic-gate hygiene (rt-8 / Pam rt-10 nit): the voice session
   // opens the mic permission gate by persisting realtimeVoiceEnabled=true and
   // closes it on disconnect — but a hard crash/reload mid-session skips that
@@ -5088,7 +5184,9 @@ app.whenReady().then(() => {
   analytics.init({
     stateDir: app.getPath('userData'),
     appVersion: app.getVersion(),
-    enabled: readConfig().telemetryEnabled !== false
+    // MUNDER_DEV=1: never emit product analytics from a dev build (a dev run
+    // must not register as a distinct install or masquerade as Stable).
+    enabled: readConfig().telemetryEnabled !== false && !DEV_ISOLATION
   });
 
   // A cold-start deep link (Windows/Linux) rides in on OUR argv.

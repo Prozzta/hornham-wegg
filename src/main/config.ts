@@ -1,5 +1,6 @@
 import { app } from 'electron';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { DEV_ISOLATION, devDataRoot, devHarnessHome } from './devIsolation';
 import { dirname, join } from 'node:path';
 import { homedir } from 'node:os';
 import {
@@ -588,13 +589,13 @@ export function readConfig(): HarnessConfig {
   // No file yet = a first run with nothing to migrate; the defaults ARE the
   // post-migration shape. Deliberately does not persist — a bare read must not
   // conjure a config.json before onboarding has written one.
-  if (!existsSync(p)) return withTriggerDefaults({ ...DEFAULTS });
+  if (!existsSync(p)) return clampDevHome(withTriggerDefaults({ ...DEFAULTS }));
   try {
     const raw = readFileSync(p, 'utf8');
     const parsed = JSON.parse(raw);
     return normalizeStoredHomes(migrateTriggersV1(withTriggerDefaults({ ...DEFAULTS, ...parsed })));
   } catch {
-    return withTriggerDefaults({ ...DEFAULTS });
+    return clampDevHome(withTriggerDefaults({ ...DEFAULTS }));
   }
 }
 
@@ -607,7 +608,18 @@ export function readConfig(): HarnessConfig {
  *  this cleans them on the way OUT, so no consumer can see a `~` path
  *  regardless of the file's vintage. Expanded duplicates collapse (a stale
  *  "~/X" next to its absolute twin becomes one entry). */
+/** MUNDER_DEV=1: the harness home is CLAMPED to the dev data root, whatever the
+ *  wizard, a stale config.json or a picker says. Every derived path (hive,
+ *  palace, worktrees, roster.json) follows from harnessHome, so this one clamp
+ *  is what keeps a dev build off Stable's data; index.ts re-verifies at startup.
+ *  No-op when isolation is off. */
+function clampDevHome(cfg: HarnessConfig): HarnessConfig {
+  if (DEV_ISOLATION) cfg.harnessHome = devHarnessHome(devDataRoot());
+  return cfg;
+}
+
 function normalizeStoredHomes(cfg: HarnessConfig): HarnessConfig {
+  clampDevHome(cfg);
   if (typeof cfg.harnessHome === 'string' && cfg.harnessHome.trim()) {
     cfg.harnessHome = expandTilde(cfg.harnessHome);
   }
@@ -750,7 +762,9 @@ export function ensureHarnessHome(path: string): { ok: boolean; error?: string }
     // the hive then lives at a path the user cannot find. This is the
     // "defense-in-depth at the consumers" the expandTilde doc calls for: the
     // ingestion point normalizes, and the consumer refuses to trust that it did.
-    mkdirSync(expandTilde(path), { recursive: true });
+    // MUNDER_DEV=1: the wizard's free-text folder is ignored; only the clamped
+    // dev root is ever created (so a typed `C:\Dunder` never mkdirs anything).
+    mkdirSync(DEV_ISOLATION ? devHarnessHome(devDataRoot()) : expandTilde(path), { recursive: true });
     return { ok: true };
   } catch (e) {
     return { ok: false, error: e instanceof Error ? e.message : String(e) };

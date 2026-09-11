@@ -12,6 +12,7 @@
   },
   "scripts": {
     "dev": "electron-vite dev",
+    "dev:isolated": "node tools/dev-isolated.cjs",
     "build": "electron-vite build && npm run copy:main-assets",
     "copy:main-assets": "node tools/copy-main-assets.cjs",
     "preview": "electron-vite preview",
