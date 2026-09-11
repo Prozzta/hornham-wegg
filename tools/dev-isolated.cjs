@@ -8,7 +8,7 @@
  * so this script is a convenience, not the guard.
  *
  * Pass-through: extra args go to electron-vite (`npm run dev:isolated -- --help`).
- * Override the data root with MUNDER_DEV_DATA=<dir> in the calling shell.
+ * The data root is fixed (C:\Dunder\MunderDevData on Windows); there is no override.
  */
 const { spawn } = require('node:child_process');
 const path = require('node:path');
@@ -17,7 +17,10 @@ const path = require('node:path');
 const STABLE_ENV_KEYS = [
   'HIVE_ROOT', 'HIVE_SOCK', 'HIVE_NODE', 'HIVE_AUTO_APPROVE', 'AGENT_ID', 'AGENT_DIR', 'AGENT_NAME',
   'MEMPALACE_PALACE_PATH', 'MD_SLACK_REPLY_CONFIG', 'CODEX_HOME', 'PI_CODING_AGENT_DIR',
-  'OPENCODE_CONFIG_DIR', 'GEMINI_CLI_SYSTEM_SETTINGS_PATH', 'CRUSH_GLOBAL_CONFIG', 'CRUSH_GLOBAL_DATA'
+  'OPENCODE_CONFIG_DIR', 'OPENCODE_CONFIG_CONTENT', 'GEMINI_CLI_SYSTEM_SETTINGS_PATH',
+  'CRUSH_GLOBAL_CONFIG', 'CRUSH_GLOBAL_DATA', 'KG_ROOT', 'KG_CLI', 'KG_CORE', 'MD_BROKER_URL',
+  'MD_BROKER_TOKEN', 'HIVE_PROXY_SESSION', 'OPENAI_BASE_URL', 'CRUSH_PROXY_BASE_URL',
+  'CLAUDE_CODE_ENABLE_TELEMETRY'
 ];
 const STABLE_ENV_PREFIXES = ['OTEL_'];
 
@@ -28,7 +31,7 @@ for (const k of scrubbed) delete env[k];
 const isWin = process.platform === 'win32';
 const bin = path.join(__dirname, '..', 'node_modules', '.bin', isWin ? 'electron-vite.cmd' : 'electron-vite');
 
-console.log(`[dev:isolated] MUNDER_DEV=1 (data root: ${env.MUNDER_DEV_DATA || (isWin ? 'C:\\Dunder\\MunderDevData' : '~/MunderDevData')})`);
+console.log(`[dev:isolated] MUNDER_DEV=1 (data root is fixed: ${isWin ? 'C:\\Dunder\\MunderDevData' : '~/MunderDevData'})`);
 if (scrubbed.length) console.log(`[dev:isolated] scrubbed inherited Stable env: ${scrubbed.join(', ')}`);
 
 // A .cmd shim needs a shell on Windows (Node >= 18.20 refuses to spawn it directly).

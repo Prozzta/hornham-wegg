@@ -145,6 +145,10 @@ export class SlackWebhookServer {
    */
   async start(): Promise<{ ok: boolean; url?: string; error?: string }> {
     if (this.server) return { ok: false, error: 'already running' };
+    // MUNDER_DEV=1: do not bind the local listener at all — its fixed default
+    // port (3847) is the same one Stable would use, and the public tunnel is
+    // refused anyway. Refusing before `listen` removes the port collision.
+    if (DEV_ISOLATION) return { ok: false, error: 'dev build — the Slack listener is disabled under MUNDER_DEV=1' };
     if (!this.signingSecret) return { ok: false, error: 'missing signing secret' };
     try {
       await this.listen();

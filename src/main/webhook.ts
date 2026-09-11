@@ -210,6 +210,10 @@ export class WebhookServer {
    */
   async start(): Promise<{ ok: boolean; url?: string; error?: string }> {
     if (this.server) return { ok: false, error: 'already running' };
+    // MUNDER_DEV=1: do not bind the local listener at all — its fixed default
+    // port (3849) is the same one Stable would use, and the public tunnel is
+    // refused anyway. Refusing before `listen` removes the port collision.
+    if (DEV_ISOLATION) return { ok: false, error: 'dev build — the webhook listener is disabled under MUNDER_DEV=1' };
     if (this.endpoints.size === 0) return { ok: false, error: 'no enabled webhook endpoints' };
     try {
       await this.listen();

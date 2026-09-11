@@ -21,10 +21,13 @@ test('DEV_ISOLATION is a boolean derived from MUNDER_DEV', () => {
   assert.equal(typeof iso.DEV_ISOLATION, 'boolean');
 });
 
-test('devDataRoot: default on win32, MUNDER_DEV_DATA override wins', () => {
-  assert.equal(iso.devDataRoot({}, WIN), 'C:\\Dunder\\MunderDevData');
-  assert.equal(iso.devDataRoot({ MUNDER_DEV_DATA: 'D:\\x\\devdata' }, WIN), path.resolve('D:\\x\\devdata'));
-  assert.equal(iso.devDataRoot({ MUNDER_DEV_DATA: '   ' }, WIN), 'C:\\Dunder\\MunderDevData');
+test('devDataRoot is FIXED on win32 and ignores the environment (no MUNDER_DEV_DATA override)', () => {
+  assert.equal(iso.devDataRoot(WIN), 'C:\\Dunder\\MunderDevData');
+  const saved = process.env.MUNDER_DEV_DATA;
+  process.env.MUNDER_DEV_DATA = 'D:\\x\\devdata';
+  try { assert.equal(iso.devDataRoot(WIN), 'C:\\Dunder\\MunderDevData'); }
+  finally { if (saved === undefined) delete process.env.MUNDER_DEV_DATA; else process.env.MUNDER_DEV_DATA = saved; }
+  assert.equal(iso.devDataRoot('linux').endsWith('MunderDevData'), true);
 });
 
 test('devPaths derive hive/palace/worktrees/userData under the root with a dev pipe marker', () => {
@@ -75,6 +78,8 @@ test('stableForbiddenPaths: literals + default userData + paths under Stable har
   assert.ok(f.includes('C:\\Dunder\\palace'));
   assert.ok(f.includes(STABLE_USERDATA));
   assert.ok(f.includes('C:\\Dunder\\roster.json'));
+  assert.ok(f.includes('C:\\Dunder\\hallways.json'));
+  assert.ok(f.includes('C:\\Dunder\\tunnels.json'));
   assert.equal(new Set(f.map((p) => p.toLowerCase())).size, f.length, 'deduped');
 });
 
@@ -113,13 +118,15 @@ test('checkIsolation: rejects a pipe equal to Stable\'s and one without the dev 
 });
 
 test('scrubInheritedEnv removes exactly the Stable identity keys and reports them', () => {
-  const env = {
-    HIVE_ROOT: 'C:\\Dunder\\hive', HIVE_SOCK: 'x', HIVE_NODE: 'y', HIVE_AUTO_APPROVE: '1', AGENT_ID: 'jim', AGENT_DIR: 'd',
-    AGENT_NAME: 'Jim', MEMPALACE_PALACE_PATH: 'C:\\Dunder\\palace', MD_SLACK_REPLY_CONFIG: 's', CODEX_HOME: 'c',
-    PI_CODING_AGENT_DIR: 'p', OPENCODE_CONFIG_DIR: 'o', GEMINI_CLI_SYSTEM_SETTINGS_PATH: 'g', CRUSH_GLOBAL_CONFIG: 'cc',
-    CRUSH_GLOBAL_DATA: 'cd', OTEL_EXPORTER_OTLP_ENDPOINT: 'http://127.0.0.1:1', OTEL_METRICS_EXPORTER: 'otlp',
-    PATH: 'keep', MEMPALACE_EMBEDDING_MODEL: 'minilm', CLAUDE_CONFIG_DIR: 'keep-too'
-  };
+  const env = { PATH: 'keep', MEMPALACE_EMBEDDING_MODEL: 'minilm', CLAUDE_CONFIG_DIR: 'keep-too',
+    OTEL_EXPORTER_OTLP_ENDPOINT: 'http://127.0.0.1:1', OTEL_METRICS_EXPORTER: 'otlp' };
+  for (const k of iso.STABLE_ENV_KEYS) env[k] = 'stable-value';
+  // Every key Dwight's audit listed must be in the scrub set.
+  for (const k of ['KG_ROOT', 'KG_CLI', 'KG_CORE', 'MD_BROKER_URL', 'MD_BROKER_TOKEN', 'HIVE_PROXY_SESSION',
+    'OPENAI_BASE_URL', 'CRUSH_PROXY_BASE_URL', 'CLAUDE_CODE_ENABLE_TELEMETRY', 'OPENCODE_CONFIG_CONTENT',
+    'HIVE_ROOT', 'HIVE_SOCK', 'HIVE_NODE', 'AGENT_ID', 'AGENT_DIR', 'AGENT_NAME', 'MEMPALACE_PALACE_PATH']) {
+    assert.ok(iso.STABLE_ENV_KEYS.includes(k), `${k} must be scrubbed`);
+  }
   const removed = iso.scrubInheritedEnv(env);
   assert.deepEqual(removed.sort(), [...iso.STABLE_ENV_KEYS, 'OTEL_EXPORTER_OTLP_ENDPOINT', 'OTEL_METRICS_EXPORTER'].sort());
   assert.equal(env.PATH, 'keep');

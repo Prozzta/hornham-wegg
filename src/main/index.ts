@@ -119,19 +119,26 @@ if (DEV_ISOLATION) {
     console.error('[dev-isolation] REFUSING TO START — resolved dev paths overlap Stable:\n  ' + violations.join('\n  '));
     process.exit(97);
   }
-  mkdirSync(paths.userData, { recursive: true });
-  // Distinct app identity: anything Electron derives from the app name (default
-  // path roots, notification sender, crash-reporter product) reads as the dev
-  // build, not Stable. The explicit setPath calls below are the guarantee; the
-  // name is belt-and-braces plus the visible identity in OS notifications.
+  // Electron documents that setPath targets must exist — create every one first.
+  const logsDir = join(paths.userData, 'logs');
+  const crashDir = join(paths.userData, 'crashDumps');
+  const tempDir = join(paths.userData, 'temp');
+  for (const d of [paths.userData, logsDir, crashDir, tempDir]) mkdirSync(d, { recursive: true });
+  // Distinct app identity. `app.setName` only changes Electron's INTERNAL name
+  // (default path derivation) — it does not change Windows shell identity. The
+  // AppUserModelID is what the taskbar and toast notifications key on, so the
+  // dev build gets its own (Stable's packaged one is electron-builder's
+  // `appId: in.munderdiffl.app`; a bare electron.exe run otherwise carries
+  // Electron's default). Validation of taskbar/toast identity: Andy item.
   app.setName('munder-difflin-dev');
+  app.setAppUserModelId('in.munderdiffl.app.dev');
   app.setPath('userData', paths.userData);
   app.setPath('sessionData', paths.userData);
-  app.setPath('logs', join(paths.userData, 'logs'));
-  app.setPath('crashDumps', join(paths.userData, 'crashDumps'));
+  app.setPath('logs', logsDir);
+  app.setPath('crashDumps', crashDir);
   // `temp` feeds the paste-drop dir (join(app.getPath('temp'), 'cth-pastes'));
   // keep even that out of the shared %TEMP% so Dev never touches a Stable file.
-  app.setPath('temp', join(paths.userData, 'temp'));
+  app.setPath('temp', tempDir);
   const scrubbed = scrubInheritedEnv(process.env);
   console.warn(
     `[dev-isolation] MUNDER_DEV=1 — userData=${paths.userData} harnessHome=${paths.harnessHome} pipe=${paths.pipeName}` +
@@ -3157,6 +3164,10 @@ ipcMain.handle('config:ensureHome', (_evt, path: unknown) => {
 ipcMain.handle('config:changeHome', async (_evt, payload: unknown) => {
   const p = (payload ?? {}) as { newHome?: unknown; mode?: unknown };
   if (typeof p.newHome !== 'string' || !p.newHome) return { ok: false, error: 'invalid newHome' };
+  // MUNDER_DEV=1: the harness home is fixed at the DEV root. This handler copies
+  // hive/palace/roster to an arbitrary destination and persists it — refused
+  // outright so a dev build can never move data outside MunderDevData.
+  if (DEV_ISOLATION) return { ok: false, error: 'dev build — the harness home is fixed under MUNDER_DEV=1; changeHome is disabled' };
   const mode: 'move' | 'fresh' = p.mode === 'fresh' ? 'fresh' : 'move';
   // expandTilde BEFORE resolve: both UI callers feed a folder-dialog result
   // (always absolute), but the hive picker's recents list can serve a literal
@@ -3486,6 +3497,9 @@ ipcMain.handle('skills:install', async (_evt, url: unknown, name: unknown) => {
 /** Delete an installed skill. The guard rails live in uninstallSkill — it refuses
  *  any path it cannot prove is a skill folder inside a skills root. */
 ipcMain.handle('skills:uninstall', (_evt, path: unknown) => {
+  // MUNDER_DEV=1: uninstall deletes from the user's GLOBAL/project skill dirs
+  // shared with Stable's agents. Refused, like install.
+  if (DEV_ISOLATION) return { ok: false as const, error: 'dev build — skill uninstalls are disabled under MUNDER_DEV=1' };
   if (typeof path !== 'string') return { ok: false as const, error: 'bad request' };
   const cfg = readConfig();
   return uninstallSkill(path, { cwds: cfg.registeredRepos ?? [] });

@@ -30,7 +30,7 @@
 import { createHash } from 'node:crypto';
 import { realpathSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { join, resolve, sep, win32, posix, dirname } from 'node:path';
+import { join, sep, win32, posix, dirname } from 'node:path';
 
 /** True when the process was launched with MUNDER_DEV=1. Read once at load. */
 export const DEV_ISOLATION: boolean = process.env.MUNDER_DEV === '1';
@@ -52,9 +52,23 @@ export const STABLE_ENV_KEYS = [
   'CODEX_HOME',
   'PI_CODING_AGENT_DIR',
   'OPENCODE_CONFIG_DIR',
+  'OPENCODE_CONFIG_CONTENT',
   'GEMINI_CLI_SYSTEM_SETTINGS_PATH',
   'CRUSH_GLOBAL_CONFIG',
-  'CRUSH_GLOBAL_DATA'
+  'CRUSH_GLOBAL_DATA',
+  // Knowledge-graph CLI wiring, integration broker capability, proxy sidecar
+  // routing and Claude OTel enablement (Dwight audit of 0d1441db). The proxy
+  // and broker ones are normally sidecar/agent-only, but a dev launched from
+  // an agent terminal inherits whatever that agent was given.
+  'KG_ROOT',
+  'KG_CLI',
+  'KG_CORE',
+  'MD_BROKER_URL',
+  'MD_BROKER_TOKEN',
+  'HIVE_PROXY_SESSION',
+  'OPENAI_BASE_URL',
+  'CRUSH_PROXY_BASE_URL',
+  'CLAUDE_CODE_ENABLE_TELEMETRY'
 ] as const;
 
 /** Prefixes scrubbed wholesale: Stable's OTel exporter settings for the
@@ -70,17 +84,14 @@ const STABLE_LITERALS_WIN32 = [
   'C:\\Dunder\\worktrees',
   'C:\\Dunder\\roster.json',
   'C:\\Dunder\\roster-backups',
-  'C:\\Dunder\\hallways.json'
+  'C:\\Dunder\\hallways.json',
+  'C:\\Dunder\\tunnels.json'
 ];
 
-/** The dev data root. `MUNDER_DEV_DATA` overrides; default is the mission's
- *  dedicated location on Windows and `~/MunderDevData` elsewhere. */
-export function devDataRoot(
-  env: NodeJS.ProcessEnv = process.env,
-  platform: NodeJS.Platform = process.platform
-): string {
-  const override = typeof env.MUNDER_DEV_DATA === 'string' ? env.MUNDER_DEV_DATA.trim() : '';
-  if (override) return resolve(override);
+/** The dev data root: FIXED by the mission contract (no environment override —
+ *  a relocatable root was removed at Dwight's audit of 0d1441db). Windows uses
+ *  the mission's dedicated location; other platforms `~/MunderDevData`. */
+export function devDataRoot(platform: NodeJS.Platform = process.platform): string {
   return platform === 'win32' ? 'C:\\Dunder\\MunderDevData' : join(homedir(), 'MunderDevData');
 }
 

@@ -634,6 +634,10 @@ function normalizeStoredHomes(cfg: HarnessConfig): HarnessConfig {
 }
 
 function persistConfig(next: HarnessConfig): HarnessConfig {
+  // MUNDER_DEV=1: enforce the harnessHome clamp at the persistence boundary
+  // too, so no caller (writeConfig patch, migration, reset) can persist or
+  // return a non-DEV home even if it merged one in.
+  clampDevHome(next);
   const p = configPath();
   mkdirSync(dirname(p), { recursive: true });
   writeFileSync(p, JSON.stringify(next, null, 2), 'utf8');
