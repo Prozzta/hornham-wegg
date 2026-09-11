@@ -614,7 +614,13 @@ export function readConfig(): HarnessConfig {
  *  is what keeps a dev build off Stable's data; index.ts re-verifies at startup.
  *  No-op when isolation is off. */
 function clampDevHome(cfg: HarnessConfig): HarnessConfig {
-  if (DEV_ISOLATION) cfg.harnessHome = devHarnessHome(devDataRoot());
+  if (DEV_ISOLATION) {
+    const home = devHarnessHome(devDataRoot());
+    cfg.harnessHome = home;
+    // The hive picker's history must not advertise a Stable/out-of-tree path
+    // either (Andy 72f6180a spot-check): under DEV it is exactly the DEV root.
+    cfg.recentHives = [home];
+  }
   return cfg;
 }
 

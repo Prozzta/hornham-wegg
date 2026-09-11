@@ -45,12 +45,25 @@ test('wizard path: an out-of-tree harnessHome is clamped ON DISK, not only on re
   assert.equal(fs.existsSync(typed), false, 'nothing was created at the typed path');
 });
 
-test('wizard path: even the Stable home C:\\Dunder cannot be persisted', () => {
+test('wizard path: even the Stable home C:\\Dunder cannot be persisted, and recentHives holds only the DEV root', () => {
   const stable = process.platform === 'win32' ? 'C:\\Dunder' : '/opt/dunder';
   writeConfig({ harnessHome: stable });
   assert.equal(onDisk().harnessHome, DEV_HOME);
-  // recentHives may still list what was typed — it is picker history, not a
-  // path anything resolves against; the guard is on harnessHome.
+  // The hive picker's history (recentHives) is clamped too — an out-of-tree
+  // path must not be advertised in the DEV picker (Andy, 72f6180a spot-check).
+  assert.deepEqual(onDisk().recentHives, [DEV_HOME]);
+  assert.deepEqual(readConfig().recentHives, [DEV_HOME]);
+});
+
+test('a stale config.json with out-of-tree harnessHome and recentHives is clamped on the next read and on the next save', () => {
+  const stale = { harnessHome: 'C:\\Dunder\\research\\experiments\\dev-isolation\\tmp-onboard-probe', recentHives: ['C:\\Dunder', 'C:\\Elsewhere'], onboardingComplete: true };
+  fs.writeFileSync(path.join(userData, 'config.json'), JSON.stringify(stale), 'utf8');
+  const r = readConfig();
+  assert.equal(r.harnessHome, DEV_HOME);
+  assert.deepEqual(r.recentHives, [DEV_HOME]);
+  writeConfig({ notifications: true });
+  assert.equal(onDisk().harnessHome, DEV_HOME);
+  assert.deepEqual(onDisk().recentHives, [DEV_HOME]);
 });
 
 test('a later unrelated patch cannot un-clamp what is on disk', () => {
