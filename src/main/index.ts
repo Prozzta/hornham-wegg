@@ -2746,13 +2746,26 @@ async function spawnAgentCore(opts: AgentSpawnOptions, owner: Electron.WebConten
           skillsDir: skillsResourceDir()
         }
       );
+      // F1 FAIL-CLOSED GATE. Checked here, before ANY injection state is merged and
+      // long before ptyManager.spawn: provisioning can now REFUSE to make an agent
+      // safe to start, and a refusal must block the PTY rather than downgrade the
+      // spawn. Returning early (rather than throwing) is what makes it survive the
+      // best-effort catch below — a throw would be logged there and the spawn would
+      // continue on exactly the unsafe state the refusal exists to prevent.
+      if (inj.refusal) return { ok: false, error: inj.refusal };
       opts.args = [...(opts.args ?? []), ...inj.args];
       seedPrompt = inj.seedPrompt;
       // Point the agent's mempalace CLI at the shared palace + the `kg` CLI at the
       // enterprise knowledge store (both no-ops / empty when their flags are off).
       opts.env = { ...(opts.env ?? {}), ...inj.env, ...memory.env(), ...knowledge.env() };
     } catch (e) {
-      // Hive provisioning is best-effort; never block a spawn on it.
+      // POLICY: hive provisioning is best-effort IN GENERAL — an unexpected failure is
+      // logged here and never blocks a spawn — EXCEPT the F1 fail-closed Codex
+      // credential-migration refusal, which BLOCKS THE SPAWN BY DESIGN. That refusal is
+      // deliberately RETURNED as a typed result and checked at the gate above, so it
+      // never reaches this handler; converting it into a throw would land it here, get
+      // logged, and let the spawn continue on the unsafe state it exists to prevent.
+      // The exception is documented here, at the place someone would otherwise undo it.
       console.error('[hive] ensureAgent failed:', e);
     }
   }

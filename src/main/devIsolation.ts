@@ -28,7 +28,7 @@
  *     Stable-owned path, or the pipe name equals Stable's.
  */
 import { createHash } from 'node:crypto';
-import { realpathSync } from 'node:fs';
+import { realpathSync, lstatSync, readlinkSync, unlinkSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join, sep, win32, posix, dirname } from 'node:path';
 
@@ -370,4 +370,184 @@ export function devWindowTitle(base: string, dev: boolean = DEV_ISOLATION): stri
   return base.includes('Munder Difflin')
     ? base.replace('Munder Difflin', 'Munder Difflin DEV')
     : `${base} [DEV]`;
+}
+
+/** F1 — where a Codex agent home may seed its credential from, or `null` when it
+ *  must not be seeded at all.
+ *
+ *  v0.4.5 unconditionally links the user's GLOBAL `~/.codex/auth.json` into every
+ *  per-agent CODEX_HOME (hive.ts installCodexHooks), which under MUNDER_DEV=1 hands a
+ *  Dev agent a live, writable handle on the credential Stable also uses. `homedir()`
+ *  is the OS home and DEV does not move it, so that source is the real global one in
+ *  Dev exactly as in Stable. Under DEV it is therefore never a legal source: the Dev
+ *  home is left without a credential, and a `codex login` run inside Dev writes a
+ *  DEV-OWNED one into the agent's own `.codex`, which already lives under the dev
+ *  data root.
+ *
+ *  Pure on purpose. This is the SOURCE decision only; the lstat/readlink/unlink EFFECT
+ *  that migrates an already-linked home is `migrateCodexAuthLink` below, kept a
+ *  separate function so the policy stays independently testable. Every use of a global
+ *  credential source must flow through here — a second path reaching `homedir()`
+ *  directly would bypass the policy silently. */
+export function codexAuthSeedSource(opts: {
+  userCodexHome: string;
+  devIsolation?: boolean;
+}): string | null {
+  const dev = opts.devIsolation ?? DEV_ISOLATION;
+  if (dev) return null;
+  return join(opts.userCodexHome, 'auth.json');
+}
+
+/** Proof that a credential path is a legal place to DELETE a link from.
+ *  `ok:false` carries the reason; every caller treats it as fail-closed. */
+export type CodexAuthDestBound =
+  | { ok: true; realParent: string }
+  | { ok: false; reason: string };
+
+/** F1 — prove `authDest` is confined to a DEV agent's own Codex home BEFORE anything
+ *  is inspected or unlinked. `DEV_ISOLATION` is a MODE gate, not a containment proof:
+ *  `installCodexHooks(dir)` derives the destination from `dir`, and `agentDir(id)`
+ *  is a plain join with no containment check of its own, so a deletion primitive must
+ *  not rest on ID sanitisation or an uncorrupted registry.
+ *
+ *  NO SECOND PATH-SECURITY MODEL: this reuses `normalizePath`, `canonicalPath` and
+ *  `isInside` exactly as the rest of this module does. The one difference is
+ *  deliberate and narrow — for THIS object, the destructive destination parent, the
+ *  FORGIVING ERROR PATH is removed. `canonicalPath` catches any `realpathSync.native`
+ *  failure, walks to the nearest existing ancestor and re-appends the unresolved tail,
+ *  so a DANGLING parent symlink/junction would rebuild an apparently in-root lexical
+ *  parent and pass a check it should fail. Here the parent must resolve for real, or
+ *  the operation refuses.
+ *
+ *  The PARENT is resolved, never `authDest` itself: resolving the link would
+ *  deliberately follow it to the outside target, the opposite of what is being proved.
+ *  (`canonicalPath` is still right for the link TARGET in `migrateCodexAuthLink` — a
+ *  broken target must stay classifiable. The fallback is fine when deciding what a link
+ *  POINTS AT, and unacceptable when proving where we may DELETE.) */
+export function codexAuthDestBound(opts: {
+  authDest: string;
+  devDataRoot: string;
+  platform?: NodeJS.Platform;
+}): CodexAuthDestBound {
+  const platform = opts.platform ?? process.platform;
+  const lib = platform === 'win32' ? win32 : posix;
+
+  if (lib.basename(opts.authDest) !== 'auth.json') {
+    return { ok: false, reason: `destination basename is not auth.json: ${opts.authDest}` };
+  }
+
+  // DIRECT realpath, no fallback. On this path the parent MUST already exist —
+  // authDest cannot exist, and no unlink can be attempted, unless it does — so a
+  // resolution failure here is never a normal case. It is ambiguity, and ambiguity
+  // refuses. This is the branch a dangling parent reparse point lands in.
+  const parent = lib.dirname(opts.authDest);
+  let realParent: string;
+  try {
+    realParent = normalizePath(realpathSync.native(parent), platform);
+  } catch (e) {
+    return { ok: false, reason: `could not resolve the credential directory ${parent}: ${e instanceof Error ? e.message : String(e)}` };
+  }
+
+  const agentsRoot = lib.join(opts.devDataRoot, 'hive', 'agents');
+  // isInside() is true for an exact match, so strictness is spelled out: the agents
+  // directory ITSELF is not a legal place to delete a credential from.
+  const strict =
+    isInside(realParent, agentsRoot, platform) &&
+    canonicalPath(realParent, platform) !== canonicalPath(agentsRoot, platform);
+  if (!strict) {
+    return { ok: false, reason: `${realParent} is not inside a DEV agent home under ${agentsRoot}` };
+  }
+  return { ok: true, realParent };
+}
+
+/** What `migrateCodexAuthLink` did, or why it refused. A refusal is FAIL-CLOSED: the
+ *  caller must block the Codex spawn rather than continue with a possibly-live
+ *  external link. */
+export type CodexAuthMigration =
+  | { ok: true; action: 'skipped-not-dev' | 'absent' | 'preserved-regular' | 'preserved-inside-link' | 'removed-outside-link' }
+  | { ok: false; reason: string };
+
+/** F1 — remove a pre-existing link from a DEV agent's Codex home to a credential
+ *  OUTSIDE the dev data root, and prove the result is safe.
+ *
+ *  This exists because the v0.4.5 seed only runs when `authDest` does NOT already
+ *  exist, so changing the seed policy alone would leave every pre-existing Dev agent
+ *  still linked while F1 reported success.
+ *
+ *  It is the ONLY deletion in F1, and it removes the LINK ENTRY ONLY. The resolved
+ *  external target — the user's real credential — is never unlinked, never written,
+ *  never read. On Windows, unlinking a file symlink removes the directory entry for
+ *  the link, not the target.
+ *
+ *  Every failure and every unrecognised state returns `ok:false`. Nothing here throws
+ *  for an expected condition, because a thrown error would be absorbed by the caller's
+ *  best-effort catch and the spawn would continue — which is precisely the failure this
+ *  is here to close. */
+export function migrateCodexAuthLink(opts: {
+  authDest: string;
+  devDataRoot?: string;
+  devIsolation?: boolean;
+  platform?: NodeJS.Platform;
+}): CodexAuthMigration {
+  const dev = opts.devIsolation ?? DEV_ISOLATION;
+  // Stable never enters this code. Not even to look.
+  if (!dev) return { ok: true, action: 'skipped-not-dev' };
+
+  const platform = opts.platform ?? process.platform;
+  const lib = platform === 'win32' ? win32 : posix;
+  const root = opts.devDataRoot ?? devDataRoot(platform);
+
+  const bound = codexAuthDestBound({ authDest: opts.authDest, devDataRoot: root, platform });
+  if (!bound.ok) return { ok: false, reason: bound.reason };
+
+  let st;
+  try {
+    st = lstatSync(opts.authDest); // lstat, never stat: we classify the LINK, not its target.
+  } catch (e) {
+    const code = (e as NodeJS.ErrnoException)?.code;
+    if (code === 'ENOENT') return { ok: true, action: 'absent' };
+    return { ok: false, reason: `could not classify ${opts.authDest}: ${e instanceof Error ? e.message : String(e)}` };
+  }
+
+  // A regular file is a DEV-OWNED credential the user created by logging in inside
+  // Dev. Preserve it — deleting it would log them out on every spawn.
+  if (st.isFile()) return { ok: true, action: 'preserved-regular' };
+
+  if (!st.isSymbolicLink()) {
+    return { ok: false, reason: `${opts.authDest} is neither a regular file nor a symbolic link` };
+  }
+
+  let target: string;
+  try {
+    // A relative target resolves against the link's OWN directory, not the cwd.
+    // canonicalPath (with its nearest-existing-ancestor fallback) is wanted here: a
+    // DANGLING target must still be classifiable.
+    target = canonicalPath(lib.resolve(lib.dirname(opts.authDest), readlinkSync(opts.authDest)), platform);
+  } catch (e) {
+    return { ok: false, reason: `could not read the link target of ${opts.authDest}: ${e instanceof Error ? e.message : String(e)}` };
+  }
+
+  if (isInside(target, root, platform)) return { ok: true, action: 'preserved-inside-link' };
+
+  try {
+    unlinkSync(opts.authDest); // the LINK ENTRY only — never the resolved target.
+  } catch (e) {
+    return { ok: false, reason: `could not remove the external credential link ${opts.authDest}: ${e instanceof Error ? e.message : String(e)}` };
+  }
+
+  // Postcondition, re-checked rather than assumed: absent, a regular file, or a link
+  // that stays inside the dev root. Anything else refuses.
+  try {
+    const after = lstatSync(opts.authDest);
+    if (after.isFile()) return { ok: true, action: 'removed-outside-link' };
+    if (after.isSymbolicLink()) {
+      const t2 = canonicalPath(lib.resolve(lib.dirname(opts.authDest), readlinkSync(opts.authDest)), platform);
+      if (isInside(t2, root, platform)) return { ok: true, action: 'removed-outside-link' };
+    }
+    return { ok: false, reason: `an external credential link is still present at ${opts.authDest} after removal` };
+  } catch (e) {
+    const code = (e as NodeJS.ErrnoException)?.code;
+    if (code === 'ENOENT') return { ok: true, action: 'removed-outside-link' };
+    return { ok: false, reason: `could not verify ${opts.authDest} after removal: ${e instanceof Error ? e.message : String(e)}` };
+  }
 }

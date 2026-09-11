@@ -26,7 +26,10 @@ import { join, dirname, isAbsolute } from 'node:path';
 import { homedir } from 'node:os';
 import { spawnSync, spawn, type ChildProcess } from 'node:child_process';
 import { randomBytes, createHash } from 'node:crypto';
-import { DEV_ISOLATION, sanitizeCodexConfigForDev, hookPipeId } from './devIsolation';
+import {
+  DEV_ISOLATION, sanitizeCodexConfigForDev, hookPipeId,
+  codexAuthSeedSource, migrateCodexAuthLink
+} from './devIsolation';
 import type { AgentUsageSample } from './usage';
 import { COMMAND_GROUPS } from '../shared/claudeCommands';
 import {
@@ -182,6 +185,14 @@ export interface SpawnInjection {
    *  bare TUI rejects a positional seed. The renderer types it through the same
    *  per-pty write-chain as the inbox-wake nudge. (ondev-b) */
   seedPrompt?: string;
+  /** F1 — set when provisioning REFUSED to make this agent safe to start, and the
+   *  spawn must be BLOCKED rather than downgraded. Today the only source is the
+   *  Dev Codex credential migration: if an external credential link cannot be
+   *  classified or removed, starting Codex anyway would leave that live link in
+   *  place, which is exactly the state F1 exists to prevent. The caller must check
+   *  this BEFORE merging `args`/`env` and before reaching `ptyManager.spawn` — an
+   *  empty injection would silently downgrade the spawn instead of refusing it. */
+  refusal?: string;
 }
 
 const HOP_CAP = 12;
@@ -736,8 +747,10 @@ export class HiveManager {
       // preset's `hookBridge`. agy needs a translating shim (its hook stdin/stdout
       // shape differs from Claude's); codex reuses the Claude `cth-hook` shim
       // verbatim (its hook payload + response contract are already Claude-shaped)
-      // and is isolated to a per-agent CODEX_HOME so the user's global ~/.codex is
-      // never mutated. Both share the HIVE_SOCK wiring below.
+      // and is isolated to a per-agent CODEX_HOME so the user's global ~/.codex
+      // CONFIG is never mutated. (The credential is a separate question: outside DEV
+      // the global auth.json is still linked into that home — see installCodexHooks
+      // and F1. Under MUNDER_DEV=1 it is not.) Both share the HIVE_SOCK wiring below.
       const preArgs: string[] = [];
       // Dispatch on the structured bridge descriptor (the foundation's `bridgeOf`
       // derives {kind:'hooks'} from the legacy `hookBridge` for agy/codex, and
@@ -763,7 +776,10 @@ export class HiveManager {
               else this.installAgyHooks();
             }
             else if (desc.shim === 'codex') {
-              env.CODEX_HOME = this.installCodexHooks(dir);
+              const codex = this.installCodexHooks(dir);
+              // F1 fail-closed: provisioning refused, so this agent must not start.
+              if (codex.refusal) return { args: [], env: {}, refusal: codex.refusal };
+              env.CODEX_HOME = codex.home;
               // Codex refuses to run hooks from a config dir without persisted
               // "hook trust" (normally an interactive gate). Our hooks.json is
               // hive-authored inside an isolated CODEX_HOME, so we bypass that gate
@@ -1884,10 +1900,20 @@ export class HiveManager {
    *  their login), we point this worker at a PER-AGENT CODEX_HOME (`<dir>/.codex`,
    *  alongside Claude's settings.json) holding our own config.toml with `[hooks]`
    *  tables — so the hooks fire ONLY for hive workers and a personal `codex` run is
-   *  untouched. The user's ~/.codex/auth.json is linked in and their config.toml is
-   *  copied + extended (login + model/provider/trust settings still apply).
-   *  Returns the CODEX_HOME path for the caller to put in the worker's env. */
-  private installCodexHooks(dir: string): string {
+   *  untouched. Their config.toml is copied + extended (model/provider/trust settings
+   *  still apply).
+   *
+   *  CREDENTIAL (F1). OUTSIDE DEV the user's ~/.codex/auth.json is linked in, so the
+   *  isolated home authenticates as them — unchanged v0.4.5 behaviour. UNDER
+   *  MUNDER_DEV=1 it is NOT: `codexAuthSeedSource` returns null, the Dev home is left
+   *  without a credential, and a `codex login` run inside Dev writes a DEV-OWNED one
+   *  here instead. A link left over from before F1 is removed by
+   *  `migrateCodexAuthLink`, and if that cannot be done safely this returns a REFUSAL
+   *  and the spawn is blocked.
+   *
+   *  Returns the CODEX_HOME path for the caller to put in the worker's env, or a
+   *  refusal the caller must honour. */
+  private installCodexHooks(dir: string): { home: string; refusal?: string } {
     const home = join(dir, '.codex');
     try {
       mkdirSync(home, { recursive: true });
@@ -1896,9 +1922,26 @@ export class HiveManager {
       // (config.toml is NOT symlinked — we write our own below, seeded from theirs,
       // because it must carry our [hooks] tables.) Fall back to copy where symlinks
       // need privilege (Windows). Idempotent — skip if already linked.
-      const authSrc = join(userHome, 'auth.json');
       const authDest = join(home, 'auth.json');
-      if (existsSync(authSrc) && !existsSync(authDest)) {
+      // F1 — the SOURCE decision is a pure policy call; null means the global
+      // credential is not a legal source here (DEV). Every global credential source
+      // must flow through it, so there is no second path that reaches homedir().
+      const authSrc = codexAuthSeedSource({ userCodexHome: userHome });
+      if (authSrc === null) {
+        // DEV: no seeding, and any pre-F1 link OUT of the dev root is removed first.
+        // FAIL CLOSED — a migration we cannot complete blocks the spawn rather than
+        // starting Codex on a live external link. Returned, never thrown: a throw
+        // would be swallowed by the caller's best-effort catch and the spawn would
+        // continue, which is the exact failure this is here to prevent.
+        const m = migrateCodexAuthLink({ authDest });
+        if (!m.ok) {
+          console.error('[dev-isolation] codex credential migration REFUSED:', m.reason);
+          return { home, refusal: `refusing to start Codex: ${m.reason}` };
+        }
+        if (m.action === 'removed-outside-link') {
+          console.warn(`[dev-isolation] removed a pre-F1 external Codex credential link at ${authDest} (the link only; the target was not touched)`);
+        }
+      } else if (existsSync(authSrc) && !existsSync(authDest)) {
         try { symlinkSync(authSrc, authDest); }
         catch { try { copyFileSync(authSrc, authDest); } catch { /* best-effort */ } }
       }
@@ -1959,7 +2002,7 @@ export class HiveManager {
       }
       writeFileSync(join(home, 'config.toml'), config, 'utf8');
     } catch (e) { console.error('[hive] installCodexHooks failed:', e); }
-    return home;
+    return { home };
   }
 
   /** Pi (earendil-works) bridge. Pi has a rich `pi.on(event, …)` lifecycle but no
