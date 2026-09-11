@@ -281,6 +281,38 @@ export function scrubInheritedEnv(env: NodeJS.ProcessEnv): string[] {
   return removed;
 }
 
+/**
+ * Sanitise the user's global `~/.codex/config.toml` before it is seeded into a
+ * DEV agent's isolated CODEX_HOME (Andy M4 finding on 0d1441db). Two things in
+ * the global file point back at Stable/user state and must not be inherited:
+ *   - any `CODEX_HOME = "…"` key (the global file carries one under an MCP
+ *     server's `env` table, pointing at ~/.codex) — dropped wherever it occurs;
+ *   - every `[projects.'<path>']` / `[projects."<path>"]` trust table (the
+ *     user's global folder-trust list) — dropped with its body. A DEV agent's
+ *     trust gate is suppressed by the preset's CODEX_NON_INTERACTIVE anyway.
+ * Line-based on purpose: the file is simple TOML written by Codex itself, and a
+ * full parser would add a dependency. Everything else is passed through
+ * verbatim so auth/model/MCP settings keep working.
+ */
+export function sanitizeCodexConfigForDev(toml: string): { text: string; droppedKeys: number; droppedTables: number } {
+  const out: string[] = [];
+  let droppedKeys = 0;
+  let droppedTables = 0;
+  let skippingTable = false;
+  for (const line of toml.split(/\r?\n/)) {
+    const header = /^\s*\[\[?([^\]]+)\]\]?\s*$/.exec(line);
+    if (header) {
+      skippingTable = /^projects\s*[."']/.test(header[1].trim());
+      if (skippingTable) { droppedTables++; continue; }
+    } else if (skippingTable) {
+      continue; // body of a dropped [projects.…] table
+    }
+    if (/^\s*CODEX_HOME\s*=/.test(line)) { droppedKeys++; continue; }
+    out.push(line);
+  }
+  return { text: out.join('\n'), droppedKeys, droppedTables };
+}
+
 /** Window title for the dev build. Unchanged when isolation is off. */
 export function devWindowTitle(base: string, dev: boolean = DEV_ISOLATION): string {
   if (!dev) return base;

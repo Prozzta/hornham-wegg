@@ -26,7 +26,7 @@ import { join, dirname, isAbsolute } from 'node:path';
 import { homedir } from 'node:os';
 import { spawnSync, spawn, type ChildProcess } from 'node:child_process';
 import { randomBytes, createHash } from 'node:crypto';
-import { DEV_ISOLATION } from './devIsolation';
+import { DEV_ISOLATION, sanitizeCodexConfigForDev } from './devIsolation';
 import type { AgentUsageSample } from './usage';
 import { COMMAND_GROUPS } from '../shared/claudeCommands';
 import {
@@ -1941,6 +1941,16 @@ export class HiveManager {
       const shim = this.shimPath();
       let config = existsSync(join(userHome, 'config.toml'))
         ? readFileSync(join(userHome, 'config.toml'), 'utf8') : '';
+      // MUNDER_DEV=1: the global file carries a nested CODEX_HOME (pointing at
+      // ~/.codex) and the user's global project-trust list — strip both so the
+      // DEV agent's home inherits settings but not Stable/user identity.
+      if (DEV_ISOLATION && config) {
+        const s = sanitizeCodexConfigForDev(config);
+        config = s.text;
+        if (s.droppedKeys || s.droppedTables) {
+          console.warn(`[dev-isolation] codex config seed: dropped ${s.droppedKeys} CODEX_HOME key(s) and ${s.droppedTables} [projects.*] trust table(s)`);
+        }
+      }
       if (shim) {
         const events = ['PreToolUse', 'PostToolUse', 'Stop', 'SubagentStop',
           'SessionStart', 'UserPromptSubmit', 'PreCompact', 'PostCompact'];
