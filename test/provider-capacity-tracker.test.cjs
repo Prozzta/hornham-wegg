@@ -17,7 +17,7 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const loadTs = require('./load-ts.cjs');
 
-const { ProviderCapacityTracker, L0_SEM_POLICY, REASON } = loadTs('src/main/providerCapacityTracker.ts');
+const { ProviderCapacityTracker, L0_SEM_POLICY, REASON, RETENTION_CAPS } = loadTs('src/main/providerCapacityTracker.ts');
 
 const T0 = 1_800_000_000_000;
 const KEY = 'codex:acct-a:codex';
@@ -476,4 +476,151 @@ test('an invalid NEGATIVE percentage reaching the tracker is UNKNOWN, never AVAI
   m.t.ingest(obs({ windows: [win('five_hour', 'FIVE_HOUR', null, RESET_5H), win('seven_day', 'SEVEN_DAY', 60, T0 + 86_400_000)] }));
   assert.equal(m.state(), 'UNKNOWN');
   assert.equal(m.reason(), REASON.NO_NUMBERS);
+});
+
+// ── L0-SPEC4: conformance repairs against Oscar 1bd4fd19 ────────────────────
+
+test('SPEC4/121: a window of UNKNOWN applicability makes the pool UNKNOWN, not AVAILABLE', () => {
+  const m = make();
+  // Identified windows are positive and fresh. The third window is one we could not
+  // identify at all - no kind, no duration - so we do not know what it constrains.
+  // Leaving it out of the arithmetic and reporting AVAILABLE on the other two is
+  // exactly the silent skip 121 forbids.
+  m.t.ingest(obs({ windows: [
+    win('five_hour', 'FIVE_HOUR', 80, RESET_5H),
+    win('seven_day', 'SEVEN_DAY', 60, T0 + 86_400_000),
+    { windowId: 'primary', kind: 'OTHER', label: 'primary', windowMinutes: null, usedPercent: 5, remainingPercent: 95, resetsAt: null }
+  ] }));
+  assert.equal(m.state(), 'UNKNOWN');
+  assert.equal(m.reason(), REASON.UNKNOWN_APPLICABILITY, '89 keeps the reveal reasons separate');
+});
+
+test('SPEC4/121: a known-INAPPLICABLE window is EXCLUDED and is not a gap', () => {
+  const m = make();
+  m.t.ingest(obs({ windows: [
+    win('five_hour', 'FIVE_HOUR', 80, RESET_5H),
+    { windowId: 'legacy', kind: 'OTHER', label: 'legacy', windowMinutes: null,
+      usedPercent: null, remainingPercent: null, resetsAt: null, applicability: 'INAPPLICABLE' }
+  ] }));
+  assert.equal(m.state(), 'AVAILABLE', 'a window that does not constrain this pool is not missing data');
+});
+
+test('SPEC4/121: an inapplicable window cannot be the thing that exhausts a pool', () => {
+  const m = make();
+  m.t.ingest(obs({ windows: [
+    win('five_hour', 'FIVE_HOUR', 80, RESET_5H),
+    { windowId: 'legacy', kind: 'OTHER', label: 'legacy', windowMinutes: null,
+      usedPercent: 100, remainingPercent: 0, resetsAt: null, applicability: 'INAPPLICABLE' }
+  ] }));
+  assert.equal(m.state(), 'AVAILABLE');
+  assert.deepEqual(m.t.pool(KEY).numericallyExhaustedWindowIds, []);
+});
+
+test('SPEC4/95: a newer NON-AUTHORITATIVE snapshot suggesting improvement is a HINT, never AVAILABLE', () => {
+  const m = make();
+  m.t.ingest(obs({
+    providerReachedType: 'rate_limit_reached',
+    windows: [win('five_hour', 'FIVE_HOUR', 0, RESET_5H), win('seven_day', 'SEVEN_DAY', 40, T0 + 86_400_000)]
+  }));
+  assert.equal(m.state(), 'LIMITED');
+
+  // Newer, no hard evidence, and NOT authoritative - the five-hour window is still
+  // short of a complete all-positive set on its own terms, but it has moved up.
+  const t1 = T0 + 30_000;
+  m.set(t1);
+  m.t.ingest(obs({
+    observedAt: t1, receivedAt: t1,
+    windows: [win('five_hour', 'FIVE_HOUR', 3, RESET_5H), win('seven_day', 'SEVEN_DAY', null, T0 + 86_400_000)]
+  }));
+  assert.equal(m.state(), 'RECOVERING', 'improvement de-escalates');
+  assert.equal(m.reason(), REASON.RECOVERY_HINT_UNCONFIRMED);
+});
+
+test('SPEC4/95: improvement is a STRICT INCREASE - not equal, and not worse', () => {
+  // The window set and every reset time are held identical across both readings, so
+  // this isolates the improvement hint from the re-anchor hint, which is a separate
+  // clause of 95 and fires on any change to the reported anchors.
+  const refusal = [win('five_hour', 'FIVE_HOUR', 0, RESET_5H), win('seven_day', 'SEVEN_DAY', 40, T0 + 86_400_000)];
+  for (const [label, later] of [
+    ['unchanged', [win('five_hour', 'FIVE_HOUR', 0, RESET_5H), win('seven_day', 'SEVEN_DAY', 40, T0 + 86_400_000)]],
+    ['worse', [win('five_hour', 'FIVE_HOUR', 0, RESET_5H), win('seven_day', 'SEVEN_DAY', 30, T0 + 86_400_000)]]
+  ]) {
+    const m = make();
+    m.t.ingest(obs({ providerReachedType: 'rate_limit_reached', windows: refusal }));
+    const t1 = T0 + 30_000;
+    m.set(t1);
+    m.t.ingest(obs({ observedAt: t1, receivedAt: t1, windows: later }));
+    assert.equal(m.state(), 'LIMITED', `${label} is not improvement`);
+  }
+});
+
+test('SPEC4/135: a change of PROVENANCE alone moves the pool revision', () => {
+  const m = make();
+  m.t.ingest(obs());
+  const before = m.t.pool(KEY).revision;
+  const t1 = T0 + 1_000;
+  m.set(t1);
+  // Same numbers, same everything - read from a different collector.
+  assert.equal(
+    m.t.ingest(obs({ observedAt: t1, receivedAt: t1, source: 'codex-account-read' })),
+    true,
+    'provenance is a domain field, so the projection changed'
+  );
+  assert.equal(m.t.pool(KEY).source, 'codex-account-read');
+  assert.ok(m.t.pool(KEY).revision > before);
+});
+
+test('SPEC4/172: exceeding the per-pool WINDOW cap is UNKNOWN, not a truncated healthy answer', () => {
+  const m = make();
+  const many = [];
+  for (let i = 0; i < RETENTION_CAPS.maxWindowsPerPool + 1; i += 1) {
+    many.push({ windowId: `w${i}`, kind: 'FIVE_HOUR', label: '5h', windowMinutes: 300,
+      usedPercent: 10, remainingPercent: 90, resetsAt: RESET_5H });
+  }
+  m.t.ingest(obs({ windows: many }));
+  assert.equal(m.state(), 'UNKNOWN');
+  assert.equal(m.reason(), REASON.CAP_EXCEEDED, 'it must not silently discard an applicable window and stay healthy');
+});
+
+test('SPEC4/172: the pool that exceeds the POOL cap becomes UNKNOWN rather than vanishing', () => {
+  const m = make();
+  for (let i = 0; i < RETENTION_CAPS.maxPools; i += 1) {
+    m.t.ingest(obs({ poolKey: `codex:acct-${i}:codex`, accountScope: `acct-${i}` }));
+  }
+  const overflow = 'codex:acct-over:codex';
+  m.t.ingest(obs({ poolKey: overflow, accountScope: 'acct-over' }));
+  const pool = m.t.pool(overflow);
+  assert.ok(pool, 'the pool is REPORTED, because dropping it is the silent discard 172 forbids');
+  assert.equal(pool.state, 'UNKNOWN');
+  assert.equal(pool.stateReason, REASON.CAP_EXCEEDED);
+});
+
+test('SPEC4/172: the cap diagnostic is DEDUPLICATED - repeated breaches publish nothing new', () => {
+  const m = make();
+  const many = [];
+  for (let i = 0; i < RETENTION_CAPS.maxWindowsPerPool + 1; i += 1) {
+    many.push({ windowId: `w${i}`, kind: 'FIVE_HOUR', label: '5h', windowMinutes: 300,
+      usedPercent: 10, remainingPercent: 90, resetsAt: RESET_5H });
+  }
+  m.t.ingest(obs({ windows: many }));
+  const revision = m.t.pool(KEY).revision;
+  const t1 = T0 + 1_000;
+  m.set(t1);
+  assert.equal(m.t.ingest(obs({ observedAt: t1, receivedAt: t1, windows: many })), false);
+  assert.equal(m.t.pool(KEY).revision, revision, 'one diagnostic, not one per observation');
+});
+
+test('SPEC4: a pool that breached a cap RECOVERS when a reading fits again', () => {
+  const m = make();
+  const many = [];
+  for (let i = 0; i < RETENTION_CAPS.maxWindowsPerPool + 1; i += 1) {
+    many.push({ windowId: `w${i}`, kind: 'FIVE_HOUR', label: '5h', windowMinutes: 300,
+      usedPercent: 10, remainingPercent: 90, resetsAt: RESET_5H });
+  }
+  m.t.ingest(obs({ windows: many }));
+  assert.equal(m.state(), 'UNKNOWN');
+  const t1 = T0 + 1_000;
+  m.set(t1);
+  m.t.ingest(obs({ observedAt: t1, receivedAt: t1 }));
+  assert.equal(m.state(), 'AVAILABLE', 'the breach is a property of the reading, not a latch on the pool');
 });

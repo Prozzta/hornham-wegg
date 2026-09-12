@@ -59,10 +59,46 @@ export type ObservationSource =
   | 'codex-account-read';
 
 /** One normalised allowance window. Every numeric field is nullable on purpose. */
+/**
+ * Whether a window constrains THIS pool, as a tri-state rather than a presence test.
+ *
+ * L0-SEM 121 needs all three and they behave differently: a known-APPLICABLE window
+ * is classified, a known-INAPPLICABLE one is EXCLUDED and is not a gap, and one whose
+ * applicability is UNKNOWN forces the pool to UNKNOWN. Collapsing the last two into
+ * "absent" is what let an unidentified window be silently skipped while the pool went
+ * on reporting AVAILABLE on the windows that happened to parse.
+ *
+ * INAPPLICABLE is representable and is not produced by either adapter today: neither
+ * provider states that a window does not apply to an account. It exists so a future
+ * provider fact has somewhere true to land, and NOT as a place to put a guess.
+ */
+export type WindowApplicability = 'APPLICABLE' | 'INAPPLICABLE' | 'UNKNOWN';
+
+/**
+ * Applicability of a window, STATED if the payload said so and DERIVED otherwise.
+ *
+ * There is one rule and this is it, so a caller that builds a window by hand and a
+ * normaliser that builds one from a payload cannot disagree. The derivation is the
+ * same question the normalisers ask: COULD WE IDENTIFY THIS WINDOW? A window with a
+ * known kind or a real duration is one we can name, and a named window applies. One
+ * with neither is a window we fell back to a slot name for — a slot a plan change can
+ * move — so we do not know what it constrains, and 121 makes that UNKNOWN rather
+ * than something to leave quietly out of the arithmetic.
+ */
+export const applicabilityOf = (w: CapacityWindow): WindowApplicability =>
+  w.applicability ?? (w.kind === 'OTHER' && w.windowMinutes === null ? 'UNKNOWN' : 'APPLICABLE');
+
 export interface CapacityWindow {
   /** Stable within a pool. Derived from duration where known, so it survives re-anchoring. */
   windowId: string;
   kind: WindowKind;
+  /**
+   * Does this window constrain this pool? Optional because the provider states it
+   * only when it has something to say; absent means "derive it", via
+   * `applicabilityOf`. Never read this field directly — read that function, so the
+   * stated and derived cases cannot drift apart.
+   */
+  applicability?: WindowApplicability;
   /** User-safe label, main-owned. The renderer never composes window wording. */
   label: string;
   windowMinutes: number | null;
@@ -115,6 +151,13 @@ export interface PoolCapacitySnapshot {
   /** Main-owned, non-causal unless the provider attributed the limit. */
   stateReason: string;
   windows: CapacityWindow[];
+  /**
+   * Which collector produced the reading behind this projection. PROVENANCE IS A
+   * DOMAIN FIELD (L0-SEM 135): the same numbers arriving from a live status line and
+   * from a replayed rollout are not the same fact, and a consumer that cannot see
+   * the difference cannot tell a current reading from a re-read of an old one.
+   */
+  source: ObservationSource;
   freshness: CapacityFreshness;
   observedAt: number;
   receivedAt: number;

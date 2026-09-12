@@ -128,6 +128,11 @@ export function normalizeClaudeStatusLine(input: {
     windows.push({
       windowId: key,
       kind,
+      // A DOCUMENTED window name identifies a window we know constrains this
+      // subscription. An unrecognised key is a window we cannot identify - not one
+      // we know is irrelevant - so its applicability is UNKNOWN and the pool is
+      // UNKNOWN with it, rather than AVAILABLE on whatever else parsed.
+      applicability: known ? 'APPLICABLE' : 'UNKNOWN',
       label: known ? windowLabel(kind, minutes) : key,
       windowMinutes: minutes,
       usedPercent: used,
@@ -218,6 +223,12 @@ function codexWindow(slot: string, raw: unknown): CapacityWindow | null {
     // downstream can mistake it for a known window.
     windowId: kind === 'OTHER' ? (minutes !== null ? `w${minutes}m` : slot) : kind.toLowerCase(),
     kind,
+    // A window with a real duration is a real window and it applies. Without one we
+    // could not identify it at all - we fell back to the SLOT name, which a plan
+    // change can move - so we do not know what it constrains. That is UNKNOWN
+    // applicability, and it is exactly the case L0-SEM 121 refuses to let pass as
+    // healthy.
+    applicability: minutes !== null ? 'APPLICABLE' : 'UNKNOWN',
     label: windowLabel(kind, minutes),
     windowMinutes: minutes,
     usedPercent: used,

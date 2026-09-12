@@ -363,3 +363,49 @@ test('the two accounts of one provider do not share a pool', () => {
   const b = normalizeCodexRateLimits({ rateLimits: CODEX_OBSERVED, accountScope: 'acct-b', observedAt: OBSERVED, receivedAt: RECEIVED });
   assert.notEqual(a.poolKey, b.poolKey);
 });
+
+// ── L0-SPEC4: applicability is emitted, not left for a consumer to guess ─────
+
+test('SPEC4: a DOCUMENTED Claude window is applicable; an unrecognised one is UNKNOWN', () => {
+  const o = normalizeClaudeStatusLine({
+    rateLimits: {
+      five_hour: { used_percentage: 10, resets_at: 1789004151 },
+      opus_weekly_preview: { used_percentage: 5, resets_at: 1789590951 }
+    },
+    accountScope: 'acct-a', observedAt: OBSERVED, receivedAt: RECEIVED
+  });
+  assert.equal(o.windows.find((w) => w.windowId === 'five_hour').applicability, 'APPLICABLE');
+  assert.equal(
+    o.windows.find((w) => w.windowId === 'opus_weekly_preview').applicability,
+    'UNKNOWN',
+    'a window we cannot identify is not a window we know is irrelevant'
+  );
+});
+
+test('SPEC4: a Codex window with a real duration applies; one without is UNKNOWN', () => {
+  const o = normalizeCodexRateLimits({
+    rateLimits: {
+      limit_id: 'codex',
+      primary: { used_percent: 20, window_minutes: 300, resets_at: 1789004151 },
+      secondary: { used_percent: 30, resets_at: 1789590951 }
+    },
+    accountScope: 'acct-b', observedAt: OBSERVED, receivedAt: RECEIVED
+  });
+  assert.equal(o.windows.find((w) => w.kind === 'FIVE_HOUR').applicability, 'APPLICABLE');
+  // No window_minutes, so the identity fell back to the SLOT name - and a plan change
+  // can move which duration sits in a slot.
+  assert.equal(o.windows.find((w) => w.windowId === 'secondary').applicability, 'UNKNOWN');
+});
+
+test('SPEC4: neither adapter ever emits INAPPLICABLE, because no provider states it', () => {
+  const payloads = [
+    normalizeClaudeStatusLine({ rateLimits: { five_hour: { used_percentage: 1, resets_at: 1789004151 } },
+      accountScope: 'a', observedAt: OBSERVED, receivedAt: RECEIVED }),
+    normalizeCodexRateLimits({ rateLimits: CODEX_OBSERVED, accountScope: 'b', observedAt: OBSERVED, receivedAt: RECEIVED })
+  ];
+  for (const o of payloads) {
+    for (const w of o.windows) {
+      assert.notEqual(w.applicability, 'INAPPLICABLE', 'the state exists for a provider fact we do not have');
+    }
+  }
+});

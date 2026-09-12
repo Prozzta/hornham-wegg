@@ -48,9 +48,11 @@ import type {
   CapacityFreshness,
   CapacityObservation,
   CapacityState,
+  CapacityWindow,
   ObservationSource,
   PoolCapacitySnapshot
 } from '../shared/providerCapacity';
+import { applicabilityOf } from '../shared/providerCapacity';
 
 /**
  * Operational constants from L0-SEM §6 and §9.2. These are conservative L0
@@ -75,6 +77,25 @@ export const L0_SEM_POLICY: CapacityPolicy = {
   anchorCoalesceMs: 30_000
 };
 
+/**
+ * Retention caps (L0-SEM 162). Exceeding one is not a licence to drop data quietly:
+ * 172 requires the affected pool to become UNKNOWN with ONE deduplicated diagnostic,
+ * and forbids silently discarding an applicable window while still looking healthy.
+ * That is the whole point — truncating to the cap and carrying on would turn a
+ * budget breach into a confident answer computed from part of the evidence.
+ *
+ * The 1 MiB tracker-heap cap from the same line is NOT enforced here: retained heap
+ * is not measurable from inside this class without an allocator hook, and a number
+ * invented to look enforced would be worse than an honestly absent one. The
+ * per-pool and per-collection byte caps bound the same quantity from above.
+ */
+export const RETENTION_CAPS = {
+  maxPools: 32,
+  maxWindowsPerPool: 16,
+  maxPoolBytes: 8 * 1024,
+  maxCollectionBytes: 256 * 1024
+} as const;
+
 const ttlFor = (source: ObservationSource, policy: CapacityPolicy): number =>
   source === 'codex-account-read' ? policy.accountReadTtlMs : policy.liveTtlMs;
 
@@ -90,6 +111,8 @@ export const REASON = {
   NO_READING: 'NO_READING',
   NO_NUMBERS: 'NO_USABLE_NUMBERS',
   CONFLICT: 'SAME_KEY_CONFLICT',
+  UNKNOWN_APPLICABILITY: 'UNKNOWN_APPLICABILITY',
+  CAP_EXCEEDED: 'RETENTION_CAP_EXCEEDED',
   PROVIDER_ADVISORY: 'PROVIDER_NATIVE_ADVISORY',
   FRESH: 'FRESH_READING'
 } as const;
@@ -104,12 +127,21 @@ interface LimitEpoch {
   permissionDenied: boolean;
   /** Reset/limit-identity anchors at the moment of the refusal, for re-anchor detection. */
   anchors: string;
+  /**
+   * Applicable window remainders as they stood at the refusal. A later snapshot that
+   * reports MORE than this on some window is the "newer incomplete/non-authoritative
+   * snapshot suggests improvement" hint of L0-SEM 95 — which needs a baseline to be
+   * an improvement over, and the refusal is that baseline.
+   */
+  remaindersAtRefusal: Record<string, number>;
   /** Latched once a recovery HINT appears. Hints never confirm; they only de-escalate. */
   hinted: boolean;
 }
 
 interface PoolRecord {
   observation: CapacityObservation;
+  /** Which retention cap this pool breached, or null. Sticky until a reading fits. */
+  capBreach: string | null;
   projection: PoolCapacitySnapshot;
   epoch: LimitEpoch | null;
   /** Same ordering key, different content: facts are invalid until something newer. */
@@ -153,6 +185,10 @@ const fingerprint = (obs: CapacityObservation): string => JSON.stringify([
 const sameProjection = (a: PoolCapacitySnapshot, b: PoolCapacitySnapshot): boolean =>
   a.state === b.state
   && a.stateReason === b.stateReason
+  // Provenance is a DOMAIN field (L0-SEM 135), not bookkeeping: identical numbers
+  // from a live status line and from a replayed rollout are different facts, and a
+  // consumer that never sees the change cannot tell one from the other.
+  && a.source === b.source
   && a.freshness === b.freshness
   && a.observedAt === b.observedAt
   && a.providerAttributedLimitingWindowId === b.providerAttributedLimitingWindowId
@@ -223,6 +259,7 @@ export class ProviderCapacityTracker {
 
     const rec: PoolRecord = prev ?? {
       observation: obs,
+      capBreach: null,
       projection: blankProjection(obs, this.revisionFloor.get(obs.poolKey) ?? 0),
       epoch: null,
       conflicted: false,
@@ -233,6 +270,7 @@ export class ProviderCapacityTracker {
       acceptedMono: 0
     };
     rec.observation = obs;
+    rec.capBreach = this.capBreachFor(obs, prev !== undefined);
     this.stampDeadline(rec, obs, now);
     rec.conflicted = conflicted;
     rec.epoch = this.nextEpoch(rec, obs, now);
@@ -349,6 +387,7 @@ export class ProviderCapacityTracker {
         reachedType: obs.providerReachedType,
         permissionDenied: obs.ordinaryUsageAllowed === false,
         anchors: anchorsOf(obs),
+        remaindersAtRefusal: remaindersOf(obs),
         hinted: false
       };
     }
@@ -361,8 +400,13 @@ export class ProviderCapacityTracker {
     // K3 — a fresh authoritative snapshot after the event, no reached fact, every
     // known-applicable window valid and above zero.
     if (this.isFresh(obs, now) && obs.windows.length > 0 && allWindowsPositive(obs)) return null;
-    // Otherwise: not confirmation. A re-anchored reset or limit identity is a HINT.
+    // Otherwise: not confirmation, but possibly a HINT. The three hint forms that
+    // can be seen at ingestion (L0-SEM 95): a re-anchored reset or limit identity,
+    // and a newer snapshot that suggests improvement without being authoritative
+    // enough to confirm. The fourth, the reset boundary passing, is time-relative
+    // and is resolved in project() instead.
     if (anchorsOf(obs) !== epoch.anchors) return { ...epoch, hinted: true };
+    if (suggestsImprovement(obs, epoch)) return { ...epoch, hinted: true };
     return epoch;
   }
 
@@ -378,6 +422,28 @@ export class ProviderCapacityTracker {
     rec.ageAtAccept = age;
     rec.acceptedMono = mono;
     rec.staleAt = mono + (ttlFor(obs.source, this.policy) - age);
+  }
+
+  /**
+   * Which retention cap this reading breaches, or null. Checked at ACCEPTANCE rather
+   * than at publication, so the breach is a property of the reading that caused it.
+   *
+   * A breach makes the pool UNKNOWN (172). It deliberately does NOT reject the
+   * reading: rejecting would leave the previous, smaller reading in place and being
+   * reported as current, which is the silent-discard outcome 172 forbids by another
+   * route.
+   */
+  private capBreachFor(obs: CapacityObservation, poolExists: boolean): string | null {
+    if (obs.windows.length > RETENTION_CAPS.maxWindowsPerPool) return 'WINDOWS_PER_POOL';
+    if (!poolExists && this.pools.size >= RETENTION_CAPS.maxPools) return 'POOLS';
+    const bytes = byteLength(obs);
+    if (bytes > RETENTION_CAPS.maxPoolBytes) return 'POOL_BYTES';
+    // The collection cap counts what is already retained plus what is arriving, so
+    // the pool that pushes the collection over is the pool that reports it.
+    let total = bytes;
+    for (const [key, rec] of this.pools) if (key !== obs.poolKey) total += byteLength(rec.observation);
+    if (total > RETENTION_CAPS.maxCollectionBytes) return 'COLLECTION_BYTES';
+    return null;
   }
 
   private isFresh(obs: CapacityObservation, now: number): boolean {
@@ -441,6 +507,7 @@ export class ProviderCapacityTracker {
       state,
       stateReason,
       windows: obs.windows,
+      source: obs.source,
       freshness,
       observedAt: obs.observedAt,
       receivedAt: obs.receivedAt,
@@ -482,8 +549,20 @@ export class ProviderCapacityTracker {
     }
     // A same-key contradiction leaves facts unusable rather than merged (§7).
     if (rec.conflicted) return { state: 'UNKNOWN', stateReason: REASON.CONFLICT };
+    // A breached retention cap is UNKNOWN, never a confident answer computed from
+    // part of the evidence (L0-SEM 172).
+    if (rec.capBreach) return { state: 'UNKNOWN', stateReason: REASON.CAP_EXCEEDED };
     if (ctx.freshness === 'STALE') return { state: 'UNKNOWN', stateReason: REASON.STALE };
-    if (!obs.windows.length || obs.windows.some((w) => w.remainingPercent === null)) {
+    // Applicability is decided BEFORE the numbers, because a window we cannot
+    // identify is not a window we can leave out of the arithmetic. Known-inapplicable
+    // windows are excluded and are not a gap; unknown applicability is UNKNOWN
+    // (L0-SEM 121), and its own reason code, because 89 keeps the reveal reasons
+    // exhaustive and separate rather than folding this into "no usable numbers".
+    if (obs.windows.some((w) => applicabilityOf(w) === 'UNKNOWN')) {
+      return { state: 'UNKNOWN', stateReason: REASON.UNKNOWN_APPLICABILITY };
+    }
+    const applicable = applicableWindows(obs);
+    if (!applicable.length || applicable.some((w) => w.remainingPercent === null)) {
       // Incomplete is UNKNOWN, never "healthy on the windows we happen to have".
       return { state: 'UNKNOWN', stateReason: REASON.NO_NUMBERS };
     }
@@ -512,13 +591,58 @@ function publish(p: PoolCapacitySnapshot): PoolCapacitySnapshot {
   return Object.freeze(p);
 }
 
-/** Fresh exact zero. An OBSERVATION; it never implies the provider said anything. */
-function numericallyExhausted(obs: CapacityObservation): string[] {
-  return obs.windows.filter((w) => w.remainingPercent === 0).map((w) => w.windowId);
+/** Serialized size of one retained reading, which is what the byte caps bound. */
+const byteLength = (obs: CapacityObservation): number => JSON.stringify(obs).length;
+
+/** Applicable, known remainders, keyed by window. The baseline a later snapshot is
+ *  compared against for improvement. */
+function remaindersOf(obs: CapacityObservation): Record<string, number> {
+  const out: Record<string, number> = {};
+  for (const w of applicableWindows(obs)) if (w.remainingPercent !== null) out[w.windowId] = w.remainingPercent;
+  return out;
 }
 
+/**
+ * Does this newer, non-confirming snapshot suggest the refusal is easing?
+ *
+ * L0-SEM 95 makes "a newer incomplete/non-authoritative snapshot suggests
+ * improvement" a recovery hint Q. It is reached only after K1 and K3 have already
+ * declined, so by construction this snapshot is NOT authoritative — which is exactly
+ * why it can only de-escalate to RECOVERING and can never reach AVAILABLE (ruling 4).
+ *
+ * IMPROVEMENT IS A STRICT INCREASE ON A WINDOW THAT WAS ALREADY KNOWN. A window
+ * absent from the refusal is not an improvement: there is nothing it improved on, and
+ * treating an unmeasured window as progress is how a missing reading becomes good
+ * news. A snapshot carrying hard evidence never reaches here.
+ */
+function suggestsImprovement(obs: CapacityObservation, epoch: LimitEpoch): boolean {
+  for (const w of applicableWindows(obs)) {
+    const before = epoch.remaindersAtRefusal[w.windowId];
+    if (before === undefined || w.remainingPercent === null) continue;
+    if (w.remainingPercent > before) return true;
+  }
+  return false;
+}
+
+/** Windows that actually constrain this pool. Known-inapplicable ones are excluded
+ *  and are not treated as missing data (L0-SEM 121). */
+const applicableWindows = (obs: CapacityObservation): CapacityWindow[] =>
+  obs.windows.filter((w) => applicabilityOf(w) === 'APPLICABLE');
+
+/** Fresh exact zero on an APPLICABLE window. An OBSERVATION; it never implies the
+ *  provider said anything. */
+function numericallyExhausted(obs: CapacityObservation): string[] {
+  return applicableWindows(obs).filter((w) => w.remainingPercent === 0).map((w) => w.windowId);
+}
+
+/** K3's "every known-applicable window valid and above zero". A window of unknown
+ *  applicability disqualifies the snapshot rather than being skipped: it cannot be
+ *  an AUTHORITATIVE all-clear while something in it is unidentified. */
 function allWindowsPositive(obs: CapacityObservation): boolean {
-  return obs.windows.every((w) => w.remainingPercent !== null && w.remainingPercent > 0);
+  if (obs.windows.some((w) => applicabilityOf(w) === 'UNKNOWN')) return false;
+  const applicable = applicableWindows(obs);
+  return applicable.length > 0
+    && applicable.every((w) => w.remainingPercent !== null && w.remainingPercent > 0);
 }
 
 /** Has the reset boundary relevant to the refusal passed? A passed boundary is a
@@ -566,6 +690,7 @@ function blankProjection(obs: CapacityObservation, floor = 0): PoolCapacitySnaps
     state: 'UNKNOWN',
     stateReason: REASON.NO_READING,
     windows: [],
+    source: obs.source,
     freshness: 'STALE',
     observedAt: 0,
     receivedAt: 0,
