@@ -15,8 +15,8 @@
  *     session boundary happened or the cached file disappears.
  *   - A cached file is `stat`ed and only read when its mtime has ADVANCED. An
  *     unchanged file is not reopened, so an idle agent costs one stat.
- * Only the last few kilobytes are read. A rollout grows without bound and the
- * newest snapshot is always at the end.
+ * Only the tail is read. A rollout grows without bound, and the newest snapshot is
+ * at the end - though not necessarily within reach; see TAIL_BYTES.
  *
  * This module never reads, resolves or reports credential material. It touches
  * exactly one thing in a Codex home: the session rollout.
@@ -27,8 +27,24 @@ import type { CapacityObservation } from '../shared/providerCapacity';
 import { normalizeCodexRateLimits } from './capacityNormalize';
 import { codexAccountScope } from './capacityScope';
 
-/** The newest snapshot sits at the end of the file; this is generous for one event. */
-const TAIL_BYTES = 64 * 1024;
+/**
+ * How far back a read reaches. 256 KiB is not a chosen number: it is L0-SEM section
+ * 8's own per-read budget ("max 256 KiB appended bytes per read"), and this reader
+ * was running four times under its own specification.
+ *
+ * WHAT IT DOES AND DOES NOT BUY. Measured on a real 26.2 MiB rollout, 64 KiB could
+ * not reach the last usable snapshot (~212 KiB from the end) and 256 KiB could, at
+ * 0.93 ms per read against a 5 ms p95 budget. But the idle chatter rate on that
+ * same file is ~9.5 KiB/min, so 256 KiB reaches back about 27 MINUTES rather than
+ * the ~7 that 64 KiB managed. An agent idle longer than that still walks out of
+ * range. This closes nothing; it makes the implementation match its own spec for
+ * free and moves the failure from routine to frequent.
+ *
+ * The pathological case is LONG IDLE AFTER ACTIVITY: during active work a snapshot
+ * is written every turn and is in the tail anyway, so a high chatter rate is the
+ * safe case, not the dangerous one.
+ */
+const TAIL_BYTES = 256 * 1024;
 
 interface HomeCache {
   file: string | null;
