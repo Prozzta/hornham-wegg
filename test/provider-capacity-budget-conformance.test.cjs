@@ -7,9 +7,10 @@
  * guessing which rows looked thin: by MUTATION. Each defence in the capacity surface
  * was removed or altered in an isolated worktree and all nine capacity suites rerun.
  * A defence whose removal leaves 171 of 171 green is a defence nothing checks — "a
- * test that would still pass if the thing it names were removed". Of 24 mutants 18
- * were killed; every genuine survivor was a §8 budget row, which is what this file
- * closes.
+ * test that would still pass if the thing it names were removed". Of 25 mutants 18
+ * were killed and 7 survived; of those 7, six were genuine gaps and every one was a
+ * §8 budget row, which is what this file closes. Five of the six are closed here; the
+ * sixth cannot be closed by a fixture and is recorded in the arithmetic tripwire below.
  *
  * Each surviving mutant was then probed for EQUIVALENCE before being believed. A
  * mutation that changes no observable behaviour survives for a reason that has
