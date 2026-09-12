@@ -301,11 +301,27 @@ test('REGR-5 A10: removing and re-adding a pool never rolls its revision BACKWAR
 
   assert.ok(
     after >= before,
-    `THE DEFECT: pool revision rolled BACKWARD, ${before} -> ${after}. A consumer ` +
-      'that diffs by per-pool revision — the stated purpose of the field — sees a ' +
-      'lower number for the same poolKey and treats fresh state as stale.'
+    `THE ORIGINAL DEFECT: pool revision rolled BACKWARD, ${before} -> ${after}. A ` +
+      'consumer that diffs by per-pool revision — the stated purpose of the field — ' +
+      'sees a lower number for the same poolKey and treats fresh state as stale.'
   );
-  // Deliberately NOT asserted: whether a reappearance must strictly INCREASE the
-  // revision. It arguably should, since the projection did change, but the audit
-  // finding is the backward roll and that call belongs to the design owner.
+  // TIGHTENED after the design owner ruled, which the red version deliberately left
+  // open. L0-SEM §"Per-pool revision" (Oscar 1bd4fd19): poolRevision is "a monotonic
+  // integer local to stable poolId" and increments on any domain-semantic change
+  // INCLUDING MEMBERSHIP. Remove is one membership change and re-add is another, and
+  // because the counter belongs to the STABLE identity rather than to the current
+  // membership record, a reappearance must move it FORWARD.
+  //
+  // The weaker >= above is kept, because it names the audit finding and the stronger
+  // claim would report a different failure. But >= ALONE IS NOT A PIN: it passes a
+  // retained floor that has stopped incrementing (3 -> 3), which is a plausible
+  // regression of the very fix it is meant to protect. AN ASSERTION THAT CANNOT
+  // DISTINGUISH THE FIXED STATE FROM A PLAUSIBLE REGRESSION IS NOT PROTECTING
+  // ANYTHING.
+  assert.ok(
+    after > before,
+    `revision did not advance across remove + re-add, ${before} -> ${after}. A stalled ` +
+      'floor is not a monotonic counter: membership changed twice and the consumer ' +
+      'that diffs by revision saw neither.'
+  );
 });
