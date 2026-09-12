@@ -30,6 +30,7 @@ import {
 } from './git';
 import { HiveManager, type AgentMeta, type HiveMessage, type HiveTask } from './hive';
 import { HookServer } from './hooks';
+import { ProviderCapacityTracker } from './providerCapacityTracker';
 import { CircuitBreaker, type BreakerInput } from './breaker';
 import type { UsageProvider } from './usage';
 import { MemoryManager } from './memory';
@@ -347,6 +348,12 @@ function standingGoalFromRoster(agentId: string): string | null {
 const workerWake = new WorkerWakeWatchdog();
 // HookServer needs BOTH: Oscar's control registry (HITL pause/gate/steer/halt via
 // hook returns) AND Jim's breaker (feed recordToolUse on each PostToolUse).
+// L0 — provider allowance, keyed by provider-account/limit identity. Fed from
+// sources that already exist (the Claude status-line tick below; Codex rollout
+// events), never by polling a provider. Nothing consumes it yet: the admission
+// seam and the UI are separate cards, and the freshness/evaluate cadence is an
+// overhead question owned by L0-SEM, so no timer is started here on a guess.
+const providerCapacity = new ProviderCapacityTracker();
 const hookServer = new HookServer(
   hive,
   () => liveWebContents(),
@@ -354,7 +361,8 @@ const hookServer = new HookServer(
   control,
   breaker,
   standingGoalFromRoster,
-  (agentId, event, message) => workerWake.noteHook(agentId, event, message)
+  (agentId, event, message) => workerWake.noteHook(agentId, event, message),
+  (obs) => { providerCapacity.ingest(obs); }
 );
 const memory = new MemoryManager(
   () => readConfig().harnessHome,

@@ -18,6 +18,9 @@ import type { HarnessConfig } from './config';
 import type { ControlRegistry } from './control';
 import type { CircuitBreaker } from './breaker';
 import { estimateCostUsd } from './pricing';
+import { normalizeClaudeStatusLine } from './capacityNormalize';
+import { claudeAccountScope } from './capacityScope';
+import type { CapacityObservation } from '../shared/providerCapacity';
 
 interface HookPayload {
   hook_event_name?: string;
@@ -26,6 +29,13 @@ interface HookPayload {
   transcript_path?: string;
   /** Status-line payloads only: the session's live context accounting. */
   context_window?: { total_input_tokens?: number; context_window_size?: number };
+  /** Status-line payloads only: the subscription's rolling allowance windows
+   *  (`five_hour`, `seven_day`, possibly model-family windows). The shim already
+   *  forwards the WHOLE status JSON, so this field has always arrived here — it was
+   *  simply not declared, and therefore dropped. Typed as unknown because the
+   *  schema is the provider's and may grow; shape checking lives in the
+   *  normaliser, which is pure and tested. */
+  rate_limits?: unknown;
   cwd?: string;
   tool_name?: string;
   tool_input?: unknown;
@@ -74,7 +84,12 @@ export class HookServer {
     /** Optional observer of every hook boundary (agentId, event, message). The
      *  worker inbox-wake watchdog (workerWake.ts) feeds on this to learn when an
      *  agent is parked on a permission/HITL prompt so it never types into it. */
-    private onEvent?: (agentId: string | undefined, event: string, message: string | undefined) => void
+    private onEvent?: (agentId: string | undefined, event: string, message: string | undefined) => void,
+    /** L0 — provider allowance observed on the status line. Optional so the server
+     *  runs unchanged where no tracker is wired (tests, and any build without L0).
+     *  HookServer deliberately does not hold the tracker: it hands over a
+     *  normalised observation and knows nothing about states, thresholds or pools. */
+    private onCapacity?: (obs: CapacityObservation) => void
   ) {}
 
   start(): void {
@@ -153,6 +168,25 @@ export class HookServer {
           tokens: cw.total_input_tokens,
           limit: cw.context_window_size
         });
+      }
+      // L0 — the same payload carries the SUBSCRIPTION's rolling allowance
+      // windows, which is a different quantity from the context accounting above:
+      // context is per session and per agent, allowance is shared at account scope
+      // across every session drawing on it. This is the supported machine-readable
+      // pre-limit signal for a Claude subscription, and it arrives here for free on
+      // a status tick that is already happening — no poll, no extra request, and no
+      // credential is touched. Guarded so a payload without the field, or with a
+      // shape we do not recognise, changes nothing.
+      if (p.rate_limits !== undefined && this.onCapacity) {
+        try {
+          const now = Date.now();
+          const obs = normalizeClaudeStatusLine({
+            rateLimits: p.rate_limits,
+            accountScope: claudeAccountScope(),
+            receivedAt: now
+          });
+          if (obs) this.onCapacity(obs);
+        } catch { /* telemetry must never break a status tick */ }
       }
       return {};
     }
