@@ -278,6 +278,46 @@ export class ProviderCapacityTracker {
   }
 
   /**
+   * How long until the SOONEST moment a projection could change with no new
+   * reading at all, or null when nothing is pending.
+   *
+   * WHY THE TRACKER ANSWERS THIS AND NOT THE SCHEDULER. Two things move on their
+   * own: a reading expires, and a reset boundary passes. Both instants are derived
+   * from state only this class holds - the monotonic staleness deadline and the
+   * epoch-scoped reset arithmetic - and a scheduler that recomputed them from the
+   * published projection would be a second implementation of the same rules, free
+   * to drift from this one. So the tracker names the instant and the scheduler does
+   * nothing but wait for it.
+   *
+   * A DELAY, NOT A TIMESTAMP, DELIBERATELY. The staleness deadline lives on the
+   * monotonic clock and the reset boundary on the wall clock; they cannot be
+   * compared as instants without picking one basis and corrupting the other. As
+   * durations from now they compare honestly.
+   */
+  nextBoundaryDelayMs(now: number = this.clock(), monoNow: number = this.monotonic()): number | null {
+    let soonest: number | null = null;
+    const consider = (delay: number): void => {
+      if (delay < 0) return;
+      soonest = soonest === null ? delay : Math.min(soonest, delay);
+    };
+    for (const rec of this.pools.values()) {
+      // A fresh reading will expire. A stale one has already published that fact.
+      // The deadline is the LAST fresh instant - freshness is `monoNow <= staleAt` -
+      // so the predicate flips one tick after it. Waking exactly ON the deadline
+      // finds the reading still fresh and re-arms for zero, which is a busy loop
+      // rather than a boundary.
+      if (monoNow <= rec.staleAt) consider(rec.staleAt - monoNow + 1);
+      // A refusal whose boundary has not yet been treated as a hint. Once hinted,
+      // the pool is already RECOVERING and only new evidence moves it.
+      const epoch = rec.epoch;
+      if (!epoch || epoch.hinted) continue;
+      const at = nextResetBoundary(rec.observation, epoch);
+      if (at !== null && at > now) consider(at - now);
+    }
+    return soonest;
+  }
+
+  /**
    * Removal is explicit. Nothing here expires a pool on its own at L0.
    *
    * The record goes; the revision high-water mark stays. See `revisionFloor`.
@@ -481,17 +521,24 @@ function allWindowsPositive(obs: CapacityObservation): boolean {
   return obs.windows.every((w) => w.remainingPercent !== null && w.remainingPercent > 0);
 }
 
-/**
- * Has the reset boundary relevant to the refusal passed? Attributed window first,
- * then exhausted windows, then the earliest known reset — the narrowest evidence
- * available. A passed boundary is a HINT and never a confirmation (ruling 4).
- */
+/** Has the reset boundary relevant to the refusal passed? A passed boundary is a
+ *  HINT and never a confirmation (ruling 4). */
 function resetPassed(obs: CapacityObservation, epoch: LimitEpoch, now: number): boolean {
-  // A boundary that had ALREADY passed when the refusal was recorded is not news
-  // about it: the provider refused knowing it. Only a boundary still ahead at the
-  // moment of the evidence can later become a recovery hint - which is also what
-  // makes a fresh refusal during RECOVERING land back on LIMITED rather than
-  // bouncing straight off the old, already-expired reset time.
+  const at = nextResetBoundary(obs, epoch);
+  return at !== null && at <= now;
+}
+
+/**
+ * The earliest reset boundary that could become a recovery hint for this epoch, or
+ * null if there is none. Attributed window first, then exhausted windows, then the
+ * earliest known reset - the narrowest evidence available.
+ *
+ * A boundary that had ALREADY passed when the refusal was recorded is excluded: the
+ * provider refused knowing it, so it is not news about that refusal (L0-SEM 11.1).
+ * That exclusion is also what makes a fresh refusal during RECOVERING land back on
+ * LIMITED rather than bouncing straight off the old, already-expired reset time.
+ */
+function nextResetBoundary(obs: CapacityObservation, epoch: LimitEpoch): number | null {
   const scoped = epoch.attributedWindowId
     ? obs.windows.filter((w) => w.windowId === epoch.attributedWindowId)
     : obs.windows.filter((w) => w.remainingPercent === 0);
@@ -501,7 +548,7 @@ function resetPassed(obs: CapacityObservation, epoch: LimitEpoch, now: number): 
     if (w.resetsAt === null || w.resetsAt <= epoch.evidenceAt) continue;
     earliest = earliest === null ? w.resetsAt : Math.min(earliest, w.resetsAt);
   }
-  return earliest !== null && earliest <= now;
+  return earliest;
 }
 
 /**

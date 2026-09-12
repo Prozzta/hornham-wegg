@@ -34,7 +34,7 @@ const statusPayload = (over = {}) => ({
 
 test('a status tick carrying rate_limits produces exactly one capacity observation', () => {
   const seen = [];
-  const s = server((obs) => seen.push(obs));
+  const s = server((agentId, obs) => seen.push(obs));
   s.handle(statusPayload({
     rate_limits: {
       five_hour: { used_percentage: 37, resets_at: 1789004151 },
@@ -50,16 +50,29 @@ test('a status tick carrying rate_limits produces exactly one capacity observati
   assert.equal(seen[0].providerAttributedLimitingWindowId, null);
 });
 
+test('the observation arrives WITH the agent that produced it', () => {
+  // L0-WIRE depends on this: an agent is mapped to a pool by readings that actually
+  // arrived from it, never by a guessed limit id. If the hook boundary dropped the
+  // agent here, every agent would map to no pool and the seam would answer UNKNOWN
+  // forever - which is safe, silent, and completely useless.
+  const seen = [];
+  const s = server((agentId, obs) => seen.push([agentId, obs]));
+  s.handle(statusPayload({ rate_limits: { five_hour: { used_percentage: 37, resets_at: 1789004151 } } }));
+  assert.equal(seen.length, 1);
+  assert.equal(seen[0][0], 'jim');
+  assert.equal(seen[0][1].provider, 'claude');
+});
+
 test('a status tick WITHOUT rate_limits observes nothing - absence is not an empty reading', () => {
   const seen = [];
-  server((obs) => seen.push(obs)).handle(statusPayload());
+  server((agentId, obs) => seen.push(obs)).handle(statusPayload());
   assert.equal(seen.length, 0);
 });
 
 test('a malformed rate_limits payload is ignored and never throws on a status tick', () => {
   for (const junk of ['nonsense', 42, [], { five_hour: 'nope' }, { five_hour: {} }]) {
     const seen = [];
-    const s = server((obs) => seen.push(obs));
+    const s = server((agentId, obs) => seen.push(obs));
     assert.doesNotThrow(() => s.handle(statusPayload({ rate_limits: junk })));
     assert.equal(seen.length, 0, `expected no observation for ${JSON.stringify(junk)}`);
   }
@@ -67,7 +80,7 @@ test('a malformed rate_limits payload is ignored and never throws on a status ti
 
 test('capacity is collected from status ticks only, never from ordinary hook events', () => {
   const seen = [];
-  const s = server((obs) => seen.push(obs));
+  const s = server((agentId, obs) => seen.push(obs));
   s.handle({
     hook_event_name: 'PostToolUse',
     agent_id: 'jim',

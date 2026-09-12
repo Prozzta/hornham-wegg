@@ -46,7 +46,8 @@ function rig(start = T0) {
   const tracker = new ProviderCapacityTracker(L0_SEM_POLICY, () => now, () => mono);
   const seam = new CapacityAdmission({
     poolKeyForAgent: (id) => SHARED[id] ?? null,
-    poolState: (key) => tracker.pool(key)
+    poolState: (key) => tracker.pool(key),
+    now: () => now
   });
   return { tracker, seam, set: (v) => { mono += Math.max(0, v - now); now = v; } };
 }
@@ -153,7 +154,12 @@ test('a re-refusal inside an UNRESOLVED epoch does NOT hand out a second turn', 
   r.tracker.ingest(obs({ providerReachedType: 'usage' }));
   r.set(RESET_5H + 1);
   r.tracker.evaluate();
-  assert.equal(r.seam.admit('dwight').verdict, 'ALLOW', 'the one permitted turn');
+  const granted = r.seam.admit('dwight');
+  assert.equal(granted.verdict, 'ALLOW', 'the one permitted turn');
+  // And the turn actually STARTED, so the grant is committed. A reservation that is
+  // never confirmed is treated as abandoned and returned to the epoch, which is the
+  // right behaviour for a caller that died before launching and the wrong one here.
+  r.seam.confirmLaunch(granted);
   // That turn evidently did not succeed: the provider refused again. The epoch was
   // never cleared, so it is the SAME refusal continuing - and granting another turn
   // would be the retry storm the single-grant rule exists to prevent.

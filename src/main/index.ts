@@ -30,7 +30,8 @@ import {
 } from './git';
 import { HiveManager, type AgentMeta, type HiveMessage, type HiveTask } from './hive';
 import { HookServer } from './hooks';
-import { ProviderCapacityTracker } from './providerCapacityTracker';
+import { CapacityRuntime } from './capacityRuntime';
+import type { CapacityNotifyIntent } from './capacityNotify';
 import { CircuitBreaker, type BreakerInput } from './breaker';
 import type { UsageProvider } from './usage';
 import { MemoryManager } from './memory';
@@ -350,10 +351,20 @@ const workerWake = new WorkerWakeWatchdog();
 // hook returns) AND Jim's breaker (feed recordToolUse on each PostToolUse).
 // L0 — provider allowance, keyed by provider-account/limit identity. Fed from
 // sources that already exist (the Claude status-line tick below; Codex rollout
-// events), never by polling a provider. Nothing consumes it yet: the admission
-// seam and the UI are separate cards, and the freshness/evaluate cadence is an
-// overhead question owned by L0-SEM, so no timer is started here on a guess.
-const providerCapacity = new ProviderCapacityTracker();
+// events), never by polling a provider.
+//
+// The runtime owns the three parts together: it evaluates on a single timer armed
+// at the next instant a projection can change (never a poll), decides transitions
+// against the previous collection, and answers the admission question below. UI is
+// still a separate card and nothing here reaches a renderer.
+const providerCapacity = new CapacityRuntime({
+  deliver: (intents) => {
+    for (const intent of intents) {
+      console.log(`[capacity] ${intent.kind} ${intent.poolKey} ${intent.from}->${intent.to} (${intent.stateReason})`);
+      capacityToast(intent);
+    }
+  }
+});
 const hookServer = new HookServer(
   hive,
   () => liveWebContents(),
@@ -362,7 +373,7 @@ const hookServer = new HookServer(
   breaker,
   standingGoalFromRoster,
   (agentId, event, message) => workerWake.noteHook(agentId, event, message),
-  (obs) => { providerCapacity.ingest(obs); }
+  (agentId, obs) => { providerCapacity.ingest(agentId, obs); }
 );
 const memory = new MemoryManager(
   () => readConfig().harnessHome,
@@ -1166,6 +1177,23 @@ function godActionableInboxCount(): number {
 function reengageGod(digest: string): void {
   if (!hive.enabled()) return;
   hive.send({ to: 'god', act: 'request', subject: 'Heartbeat', body: digest }, 'heartbeat');
+}
+
+/**
+ * A native toast for a capacity transition, gated on the same notifications setting
+ * as every other toast. Main-side only: the renderer is not involved in deciding or
+ * delivering this, so a closed or throttled window cannot swallow it.
+ *
+ * WORDING IS THE MAIN-OWNED REASON CODE, not renderer copy and not a percentage.
+ * L0 has no approved user-facing wording yet — that is held with the UI card — so
+ * this says what happened in the vocabulary the tracker already publishes rather
+ * than inventing a phrasing that would then have to be unlearned.
+ */
+function capacityToast(intent: CapacityNotifyIntent): void {
+  if (!readConfig().notifications) return;
+  const body = `${intent.provider} ${intent.from} -> ${intent.to} (${intent.stateReason})`;
+  try { if (Notification.isSupported()) new Notification({ title: 'Provider capacity', body }).show(); }
+  catch { /* unsupported platform */ }
 }
 
 /** A native toast for breaker constrain/stop, gated on the notifications setting. */
@@ -5095,8 +5123,23 @@ function runWorkerWakeBeat(): void {
     // is the exact staleness #187 exists to stop.
     const ids = hive.inbox(agentId).map((m) => m.id).filter(Boolean);
     if (!ids.length) { console.log(`[worker-wake] ${agentId} drained before delivery, skipping`); continue; }
+    // L0-SEAM. A nudge starts a PROVIDER TURN that nobody asked for in this moment,
+    // so it is exactly the automatic start the admission seam exists to gate: with
+    // the pool LIMITED this would have been a retry against a provider that just
+    // refused. UNKNOWN is NOT a refusal - the seam declines to infer safety and this
+    // caller's configured behaviour is to proceed, which keeps a pool we have never
+    // observed behaving as it did before capacity existed.
+    const decision = providerCapacity.admit(agentId, 'ORDINARY_TURN');
+    if (decision.verdict === 'REFUSE') {
+      console.log(`[worker-wake] ${agentId} held: ${decision.reason} (${decision.poolKey})`);
+      continue;
+    }
     console.log(`[worker-wake] nudging ${agentId} on ${ptyId} (${ids.length} pending)`);
     nudgeWorker(ptyId, ids);
+    // The turn really started, so a reserved recovery grant is now spent. Confirming
+    // AFTER the nudge is the point of the two-step: a decision that never became a
+    // turn must not consume the one attempt the epoch is allowed.
+    providerCapacity.confirmLaunch(decision);
   }
 }
 

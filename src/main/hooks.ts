@@ -93,7 +93,7 @@ export class HookServer {
      *  runs unchanged where no tracker is wired (tests, and any build without L0).
      *  HookServer deliberately does not hold the tracker: it hands over a
      *  normalised observation and knows nothing about states, thresholds or pools. */
-    private onCapacity?: (obs: CapacityObservation) => void
+    private onCapacity?: (agentId: string | null, obs: CapacityObservation) => void
   ) {}
 
   start(): void {
@@ -133,7 +133,9 @@ export class HookServer {
       const home = this.hive.codexHomeFor(agentId);
       if (!home) return;
       const obs = this.codexCapacity.observe(home, { rescan: event === 'SessionStart' });
-      if (obs) this.onCapacity?.(obs);
+      // The agent is carried with the reading: a pool key is a provider fact, and
+      // which agents draw on it can only be learned from readings that arrived.
+      if (obs) this.onCapacity?.(agentId, obs);
     } catch { /* telemetry must never break a hook boundary */ }
   }
 
@@ -209,7 +211,7 @@ export class HookServer {
             accountScope: claudeAccountScope(),
             receivedAt: now
           });
-          if (obs) this.onCapacity(obs);
+          if (obs) this.onCapacity(agentId ?? null, obs);
         } catch { /* telemetry must never break a status tick */ }
       }
       return {};

@@ -23,10 +23,20 @@
  * NO CROSS-PROVIDER MIGRATION. This seam admits or refuses. It never moves work to
  * another provider, never picks a provider, and never returns an alternative.
  *
- * NOTHING IS ENFORCED YET. This module is a pure decision function plus one small
- * per-epoch grant record. No caller is wired to it in this commit: turning it on is
- * a separate, visible change, because a seam that silently starts refusing work is
- * exactly the kind of behaviour change that should never arrive as a side effect.
+ * A DECISION IS NOT A LAUNCH. The single RECOVERING turn per epoch is the evidence
+ * that a refusal has ended, so it must be spent by a turn that actually happened.
+ * Recording the grant inside `admit()` spent it on the DECISION, and a caller that
+ * asked and then did not start - a cancelled queue item, a guard further down, a
+ * worker that drained its mail before delivery - burned the one chance the epoch
+ * had. So a grant is taken in two steps: `admit()` RESERVES it, and
+ * `confirmLaunch()` commits it once the turn really started. `cancelGrant()`
+ * returns it if the launch never happens.
+ *
+ * The reservation still blocks a second concurrent asker, because two callers each
+ * seeing ALLOW before either starts is the retry storm this exists to prevent. A
+ * reservation nobody ever resolves expires, so a caller that dies between deciding
+ * and launching cannot strand the pool in a state where recovery can never be
+ * attempted again.
  */
 import type { CapacityState, PoolCapacitySnapshot } from '../shared/providerCapacity';
 
@@ -52,6 +62,16 @@ export type AdmissionVerdict =
    */
   | 'UNKNOWN_NOT_INFERRED_SAFE';
 
+/**
+ * How long a RESERVED but unconfirmed recovery grant is honoured before it is
+ * treated as abandoned. It bounds one failure only - a caller that decides and then
+ * neither launches nor cancels - and the cost of it being wrong in either direction
+ * is small: too short risks two attempts at one recovery, too long delays a retry
+ * that a stuck caller already lost. It is not a provider constant and nothing about
+ * capacity is derived from it.
+ */
+export const RECOVERY_RESERVATION_TTL_MS = 60_000;
+
 export const ADMISSION_REASON = {
   NO_POOL: 'NO_CAPACITY_POOL_FOR_AGENT',
   NO_STATE: 'NO_CAPACITY_STATE_FOR_POOL',
@@ -75,6 +95,13 @@ export interface AdmissionDecision {
   workClass: WorkClass;
   /** The epoch this decision was taken under, so a later refusal is distinguishable. */
   limitEpochAt: number | null;
+  /**
+   * Present only on the ALLOW that reserved the one recovery turn for an epoch.
+   * Hand it back to `confirmLaunch()` when the turn really starts, or to
+   * `cancelGrant()` when it does not. Every other decision carries null, so a
+   * caller cannot confirm a launch it was never granted.
+   */
+  grantId: string | null;
 }
 
 /** What the seam needs from the world. Injected, so the decision stays testable. */
@@ -83,6 +110,16 @@ export interface AdmissionDeps {
   poolKeyForAgent: (agentId: string) => string | null;
   /** Pool key → the tracker's published projection. */
   poolState: (poolKey: string) => PoolCapacitySnapshot | null;
+  /**
+   * Wall-clock milliseconds, for the reservation TTL below and nothing else.
+   *
+   * REQUIRED RATHER THAN DEFAULTED, on purpose. This module must contain no clock
+   * of its own - a seam that can read the time is a seam that can start deriving
+   * facts from it, and the one fact it is allowed is the one the tracker publishes.
+   * A registered test asserts that this file names no ambient clock at all, and it
+   * caught exactly that drift when a defaulted one arrived with the TTL.
+   */
+  now: () => number;
 }
 
 export class CapacityAdmission {
@@ -92,9 +129,13 @@ export class CapacityAdmission {
    * single permitted turn is the evidence, and a second attempt before that turn
    * reports back would be a retry storm against a provider that just refused.
    */
-  private recoveryGrants = new Map<string, number>();
+  private recoveryGrants = new Map<string, RecoveryGrant>();
+  private grantSeq = 0;
 
-  constructor(private readonly deps: AdmissionDeps) {}
+  constructor(
+    private readonly deps: AdmissionDeps,
+    private readonly reservationTtlMs: number = RECOVERY_RESERVATION_TTL_MS
+  ) {}
 
   admit(agentId: string, workClass: WorkClass = 'ORDINARY_TURN'): AdmissionDecision {
     const poolKey = this.deps.poolKeyForAgent(agentId);
@@ -118,11 +159,13 @@ export class CapacityAdmission {
         // At most one real queued turn per epoch, and never a synthetic probe: the
         // turn must be work the caller already needed.
         const epoch = pool.limitEpochAt ?? 0;
-        if (this.recoveryGrants.get(poolKey) === epoch) {
+        const held = this.recoveryGrants.get(poolKey);
+        if (held && held.epoch === epoch && !this.abandoned(held)) {
           return at('REFUSE', ADMISSION_REASON.RECOVERING_SPENT);
         }
-        this.recoveryGrants.set(poolKey, epoch);
-        return at('ALLOW', ADMISSION_REASON.RECOVERING_GRANT);
+        const grantId = `${poolKey}#${epoch}#${++this.grantSeq}`;
+        this.recoveryGrants.set(poolKey, { epoch, grantId, confirmed: false, reservedAt: this.deps.now() });
+        return { ...at('ALLOW', ADMISSION_REASON.RECOVERING_GRANT), grantId };
       }
 
       case 'RESERVE_ONLY':
@@ -145,10 +188,44 @@ export class CapacityAdmission {
     }
   }
 
+  /**
+   * The turn really started. Commit the reservation, so it is spent by a launch
+   * rather than by a question.
+   */
+  confirmLaunch(decision: AdmissionDecision): void {
+    const held = decision.poolKey ? this.recoveryGrants.get(decision.poolKey) : undefined;
+    if (!held || !decision.grantId || held.grantId !== decision.grantId) return;
+    held.confirmed = true;
+  }
+
+  /**
+   * The turn did not start after all. Return the reservation so the epoch keeps its
+   * one attempt — but only a reservation, never a CONFIRMED grant: a turn that ran
+   * cannot be un-run by cancelling the permission it ran under.
+   */
+  cancelGrant(decision: AdmissionDecision): void {
+    const held = decision.poolKey ? this.recoveryGrants.get(decision.poolKey) : undefined;
+    if (!held || !decision.grantId || held.grantId !== decision.grantId || held.confirmed) return;
+    this.recoveryGrants.delete(decision.poolKey!);
+  }
+
   /** Forget a pool's grant record — used when a pool is removed. */
   forget(poolKey: string): void {
     this.recoveryGrants.delete(poolKey);
   }
+
+  /** A reservation nobody confirmed or cancelled within the TTL. Confirmed grants
+   *  never expire: they record something that actually happened. */
+  private abandoned(grant: RecoveryGrant): boolean {
+    return !grant.confirmed && this.deps.now() - grant.reservedAt >= this.reservationTtlMs;
+  }
+}
+
+interface RecoveryGrant {
+  epoch: number;
+  grantId: string;
+  confirmed: boolean;
+  reservedAt: number;
 }
 
 function decision(
@@ -159,5 +236,5 @@ function decision(
   workClass: WorkClass,
   limitEpochAt: number | null
 ): AdmissionDecision {
-  return { verdict, reason, poolKey, state, workClass, limitEpochAt };
+  return { verdict, reason, poolKey, state, workClass, limitEpochAt, grantId: null };
 }
