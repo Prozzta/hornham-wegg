@@ -86,8 +86,35 @@ function readTail(file: string, bytes = TAIL_BYTES): string {
   }
 }
 
-/** The last rate-limit snapshot in a rollout tail, with the event's own timestamp. */
-export function latestRateLimitsInTail(tail: string): { rateLimits: unknown; observedAt: number | null } | null {
+/**
+ * The newest USABLE rate-limit snapshot in a rollout tail.
+ *
+ * "Newest line with a `rate_limits` key" is NOT the same thing, and the difference
+ * is not theoretical: Codex emits TWO limit identities into one stream. `codex`
+ * carries real windows; `premium` carries `primary: null, secondary: null` and
+ * lands about once a minute. A reader that stops at the newest line holding the KEY
+ * therefore stops on an empty snapshot and never sees the good one behind it - and
+ * because an empty snapshot legitimately produces no observation, capacity
+ * collection goes silent while the file is full of readings.
+ *
+ * USABILITY IS DECIDED BY THE CALLER'S `accept`, which in practice is the
+ * normaliser itself. That is deliberate. A local "looks usable" test would be a
+ * second opinion about the same question, and the two would eventually disagree -
+ * dropping good lines, or handing back candidates the normaliser then refuses.
+ * Asking the normaliser makes the agreement structural instead of maintained.
+ *
+ * The accepted line keeps ITS OWN embedded timestamp, so an older `codex` snapshot
+ * selected past newer empty ones ages out on the normal TTL rather than being
+ * passed off as current.
+ *
+ * The tail is the bound. Scanning stops at the first accepted line, so the ordinary
+ * case costs one attempt and the worst case is the handful of snapshots that fit in
+ * the tail window.
+ */
+export function latestUsableRateLimits<T>(
+  tail: string,
+  accept: (rateLimits: unknown, observedAt: number | null) => T | null
+): T | null {
   const lines = tail.split('\n');
   // Backwards: the newest snapshot wins, and the first line of a tail is usually a
   // fragment of a longer line, which simply fails to parse and is skipped.
@@ -104,7 +131,10 @@ export function latestRateLimitsInTail(tail: string): { rateLimits: unknown; obs
     const rateLimits = payload?.rate_limits ?? rec.rate_limits;
     if (!rateLimits) continue;
     const ts = typeof rec.timestamp === 'string' ? Date.parse(rec.timestamp) : NaN;
-    return { rateLimits, observedAt: Number.isFinite(ts) ? ts : null };
+    const accepted = accept(rateLimits, Number.isFinite(ts) ? ts : null);
+    // Not usable - an empty `premium` snapshot, or a line whose time cannot be
+    // established. Keep walking back rather than reporting nothing at all.
+    if (accepted !== null) return accepted;
   }
   return null;
 }
@@ -142,17 +172,18 @@ export class CodexRolloutCapacitySource {
     if (mtimeMs <= entry.mtimeMs) return null;
     entry.mtimeMs = mtimeMs;
 
-    const found = latestRateLimitsInTail(readTail(entry.file));
-    if (!found) return null;
-    return normalizeCodexRateLimits({
-      rateLimits: found.rateLimits,
-      accountScope: this.scopeOf(codexHome),
+    const scope = this.scopeOf(codexHome);
+    return latestUsableRateLimits(readTail(entry.file), (rateLimits, observedAt) => normalizeCodexRateLimits({
+      rateLimits,
+      accountScope: scope,
       // The event's own timestamp, not now: a rollout copy is authoritative at the
-      // time it was written, and the tracker orders readings by that.
-      observedAt: found.observedAt,
+      // time it was written, and the tracker orders readings by that. An older
+      // `codex` line selected past newer empty ones therefore ages out on the normal
+      // TTL instead of being passed off as current.
+      observedAt,
       receivedAt: now,
       source: 'codex-rollout'
-    });
+    }));
   }
 
   /** Drop a home's cache — used when an agent is removed. */

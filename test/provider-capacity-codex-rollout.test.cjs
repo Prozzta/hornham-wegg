@@ -16,7 +16,11 @@ const os = require('node:os');
 const path = require('node:path');
 const loadTs = require('./load-ts.cjs');
 
-const { CodexRolloutCapacitySource, latestRateLimitsInTail } = loadTs('src/main/codexRolloutCapacity.ts');
+const { CodexRolloutCapacitySource, latestUsableRateLimits } = loadTs('src/main/codexRolloutCapacity.ts');
+
+/** Stands in for the normaliser in the pure-tail test: accept anything with windows. */
+const acceptAnyWindows = (rateLimits, observedAt) =>
+  (rateLimits && rateLimits.primary) ? { rateLimits, observedAt } : null;
 
 const line = (usedPrimary, usedSecondary, ts, reached = null) => JSON.stringify({
   timestamp: ts,
@@ -137,9 +141,56 @@ test('a home with no sessions, no rollouts, or nothing but junk reports nothing 
 test('a truncated first line in the tail is skipped, not treated as corruption', () => {
   const good = line(10, 5, '2026-09-09T21:00:00.000Z');
   const tail = `{"timestamp":"2026-09-09T20:00:00.000Z","payload":{"rate_li\n${good}`;
-  const found = latestRateLimitsInTail(tail);
+  const found = latestUsableRateLimits(tail, acceptAnyWindows);
   assert.ok(found);
   assert.equal(found.rateLimits.primary.used_percent, 10);
+});
+
+/** A `premium` snapshot, verbatim in shape from live data: both windows null. */
+const premiumLine = (ts) => JSON.stringify({
+  timestamp: ts,
+  type: 'event_msg',
+  payload: {
+    type: 'token_count',
+    rate_limits: {
+      limit_id: 'premium', limit_name: null, primary: null, secondary: null,
+      credits: { has_credits: false, unlimited: false, balance: '0' },
+      individual_limit: null, spend_control_reached: null, plan_type: 'plus',
+      rate_limit_reached_type: null
+    }
+  }
+});
+
+test('a tail whose NEWEST snapshots are empty premium ones still yields the codex reading behind them', () => {
+  // The live steady state, not a contrived case: premium snapshots land about once
+  // a minute and carry no windows at all, so a reader that stops at the newest line
+  // holding a rate_limits key collects NOTHING while the file is full of readings.
+  const h = makeHome([
+    line(37, 12, '2026-09-09T20:50:00.000Z'),
+    premiumLine('2026-09-09T20:54:50.000Z'),
+    premiumLine('2026-09-09T20:55:50.000Z'),
+    premiumLine('2026-09-09T20:57:50.000Z'),
+    premiumLine('2026-09-09T20:58:50.000Z')
+  ]);
+  const obs = source().observe(h.home);
+  assert.ok(obs, 'four trailing empty snapshots must not hide the codex reading');
+  assert.equal(obs.limitId, 'codex');
+  assert.equal(obs.windows.find((w) => w.kind === 'FIVE_HOUR').remainingPercent, 63);
+  // Dated by ITS OWN time - not by the newer empty lines and not by now - so it
+  // ages out on the normal TTL instead of being passed off as current.
+  assert.equal(obs.observedAt, Date.parse('2026-09-09T20:50:00.000Z'));
+  h.cleanup();
+});
+
+test('a tail containing ONLY empty premium snapshots still yields nothing', () => {
+  const h = makeHome([
+    premiumLine('2026-09-09T20:57:50.000Z'),
+    premiumLine('2026-09-09T20:58:50.000Z')
+  ]);
+  // No window, no reached type, nothing to report. Walking further back must never
+  // turn an absence of data into an observation.
+  assert.equal(source().observe(h.home), null);
+  h.cleanup();
 });
 
 test('a line with no rate_limits at all is passed over', () => {
