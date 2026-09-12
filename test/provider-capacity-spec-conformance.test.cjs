@@ -30,17 +30,43 @@ const {
 
 const { ProviderCapacityTracker, L0_SEM_POLICY } = loadTs('src/main/providerCapacityTracker.ts');
 
-/** A tracker whose clock this test owns outright. */
+/**
+ * A tracker whose clocks this test owns outright — BOTH of them.
+ *
+ * §6 converts the remaining wall TTL into a MONOTONIC deadline on acceptance, so
+ * that wall-clock changes cannot make stale data healthy. That makes the two
+ * clocks semantically different, and a rig that moves only the wall clock is not
+ * simulating time passing — it is simulating the very anomaly the deadline
+ * defends against, which is indistinguishable from it by construction.
+ *
+ * So ordinary time travel moves both together, and wall-only movement is a
+ * separate, explicitly named operation used only where the anomaly IS the subject.
+ */
 function makeTracker(startAt = T0) {
   let now = startAt;
-  const tracker = new ProviderCapacityTracker(L0_SEM_POLICY, () => now);
+  let mono = 0; // monotonic milliseconds; never moves backwards
+  const tracker = new ProviderCapacityTracker(L0_SEM_POLICY, () => now, () => mono);
   return {
     tracker,
+    /** Assigning a wall time advances the monotonic clock by the same delta: time passing. */
     set now(v) {
+      mono += v - now;
       now = v;
     },
     get now() {
       return now;
+    },
+    /** Elapsed time, both clocks. */
+    advance(ms) {
+      now += ms;
+      mono += ms;
+    },
+    /**
+     * THE ANOMALY, named rather than implied: the wall clock moves and monotonic
+     * time does not. An NTP correction or a manual clock change, never elapsed time.
+     */
+    setWallOnly(v) {
+      now = v;
     },
     pool(key) {
       return tracker.snapshot().pools.find((p) => p.poolKey === key) ?? null;
@@ -151,6 +177,46 @@ for (const f of CORPUS) {
     }
   });
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 2b. §6's monotonic deadline — the defence my own rig could not see
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * This case exists because of a blind spot in the first version of this file.
+ * §6 states the wall-clock age formula AND the monotonic deadline in one
+ * paragraph, and on a machine nobody is fiddling with the two agree exactly — so
+ * a wall-clock-only rig tests the letter of one sentence and CANNOT detect a
+ * missing monotonic deadline, because what it does on every step is
+ * indistinguishable from the anomaly the deadline defends against.
+ *
+ * The dangerous direction is the one asserted here: a reading that IS genuinely
+ * stale must not be resurrected by the wall clock moving backwards.
+ */
+test('a backwards wall-clock move does not make a genuinely stale reading healthy', () => {
+  const h = makeTracker(T0);
+  const key = 'codex:acct-a:limit-1';
+  h.tracker.ingest(obs({ windows: [win()] }));
+
+  // Real elapsed time: both clocks. The reading is now genuinely stale.
+  h.advance(LIVE_TTL_MS + 1);
+  h.tracker.evaluate();
+  assert.equal(h.pool(key).freshness, 'STALE', 'precondition: the reading has genuinely expired');
+  assert.equal(h.pool(key).state, 'UNKNOWN', 'precondition: stale never reads healthy');
+
+  // Now the system clock is corrected backwards to before the reading was taken.
+  // Monotonic time does not move. Under wall-clock-only freshness this reading
+  // would look brand new.
+  h.setWallOnly(T0 - 60_000);
+  h.tracker.evaluate();
+
+  assert.equal(
+    h.pool(key).freshness,
+    'STALE',
+    '§6: "wall-clock changes do not make stale data healthy"'
+  );
+  assert.notEqual(h.pool(key).state, 'AVAILABLE', 'a clock correction must not resurrect an expired reading');
+});
 
 // ─────────────────────────────────────────────────────────────────────────────
 // 3. Recovery — built to CATCH, per §5. A clock must never reach AVAILABLE.
