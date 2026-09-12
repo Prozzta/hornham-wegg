@@ -8,28 +8,31 @@
  * provider window. This tracker holds the only thing that does — a normalised
  * remaining figure per window, per pool, with its freshness and its provenance.
  *
- * TWO MUTATORS, BOTH EXPLICIT:
- *   - `ingest(observation)` — a new reading arrived.
- *   - `evaluate(now)`       — time passed, so freshness and reset boundaries move.
- * Reading never mutates. The alternative, a getter that recomputes and bumps a
- * revision, would make revision counts depend on how often something looked, which
- * is precisely what a consumer diffing on revision must be able to trust.
+ * SEMANTICS ARE NOT MINE. The state predicates, the transition table, the TTLs and
+ * the recovery rules implemented here are Oscar's L0-SEM
+ * (`research/notes/oscar-l0-sem.md`, 21,515 bytes, sha256 643D45C0…86CC, frozen at
+ * research 8b92e2ea). Where a comment below says why, it is explaining that note,
+ * not deciding anything. Section references are to it unless marked C2.
  *
- * REVISIONS ARE CHANGE COUNTERS, NOT EVENT COUNTERS. A re-observation that says
- * exactly what the last one said bumps nothing. Provider snapshots repeat far more
- * often than they change, and a revision that ticks on every repeat would push a
- * no-op update through every consumer above it.
+ * THREE MUTATORS, ALL EXPLICIT:
+ *   - `ingest(observation)`     — a reading arrived.
+ *   - `evaluate(now)`           — time passed, so freshness and reset boundaries move.
+ *   - `noteSuccessfulTurn(...)` — the caller completed a real turn on this pool.
+ * Reading never mutates. A getter that recomputed and bumped a revision would make
+ * revision counts depend on how often something looked, which is the one property a
+ * consumer diffing on revision has to be able to trust.
  *
- * RECOVERY IS NEVER INFERRED FROM A CLOCK. A passed reset time moves LIMITED to
- * RECOVERING and no further. Leaving RECOVERING requires observed evidence:
- * `ordinaryUsageAllowed === true`, or a fresh reading with no reached signal and
- * materially restored capacity. A clock passing is not evidence about a provider.
+ * THE FOUR RULINGS THIS FILE EXISTS TO OBEY (§2, §4, §5):
+ *   1. Typed or attributed provider limiting is a STICKY limit epoch.
+ *   2. A fresh numeric zero WITHOUT attribution is RESERVE_ONLY, never LIMITED.
+ *   3. Positive percentages alone never synthesize APPROACHING or RESERVE_ONLY.
+ *      APPROACHING needs an allowlisted provider-native advisory.
+ *   4. A reset time passing enters RECOVERING only — never AVAILABLE.
  *
- * THE STATE DERIVATION BELOW IS PROVISIONAL. Thresholds, the freshness budget and
- * the exact transition table are capacity SEMANTICS and are owned by Oscar's
- * L0-SEM. Everything policy-shaped is gathered into `CapacityPolicy` with clearly
- * labelled provisional defaults, so reconciling with L0-SEM is a change to one
- * object and one function rather than a rewrite of the store.
+ * WHAT IS DELIBERATELY NOT HERE. No percentage reserve floor, no forecast, no
+ * cross-window comparison, no `binding`/`tighter`/`headroom` field, and no reading
+ * of the display threshold. The display threshold decides display and nothing else;
+ * nothing in this file can see it.
  */
 import type {
   CapacityCollectionSnapshot,
@@ -41,37 +44,30 @@ import type {
 } from '../shared/providerCapacity';
 
 /**
- * PROVISIONAL policy inputs — pending Oscar's L0-SEM.
- *
- * None of these numbers is called safe. The scheduling audit's reserve analysis is
- * explicit that the dependable reserve is unmeasured (one observed Codex account
- * went from 86% used to 100% in about 196 seconds), so a percentage floor here is
- * a placeholder for a learned envelope, not a substitute for one.
+ * Operational constants from L0-SEM §6 and §9.2. These are conservative L0
+ * constants to be measured in isolated Dev, not provider truth, and changing them
+ * is tracker policy — never renderer logic and never a display setting.
  */
 export interface CapacityPolicy {
-  /** Beyond this age a reading is STALE and the pool is UNKNOWN, not "last known good". */
-  freshnessMs: number;
-  /** Provisional: remaining at or below this enters RESERVE_ONLY. */
-  reservePercent: number;
-  /** Provisional: remaining at or below this enters APPROACHING. */
-  approachingPercent: number;
-  /** Provisional: remaining above this, on a fresh unreached reading, is evidence of recovery. */
-  recoveredPercent: number;
+  /** Live status-line / rollout snapshots (§6). */
+  liveTtlMs: number;
+  /** Provider-owned account read (§6). */
+  accountReadTtlMs: number;
+  /** A timestamp further ahead than this is invalid rather than very fresh (§6). */
+  futureSkewMs: number;
+  /** Identical renewals refresh the published anchor at most this often (§7). */
+  anchorCoalesceMs: number;
 }
 
-export const PROVISIONAL_POLICY: CapacityPolicy = {
-  freshnessMs: 10 * 60 * 1000,
-  reservePercent: 5,
-  approachingPercent: 20,
-  recoveredPercent: 10
+export const L0_SEM_POLICY: CapacityPolicy = {
+  liveTtlMs: 120_000,
+  accountReadTtlMs: 300_000,
+  futureSkewMs: 30_000,
+  anchorCoalesceMs: 30_000
 };
 
-/** Provenance authority, used only to break ties between equally-timed readings. */
-const SOURCE_AUTHORITY: Record<ObservationSource, number> = {
-  'codex-account-read': 3,
-  'codex-rollout': 2,
-  'claude-status-line': 2
-};
+const ttlFor = (source: ObservationSource, policy: CapacityPolicy): number =>
+  source === 'codex-account-read' ? policy.accountReadTtlMs : policy.liveTtlMs;
 
 /** Main-owned reason codes. Non-causal unless the provider itself attributed the limit. */
 export const REASON = {
@@ -79,34 +75,70 @@ export const REASON = {
   PROVIDER_REACHED_UNATTRIBUTED: 'PROVIDER_REACHED_UNATTRIBUTED',
   ORDINARY_USE_DENIED: 'ORDINARY_USE_DENIED',
   NUMERICALLY_EXHAUSTED: 'NUMERICALLY_EXHAUSTED',
-  RESET_PASSED_UNCONFIRMED: 'RESET_PASSED_UNCONFIRMED',
+  RECOVERY_HINT_UNCONFIRMED: 'RECOVERY_HINT_UNCONFIRMED',
+  LIMIT_EPOCH_UNCLEARED: 'LIMIT_EPOCH_UNCLEARED',
   STALE: 'STALE_READING',
   NO_READING: 'NO_READING',
   NO_NUMBERS: 'NO_USABLE_NUMBERS',
-  RESERVE: 'AT_OR_BELOW_PROVISIONAL_RESERVE',
-  APPROACHING: 'AT_OR_BELOW_PROVISIONAL_APPROACHING',
+  CONFLICT: 'SAME_KEY_CONFLICT',
+  PROVIDER_ADVISORY: 'PROVIDER_NATIVE_ADVISORY',
   FRESH: 'FRESH_READING'
 } as const;
 
-interface PoolRecord {
-  observation: CapacityObservation;
-  /** Last published projection, for change detection. */
-  projection: PoolCapacitySnapshot;
-  /** Sticky until recovery is EVIDENCED, so a later quiet reading cannot erase a refusal. */
-  limitedSince: number | null;
+/** A sticky limit epoch (§5). Begins at accepted hard evidence; staleness never clears it. */
+interface LimitEpoch {
+  since: number;
+  /** The observation time of the evidence. A confirmation must be STRICTLY newer. */
+  evidenceAt: number;
+  attributedWindowId: string | null;
+  reachedType: string | null;
+  permissionDenied: boolean;
+  /** Reset/limit-identity anchors at the moment of the refusal, for re-anchor detection. */
+  anchors: string;
+  /** Latched once a recovery HINT appears. Hints never confirm; they only de-escalate. */
+  hinted: boolean;
 }
 
+interface PoolRecord {
+  observation: CapacityObservation;
+  projection: PoolCapacitySnapshot;
+  epoch: LimitEpoch | null;
+  /** Same ordering key, different content: facts are invalid until something newer. */
+  conflicted: boolean;
+  /** K form 2 — a real turn the caller already needed, never a synthetic probe. */
+  successfulTurnAt: number | null;
+  /** Last time the published observation anchor moved (§7 renewal coalescing). */
+  anchorAt: number;
+}
+
+/** Hard evidence = typed quota signal or explicit denial. NOT a 429, overload or context error. */
+const hasHardEvidence = (obs: CapacityObservation): boolean =>
+  obs.ordinaryUsageAllowed === false || obs.providerReachedType !== null;
+
+/** Reset times and limit identity — a change is a re-anchor, which is a recovery HINT (§5). */
+const anchorsOf = (obs: CapacityObservation): string =>
+  `${obs.limitId}|${obs.windows.map((w) => `${w.windowId}@${w.resetsAt ?? '-'}`).sort().join(',')}`;
+
+/** Semantic fingerprint for duplicate and same-key-conflict detection (§7). */
+const fingerprint = (obs: CapacityObservation): string => JSON.stringify([
+  obs.windows.map((w) => [w.windowId, w.remainingPercent, w.resetsAt]),
+  obs.providerAttributedLimitingWindowId,
+  obs.providerReachedType,
+  obs.ordinaryUsageAllowed,
+  obs.planType
+]);
+
 /**
- * SEMANTIC change detection. Deliberately excludes `observedAt`, `receivedAt` and
- * `ageMs`: those move on every repeat reading and on every tick, and a revision
- * that moved with them would tell a consumer "something changed" once per status
- * line for a pool whose figures are identical. The semantic part of time is
- * `freshness`, and that IS compared.
+ * SEMANTIC change detection. Deliberately excludes `receivedAt` and `ageMs`, which
+ * move on every tick; `observedAt` is included because §7 counts the published
+ * observation anchor as a domain field, but renewals that change nothing else are
+ * coalesced before they reach here.
  */
 const sameProjection = (a: PoolCapacitySnapshot, b: PoolCapacitySnapshot): boolean =>
   a.state === b.state
   && a.stateReason === b.stateReason
   && a.freshness === b.freshness
+  && a.observedAt === b.observedAt
   && a.providerAttributedLimitingWindowId === b.providerAttributedLimitingWindowId
   && a.ordinaryUsageAllowed === b.ordinaryUsageAllowed
   && a.planType === b.planType
@@ -120,42 +152,63 @@ export class ProviderCapacityTracker {
   private updatedAt = 0;
 
   constructor(
-    private readonly policy: CapacityPolicy = PROVISIONAL_POLICY,
+    private readonly policy: CapacityPolicy = L0_SEM_POLICY,
     private readonly clock: () => number = () => Date.now()
   ) {}
 
   /**
-   * Accept a reading. Returns true when the pool's public projection changed.
+   * Accept a reading. Returns true when the pool's published projection changed.
    *
-   * Older readings are rejected outright. That is what keeps a stale 20%-remaining
-   * snapshot from overwriting a newer typed refusal — file order and arrival order
-   * are both unreliable here, because a long-running session can emit an event
-   * newer than one from a file created later.
+   * ORDERING (§7). A lower ordering key than the last accepted one is out of order
+   * and ignored — which is what stops a late-arriving stale snapshot from
+   * overwriting a newer typed refusal. An equal key with equal content is a
+   * duplicate no-op. An equal key with DIFFERENT content is a schema/order
+   * conflict: hard evidence is accepted because risk dominates, and anything else
+   * invalidates the pool's facts to UNKNOWN rather than merging two stories.
    */
   ingest(obs: CapacityObservation): boolean {
     const now = this.clock();
+    // A timestamp far in the future is invalid, not very fresh (§6).
+    if (obs.observedAt > now + this.policy.futureSkewMs) return false;
+
     const prev = this.pools.get(obs.poolKey);
+    let conflicted = false;
+    let pinAnchor = false;
     if (prev) {
-      const older = obs.observedAt < prev.observation.observedAt;
-      const sameTimeLowerAuthority = obs.observedAt === prev.observation.observedAt
-        && SOURCE_AUTHORITY[obs.source] < SOURCE_AUTHORITY[prev.observation.source];
-      if (older || sameTimeLowerAuthority) return false;
+      if (obs.observedAt < prev.observation.observedAt) return false;
+      const identical = fingerprint(obs) === fingerprint(prev.observation);
+      if (obs.observedAt === prev.observation.observedAt) {
+        // Exact duplicate: same ordering key, same content. A pure no-op (§7).
+        if (identical) return false;
+        if (!hasHardEvidence(obs)) conflicted = true;
+      } else if (identical) {
+        // A live RENEWAL: newer reading, identical values. The freshness deadline
+        // moves immediately - the reading really is current again - but the
+        // PUBLISHED observation anchor is coalesced, so a pool observed every turn
+        // does not emit a revision per turn for a value that never changed (§7).
+        pinAnchor = now - prev.anchorAt < this.policy.anchorCoalesceMs;
+      }
     }
 
-    const limitedSince = this.nextLimitedSince(prev, obs, now);
-    const record: PoolRecord = {
+    const rec: PoolRecord = prev ?? {
       observation: obs,
-      limitedSince,
-      projection: prev ? prev.projection : blankProjection(obs)
+      projection: blankProjection(obs),
+      epoch: null,
+      conflicted: false,
+      successfulTurnAt: null,
+      anchorAt: 0
     };
-    this.pools.set(obs.poolKey, record);
-    return this.reproject(obs.poolKey, now);
+    rec.observation = obs;
+    rec.conflicted = conflicted;
+    rec.epoch = this.nextEpoch(rec, obs, now);
+    if (!pinAnchor) rec.anchorAt = now;
+    this.pools.set(obs.poolKey, rec);
+    return this.reproject(obs.poolKey, now, pinAnchor);
   }
 
   /**
-   * Recompute time-derived facts. Freshness expires and reset boundaries pass
-   * without any new reading, and a consumer must see that happen. Returns true when
-   * any pool's projection changed.
+   * Recompute time-derived facts: freshness expires and reset boundaries pass with
+   * no new reading at all, and a consumer must see that happen.
    */
   evaluate(now: number = this.clock()): boolean {
     let changed = false;
@@ -163,7 +216,20 @@ export class ProviderCapacityTracker {
     return changed;
   }
 
-  /** Pure read of the last evaluated projection. */
+  /**
+   * K form 2 (§5) — a successful REAL ordinary turn the caller already needed. It
+   * confirms recovery from the old refusal and nothing else: with no fresh capacity
+   * snapshot the pool lands in UNKNOWN, because proving the refusal ended is not
+   * proving there is headroom now. Never call this for a synthetic probe; L0 has no
+   * such thing.
+   */
+  noteSuccessfulTurn(poolKey: string, at: number = this.clock()): boolean {
+    const rec = this.pools.get(poolKey);
+    if (!rec) return false;
+    rec.successfulTurnAt = at;
+    return this.reproject(poolKey, this.clock());
+  }
+
   snapshot(): CapacityCollectionSnapshot {
     return {
       collectionRevision: this.collectionRevision,
@@ -185,35 +251,63 @@ export class ProviderCapacityTracker {
   }
 
   /**
-   * LIMITED is sticky until recovery is evidenced. Without this, a rollout event
-   * that merely lacks a reached signal would clear a real refusal, and the tracker
-   * would oscillate between LIMITED and AVAILABLE on ordinary traffic.
+   * The limit epoch (§5). Begins at accepted hard evidence and is sticky; it is
+   * cleared only by a STRICTLY NEWER confirmation. A numeric zero never opens one —
+   * that is ruling 2, and it is the whole reason attribution and exhaustion are
+   * separate facts rather than one flag.
    */
-  private nextLimitedSince(prev: PoolRecord | undefined, obs: CapacityObservation, now: number): number | null {
-    if (obs.ordinaryUsageAllowed === false || obs.providerReachedType) return prev?.limitedSince ?? now;
-    if (numericallyExhausted(obs).length) return prev?.limitedSince ?? now;
-    if (!prev?.limitedSince) return null;
-    // Evidence-based exits only.
+  private nextEpoch(rec: PoolRecord, obs: CapacityObservation, now: number): LimitEpoch | null {
+    if (hasHardEvidence(obs)) {
+      // Contradictory same-payload permission cannot confirm recovery (§4): the
+      // risk-dominant fact wins and the epoch is (re)opened at this evidence.
+      return {
+        since: rec.epoch?.since ?? now,
+        evidenceAt: obs.observedAt,
+        attributedWindowId: obs.providerAttributedLimitingWindowId,
+        reachedType: obs.providerReachedType,
+        permissionDenied: obs.ordinaryUsageAllowed === false,
+        anchors: anchorsOf(obs),
+        hinted: false
+      };
+    }
+    const epoch = rec.epoch;
+    if (!epoch) return null;
+    if (obs.observedAt <= epoch.evidenceAt) return epoch; // same-time or older cannot confirm
+
+    // K1 — explicit provider permission.
     if (obs.ordinaryUsageAllowed === true) return null;
-    const best = maxRemaining(obs);
-    if (best !== null && best > this.policy.recoveredPercent) return null;
-    return prev.limitedSince;
+    // K3 — a fresh authoritative snapshot after the event, no reached fact, every
+    // known-applicable window valid and above zero.
+    if (this.isFresh(obs, now) && obs.windows.length > 0 && allWindowsPositive(obs)) return null;
+    // Otherwise: not confirmation. A re-anchored reset or limit identity is a HINT.
+    if (anchorsOf(obs) !== epoch.anchors) return { ...epoch, hinted: true };
+    return epoch;
   }
 
-  private reproject(poolKey: string, now: number): boolean {
+  private isFresh(obs: CapacityObservation, now: number): boolean {
+    return Math.max(0, now - obs.observedAt) <= ttlFor(obs.source, this.policy);
+  }
+
+  /**
+   * `pinAnchor` holds the PUBLISHED observation time at its last value while the
+   * internal reading moves on. It is the coalescing half of §7, and it is why an
+   * identical renewal can refresh freshness without publishing anything.
+   */
+  private reproject(poolKey: string, now: number, pinAnchor = false): boolean {
     const rec = this.pools.get(poolKey);
     if (!rec) return false;
     const next = this.project(rec, now);
+    if (pinAnchor && rec.projection.observedAt > 0) {
+      next.observedAt = rec.projection.observedAt;
+      next.ageMs = Math.max(0, now - rec.projection.observedAt);
+    }
     if (sameProjection(rec.projection, next)) {
-      // Nothing semantic moved, but the timestamps did. Store them - otherwise a
-      // fresh reading identical to the last one would keep the OLD observedAt and
-      // the pool would expire into STALE while it was in fact being observed - and
-      // leave the revision exactly where it was.
+      // Nothing semantic moved; keep the revision and store the refreshed clock
+      // fields so a pool being actively observed cannot expire on an old timestamp.
       next.revision = rec.projection.revision;
       rec.projection = next;
       return false;
     }
-    // Carry the revision forward and increment ONLY on a real change.
     next.revision = rec.projection.revision + 1;
     rec.projection = next;
     this.collectionRevision += 1;
@@ -224,12 +318,22 @@ export class ProviderCapacityTracker {
   private project(rec: PoolRecord, now: number): PoolCapacitySnapshot {
     const obs = rec.observation;
     const ageMs = Math.max(0, now - obs.observedAt);
-    const freshness: CapacityFreshness = ageMs <= this.policy.freshnessMs ? 'FRESH' : 'STALE';
+    const freshness: CapacityFreshness = ageMs <= ttlFor(obs.source, this.policy) ? 'FRESH' : 'STALE';
     const exhausted = numericallyExhausted(obs);
-    const resetPassed = earliestRelevantReset(obs, exhausted) !== null
-      && (earliestRelevantReset(obs, exhausted) as number) <= now;
-    const recoveryPending = rec.limitedSince !== null && resetPassed;
-    const { state, stateReason } = this.deriveState(obs, rec, { freshness, exhausted, recoveryPending });
+
+    // K form 2 and the reset-passage HINT are both time-relative, so they are
+    // resolved here rather than at ingest: a reset can pass with no reading at all.
+    let epoch = rec.epoch;
+    if (epoch && rec.successfulTurnAt !== null && rec.successfulTurnAt > epoch.evidenceAt) {
+      epoch = null;
+      rec.epoch = null;
+    }
+    if (epoch && !epoch.hinted && resetPassed(obs, epoch, now)) {
+      epoch = { ...epoch, hinted: true };
+      rec.epoch = epoch;
+    }
+
+    const { state, stateReason } = this.deriveState(rec, obs, { freshness, exhausted, epoch });
     return {
       poolKey: obs.poolKey,
       provider: obs.provider,
@@ -247,99 +351,78 @@ export class ProviderCapacityTracker {
       numericallyExhaustedWindowIds: exhausted,
       ordinaryUsageAllowed: obs.ordinaryUsageAllowed,
       planType: obs.planType,
-      recoveryPending
+      recoveryPending: epoch?.hinted === true
     };
   }
 
   /**
-   * PROVISIONAL state derivation — to be reconciled against Oscar's L0-SEM before
-   * anything downstream depends on the exact boundaries.
+   * The state predicates of L0-SEM §2, in risk order.
    *
-   * The ordering is risk-monotonic on purpose: refusal evidence outranks numbers,
-   * numbers outrank staleness, and nothing reaches AVAILABLE without a fresh
-   * reading that actually carries a figure.
+   * The epoch is settled first because it outranks every numeric fact: a sticky
+   * refusal is not a reading and staleness cannot clear it. Then freshness, then
+   * completeness, then exhaustion. AVAILABLE is last and is the only state that
+   * requires everything to be present, fresh and positive.
    *
-   * One deliberate choice worth naming, because it is the one place the design of
-   * record admits two readings: C2.7 defines the overall state as LIMITED when an
-   * applicable window is exhausted AND blocking ordinary use. Fresh numeric
-   * exhaustion establishes the first and not the second. It is treated as LIMITED
-   * here — understating it would let a scheduler spend against a spent window —
-   * but it carries the OBSERVATIONAL reason code, never the attributed one, so no
-   * surface above can turn it into a causal claim.
+   * APPROACHING has no branch that any current payload can reach. It requires an
+   * allowlisted provider-native advisory, and neither adapter emits one — which is
+   * a fact about the payloads, not a gap here. Synthesizing it from a percentage is
+   * exactly what ruling 3 forbids, so the state stays unreachable until an
+   * allowlisted provider fact exists with a fixture behind it.
    */
   private deriveState(
-    obs: CapacityObservation,
     rec: PoolRecord,
-    ctx: { freshness: CapacityFreshness; exhausted: string[]; recoveryPending: boolean }
+    obs: CapacityObservation,
+    ctx: { freshness: CapacityFreshness; exhausted: string[]; epoch: LimitEpoch | null }
   ): { state: CapacityState; stateReason: string } {
-    if (obs.ordinaryUsageAllowed === false) {
-      return { state: 'LIMITED', stateReason: REASON.ORDINARY_USE_DENIED };
+    if (ctx.epoch) {
+      if (ctx.epoch.hinted) return { state: 'RECOVERING', stateReason: REASON.RECOVERY_HINT_UNCONFIRMED };
+      if (ctx.epoch.permissionDenied) return { state: 'LIMITED', stateReason: REASON.ORDINARY_USE_DENIED };
+      if (ctx.epoch.attributedWindowId) return { state: 'LIMITED', stateReason: REASON.PROVIDER_ATTRIBUTED };
+      if (ctx.epoch.reachedType) return { state: 'LIMITED', stateReason: REASON.PROVIDER_REACHED_UNATTRIBUTED };
+      return { state: 'LIMITED', stateReason: REASON.LIMIT_EPOCH_UNCLEARED };
     }
-    if (rec.limitedSince !== null) {
-      // A passed reset moves LIMITED to RECOVERING and no further. Never AVAILABLE.
-      if (ctx.recoveryPending) return { state: 'RECOVERING', stateReason: REASON.RESET_PASSED_UNCONFIRMED };
-      if (obs.providerAttributedLimitingWindowId) {
-        return { state: 'LIMITED', stateReason: REASON.PROVIDER_ATTRIBUTED };
-      }
-      if (obs.providerReachedType) {
-        return { state: 'LIMITED', stateReason: REASON.PROVIDER_REACHED_UNATTRIBUTED };
-      }
-      return { state: 'LIMITED', stateReason: REASON.NUMERICALLY_EXHAUSTED };
-    }
+    // A same-key contradiction leaves facts unusable rather than merged (§7).
+    if (rec.conflicted) return { state: 'UNKNOWN', stateReason: REASON.CONFLICT };
     if (ctx.freshness === 'STALE') return { state: 'UNKNOWN', stateReason: REASON.STALE };
-    const remaining = minRemaining(obs);
-    if (remaining === null) return { state: 'UNKNOWN', stateReason: REASON.NO_NUMBERS };
-    if (remaining <= this.policy.reservePercent) return { state: 'RESERVE_ONLY', stateReason: REASON.RESERVE };
-    if (remaining <= this.policy.approachingPercent) return { state: 'APPROACHING', stateReason: REASON.APPROACHING };
+    if (!obs.windows.length || obs.windows.some((w) => w.remainingPercent === null)) {
+      // Incomplete is UNKNOWN, never "healthy on the windows we happen to have".
+      return { state: 'UNKNOWN', stateReason: REASON.NO_NUMBERS };
+    }
+    if (ctx.exhausted.length) return { state: 'RESERVE_ONLY', stateReason: REASON.NUMERICALLY_EXHAUSTED };
     return { state: 'AVAILABLE', stateReason: REASON.FRESH };
   }
 }
 
-/**
- * The least remaining figure across windows that HAVE one.
- *
- * This is a minimum over same-kind quantities, not a claim that the lowest window
- * binds. There is deliberately no accompanying "which window binds" field: the
- * denominators differ, so ordering these percentages orders nothing real (C2.2).
- */
-function minRemaining(obs: CapacityObservation): number | null {
-  let min: number | null = null;
-  for (const w of obs.windows) {
-    if (w.remainingPercent === null) continue;
-    min = min === null ? w.remainingPercent : Math.min(min, w.remainingPercent);
-  }
-  return min;
-}
-
-function maxRemaining(obs: CapacityObservation): number | null {
-  let max: number | null = null;
-  for (const w of obs.windows) {
-    if (w.remainingPercent === null) continue;
-    max = max === null ? w.remainingPercent : Math.max(max, w.remainingPercent);
-  }
-  return max;
-}
-
-/** Fresh zero remainder. An OBSERVATION; it never implies the provider said anything. */
+/** Fresh exact zero. An OBSERVATION; it never implies the provider said anything. */
 function numericallyExhausted(obs: CapacityObservation): string[] {
   return obs.windows.filter((w) => w.remainingPercent === 0).map((w) => w.windowId);
 }
 
+function allWindowsPositive(obs: CapacityObservation): boolean {
+  return obs.windows.every((w) => w.remainingPercent !== null && w.remainingPercent > 0);
+}
+
 /**
- * The reset time that matters for recovery: the earliest reset among the windows
- * that are actually spent, falling back to the earliest known reset when nothing is
- * numerically spent (a typed refusal with no zeroed window still has a boundary).
+ * Has the reset boundary relevant to the refusal passed? Attributed window first,
+ * then exhausted windows, then the earliest known reset — the narrowest evidence
+ * available. A passed boundary is a HINT and never a confirmation (ruling 4).
  */
-function earliestRelevantReset(obs: CapacityObservation, exhausted: string[]): number | null {
-  const pool = exhausted.length
-    ? obs.windows.filter((w) => exhausted.includes(w.windowId))
-    : obs.windows;
+function resetPassed(obs: CapacityObservation, epoch: LimitEpoch, now: number): boolean {
+  // A boundary that had ALREADY passed when the refusal was recorded is not news
+  // about it: the provider refused knowing it. Only a boundary still ahead at the
+  // moment of the evidence can later become a recovery hint - which is also what
+  // makes a fresh refusal during RECOVERING land back on LIMITED rather than
+  // bouncing straight off the old, already-expired reset time.
+  const scoped = epoch.attributedWindowId
+    ? obs.windows.filter((w) => w.windowId === epoch.attributedWindowId)
+    : obs.windows.filter((w) => w.remainingPercent === 0);
+  const pool = scoped.length ? scoped : obs.windows;
   let earliest: number | null = null;
   for (const w of pool) {
-    if (w.resetsAt === null) continue;
+    if (w.resetsAt === null || w.resetsAt <= epoch.evidenceAt) continue;
     earliest = earliest === null ? w.resetsAt : Math.min(earliest, w.resetsAt);
   }
-  return earliest;
+  return earliest !== null && earliest <= now;
 }
 
 /** Revision 0 placeholder; the first reproject replaces it and moves to revision 1. */
