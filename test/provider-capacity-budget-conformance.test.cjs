@@ -228,3 +228,109 @@ test('§8 ROLLOUT READ: the tail is a CEILING — a snapshot beyond 256 KiB is n
     h.cleanup();
   }
 });
+
+// ---------------------------------------------------------------------------
+// §8 Timers — "One main-process earliest-boundary timer for all freshness/reset
+// deadlines" — and Quiet-state work, which only became measurable once L0-WIRE gave
+// the runtime an injected timer seam.
+// ---------------------------------------------------------------------------
+
+const { CapacityRuntime } = loadTs('src/main/capacityRuntime.ts');
+
+/**
+ * A runtime rig that can hold MANY timers at once, which is the whole point.
+ *
+ * The existing runtime rig keeps ONE `pending` slot, so a second armed timer
+ * silently overwrites the first and the violation is invisible by construction:
+ * arming an extra timer on every rearm leaves all nine capacity suites green. A
+ * budget of "one timer" cannot be checked by a rig that can only represent one.
+ *
+ * Both clocks advance by the delay the runtime actually asked for, so what is under
+ * test is the schedule the runtime chose rather than one this test chose for it.
+ */
+function runtimeRig() {
+  let now = T0;
+  let mono = 0;
+  const delivered = [];
+  const live = new Map();
+  let seq = 0;
+  let maxOutstanding = 0;
+  let armedTotal = 0;
+  let fired = 0;
+  const tracker = new ProviderCapacityTracker(L0_SEM_POLICY, () => now, () => mono);
+  const runtime = new CapacityRuntime({
+    deliver: (intents) => delivered.push(...intents),
+    now: () => now,
+    setTimer: (fn, ms) => {
+      const h = ++seq;
+      live.set(h, { fn, at: now + ms });
+      armedTotal += 1;
+      maxOutstanding = Math.max(maxOutstanding, live.size);
+      return h;
+    },
+    clearTimer: (h) => live.delete(h)
+  }, tracker);
+  return {
+    tracker, runtime, delivered,
+    outstanding: () => live.size,
+    stats: () => ({ maxOutstanding, armedTotal, fired }),
+    now: () => now,
+    /** Fire every boundary due on or before `until`, in order. */
+    runUntil(until) {
+      for (let guard = 0; guard < 1000; guard++) {
+        const due = [...live.entries()].filter(([, t]) => t.at <= until).sort((a, b) => a[1].at - b[1].at)[0];
+        if (!due) break;
+        const [h, t] = due;
+        const delta = t.at - now;
+        now = t.at;
+        mono += delta;
+        live.delete(h);
+        fired += 1;
+        t.fn();
+      }
+      mono += Math.max(0, until - now);
+      now = Math.max(now, until);
+    }
+  };
+}
+
+test('§8 TIMERS: at most ONE boundary timer is outstanding, across repeated re-arming', () => {
+  const h = runtimeRig();
+  const reading = (at, remaining) =>
+    obs({ observedAt: at, receivedAt: at, windows: [win({ usedPercent: 100 - remaining, remainingPercent: remaining })] });
+
+  // Several arming events, because one rearm cannot distinguish "replaces" from "adds".
+  h.runtime.ingest('agent-1', reading(h.now(), 80));
+  assert.equal(h.outstanding(), 1, 'a fresh reading arms exactly one boundary');
+  h.runtime.ingest('agent-1', reading(h.now(), 70));
+  h.runtime.ingest('agent-2', reading(h.now(), 60));
+  assert.equal(h.outstanding(), 1, 'later readings REPLACE the boundary rather than adding one');
+
+  h.runUntil(T0 + 10 * 60_000);
+  assert.equal(
+    h.stats().maxOutstanding,
+    1,
+    '§8: "One main-process earliest-boundary timer for all freshness/reset deadlines" — ' +
+      'never two at once, at any point in the run'
+  );
+});
+
+test('§8 QUIET STATE: ten minutes of one fresh static reading fires ONE boundary and notifies nobody', () => {
+  const h = runtimeRig();
+  h.runtime.ingest('agent-1', obs({ observedAt: T0, receivedAt: T0, windows: [win()] }));
+  const key = 'codex:acct-a:limit-1';
+  assert.equal(h.tracker.pool(key).state, 'AVAILABLE', 'precondition: the reading was accepted and is healthy');
+  assert.equal(h.outstanding(), 1, 'precondition: a boundary was actually scheduled');
+
+  h.runUntil(T0 + 10 * 60_000);
+
+  // §8 Quiet-state work: "only the single scheduled semantic boundary may fire".
+  assert.equal(h.stats().fired, 1, 'exactly ONE boundary fires in ten quiet minutes — the freshness expiry');
+  assert.equal(h.delivered.length, 0, '0 notifications: a reading ageing out is not news');
+  assert.equal(h.outstanding(), 0, 'and nothing is left armed, so the quiet state is genuinely quiet');
+
+  // The boundary did real work rather than being a no-op that costs nothing to pass.
+  const p = h.tracker.pool(key);
+  assert.equal(p.freshness, 'STALE', 'the scheduled boundary is what expired the reading');
+  assert.equal(p.state, 'UNKNOWN', 'and an expired reading reads UNKNOWN, never healthy');
+});
