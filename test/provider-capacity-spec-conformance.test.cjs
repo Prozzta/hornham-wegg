@@ -1,0 +1,289 @@
+'use strict';
+
+/**
+ * L0-FIX — spec-conformance fixtures for ProviderCapacityTracker.
+ *
+ * Written against research/notes/oscar-l0-sem.md (sha256 643D45C0…86CC), whose
+ * identity was verified from disk first. Expectations cite the clause they come
+ * from. Where a fixture disagrees with the implementation the fixture is not
+ * "fixed" to match — the disagreement is the result.
+ *
+ * Independence: this file and its corpus were derived from the spec. From the
+ * implementation I read ONLY the exported surface needed to drive it — the type
+ * declarations in src/shared/providerCapacity.ts, and the constructor plus the
+ * public method names of ProviderCapacityTracker. No classification logic was read.
+ *
+ * The clock is injected, so staleness, TTL boundaries and "a reset time passed"
+ * are exercised without waiting and without touching wall time.
+ */
+const test = require('node:test');
+const assert = require('node:assert/strict');
+const loadTs = require('./load-ts.cjs');
+const {
+  T0,
+  LIVE_TTL_MS,
+  ATTRIBUTION_CAPABILITY,
+  CORPUS,
+  win,
+  obs
+} = require('./fixtures/capacity-corpus.cjs');
+
+const { ProviderCapacityTracker, L0_SEM_POLICY } = loadTs('src/main/providerCapacityTracker.ts');
+
+/** A tracker whose clock this test owns outright. */
+function makeTracker(startAt = T0) {
+  let now = startAt;
+  const tracker = new ProviderCapacityTracker(L0_SEM_POLICY, () => now);
+  return {
+    tracker,
+    set now(v) {
+      now = v;
+    },
+    get now() {
+      return now;
+    },
+    pool(key) {
+      return tracker.snapshot().pools.find((p) => p.poolKey === key) ?? null;
+    }
+  };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 1. Corpus format invariants — gap #16, enforced rather than described
+// ─────────────────────────────────────────────────────────────────────────────
+
+test('every fixture declares attribution capability and presence independently', () => {
+  for (const f of CORPUS) {
+    assert.ok(f.attribution, `${f.id} declares attribution`);
+    assert.ok(
+      ['CAPABLE', 'INCAPABLE'].includes(f.attribution.capability),
+      `${f.id} capability is explicit`
+    );
+    assert.equal(typeof f.attribution.present, 'boolean', `${f.id} presence is explicit`);
+    assert.ok(f.spec && f.catches, `${f.id} cites a clause and says what it would catch`);
+  }
+});
+
+test('a source that CANNOT attribute never carries attribution', () => {
+  for (const f of CORPUS) {
+    if (f.attribution.capability !== 'INCAPABLE') continue;
+    assert.equal(f.attribution.present, false, `${f.id}: incapable source cannot be present`);
+    assert.equal(
+      f.observation.providerAttributedLimitingWindowId,
+      null,
+      `${f.id}: incapable source names no window`
+    );
+    assert.equal(f.observation.providerReachedType, null, `${f.id}: incapable source has no reached type`);
+  }
+});
+
+test('declared capability matches the source it came from', () => {
+  for (const f of CORPUS) {
+    assert.equal(
+      f.attribution.capability,
+      ATTRIBUTION_CAPABILITY[f.observation.source],
+      `${f.id}: capability must follow the source, not the author's intent`
+    );
+  }
+});
+
+test('CANNOT-ATTRIBUTE and DID-NOT-ATTRIBUTE are indistinguishable in the production type, and distinct in the corpus', () => {
+  const cannot = CORPUS.find((f) => f.id === 'CLAUDE-CANNOT-ATTRIBUTE');
+  const didNot = CORPUS.find((f) => f.id === 'CODEX-DID-NOT-ATTRIBUTE');
+
+  // The three production fields that carry attribution are identical...
+  for (const field of ['providerAttributedLimitingWindowId', 'providerReachedType', 'ordinaryUsageAllowed']) {
+    assert.deepEqual(
+      cannot.observation[field],
+      didNot.observation[field],
+      `${field} is identical, which is exactly the ambiguity`
+    );
+  }
+  // ...and the corpus still separates them, which is the point of gap #16.
+  assert.notEqual(
+    cannot.attribution.capability,
+    didNot.attribution.capability,
+    'the corpus distinguishes what the production observation type cannot'
+  );
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 2. Drive every corpus fixture through the tracker
+// ─────────────────────────────────────────────────────────────────────────────
+
+for (const f of CORPUS) {
+  test(`${f.id} — ${f.spec}`, () => {
+    const h = makeTracker(T0);
+    const accepted = h.tracker.ingest(f.observation);
+
+    if (f.expect.rejected) {
+      assert.equal(accepted, false, 'an invalid observation is rejected, not absorbed');
+      return;
+    }
+
+    if (f.evaluateAt !== undefined) {
+      h.now = f.evaluateAt;
+      h.tracker.evaluate();
+    }
+
+    const pool = h.pool(f.observation.poolKey);
+    assert.ok(pool, `${f.id}: pool is published`);
+
+    if (f.expect.state !== undefined) {
+      assert.equal(pool.state, f.expect.state, `${f.id}: state — would catch: ${f.catches}`);
+    }
+    if (f.expect.freshness !== undefined) {
+      assert.equal(pool.freshness, f.expect.freshness, `${f.id}: freshness verdict`);
+    }
+    if (f.expect.attributedWindowId !== undefined) {
+      assert.equal(
+        pool.providerAttributedLimitingWindowId,
+        f.expect.attributedWindowId,
+        `${f.id}: attribution is preserved exactly and never invented`
+      );
+    }
+    if (f.expect.numericallyExhausted !== undefined) {
+      assert.deepEqual(
+        [...pool.numericallyExhaustedWindowIds].sort(),
+        [...f.expect.numericallyExhausted].sort(),
+        `${f.id}: numeric exhaustion is recorded separately from attribution`
+      );
+    }
+  });
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 3. Recovery — built to CATCH, per §5. A clock must never reach AVAILABLE.
+// ─────────────────────────────────────────────────────────────────────────────
+
+test('a reset time passing with the provider disconnected yields RECOVERING and NEVER AVAILABLE', () => {
+  const h = makeTracker(T0);
+  const key = 'codex:acct-a:limit-1';
+  const resetAt = T0 + 3_600_000;
+
+  h.tracker.ingest(
+    obs({
+      providerReachedType: 'usage_limit_reached',
+      windows: [win({ usedPercent: 100, remainingPercent: 0, resetsAt: resetAt })]
+    })
+  );
+  assert.equal(h.pool(key).state, 'LIMITED', 'typed refusal opens a limit epoch');
+
+  // The provider is gone. Time passes across the advertised reset and NOTHING ELSE
+  // HAPPENS — no snapshot, no permission, no successful turn.
+  h.now = resetAt + 1;
+  h.tracker.evaluate();
+
+  const after = h.pool(key);
+  assert.notEqual(after.state, 'AVAILABLE', 'THE FAILURE MODE: a clock must never reach AVAILABLE');
+  assert.equal(after.state, 'RECOVERING', '§5: a passed reset is a hint, never confirmation');
+
+  // Still nothing after a long silence.
+  h.now = resetAt + 86_400_000;
+  h.tracker.evaluate();
+  assert.equal(h.pool(key).state, 'RECOVERING', 'elapsed time alone never promotes to healthy');
+});
+
+test('staleness does not clear a limit epoch', () => {
+  const h = makeTracker(T0);
+  const key = 'codex:acct-a:limit-1';
+  h.tracker.ingest(obs({ providerReachedType: 'usage_limit_reached', windows: [win()] }));
+
+  h.now = T0 + LIVE_TTL_MS * 10;
+  h.tracker.evaluate();
+  const s = h.pool(key).state;
+  assert.ok(s === 'LIMITED' || s === 'RECOVERING', `§5 sticky epoch, got ${s}`);
+  assert.notEqual(s, 'UNKNOWN', 'a limit epoch outranks staleness');
+  assert.notEqual(s, 'AVAILABLE', 'stale data never reads healthy');
+});
+
+test('a successful real turn without a fresh snapshot does not yield AVAILABLE', () => {
+  const h = makeTracker(T0);
+  const key = 'codex:acct-a:limit-1';
+  h.tracker.ingest(obs({ providerReachedType: 'usage_limit_reached', windows: [win()] }));
+
+  h.now = T0 + LIVE_TTL_MS + 1;
+  h.tracker.noteSuccessfulTurn(key, h.now);
+  h.tracker.evaluate();
+
+  assert.notEqual(
+    h.pool(key).state,
+    'AVAILABLE',
+    '§5: confirmation proves recovery from the old refusal, not current headroom'
+  );
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 4. §7 ordering, duplicates, revisions
+// ─────────────────────────────────────────────────────────────────────────────
+
+test('an out-of-order reading cannot overwrite a newer typed refusal', () => {
+  const h = makeTracker(T0);
+  const key = 'codex:acct-a:limit-1';
+
+  h.tracker.ingest(
+    obs({ observedAt: T0 + 1_000, receivedAt: T0 + 1_000, providerReachedType: 'usage_limit_reached', windows: [win()] })
+  );
+  assert.equal(h.pool(key).state, 'LIMITED');
+
+  const changed = h.tracker.ingest(obs({ observedAt: T0, receivedAt: T0, windows: [win()] }));
+  assert.equal(changed, false, '§7: a lower ordering key is ignored');
+  assert.equal(h.pool(key).state, 'LIMITED', 'a late stale snapshot never clears a newer refusal');
+});
+
+test('an exact duplicate is a no-op and does not move the revision', () => {
+  const h = makeTracker(T0);
+  const key = 'codex:acct-a:limit-1';
+  const reading = obs({ windows: [win()] });
+
+  h.tracker.ingest(reading);
+  const first = h.pool(key).revision;
+  const collectionFirst = h.tracker.snapshot().collectionRevision;
+
+  const changed = h.tracker.ingest({ ...reading, windows: [win()] });
+  assert.equal(changed, false, '§7: identical key and fingerprint is a duplicate');
+  assert.equal(h.pool(key).revision, first, 'a duplicate does not increment poolRevision');
+  assert.equal(
+    h.tracker.snapshot().collectionRevision,
+    collectionFirst,
+    '§7: a no-op increments neither revision'
+  );
+});
+
+test('one transaction over several pools increments the collection once, not once per pool', () => {
+  const h = makeTracker(T0);
+  const before = h.tracker.snapshot().collectionRevision;
+
+  for (let i = 0; i < 5; i += 1) {
+    h.tracker.ingest(
+      obs({
+        poolKey: `codex:acct-${i}:limit-1`,
+        accountScope: `acct-${i}`,
+        windows: [win()]
+      })
+    );
+  }
+
+  const snap = h.tracker.snapshot();
+  assert.equal(snap.pools.length, 5, 'five distinct pools, keyed by account scope');
+  assert.ok(
+    snap.collectionRevision > before,
+    '§7: adding pools advances the collection revision'
+  );
+  // Each pool is independently revisioned.
+  for (const p of snap.pools) {
+    assert.equal(typeof p.revision, 'number', 'every pool carries its own revision');
+  }
+});
+
+test('two accounts of one provider never merge into one pool', () => {
+  const h = makeTracker(T0);
+  h.tracker.ingest(obs({ poolKey: 'codex:acct-a:limit-1', accountScope: 'acct-a', windows: [win()] }));
+  h.tracker.ingest(obs({ poolKey: 'codex:acct-b:limit-1', accountScope: 'acct-b', windows: [win()] }));
+
+  assert.equal(
+    h.tracker.snapshot().pools.length,
+    2,
+    '§1: a pool is keyed by provider + account scope + limitId, or the UI understates consumption'
+  );
+});
