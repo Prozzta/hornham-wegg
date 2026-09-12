@@ -21,9 +21,31 @@ import { existsSync, realpathSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 
-/** Short, stable, non-reversible. Long enough that two homes will not collide. */
+/**
+ * Whether path CASE distinguishes two locations on this machine.
+ *
+ * Platform is an approximation of a filesystem property - a case-sensitive volume
+ * can be mounted on Windows, and macOS can be formatted case-sensitive - but it is
+ * the honest default: Windows and macOS ship case-insensitive, Linux does not.
+ * Probing the actual volume would mean creating a file to see what comes back, and
+ * this module does not touch the filesystem beyond resolving a path.
+ */
+const caseInsensitiveFs = (): boolean => process.platform === 'win32' || process.platform === 'darwin';
+
+/**
+ * Short, stable, non-reversible. Long enough that two homes will not collide.
+ *
+ * CASE IS FOLDED ONLY WHERE THE FILESYSTEM FOLDS IT. Lowercasing unconditionally
+ * made `/home/Alice/.codex` and `/home/alice/.codex` one scope, and on a
+ * case-sensitive filesystem those are two directories that can hold two different
+ * credentials - so two accounts MERGED INTO ONE POOL and each understated the
+ * other's consumption. Where the filesystem itself is case-insensitive the fold is
+ * required for the opposite reason: there one account would otherwise split into
+ * two pools depending on how a path happened to be typed.
+ */
 function scopeHash(path: string): string {
-  return createHash('sha256').update(path.toLowerCase()).digest('hex').slice(0, 12);
+  const key = caseInsensitiveFs() ? path.toLowerCase() : path;
+  return createHash('sha256').update(key).digest('hex').slice(0, 12);
 }
 
 /** Resolve through symlinks where possible; the unresolved path is a fine fallback. */

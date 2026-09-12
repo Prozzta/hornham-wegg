@@ -16,9 +16,26 @@
  * emit where it has a prior state of its own to compare against.
  *
  * THE SECOND GUARD, for the case the first one cannot see: at most ONE intent per
- * `poolKey + transition + limit epoch`. A pool that re-observes LIMITED fifty times
- * inside one refusal produces one intent, and a SECOND, genuinely separate refusal
- * produces a second - which is why `limitEpochAt` exists rather than a boolean.
+ * `poolKey + transition + the episode that transition is ABOUT`. A pool that
+ * re-observes LIMITED fifty times inside one refusal produces one intent, and a
+ * SECOND, genuinely separate refusal produces a second.
+ *
+ * AND THE EPISODE IS NOT ALWAYS THE DESTINATION'S EPOCH. This is where the first
+ * version of this file was wrong, and the error is worth stating because it is not
+ * visible from the transition table. A confirmed recovery CLEARS `limitEpochAt`, so
+ * keying a RECOVERED intent on the destination snapshot keyed every recovery in the
+ * process's life to the same string - and the second genuine recovery was suppressed
+ * forever. A transition is about the epoch it OPENS or the epoch it CLOSES, so
+ * RECOVERED is scoped by the epoch it ended, which lives in the PRIOR state.
+ * RESERVE_ONLY has no epoch at all by ruling 2, so its episodes are counted here
+ * instead: a per-pool ordinal that advances on every state entry, which makes two
+ * genuine reserve episodes distinct without inventing a provider fact.
+ *
+ * ORDERING IS THE COLLECTION'S, NOT THIS MODULE'S. A complete-replace snapshot with
+ * an equal or lower `collectionRevision` is ignored wholesale (L0-SEM 11.2) - not
+ * merged, not partially applied. Without that, an older snapshot replayed after a
+ * newer one reads as a transition backwards, emits a false RECOVERED, and burns the
+ * identity the real recovery would have needed.
  *
  * DELIVERY IS MAIN-OWNED. This module decides WHETHER and WHAT; it does not deliver.
  * Nothing here touches Electron's Notification, the renderer or IPC, so the decision
@@ -45,7 +62,12 @@ export interface CapacityNotifyIntent {
   to: CapacityState;
   /** Main-owned reason code carried through from the tracker. Never renderer wording. */
   stateReason: string;
-  /** The epoch this intent belongs to. Null for transitions outside a refusal. */
+  /**
+   * The epoch this intent is ABOUT - the one it opened or the one it closed - which
+   * for a RECOVERED is the epoch that has just been cleared and is therefore no
+   * longer on the pool. Null only for a transition that genuinely has no epoch on
+   * either side, which today means RESERVE_REACHED.
+   */
   limitEpochAt: number | null;
   /** Identity: one intent per this string, ever, in this process. */
   identity: string;
@@ -55,6 +77,13 @@ export interface CapacityNotifyIntent {
 interface PoolMemory {
   state: CapacityState;
   limitEpochAt: number | null;
+  /**
+   * How many state ENTRIES this pool has made in this process. It is the identity
+   * scope for transitions that have no epoch to be scoped by - today only
+   * RESERVE_REACHED, which by ruling 2 is numeric exhaustion with nothing attributed
+   * and therefore no epoch anywhere to key on.
+   */
+  episode: number;
 }
 
 /**
@@ -71,10 +100,40 @@ function kindFor(from: CapacityState, to: CapacityState): NotifyKind | null {
   return null;
 }
 
+/**
+ * The identity scope of a transition: the epoch it is ABOUT, or - when the
+ * transition has no epoch by construction - the pool's episode ordinal.
+ *
+ * LIMIT_REACHED opens an epoch, so it is scoped by the destination's.
+ * RECOVERED ends one, so it is scoped by the PRIOR state's: the destination has
+ * already had the field cleared, which is precisely the bug this replaces.
+ * RECOVERY_POSSIBLE happens inside an epoch that is still open, so either side
+ * carries it; the destination is preferred and the prior is the fallback.
+ * RESERVE_REACHED has no epoch on either side and falls through to the ordinal.
+ */
+function identityScope(kind: NotifyKind, prev: PoolMemory, pool: PoolCapacitySnapshot, episode: number): string {
+  const epoch =
+    kind === 'LIMIT_REACHED' ? pool.limitEpochAt
+      : kind === 'RECOVERED' ? prev.limitEpochAt
+        : kind === 'RECOVERY_POSSIBLE' ? (pool.limitEpochAt ?? prev.limitEpochAt)
+          : null;
+  // The ordinal is the fallback for every epochless case, not only the expected
+  // one. If a state that should carry an epoch ever arrives without one, two
+  // genuine events stay distinguishable instead of collapsing into each other.
+  return epoch !== null ? `e${epoch}` : `n${episode}`;
+}
+
 export class CapacityNotifier {
   private memory = new Map<string, PoolMemory>();
   /** Every intent identity already emitted in this process. */
   private emitted = new Set<string>();
+  /**
+   * The highest collection revision this notifier has acted on. Complete-replace
+   * semantics (L0-SEM 11.2): any STRICTLY higher revision is accepted wholesale and
+   * needs no adjacency; equal or lower is ignored wholesale. Starts below zero so a
+   * genuinely empty first collection at revision 0 is still a real observation.
+   */
+  private lastCollectionRevision = -1;
 
   /**
    * Establish where pools already are WITHOUT emitting anything. Call this on
@@ -83,7 +142,10 @@ export class CapacityNotifier {
    * once and being told every time the window is reopened.
    */
   hydrate(snapshot: CapacityCollectionSnapshot): void {
-    for (const pool of snapshot.pools) this.memory.set(pool.poolKey, memoryOf(pool));
+    for (const pool of snapshot.pools) this.memory.set(pool.poolKey, memoryOf(pool, 0));
+    // A baseline also sets the ordering floor. Otherwise the collection that was
+    // hydrated from could be replayed afterwards and be treated as news.
+    this.lastCollectionRevision = snapshot.collectionRevision;
   }
 
   /**
@@ -93,21 +155,35 @@ export class CapacityNotifier {
    * from a first sighting at startup — so neither may notify.
    */
   observe(snapshot: CapacityCollectionSnapshot, now: number = Date.now()): CapacityNotifyIntent[] {
+    // An out-of-order or repeated collection is not news about anything. Rejecting
+    // it WHOLESALE - before a single pool is inspected - is the only version of this
+    // check that is safe, because a partial application would leave this module's
+    // memory describing a collection that never existed.
+    if (snapshot.collectionRevision <= this.lastCollectionRevision) return [];
+    this.lastCollectionRevision = snapshot.collectionRevision;
+
     const intents: CapacityNotifyIntent[] = [];
     const seen = new Set<string>();
     for (const pool of snapshot.pools) {
       seen.add(pool.poolKey);
       const prev = this.memory.get(pool.poolKey);
-      this.memory.set(pool.poolKey, memoryOf(pool));
-      if (!prev) continue;                       // baseline only
-      if (prev.state === pool.state && prev.limitEpochAt === pool.limitEpochAt) continue;
+      if (!prev) {                               // baseline only
+        this.memory.set(pool.poolKey, memoryOf(pool, 0));
+        continue;
+      }
+      const entered = prev.state !== pool.state;
+      const episode = prev.episode + (entered ? 1 : 0);
+      this.memory.set(pool.poolKey, memoryOf(pool, episode));
+      if (!entered && prev.limitEpochAt === pool.limitEpochAt) continue;
       const kind = kindFor(prev.state, pool.state);
       if (!kind) continue;
-      // Identity is keyed on the EPOCH, not on a timestamp or a revision: repeated
-      // observations of one refusal share it, and a genuinely separate refusal does
-      // not. A reload cannot manufacture a new epoch, because the epoch comes from
-      // the provider evidence rather than from this process's lifetime.
-      const identity = `${pool.poolKey}|${kind}|${pool.limitEpochAt ?? 'none'}`;
+      // Identity is keyed on the EPISODE THE TRANSITION IS ABOUT - never on a
+      // timestamp or a revision. Repeated observations of one refusal share it; a
+      // genuinely separate refusal does not. A reload cannot manufacture a new
+      // epoch, because the epoch comes from the provider evidence rather than from
+      // this process's lifetime.
+      const scope = identityScope(kind, prev, pool, episode);
+      const identity = `${pool.poolKey}|${kind}|${scope}`;
       if (this.emitted.has(identity)) continue;
       this.emitted.add(identity);
       intents.push({
@@ -117,7 +193,10 @@ export class CapacityNotifier {
         from: prev.state,
         to: pool.state,
         stateReason: pool.stateReason,
-        limitEpochAt: pool.limitEpochAt,
+        // The epoch the identity was scoped by, so a consumer reading the intent and
+        // a consumer reading the identity string can never disagree about which
+        // refusal is being reported.
+        limitEpochAt: scope.startsWith('e') ? Number(scope.slice(1)) : null,
         identity,
         at: now
       });
@@ -130,7 +209,8 @@ export class CapacityNotifier {
   }
 }
 
-const memoryOf = (pool: PoolCapacitySnapshot): PoolMemory => ({
+const memoryOf = (pool: PoolCapacitySnapshot, episode: number): PoolMemory => ({
   state: pool.state,
-  limitEpochAt: pool.limitEpochAt
+  limitEpochAt: pool.limitEpochAt,
+  episode
 });

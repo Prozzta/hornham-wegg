@@ -56,13 +56,34 @@ function parseEpochMs(v: unknown): number | null {
   return null;
 }
 
-/** used → remaining, done once here so nothing downstream does arithmetic on provider numbers. */
+/**
+ * used → remaining, done once here so nothing downstream does arithmetic on
+ * provider numbers.
+ *
+ * THE TWO OUT-OF-RANGE DIRECTIONS ARE NOT SYMMETRIC, AND TREATING THEM AS ONE WAS
+ * THE DEFECT. Above 100 is a real reading of a real state: a provider reporting
+ * 100.4% used is over its allowance, and clamping to zero remaining reports
+ * exhaustion, which is true and is the conservative direction. Below 0 is not a
+ * reading at all - no allowance can be negatively consumed - and the old clamp
+ * turned that nonsense into 100% REMAINING, which is the one thing this design
+ * says must never happen: an invalid number becoming a healthy-looking fact. So an
+ * impossible used figure yields NO NUMBER, and the window lands in UNKNOWN with
+ * the rest of its incomplete siblings rather than in AVAILABLE.
+ */
 function remainingFromUsed(used: number | null): number | null {
   if (used === null) return null;
-  const remaining = 100 - used;
-  // Clamp rather than drop: a provider reporting 100.4% used means exhausted, and a
-  // negative remainder would be a false reading of a true fact.
-  return Math.min(100, Math.max(0, remaining));
+  return Math.max(0, 100 - used);
+}
+
+/**
+ * A used-percentage that is a number but not a possible one. Rejected at the
+ * source so the invalid figure never reaches EITHER published field - a window
+ * carrying `usedPercent: -50` would be a nonsense number on a surface even with
+ * its remainder correctly suppressed.
+ */
+function usedPercent(v: unknown): number | null {
+  const n = finiteNumber(v);
+  return n === null || n < 0 ? null : n;
 }
 
 /** Claude names its windows; the duration is implied by the documented name. */
@@ -94,7 +115,7 @@ export function normalizeClaudeStatusLine(input: {
     const hasUsed = 'used_percentage' in raw;
     const hasReset = 'resets_at' in raw;
     if (!hasUsed && !hasReset) continue;
-    const used = finiteNumber(raw.used_percentage);
+    const used = usedPercent(raw.used_percentage);
     const resetsAt = parseEpochMs(raw.resets_at);
     // An entry with neither a usable number nor a usable time carries nothing; it
     // is dropped rather than kept as a window of unknowns, which would read on a
@@ -137,10 +158,56 @@ export function normalizeClaudeStatusLine(input: {
   };
 }
 
+/**
+ * `spend_control_reached` is a boolean, not a named type, so a name is needed to
+ * carry it in the one field that records what the provider said. It is deliberately
+ * NOT one of the protocol's own enum values: it did not come from that enum, and a
+ * downstream reader comparing against the closed set below must not match it.
+ */
+export const SPEND_CONTROL_REACHED = 'spend_control_reached';
+
+/**
+ * The provider's CLOSED set of reached types, and what each attributes.
+ *
+ * READ THE VALUES: NOT ONE OF THEM NAMES A WINDOW. `rate_limit_reached`,
+ * credits-depleted and usage-limit-reached, owner and member - the protocol says
+ * THAT something is limiting and never WHICH window, so every entry maps to null.
+ * That is the finding, and it is why this replaces a substring test rather than
+ * tightening one: the old code searched these strings for 'primary', 'weekly' and
+ * '5h', which no member of the enum contains, so it was scanning for a capability
+ * the provider does not have. Against today's payloads it attributed nothing and
+ * looked correct; against any future or unrecognised string it could manufacture a
+ * causal claim out of a coincidental substring.
+ *
+ * An unrecognised string is kept VERBATIM as evidence that something is limiting -
+ * that much is true whatever the string says - and attributes nothing. Adding a
+ * mapping here requires a provider value that genuinely identifies a window, and a
+ * fixture carrying it.
+ */
+const CODEX_REACHED_TYPES: Record<string, string | null> = {
+  rate_limit_reached: null,
+  workspace_owner_credits_depleted: null,
+  workspace_member_credits_depleted: null,
+  workspace_owner_usage_limit_reached: null,
+  workspace_member_usage_limit_reached: null
+};
+
+/**
+ * Which window, if any, a reached type names. Exact match against the closed set;
+ * anything else attributes nothing. Attribution is a CAUSAL claim, and C2.4 permits
+ * one only where the provider made it.
+ */
+function attributedWindowFor(reachedType: string | null, rl: Dict): string | null {
+  if (!reachedType) return null;
+  const slot = CODEX_REACHED_TYPES[reachedType];
+  if (!slot) return null;
+  return codexWindow(slot, rl[slot])?.windowId ?? null;
+}
+
 /** Codex slot → normalised window, identified by duration rather than by slot. */
 function codexWindow(slot: string, raw: unknown): CapacityWindow | null {
   if (!isDict(raw)) return null;
-  const used = finiteNumber(raw.used_percent ?? raw.usedPercent);
+  const used = usedPercent(raw.used_percent ?? raw.usedPercent);
   const minutes = finiteNumber(raw.window_minutes ?? raw.windowDurationMins);
   const resetsAt = parseEpochMs(raw.resets_at ?? raw.resetsAt);
   if (used === null && resetsAt === null) return null;
@@ -164,11 +231,17 @@ function codexWindow(slot: string, raw: unknown): CapacityWindow | null {
  * app-server account snapshot. Both spellings are accepted because the rollout
  * JSONL is snake_case while the app-server protocol is camelCase.
  *
- * ATTRIBUTION IS CONSERVATIVE. `rate_limit_reached_type` is retained verbatim
- * whenever the provider sets it, but it only becomes an attributed WINDOW when it
- * actually identifies one. A reached signal that names no window is real evidence
- * that something is limiting and is NOT evidence about which window, so inventing
- * the window would manufacture exactly the causal claim C2.4 forbids.
+ * TWO REACHED FACTS, NOT ONE. The snapshot carries `rate_limit_reached_type` and
+ * the sibling boolean `spend_control_reached`, and both are provider-native
+ * statements that ordinary use is blocked. Reading only the first left a payload
+ * whose spend control had tripped looking AVAILABLE.
+ *
+ * ATTRIBUTION IS CONSERVATIVE, AND NOW CLOSED. A reached type is retained verbatim
+ * whenever the provider sets it, but it only becomes an attributed WINDOW by exact
+ * match against the provider's own enumeration - and no member of that enumeration
+ * names a window. A reached signal that names no window is real evidence that
+ * something is limiting and is NOT evidence about which window, so inventing the
+ * window would manufacture exactly the causal claim C2.4 forbids.
  *
  * A ROLLOUT LINE MUST CARRY ITS OWN TIME. `codex-rollout` is a REPLAY source: the
  * line was written at some past moment and read later, so substituting receipt time
@@ -197,24 +270,18 @@ export function normalizeCodexRateLimits(input: {
   }
 
   const reachedRaw = rl.rate_limit_reached_type ?? rl.rateLimitReachedType;
-  const providerReachedType = typeof reachedRaw === 'string' && reachedRaw ? reachedRaw : null;
+  const reachedType = typeof reachedRaw === 'string' && reachedRaw ? reachedRaw : null;
+  // A SECOND provider-native reached fact, a sibling of the first in the same
+  // snapshot. Only a real `true` counts: absent and false are both "not reached",
+  // and a spend control that has not tripped says nothing about allowance.
+  const spendRaw = rl.spend_control_reached ?? rl.spendControlReached;
+  const spendReached = spendRaw === true;
+  const providerReachedType = reachedType ?? (spendReached ? SPEND_CONTROL_REACHED : null);
 
   // Nothing usable at all — return null rather than a healthy-looking empty record.
   if (!windows.length && !providerReachedType) return null;
 
-  let attributed: string | null = null;
-  if (providerReachedType) {
-    const hint = providerReachedType.toLowerCase();
-    const bySlot = hint.includes('secondary') || hint.includes('weekly')
-      ? 'secondary'
-      : hint.includes('primary') || hint.includes('5h') || hint.includes('five')
-        ? 'primary'
-        : null;
-    if (bySlot) {
-      const w = codexWindow(bySlot, rl[bySlot]);
-      if (w) attributed = w.windowId;
-    }
-  }
+  const attributed = attributedWindowFor(reachedType, rl);
 
   const limitIdRaw = rl.limit_id ?? rl.limitId;
   const planRaw = rl.plan_type ?? rl.planType;

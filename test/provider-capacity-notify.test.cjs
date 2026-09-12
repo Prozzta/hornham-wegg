@@ -236,3 +236,128 @@ test('the notifier delivers nothing itself - no Electron, no IPC, no renderer', 
     assert.equal(src.includes(banned), false, `the notifier must not reference "${banned}" in code`);
   }
 });
+
+// ---------------------------------------------------------------------------
+// L0-DEF3 — the counterexamples from the adversarial audit (section 10.5).
+//
+// Every one of these is a SECOND genuine event. The first version of this module
+// keyed identity on the DESTINATION snapshot's `limitEpochAt`, and a confirmed
+// recovery clears that field, so every recovery in the life of the process shared
+// one identity string and only the first was ever emitted. The bug was invisible to
+// the original tests because they each tested one episode.
+// ---------------------------------------------------------------------------
+
+/** Drive one full refusal-and-recovery cycle and return the intents, in order. */
+function cycle(r, at, reached) {
+  r.set(at);
+  r.tracker.ingest(obs({ observedAt: at, receivedAt: at, providerReachedType: reached }));
+  const limited = r.tick();
+  const back = at + 60_000;
+  r.set(back);
+  r.tracker.ingest(obs({ observedAt: back, receivedAt: back, ordinaryUsageAllowed: true }));
+  return [...limited, ...r.tick()];
+}
+
+test('a SECOND genuine recovery notifies — it does not share an identity with the first', () => {
+  const r = rig();
+  r.tracker.ingest(obs());
+  r.tick();                                        // baseline: AVAILABLE
+
+  const first = cycle(r, T0 + 10_000, 'rate_limit_reached');
+  assert.deepEqual(first.map((i) => i.kind), ['LIMIT_REACHED', 'RECOVERED']);
+
+  const second = cycle(r, T0 + 600_000, 'workspace_member_usage_limit_reached');
+  assert.deepEqual(
+    second.map((i) => i.kind),
+    ['LIMIT_REACHED', 'RECOVERED'],
+    'the second refusal AND the second recovery are both genuinely new events'
+  );
+
+  // The identities must differ, and specifically the RECOVERED ones: that is the
+  // pair that used to collide on `|none`.
+  const recovered = [first, second].map((c) => c.find((i) => i.kind === 'RECOVERED').identity);
+  assert.notEqual(recovered[0], recovered[1]);
+  assert.ok(!recovered[0].endsWith('|none'), `a recovery is scoped by the epoch it CLOSED: ${recovered[0]}`);
+});
+
+test('a RECOVERED intent carries the epoch it ended, not the cleared one', () => {
+  const r = rig();
+  r.tracker.ingest(obs());
+  r.tick();
+  const at = T0 + 10_000;
+  r.set(at);
+  r.tracker.ingest(obs({ observedAt: at, receivedAt: at, providerReachedType: 'rate_limit_reached' }));
+  const opened = r.tick()[0];
+  const back = at + 60_000;
+  r.set(back);
+  r.tracker.ingest(obs({ observedAt: back, receivedAt: back, ordinaryUsageAllowed: true }));
+  const closed = r.tick()[0];
+
+  assert.equal(closed.kind, 'RECOVERED');
+  assert.equal(closed.limitEpochAt, opened.limitEpochAt, 'the recovery reports the refusal it ended');
+  assert.equal(r.tracker.pool(POOL).limitEpochAt, null, 'while the pool itself has correctly cleared it');
+});
+
+test('a SECOND genuine reserve episode notifies, though RESERVE_ONLY has no epoch at all', () => {
+  const r = rig();
+  r.tracker.ingest(obs());
+  r.tick();
+
+  const spend = (at) => {
+    r.set(at);
+    r.tracker.ingest(obs({
+      observedAt: at, receivedAt: at,
+      windows: [win('five_hour', 'FIVE_HOUR', 0, RESET_5H), win('seven_day', 'SEVEN_DAY', 60, at + 86_400_000)]
+    }));
+    const out = r.tick();
+    const back = at + 30_000;
+    r.set(back);
+    r.tracker.ingest(obs({ observedAt: back, receivedAt: back }));
+    r.tick();
+    return out;
+  };
+
+  const first = spend(T0 + 10_000);
+  const second = spend(T0 + 300_000);
+  assert.deepEqual(first.map((i) => i.kind), ['RESERVE_REACHED']);
+  assert.deepEqual(second.map((i) => i.kind), ['RESERVE_REACHED'], 'a window spent twice is two events');
+  assert.notEqual(first[0].identity, second[0].identity);
+  assert.equal(first[0].limitEpochAt, null, 'and neither invents an epoch ruling 2 says does not exist');
+});
+
+test('an OLDER collection is ignored wholesale — no false recovery, no identity consumed', () => {
+  const r = rig();
+  r.tracker.ingest(obs());
+  const healthy = r.tracker.snapshot();
+  r.notifier.hydrate(healthy);
+
+  const at = T0 + 10_000;
+  r.set(at);
+  r.tracker.ingest(obs({ observedAt: at, receivedAt: at, providerReachedType: 'rate_limit_reached' }));
+  const limited = r.tracker.snapshot();
+  assert.ok(limited.collectionRevision > healthy.collectionRevision);
+  assert.deepEqual(r.notifier.observe(limited, at).map((i) => i.kind), ['LIMIT_REACHED']);
+
+  // The replay. Under the old code this read as LIMITED -> AVAILABLE and emitted a
+  // RECOVERED that was not true, AND burned `pool|RECOVERED|none` so the real
+  // recovery could never be delivered.
+  assert.deepEqual(r.notifier.observe(healthy, at + 1).map((i) => i.kind), [], 'an older collection is not news');
+
+  // And the state it should still be in is undisturbed: re-observing the newer
+  // collection is a duplicate, not a fresh transition.
+  assert.deepEqual(r.notifier.observe(limited, at + 2).map((i) => i.kind), []);
+
+  // The real recovery still gets through.
+  const back = at + 60_000;
+  r.set(back);
+  r.tracker.ingest(obs({ observedAt: back, receivedAt: back, ordinaryUsageAllowed: true }));
+  assert.deepEqual(r.notifier.observe(r.tracker.snapshot(), back).map((i) => i.kind), ['RECOVERED']);
+});
+
+test('an EQUAL collection revision is ignored too', () => {
+  const r = rig();
+  r.tracker.ingest(obs());
+  const snap = r.tracker.snapshot();
+  r.notifier.observe(snap, T0);
+  assert.deepEqual(r.notifier.observe(snap, T0 + 1), [], 'equal is not strictly higher');
+});

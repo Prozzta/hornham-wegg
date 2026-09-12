@@ -112,3 +112,39 @@ test('a codex home with no credential still yields a scope rather than throwing'
   assert.match(codexAccountScope(path.join(root, 'does-not-exist')), /^[0-9a-f]{12}$/);
   fs.rmSync(root, { recursive: true, force: true });
 });
+
+// ── L0-DEF3: case folding is a filesystem property, not a habit ──────────────
+
+/** Run `fn` as if the process were on `platform`, then put it back. */
+function asPlatform(platform, fn) {
+  const original = Object.getOwnPropertyDescriptor(process, 'platform');
+  Object.defineProperty(process, 'platform', { value: platform, configurable: true });
+  try { fn(); } finally { Object.defineProperty(process, 'platform', original); }
+}
+
+test('two case-distinct homes are two accounts where the filesystem says they are', () => {
+  // On a case-SENSITIVE filesystem these are two directories that can hold two
+  // different credentials. Folding case merged them into one pool, and each account
+  // then understated the other's consumption against one shared allowance.
+  asPlatform('linux', () => {
+    assert.notEqual(
+      claudeAccountScope({ CLAUDE_CONFIG_DIR: '/home/Alice/.claude' }),
+      claudeAccountScope({ CLAUDE_CONFIG_DIR: '/home/alice/.claude' })
+    );
+  });
+});
+
+test('and they are ONE account where the filesystem says that instead', () => {
+  // The opposite error is just as real: on Windows and macOS the two spellings are
+  // the same directory, so NOT folding would split one account across two pools
+  // depending on how a path happened to be typed.
+  for (const platform of ['win32', 'darwin']) {
+    asPlatform(platform, () => {
+      assert.equal(
+        claudeAccountScope({ CLAUDE_CONFIG_DIR: 'C:/Users/Alice/.claude' }),
+        claudeAccountScope({ CLAUDE_CONFIG_DIR: 'c:/users/alice/.claude' }),
+        platform
+      );
+    });
+  }
+});

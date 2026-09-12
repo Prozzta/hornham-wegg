@@ -176,13 +176,95 @@ test('codex: a reached type that names NO window attributes no window', () => {
   assert.equal(obs.providerAttributedLimitingWindowId, null);
 });
 
-test('codex: a reached type that DOES name a window attributes exactly that window', () => {
-  const obs = normalizeCodexRateLimits({
-    rateLimits: { ...CODEX_OBSERVED, rate_limit_reached_type: 'secondary' },
-    accountScope: 'acct-b',
-    observedAt: OBSERVED, receivedAt: RECEIVED
+// The provider's OWN closed enumeration (codex-rs protocol RateLimitReachedType).
+// Not one member names a window, which is the whole point of the table that
+// replaced substring matching: this fixture used to assert `secondary`, a value the
+// provider never emits, and so asserted a capability that does not exist.
+const CODEX_REACHED_ENUM = [
+  'rate_limit_reached',
+  'workspace_owner_credits_depleted',
+  'workspace_member_credits_depleted',
+  'workspace_owner_usage_limit_reached',
+  'workspace_member_usage_limit_reached'
+];
+
+test('codex: every REAL provider reached type is kept verbatim and attributes NO window', () => {
+  for (const reached of CODEX_REACHED_ENUM) {
+    const obs = normalizeCodexRateLimits({
+      rateLimits: { ...CODEX_OBSERVED, rate_limit_reached_type: reached },
+      accountScope: 'acct-b',
+      observedAt: OBSERVED, receivedAt: RECEIVED
+    });
+    assert.equal(obs.providerReachedType, reached, reached);
+    assert.equal(obs.providerAttributedLimitingWindowId, null, reached);
+  }
+});
+
+test('codex: an unrecognised reached string containing a window word attributes NOTHING', () => {
+  // The exact shape the old substring test could not survive: a string that merely
+  // CONTAINS a window word. Under `includes('secondary')` this manufactured a causal
+  // attribution out of a coincidence.
+  for (const reached of ['workspace_secondary_owner_limit', 'primary_billing_contact_missing', 'weekly_digest_failed']) {
+    const obs = normalizeCodexRateLimits({
+      rateLimits: { ...CODEX_OBSERVED, rate_limit_reached_type: reached },
+      accountScope: 'acct-b',
+      observedAt: OBSERVED, receivedAt: RECEIVED
+    });
+    assert.equal(obs.providerReachedType, reached, reached);
+    assert.equal(obs.providerAttributedLimitingWindowId, null, reached);
+  }
+});
+
+test('codex: spend_control_reached=true is a reached fact; false and absent are not', () => {
+  const tripped = normalizeCodexRateLimits({
+    rateLimits: { ...CODEX_OBSERVED, spend_control_reached: true },
+    accountScope: 'acct-b', observedAt: OBSERVED, receivedAt: RECEIVED
   });
-  assert.equal(obs.providerAttributedLimitingWindowId, 'seven_day');
+  assert.equal(tripped.providerReachedType, 'spend_control_reached');
+  assert.equal(tripped.providerAttributedLimitingWindowId, null);
+
+  for (const value of [false, null, undefined]) {
+    const obs = normalizeCodexRateLimits({
+      rateLimits: { ...CODEX_OBSERVED, spend_control_reached: value },
+      accountScope: 'acct-b', observedAt: OBSERVED, receivedAt: RECEIVED
+    });
+    assert.equal(obs.providerReachedType, null, String(value));
+  }
+});
+
+test('codex: an explicit reached TYPE outranks the spend boolean as the recorded fact', () => {
+  const obs = normalizeCodexRateLimits({
+    rateLimits: { ...CODEX_OBSERVED, rate_limit_reached_type: 'rate_limit_reached', spend_control_reached: true },
+    accountScope: 'acct-b', observedAt: OBSERVED, receivedAt: RECEIVED
+  });
+  assert.equal(obs.providerReachedType, 'rate_limit_reached');
+});
+
+test('a NEGATIVE used percentage is rejected, never turned into full headroom', () => {
+  const obs = normalizeCodexRateLimits({
+    rateLimits: { limit_id: 'codex', primary: { used_percent: -50, window_minutes: 300, resets_at: 1789004151 } },
+    accountScope: 'acct-b', observedAt: OBSERVED, receivedAt: RECEIVED
+  });
+  const w = obs.windows.find((x) => x.kind === 'FIVE_HOUR');
+  assert.equal(w.remainingPercent, null, 'an impossible figure is NO number, not 100% remaining');
+  assert.equal(w.usedPercent, null, 'and the nonsense figure is not published either');
+});
+
+test('a used percentage ABOVE 100 stays exhaustion, because that direction is true', () => {
+  const obs = normalizeCodexRateLimits({
+    rateLimits: { limit_id: 'codex', primary: { used_percent: 100.4, window_minutes: 300, resets_at: 1789004151 } },
+    accountScope: 'acct-b', observedAt: OBSERVED, receivedAt: RECEIVED
+  });
+  assert.equal(obs.windows.find((x) => x.kind === 'FIVE_HOUR').remainingPercent, 0);
+});
+
+test('claude: a negative used percentage is rejected on that path too', () => {
+  const obs = normalizeClaudeStatusLine({
+    rateLimits: { five_hour: { used_percentage: -1, resets_at: 1789004151 } },
+    accountScope: 'acct-a', observedAt: OBSERVED, receivedAt: RECEIVED
+  });
+  assert.equal(obs.windows[0].remainingPercent, null);
+  assert.equal(obs.windows[0].usedPercent, null);
 });
 
 test('codex: the camelCase app-server spelling normalises identically', () => {

@@ -165,6 +165,17 @@ const sameProjection = (a: PoolCapacitySnapshot, b: PoolCapacitySnapshot): boole
 
 export class ProviderCapacityTracker {
   private pools = new Map<string, PoolRecord>();
+  /**
+   * poolKey → the highest per-pool revision ever published for it, RETAINED ACROSS
+   * REMOVAL. A pool that is forgotten and seen again is the same pool - same
+   * provider, same account, same limit id - so its revision must keep counting.
+   * Without this the re-added pool restarted at 1 and a consumer holding revision 6
+   * discarded every update until the new count caught up, which is a silent stall
+   * rather than a visible error. Revisions are a monotonic identity, not a
+   * population count, and nothing here expires this map: it costs one small integer
+   * per pool key ever seen, against a 32-pool cap.
+   */
+  private revisionFloor = new Map<string, number>();
   private collectionRevision = 0;
   private updatedAt = 0;
 
@@ -212,7 +223,7 @@ export class ProviderCapacityTracker {
 
     const rec: PoolRecord = prev ?? {
       observation: obs,
-      projection: blankProjection(obs),
+      projection: blankProjection(obs, this.revisionFloor.get(obs.poolKey) ?? 0),
       epoch: null,
       conflicted: false,
       successfulTurnAt: null,
@@ -266,9 +277,16 @@ export class ProviderCapacityTracker {
     return this.pools.get(poolKey)?.projection ?? null;
   }
 
-  /** Removal is explicit. Nothing here expires a pool on its own at L0. */
+  /**
+   * Removal is explicit. Nothing here expires a pool on its own at L0.
+   *
+   * The record goes; the revision high-water mark stays. See `revisionFloor`.
+   */
   forget(poolKey: string): boolean {
-    if (!this.pools.delete(poolKey)) return false;
+    const rec = this.pools.get(poolKey);
+    if (!rec) return false;
+    this.revisionFloor.set(poolKey, rec.projection.revision);
+    this.pools.delete(poolKey);
     this.collectionRevision += 1;
     this.updatedAt = this.clock();
     return true;
@@ -343,11 +361,11 @@ export class ProviderCapacityTracker {
       // Nothing semantic moved; keep the revision and store the refreshed clock
       // fields so a pool being actively observed cannot expire on an old timestamp.
       next.revision = rec.projection.revision;
-      rec.projection = next;
+      rec.projection = publish(next);
       return false;
     }
     next.revision = rec.projection.revision + 1;
-    rec.projection = next;
+    rec.projection = publish(next);
     this.collectionRevision += 1;
     this.updatedAt = now;
     return true;
@@ -434,6 +452,26 @@ export class ProviderCapacityTracker {
   }
 }
 
+/**
+ * Seal a projection before it becomes the pool's published state.
+ *
+ * WHY SEALING RATHER THAN COPYING. `snapshot()` and `pool()` hand out the tracker's
+ * OWN objects, so a consumer that wrote to one was editing authoritative state
+ * directly - changing a state or a percentage with no revision, no evidence and no
+ * way for anything downstream to notice. Copying on every read would cost an
+ * allocation per pool per read and still leave the first reader's copy writable;
+ * freezing costs one pass at publication and makes the mutation itself fail. The
+ * windows array and its members are frozen too: freezing only the outer object
+ * leaves `snapshot.pools[0].windows[0].remainingPercent = 100` working, which is
+ * precisely the edit that would matter.
+ */
+function publish(p: PoolCapacitySnapshot): PoolCapacitySnapshot {
+  for (const w of p.windows) Object.freeze(w);
+  Object.freeze(p.windows);
+  Object.freeze(p.numericallyExhaustedWindowIds);
+  return Object.freeze(p);
+}
+
 /** Fresh exact zero. An OBSERVATION; it never implies the provider said anything. */
 function numericallyExhausted(obs: CapacityObservation): string[] {
   return obs.windows.filter((w) => w.remainingPercent === 0).map((w) => w.windowId);
@@ -466,14 +504,18 @@ function resetPassed(obs: CapacityObservation, epoch: LimitEpoch, now: number): 
   return earliest !== null && earliest <= now;
 }
 
-/** Revision 0 placeholder; the first reproject replaces it and moves to revision 1. */
-function blankProjection(obs: CapacityObservation): PoolCapacitySnapshot {
+/**
+ * Placeholder; the first reproject replaces it and moves to `floor + 1`. The floor
+ * is 0 for a pool never seen before and the pool's last published revision for one
+ * that was removed and has come back.
+ */
+function blankProjection(obs: CapacityObservation, floor = 0): PoolCapacitySnapshot {
   return {
     poolKey: obs.poolKey,
     provider: obs.provider,
     accountScope: obs.accountScope,
     limitId: obs.limitId,
-    revision: 0,
+    revision: floor,
     state: 'UNKNOWN',
     stateReason: REASON.NO_READING,
     windows: [],

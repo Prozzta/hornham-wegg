@@ -113,10 +113,12 @@ test('a NEW session file is found on rescan, and the newest file wins', () => {
 });
 
 test('a typed reached signal survives the read and attributes only when it names a window', () => {
-  const named = makeHome([line(100, 40, '2026-09-09T21:00:00.000Z', 'secondary')]);
+  // A REAL member of the provider's enumeration. It is hard evidence that something
+  // is limiting, and it names no window - so attribution stays null.
+  const named = makeHome([line(100, 40, '2026-09-09T21:00:00.000Z', 'rate_limit_reached')]);
   const a = source().observe(named.home);
-  assert.equal(a.providerReachedType, 'secondary');
-  assert.equal(a.providerAttributedLimitingWindowId, 'seven_day');
+  assert.equal(a.providerReachedType, 'rate_limit_reached');
+  assert.equal(a.providerAttributedLimitingWindowId, null);
   named.cleanup();
 
   const vague = makeHome([line(100, 40, '2026-09-09T21:00:00.000Z', 'usage')]);

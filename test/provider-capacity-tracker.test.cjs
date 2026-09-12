@@ -421,3 +421,59 @@ test('the projection exposes no binding/tighter/headroom vocabulary', () => {
     assert.equal(keys.includes(banned), false, `projection must not expose a "${banned}" field`);
   }
 });
+
+// ── L0-DEF3: published state is not a scratch pad, and revisions never go back ──
+
+test('a pool removed and seen again RESUMES its revision instead of restarting', () => {
+  const m = make();
+  m.t.ingest(obs());
+  m.set(T0 + 1_000);
+  m.t.ingest(obs({ observedAt: T0 + 1_000, receivedAt: T0 + 1_000,
+    windows: [win('five_hour', 'FIVE_HOUR', 70, RESET_5H), win('seven_day', 'SEVEN_DAY', 60, T0 + 86_400_000)] }));
+  const before = m.t.pool(KEY).revision;
+  assert.ok(before >= 2, 'two distinct readings published two revisions');
+
+  assert.equal(m.t.forget(KEY), true);
+  m.set(T0 + 2_000);
+  m.t.ingest(obs({ observedAt: T0 + 2_000, receivedAt: T0 + 2_000 }));
+
+  const after = m.t.pool(KEY).revision;
+  assert.ok(
+    after > before,
+    `a re-added pool keeps counting (${before} -> ${after}); restarting at 1 makes a consumer `
+    + 'holding the old number discard every update until the count catches up'
+  );
+});
+
+test('a published projection cannot be edited by whoever reads it', () => {
+  const m = make();
+  m.t.ingest(obs());
+  const pool = m.t.pool(KEY);
+  assert.equal(pool.state, 'AVAILABLE');
+
+  assert.throws(() => { pool.state = 'LIMITED'; }, TypeError, 'the pool object itself is sealed');
+  assert.throws(() => { pool.windows[0].remainingPercent = 0; }, TypeError, 'and so is each window');
+  assert.throws(() => { pool.windows.push(win('x', 'OTHER', 5, null)); }, TypeError, 'and the window list');
+
+  // The authoritative state is what it always was, with no revision spent.
+  assert.equal(m.t.pool(KEY).state, 'AVAILABLE');
+  assert.equal(m.t.pool(KEY).windows[0].remainingPercent, 80);
+  assert.equal(m.t.pool(KEY).revision, pool.revision);
+});
+
+test('the collection handed out is sealed the same way', () => {
+  const m = make();
+  m.t.ingest(obs());
+  const snap = m.t.snapshot();
+  assert.throws(() => { snap.pools[0].freshness = 'FRESH'; }, TypeError);
+  assert.equal(m.t.snapshot().pools[0].freshness, m.t.pool(KEY).freshness);
+});
+
+test('an invalid NEGATIVE percentage reaching the tracker is UNKNOWN, never AVAILABLE', () => {
+  // The normaliser rejects it at the source; this is the tracker's own arm of the
+  // same rule, so a future collector cannot reintroduce the defect downstream.
+  const m = make();
+  m.t.ingest(obs({ windows: [win('five_hour', 'FIVE_HOUR', null, RESET_5H), win('seven_day', 'SEVEN_DAY', 60, T0 + 86_400_000)] }));
+  assert.equal(m.state(), 'UNKNOWN');
+  assert.equal(m.reason(), REASON.NO_NUMBERS);
+});
