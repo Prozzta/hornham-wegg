@@ -169,6 +169,16 @@ function codexWindow(slot: string, raw: unknown): CapacityWindow | null {
  * actually identifies one. A reached signal that names no window is real evidence
  * that something is limiting and is NOT evidence about which window, so inventing
  * the window would manufacture exactly the causal claim C2.4 forbids.
+ *
+ * A ROLLOUT LINE MUST CARRY ITS OWN TIME. `codex-rollout` is a REPLAY source: the
+ * line was written at some past moment and read later, so substituting receipt time
+ * would date a stale reading to now and publish it as FRESH. L0-SEM section 6 is
+ * explicit — "replaying an old line does not make it fresh", and Codex replay
+ * requires a valid embedded time where Claude's LIVE hook may use local receipt
+ * time. So a rollout line without a usable timestamp yields NO OBSERVATION, which
+ * is the same answer section 7 already gives for a malformed or truncated trailing
+ * line. The account read keeps receipt time: it is a live RPC answered now, not a
+ * replay of something written earlier.
  */
 export function normalizeCodexRateLimits(input: {
   rateLimits: unknown;
@@ -210,14 +220,20 @@ export function normalizeCodexRateLimits(input: {
   const planRaw = rl.plan_type ?? rl.planType;
   const allowedRaw = rl.ordinary_usage_allowed ?? rl.ordinaryUsageAllowed;
 
+  const source = input.source ?? 'codex-rollout';
+  const observedAt = finiteNumber(input.observedAt);
+  // The guard, placed at the fallback that caused the defect rather than at the one
+  // caller that happened to trip it, so a future caller cannot reintroduce it.
+  if (source === 'codex-rollout' && observedAt === null) return null;
+
   const limitId = typeof limitIdRaw === 'string' && limitIdRaw ? limitIdRaw : 'codex';
   return {
     poolKey: poolKeyOf('codex', input.accountScope, limitId),
     provider: 'codex',
     accountScope: input.accountScope,
     limitId,
-    source: input.source ?? 'codex-rollout',
-    observedAt: finiteNumber(input.observedAt) ?? input.receivedAt,
+    source,
+    observedAt: observedAt ?? input.receivedAt,
     receivedAt: input.receivedAt,
     windows,
     providerAttributedLimitingWindowId: attributed,

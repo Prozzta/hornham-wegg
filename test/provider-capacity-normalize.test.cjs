@@ -21,6 +21,8 @@ const loadTs = require('./load-ts.cjs');
 const { normalizeClaudeStatusLine, normalizeCodexRateLimits } = loadTs('src/main/capacityNormalize.ts');
 
 const RECEIVED = 1_789_000_000_000;
+/** A rollout line's own embedded event time. Every real line carries one. */
+const OBSERVED = RECEIVED - 30_000;
 
 // ── Claude status line ───────────────────────────────────────────────────────
 
@@ -145,7 +147,7 @@ test('codex: DURATION decides the window, not the primary/secondary slot it arri
     primary: { used_percent: 5, window_minutes: 10080, resets_at: 1789590951 },
     secondary: { used_percent: 40, window_minutes: 300, resets_at: 1789004151 }
   };
-  const obs = normalizeCodexRateLimits({ rateLimits: swapped, accountScope: 'acct-b', receivedAt: RECEIVED });
+  const obs = normalizeCodexRateLimits({ rateLimits: swapped, accountScope: 'acct-b', observedAt: OBSERVED, receivedAt: RECEIVED });
   const week = obs.windows.find((w) => w.kind === 'SEVEN_DAY');
   const five = obs.windows.find((w) => w.kind === 'FIVE_HOUR');
   assert.equal(week.remainingPercent, 95);
@@ -156,7 +158,7 @@ test('codex: an unrecognised duration stays OTHER and keeps a duration-derived i
   const obs = normalizeCodexRateLimits({
     rateLimits: { primary: { used_percent: 1, window_minutes: 1440, resets_at: 1789004151 } },
     accountScope: 'acct-b',
-    receivedAt: RECEIVED
+    observedAt: OBSERVED, receivedAt: RECEIVED
   });
   assert.equal(obs.windows[0].kind, 'OTHER');
   assert.equal(obs.windows[0].windowId, 'w1440m');
@@ -166,7 +168,7 @@ test('codex: a reached type that names NO window attributes no window', () => {
   const obs = normalizeCodexRateLimits({
     rateLimits: { ...CODEX_OBSERVED, rate_limit_reached_type: 'usage' },
     accountScope: 'acct-b',
-    receivedAt: RECEIVED
+    observedAt: OBSERVED, receivedAt: RECEIVED
   });
   // The signal is kept - something IS limiting - but it is not evidence about
   // WHICH window, and manufacturing one would be the causal claim C2.4 forbids.
@@ -178,7 +180,7 @@ test('codex: a reached type that DOES name a window attributes exactly that wind
   const obs = normalizeCodexRateLimits({
     rateLimits: { ...CODEX_OBSERVED, rate_limit_reached_type: 'secondary' },
     accountScope: 'acct-b',
-    receivedAt: RECEIVED
+    observedAt: OBSERVED, receivedAt: RECEIVED
   });
   assert.equal(obs.providerAttributedLimitingWindowId, 'seven_day');
 });
@@ -191,7 +193,7 @@ test('codex: the camelCase app-server spelling normalises identically', () => {
       ordinaryUsageAllowed: false
     },
     accountScope: 'acct-b',
-    receivedAt: RECEIVED,
+    observedAt: OBSERVED, receivedAt: RECEIVED,
     source: 'codex-account-read'
   });
   assert.equal(obs.source, 'codex-account-read');
@@ -201,12 +203,12 @@ test('codex: the camelCase app-server spelling normalises identically', () => {
 });
 
 test('codex: ordinaryUsageAllowed is tri-state - absent and non-boolean both stay unknown', () => {
-  const absent = normalizeCodexRateLimits({ rateLimits: CODEX_OBSERVED, accountScope: 'b', receivedAt: RECEIVED });
+  const absent = normalizeCodexRateLimits({ rateLimits: CODEX_OBSERVED, accountScope: 'b', observedAt: OBSERVED, receivedAt: RECEIVED });
   assert.equal(absent.ordinaryUsageAllowed, null);
   const junk = normalizeCodexRateLimits({
     rateLimits: { ...CODEX_OBSERVED, ordinary_usage_allowed: 'yes' },
     accountScope: 'b',
-    receivedAt: RECEIVED
+    observedAt: OBSERVED, receivedAt: RECEIVED
   });
   assert.equal(junk.ordinaryUsageAllowed, null);
 });
@@ -215,29 +217,67 @@ test('codex: over-100 used clamps to zero remaining rather than going negative',
   const obs = normalizeCodexRateLimits({
     rateLimits: { primary: { used_percent: 100.4, window_minutes: 300, resets_at: 1789004151 } },
     accountScope: 'b',
-    receivedAt: RECEIVED
+    observedAt: OBSERVED, receivedAt: RECEIVED
   });
   assert.equal(obs.windows[0].remainingPercent, 0);
 });
 
 test('codex: a payload with neither windows nor a reached type yields no observation', () => {
-  assert.equal(normalizeCodexRateLimits({ rateLimits: { limit_id: 'codex' }, accountScope: 'b', receivedAt: RECEIVED }), null);
-  assert.equal(normalizeCodexRateLimits({ rateLimits: null, accountScope: 'b', receivedAt: RECEIVED }), null);
+  assert.equal(normalizeCodexRateLimits({ rateLimits: { limit_id: 'codex' }, accountScope: 'b', observedAt: OBSERVED, receivedAt: RECEIVED }), null);
+  assert.equal(normalizeCodexRateLimits({ rateLimits: null, accountScope: 'b', observedAt: OBSERVED, receivedAt: RECEIVED }), null);
 });
 
 test('a reached type alone - no windows at all - is still an observation, because a typed refusal is evidence', () => {
   const obs = normalizeCodexRateLimits({
     rateLimits: { limit_id: 'codex', rate_limit_reached_type: 'usage' },
     accountScope: 'b',
-    receivedAt: RECEIVED
+    observedAt: OBSERVED, receivedAt: RECEIVED
   });
   assert.ok(obs);
   assert.equal(obs.windows.length, 0);
   assert.equal(obs.providerReachedType, 'usage');
 });
 
+test('codex: a ROLLOUT LINE WITH NO USABLE EMBEDDED TIME YIELDS NO OBSERVATION', () => {
+  // L0-SEM section 6: "replaying an old line does not make it fresh", and Codex
+  // replay requires a valid embedded time. Receipt time here would date a line
+  // written hours ago to NOW and publish a stale reading as FRESH - the one thing
+  // this design says must never happen. No time, no observation.
+  for (const observedAt of [null, undefined, NaN, 'not-a-number']) {
+    assert.equal(
+      normalizeCodexRateLimits({ rateLimits: CODEX_OBSERVED, accountScope: 'b', observedAt, receivedAt: RECEIVED }),
+      null,
+      `a rollout line with observedAt=${String(observedAt)} must produce nothing`
+    );
+  }
+  // Including when it carries a typed refusal: evidence whose time is unknown
+  // cannot be ordered against anything, and ordering is what the tracker runs on.
+  assert.equal(
+    normalizeCodexRateLimits({
+      rateLimits: { ...CODEX_OBSERVED, rate_limit_reached_type: 'usage' },
+      accountScope: 'b', receivedAt: RECEIVED
+    }),
+    null
+  );
+});
+
+test('codex: a rollout line WITH an embedded time is unaffected, and the account read still uses receipt time', () => {
+  const rollout = normalizeCodexRateLimits({
+    rateLimits: CODEX_OBSERVED, accountScope: 'b', observedAt: OBSERVED, receivedAt: RECEIVED
+  });
+  assert.ok(rollout);
+  assert.equal(rollout.observedAt, OBSERVED, 'the line dates itself; receipt time never overrides it');
+  // The account read is a LIVE RPC answered now, not a replay of something written
+  // earlier, so its receipt-time fallback is correct and stays.
+  const live = normalizeCodexRateLimits({
+    rateLimits: CODEX_OBSERVED, accountScope: 'b', receivedAt: RECEIVED, source: 'codex-account-read'
+  });
+  assert.ok(live);
+  assert.equal(live.observedAt, RECEIVED);
+});
+
 test('the two accounts of one provider do not share a pool', () => {
-  const a = normalizeCodexRateLimits({ rateLimits: CODEX_OBSERVED, accountScope: 'acct-a', receivedAt: RECEIVED });
-  const b = normalizeCodexRateLimits({ rateLimits: CODEX_OBSERVED, accountScope: 'acct-b', receivedAt: RECEIVED });
+  const a = normalizeCodexRateLimits({ rateLimits: CODEX_OBSERVED, accountScope: 'acct-a', observedAt: OBSERVED, receivedAt: RECEIVED });
+  const b = normalizeCodexRateLimits({ rateLimits: CODEX_OBSERVED, accountScope: 'acct-b', observedAt: OBSERVED, receivedAt: RECEIVED });
   assert.notEqual(a.poolKey, b.poolKey);
 });
