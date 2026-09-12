@@ -125,6 +125,15 @@ export interface PoolCapacitySnapshot {
   planType: string | null;
   /** A reset boundary has passed but recovery is NOT yet evidenced. Never implies AVAILABLE. */
   recoveryPending: boolean;
+  /**
+   * Identity of the current limit epoch — the moment hard evidence opened it — or
+   * null when none is open. It exists because two consumers need to tell ONE refusal
+   * from a later one: the admission seam grants at most one recovery turn per epoch,
+   * and the notifier emits at most one intent per epoch. A state name alone cannot
+   * distinguish "still the same refusal" from "refused again", and a revision number
+   * moves for reasons that have nothing to do with refusals.
+   */
+  limitEpochAt: number | null;
 }
 
 /** The whole collection, with its own revision so a consumer can diff cheaply. */

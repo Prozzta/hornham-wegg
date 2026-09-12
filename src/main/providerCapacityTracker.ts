@@ -143,6 +143,7 @@ const sameProjection = (a: PoolCapacitySnapshot, b: PoolCapacitySnapshot): boole
   && a.ordinaryUsageAllowed === b.ordinaryUsageAllowed
   && a.planType === b.planType
   && a.recoveryPending === b.recoveryPending
+  && a.limitEpochAt === b.limitEpochAt
   && a.numericallyExhaustedWindowIds.join('|') === b.numericallyExhaustedWindowIds.join('|')
   && JSON.stringify(a.windows) === JSON.stringify(b.windows);
 
@@ -351,7 +352,8 @@ export class ProviderCapacityTracker {
       numericallyExhaustedWindowIds: exhausted,
       ordinaryUsageAllowed: obs.ordinaryUsageAllowed,
       planType: obs.planType,
-      recoveryPending: epoch?.hinted === true
+      recoveryPending: epoch?.hinted === true,
+      limitEpochAt: epoch?.since ?? null
     };
   }
 
@@ -444,6 +446,7 @@ function blankProjection(obs: CapacityObservation): PoolCapacitySnapshot {
     numericallyExhaustedWindowIds: [],
     ordinaryUsageAllowed: null,
     planType: null,
-    recoveryPending: false
+    recoveryPending: false,
+    limitEpochAt: null
   };
 }
