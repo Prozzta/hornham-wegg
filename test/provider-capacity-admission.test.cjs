@@ -39,12 +39,16 @@ const SHARED = { dwight: POOL, oscar: POOL, meredith: POOL, michael: 'claude:acc
 
 function rig(start = T0) {
   let now = start;
-  const tracker = new ProviderCapacityTracker(L0_SEM_POLICY, () => now);
+  let mono = 0;
+  // Both clocks advance together: freshness is decided on a MONOTONIC deadline, so a
+  // rig that moved only the wall clock would be simulating a clock anomaly rather
+  // than time passing, and nothing would ever expire.
+  const tracker = new ProviderCapacityTracker(L0_SEM_POLICY, () => now, () => mono);
   const seam = new CapacityAdmission({
     poolKeyForAgent: (id) => SHARED[id] ?? null,
     poolState: (key) => tracker.pool(key)
   });
-  return { tracker, seam, set: (v) => { now = v; } };
+  return { tracker, seam, set: (v) => { mono += Math.max(0, v - now); now = v; } };
 }
 
 test('AVAILABLE admits ordinary work', () => {

@@ -53,8 +53,19 @@ function obs(over = {}) {
 
 function make(start = T0) {
   let now = start;
-  const t = new ProviderCapacityTracker(L0_SEM_POLICY, () => now);
-  return { t, set: (v) => { now = v; }, state: () => t.pool(KEY)?.state, reason: () => t.pool(KEY)?.stateReason };
+  let mono = 0;
+  const t = new ProviderCapacityTracker(L0_SEM_POLICY, () => now, () => mono);
+  return {
+    t,
+    // Ordinary time passing: both clocks move together, which is what actually
+    // happens on a machine nobody is fiddling with.
+    set: (v) => { mono += Math.max(0, v - now); now = v; },
+    // The system clock alone moves - an NTP correction, a timezone change, a
+    // suspended laptop, a restored VM. Monotonic time does NOT follow it.
+    setWallOnly: (v) => { now = v; },
+    state: () => t.pool(KEY)?.state,
+    reason: () => t.pool(KEY)?.stateReason
+  };
 }
 
 // ── normal predicates ────────────────────────────────────────────────────────
@@ -263,6 +274,45 @@ test('the account read gets its own longer TTL', () => {
   m.set(T0 + L0_SEM_POLICY.accountReadTtlMs + 1);
   m.t.evaluate();
   assert.equal(m.t.pool(KEY).freshness, 'STALE');
+});
+
+test('a BACKWARDS wall-clock move cannot revive an expired reading', () => {
+  const m = make();
+  m.t.ingest(obs());
+  // Let it expire honestly.
+  m.set(T0 + L0_SEM_POLICY.liveTtlMs + 1);
+  m.t.evaluate();
+  assert.equal(m.t.pool(KEY).freshness, 'STALE');
+  assert.equal(m.state(), 'UNKNOWN');
+  // Now the system clock jumps BACK to before the reading was taken. Under a
+  // wall-clock freshness test this reading would read as fresh again - which is the
+  // single thing this design says must never happen. The deadline is monotonic, so
+  // it does not move.
+  m.setWallOnly(T0 - 3_600_000);
+  m.t.evaluate();
+  assert.equal(m.t.pool(KEY).freshness, 'STALE', 'a clock moved backwards must not make stale data healthy');
+  assert.equal(m.state(), 'UNKNOWN');
+});
+
+test('a FORWARD wall-clock jump does not expire a reading that is genuinely current', () => {
+  const m = make();
+  m.t.ingest(obs());
+  assert.equal(m.t.pool(KEY).freshness, 'FRESH');
+  // An NTP correction of an hour, one second after the reading arrived. No real
+  // time has passed, so the reading is still current and must stay so.
+  m.setWallOnly(T0 + 3_600_000);
+  m.t.evaluate();
+  assert.equal(m.t.pool(KEY).freshness, 'FRESH', 'a clock moved forwards must not expire current data');
+  assert.equal(m.state(), 'AVAILABLE');
+});
+
+test('a reading that is ALREADY past its TTL on arrival is stale immediately', () => {
+  const m = make(T0 + L0_SEM_POLICY.liveTtlMs + 5000);
+  // Accepted now, but the event happened more than a TTL ago: the remaining budget
+  // is negative, so the deadline lands in the past.
+  m.t.ingest(obs({ observedAt: T0, receivedAt: T0 }));
+  assert.equal(m.t.pool(KEY).freshness, 'STALE');
+  assert.equal(m.reason(), REASON.STALE);
 });
 
 test('a timestamp far in the future is INVALID, not extremely fresh', () => {

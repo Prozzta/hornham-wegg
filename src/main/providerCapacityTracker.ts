@@ -14,6 +14,15 @@
  * research 8b92e2ea). Where a comment below says why, it is explaining that note,
  * not deciding anything. Section references are to it unless marked C2.
  *
+ * FRESHNESS IS MONOTONIC, NOT WALL-CLOCK (L0-SEM §6). When a reading is accepted,
+ * its REMAINING TTL is converted to a deadline on a monotonic clock, and staleness
+ * is decided against that deadline from then on. A wall-clock move — an NTP
+ * correction, a laptop resumed in another timezone, a VM restored — therefore
+ * cannot revive an expired reading, which is the one thing this design says must
+ * never happen. The wall clock is still used for what it is the only answer to:
+ * dating the event at acceptance, the future-skew guard, and comparing a provider's
+ * absolute reset time.
+ *
  * THREE MUTATORS, ALL EXPLICIT:
  *   - `ingest(observation)`     — a reading arrived.
  *   - `evaluate(now)`           — time passed, so freshness and reset boundaries move.
@@ -109,6 +118,13 @@ interface PoolRecord {
   successfulTurnAt: number | null;
   /** Last time the published observation anchor moved (§7 renewal coalescing). */
   anchorAt: number;
+  /** Monotonic instant after which this reading is STALE (§6). */
+  staleAt: number;
+  /** How old the reading already was when it was accepted, and the monotonic
+   *  instant of that acceptance — together these give an age that survives a
+   *  wall-clock move as well as the deadline does. */
+  ageAtAccept: number;
+  acceptedMono: number;
 }
 
 /** Hard evidence = typed quota signal or explicit denial. NOT a 429, overload or context error. */
@@ -154,7 +170,10 @@ export class ProviderCapacityTracker {
 
   constructor(
     private readonly policy: CapacityPolicy = L0_SEM_POLICY,
-    private readonly clock: () => number = () => Date.now()
+    private readonly clock: () => number = () => Date.now(),
+    /** Monotonic milliseconds. Never goes backwards, and is unaffected by the
+     *  system clock — which is exactly why freshness is decided against it. */
+    private readonly monotonic: () => number = () => performance.now()
   ) {}
 
   /**
@@ -197,9 +216,13 @@ export class ProviderCapacityTracker {
       epoch: null,
       conflicted: false,
       successfulTurnAt: null,
-      anchorAt: 0
+      anchorAt: 0,
+      staleAt: 0,
+      ageAtAccept: 0,
+      acceptedMono: 0
     };
     rec.observation = obs;
+    this.stampDeadline(rec, obs, now);
     rec.conflicted = conflicted;
     rec.epoch = this.nextEpoch(rec, obs, now);
     if (!pinAnchor) rec.anchorAt = now;
@@ -211,9 +234,9 @@ export class ProviderCapacityTracker {
    * Recompute time-derived facts: freshness expires and reset boundaries pass with
    * no new reading at all, and a consumer must see that happen.
    */
-  evaluate(now: number = this.clock()): boolean {
+  evaluate(now: number = this.clock(), monoNow: number = this.monotonic()): boolean {
     let changed = false;
-    for (const key of this.pools.keys()) changed = this.reproject(key, now) || changed;
+    for (const key of this.pools.keys()) changed = this.reproject(key, now, false, monoNow) || changed;
     return changed;
   }
 
@@ -285,6 +308,20 @@ export class ProviderCapacityTracker {
     return epoch;
   }
 
+  /**
+   * Convert the REMAINING wall TTL into a monotonic deadline at the moment of
+   * acceptance (§6). After this, staleness is a monotonic comparison and the system
+   * clock cannot move it. A reading that was ALREADY past its TTL when it arrived
+   * gets a deadline in the past and is stale immediately, which is correct.
+   */
+  private stampDeadline(rec: PoolRecord, obs: CapacityObservation, now: number): void {
+    const mono = this.monotonic();
+    const age = Math.max(0, now - obs.observedAt);
+    rec.ageAtAccept = age;
+    rec.acceptedMono = mono;
+    rec.staleAt = mono + (ttlFor(obs.source, this.policy) - age);
+  }
+
   private isFresh(obs: CapacityObservation, now: number): boolean {
     return Math.max(0, now - obs.observedAt) <= ttlFor(obs.source, this.policy);
   }
@@ -294,10 +331,10 @@ export class ProviderCapacityTracker {
    * internal reading moves on. It is the coalescing half of §7, and it is why an
    * identical renewal can refresh freshness without publishing anything.
    */
-  private reproject(poolKey: string, now: number, pinAnchor = false): boolean {
+  private reproject(poolKey: string, now: number, pinAnchor = false, monoNow: number = this.monotonic()): boolean {
     const rec = this.pools.get(poolKey);
     if (!rec) return false;
-    const next = this.project(rec, now);
+    const next = this.project(rec, now, monoNow);
     if (pinAnchor && rec.projection.observedAt > 0) {
       next.observedAt = rec.projection.observedAt;
       next.ageMs = Math.max(0, now - rec.projection.observedAt);
@@ -316,10 +353,12 @@ export class ProviderCapacityTracker {
     return true;
   }
 
-  private project(rec: PoolRecord, now: number): PoolCapacitySnapshot {
+  private project(rec: PoolRecord, now: number, monoNow: number): PoolCapacitySnapshot {
     const obs = rec.observation;
-    const ageMs = Math.max(0, now - obs.observedAt);
-    const freshness: CapacityFreshness = ageMs <= ttlFor(obs.source, this.policy) ? 'FRESH' : 'STALE';
+    // Age is measured the same way the deadline is: how old the reading was when it
+    // was accepted, plus monotonic time since. A wall-clock move cannot shrink it.
+    const ageMs = Math.max(0, rec.ageAtAccept + (monoNow - rec.acceptedMono));
+    const freshness: CapacityFreshness = monoNow <= rec.staleAt ? 'FRESH' : 'STALE';
     const exhausted = numericallyExhausted(obs);
 
     // K form 2 and the reset-passage HINT are both time-relative, so they are
