@@ -20,6 +20,7 @@ import type { CircuitBreaker } from './breaker';
 import { estimateCostUsd } from './pricing';
 import { normalizeClaudeStatusLine } from './capacityNormalize';
 import { claudeAccountScope } from './capacityScope';
+import { CodexRolloutCapacitySource } from './codexRolloutCapacity';
 import type { CapacityObservation } from '../shared/providerCapacity';
 
 interface HookPayload {
@@ -68,6 +69,9 @@ export class HookServer {
    *  get_agent_detail / list_agents) can report "how full is each agent's context"
    *  without depending on a renderer round-trip. */
   private contextById = new Map<string, { tokens: number; limit: number; ts: number }>();
+  /** L0 — Codex allowance, read from the rollout a Codex worker is already writing.
+   *  Holds only a per-home cache (newest rollout path + last mtime seen). */
+  private codexCapacity = new CodexRolloutCapacitySource();
 
   constructor(
     private hive: HiveManager,
@@ -123,6 +127,16 @@ export class HookServer {
     try { if (sock && existsSync(sock)) rmSync(sock); } catch { /* noop */ }
   }
 
+  /** Read this agent's Codex allowance, if it is a Codex worker and anything moved. */
+  private observeCodexCapacity(agentId: string, event: string): void {
+    try {
+      const home = this.hive.codexHomeFor(agentId);
+      if (!home) return;
+      const obs = this.codexCapacity.observe(home, { rescan: event === 'SessionStart' });
+      if (obs) this.onCapacity?.(obs);
+    } catch { /* telemetry must never break a hook boundary */ }
+  }
+
   /** The transcript file of an agent's CURRENT session, if any hook has fired. */
   transcriptPath(agentId: string): string | undefined {
     return this.transcriptPaths.get(agentId);
@@ -141,6 +155,16 @@ export class HookServer {
     if (agentId && typeof p.transcript_path === 'string' && p.transcript_path) {
       this.transcriptPaths.set(agentId, p.transcript_path);
     }
+
+    // L0 — Codex has no status line. It stamps its rate-limit snapshot onto the
+    // token_count event of every turn in the rollout it is already writing, so the
+    // hook boundary we are standing on IS the event-driven refresh: by the time a
+    // hook fires, the turn that produced a fresh snapshot has been written. Reading
+    // it costs a stat on an unchanged file and a short tail read on a changed one,
+    // and it makes no provider request of any kind. Non-Codex agents cost one
+    // existence check. Session boundaries force a rescan, because a new session
+    // means a new rollout file rather than an append to the old one.
+    if (agentId && this.onCapacity) this.observeCodexCapacity(agentId, event);
 
     // Status-line payloads carry the session's EXACT context accounting —
     // current tokens AND the real window size (200k vs 1M, which nothing else

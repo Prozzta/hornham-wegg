@@ -358,6 +358,15 @@ export class HiveManager {
   enabled(): boolean {
     return this.root() !== null;
   }
+  /** L0 — the per-agent CODEX_HOME, when this agent actually has one.
+   *  Existence of the directory IS the discriminator: installCodexHooks creates it
+   *  only for Codex workers, so no roster lookup is needed to tell a Codex agent
+   *  from a Claude one. Returns null otherwise. */
+  codexHomeFor(id: string): string | null {
+    const home = join(this.agentDir(id), '.codex');
+    return existsSync(home) ? home : null;
+  }
+
   private agentDir(id: string): string {
     return join(this.root()!, 'agents', id);
   }
