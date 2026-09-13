@@ -854,7 +854,11 @@ export function useHive(config: HarnessConfig | null): void {
       // `manual` skips it for the same reason it skips the gate — a person pressing
       // "send now" is not an automatic start. The ticket is opaque; no capacity
       // state is derived on this side.
-      const grant = next.manual ? null : await window.cth.capacityBeginAutoDelivery(target.id);
+      // The PTY is named at MINT time so main can bind the grant to it: a keystroke
+      // that later names a different terminal must not spend this agent's turn there.
+      const grant = next.manual
+        ? null
+        : await window.cth.capacityBeginAutoDelivery(target.id, target.ptyId ?? undefined);
       if (grant && !grant.ok) { inFlight.delete(flightKey); return { sent: false }; }
       let launched = false;
       try {
@@ -874,7 +878,7 @@ export function useHive(config: HarnessConfig | null): void {
             // is still opaque and no capacity state crosses back, only a yes or a no.
             // A manual send holds no ticket, so it is not gated and types as before.
             grant?.ok
-              ? () => window.cth.capacityMarkAutoDeliveryWriting(grant.ticket)
+              ? () => window.cth.capacityMarkAutoDeliveryWriting(grant.ticket, target.ptyId ?? undefined)
               : undefined
           ),
           () => {

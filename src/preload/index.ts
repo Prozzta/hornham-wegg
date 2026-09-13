@@ -1062,8 +1062,8 @@ const api = {
    * reservation. Main owns the decision, the grant and its expiry; what comes back
    * is an opaque ticket carrying no capacity state at all.
    */
-  capacityBeginAutoDelivery: (agentId: string): Promise<CapacityDeliveryGrant> =>
-    ipcRenderer.invoke('capacity:beginAutoDelivery', agentId),
+  capacityBeginAutoDelivery: (agentId: string, ptyId?: string): Promise<CapacityDeliveryGrant> =>
+    ipcRenderer.invoke('capacity:beginAutoDelivery', agentId, ptyId ?? null),
   /**
    * ASK whether this authorised delivery may type its submit keystroke.
    *
@@ -1074,8 +1074,8 @@ const api = {
    * the ticket, so nothing authorises the send; a rejection means the same thing and
    * must never be treated as a yes.
    */
-  capacityMarkAutoDeliveryWriting: (ticket: string): Promise<boolean> =>
-    ipcRenderer.invoke('capacity:markAutoDeliveryWriting', ticket),
+  capacityMarkAutoDeliveryWriting: (ticket: string, ptyId?: string): Promise<boolean> =>
+    ipcRenderer.invoke('capacity:markAutoDeliveryWriting', ticket, ptyId ?? null),
   /** Report whether the authorised delivery actually started. Always call it. */
   capacitySettleAutoDelivery: (ticket: string, launched: boolean): Promise<void> =>
     ipcRenderer.invoke('capacity:settleAutoDelivery', ticket, launched),

@@ -264,6 +264,25 @@ export class CapacityAdmission {
 
   /** A reservation nobody confirmed or cancelled within the TTL. Confirmed grants
    *  never expire: they record something that actually happened. */
+  /**
+   * Does this decision STILL OWN the reservation it was granted?
+   *
+   * For a revalidation at the moment of the keystroke, and it exists because the
+   * obvious check is wrong: re-probing a RECOVERING pool whose turn this very
+   * decision reserved answers REFUSE / RECOVERING_SPENT. A caller that read that as a
+   * refusal would abort every recovery delivery it had legitimately been granted -
+   * MISTAKING ITS OWN RESERVATION FOR SOMEBODY ELSE'S. Epoch equality alone will not
+   * separate them either: a grant abandoned on its TTL and re-taken by another caller
+   * sits in the same epoch under a different id.
+   *
+   * False once the grant has been reclaimed, re-issued, or abandoned on its TTL.
+   */
+  holdsGrant(decision: AdmissionDecision): boolean {
+    const held = decision.poolKey ? this.recoveryGrants.get(decision.poolKey) : undefined;
+    if (!held || !decision.grantId) return false;
+    return held.grantId === decision.grantId && !this.abandoned(held);
+  }
+
   private abandoned(grant: RecoveryGrant): boolean {
     return !grant.confirmed && this.deps.now() - grant.reservedAt >= this.reservationTtlMs;
   }

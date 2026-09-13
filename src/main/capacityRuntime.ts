@@ -28,7 +28,7 @@
  * owner supplies, so the decision to notify is testable without a display and a
  * renderer can never become the thing that dedupes.
  */
-import { CapacityAdmission, type AdmissionDecision, type WorkClass } from './capacityAdmission';
+import { CapacityAdmission, ADMISSION_REASON, type AdmissionDecision, type WorkClass } from './capacityAdmission';
 import { CapacityNotifier, type CapacityNotifyIntent } from './capacityNotify';
 import { ProviderCapacityTracker } from './providerCapacityTracker';
 import type { CapacityCollectionSnapshot, CapacityObservation } from '../shared/providerCapacity';
@@ -73,6 +73,21 @@ export interface CapacityRuntimeDeps {
   clearTimer?: (handle: unknown) => void;
 }
 
+/**
+ * A reservation handed to an out-of-process deliverer. Everything here beyond the
+ * decision exists so the ticket can be RE-CHECKED at the keystroke rather than merely
+ * looked up - see `stillPermitted`.
+ */
+interface PendingDelivery {
+  decision: AdmissionDecision;
+  timer: unknown;
+  writeBegan: boolean;
+  agentId: string;
+  workClass: WorkClass;
+  /** The PTY the grant was minted for. A grant is not transferable. */
+  target: string | null;
+}
+
 export class CapacityRuntime {
   readonly tracker: ProviderCapacityTracker;
   readonly admission: CapacityAdmission;
@@ -90,10 +105,7 @@ export class CapacityRuntime {
    * without it a ticket that dies AFTER the submit keystroke is byte-for-byte the
    * same object as one that dies BEFORE it. See `markAutomaticDeliveryWriting`.
    */
-  private readonly pending = new Map<
-    string,
-    { decision: AdmissionDecision; timer: unknown; writeBegan: boolean }
-  >();
+  private readonly pending = new Map<string, PendingDelivery>();
   private ticketSeq = 0;
 
   constructor(private readonly deps: CapacityRuntimeDeps, tracker = new ProviderCapacityTracker()) {
@@ -182,7 +194,14 @@ export class CapacityRuntime {
    */
   beginAutomaticDelivery(
     agentId: string,
-    workClass: WorkClass = 'ORDINARY_TURN'
+    workClass: WorkClass = 'ORDINARY_TURN',
+    /**
+     * The PTY this delivery is for. A GRANT IS NOT TRANSFERABLE: bound here, at the
+     * moment the ticket is minted, so a later keystroke naming a different terminal
+     * cannot spend one agent's reservation on another agent's prompt. Null only for
+     * a caller that has no terminal to name.
+     */
+    target: string | null = null
   ): AutomaticDeliveryGrant {
     const decision = this.admission.admit(agentId, workClass);
     if (decision.verdict === 'REFUSE') {
@@ -191,7 +210,7 @@ export class CapacityRuntime {
     const ticket = `cap-${(this.ticketSeq += 1)}`;
     const timer = this.setTimer(() => this.expireAutomaticDelivery(ticket), AUTO_DELIVERY_TTL_MS);
     if (timer && typeof (timer as NodeJS.Timeout).unref === 'function') (timer as NodeJS.Timeout).unref();
-    this.pending.set(ticket, { decision, timer, writeBegan: false });
+    this.pending.set(ticket, { decision, timer, writeBegan: false, agentId, workClass, target });
     return { ok: true, ticket };
   }
 
@@ -268,11 +287,73 @@ export class CapacityRuntime {
    * Idempotent: marking a live ticket twice answers `true` twice and spends nothing. A
    * mark can neither resurrect a reclaimed reservation nor attach itself to the next.
    */
-  markAutomaticDeliveryWriting(ticket: string): boolean {
+  markAutomaticDeliveryWriting(ticket: string, target: string | null = null): boolean {
     const held = this.pending.get(ticket);
     if (!held) return false;
+    if (!this.stillPermitted(held, target)) return false;
     held.writeBegan = true;
     return true;
+  }
+
+  /**
+   * Would this delivery be admitted RIGHT NOW, as the holder of its own grant?
+   *
+   * L0-TOCTOU. The old check was "is the ticket still in `pending`", which answers a
+   * question nobody asked. A ticket is minted before the terminal is waited for,
+   * before the payload is typed and before the TUI pause - AN INTERVAL IN WHICH THE
+   * POOL CAN GO LIMITED OR RESERVE_ONLY, OR ENTER A NEW EPOCH - and none of that
+   * removes the ticket from `pending`, so the delivery submitted anyway. That is not a
+   * hypothetical ordering: it is the schedule this code already runs.
+   *
+   * IT RE-ASKS ADMISSION'S OWN QUESTION AGAINST THE CURRENT PROJECTION. Not a second
+   * state table - this module cannot afford one, and the seam says so itself - and NOT
+   * the decision that was taken at admission time, which cannot have changed and would
+   * read as revalidation while checking nothing. The same rule, asked again, now.
+   *
+   * THE FOUR THINGS THE PROBE ALONE DOES NOT COVER, EACH WITH ITS OWN FAILURE:
+   *  - THE TARGET. A grant is not transferable; a keystroke naming a different PTY
+   *    than the ticket was minted for would spend one agent's turn on another's prompt.
+   *  - THE MAPPING. An agent whose readings have since landed in a DIFFERENT pool is
+   *    not the agent this decision was about, even if both pools happen to allow.
+   *  - THE EPOCH. A new limit epoch has its own single recovery turn. Spending it
+   *    through a ticket admitted under the previous one would consume a turn that
+   *    `confirmLaunch` then refuses to record, because the grant ids do not match.
+   *  - THE GRANT. A reservation abandoned on its TTL and re-taken by another caller
+   *    lives in the same epoch under a different id.
+   *
+   * AND THE CARVE-OUT THAT MAKES THE PROBE USABLE AT ALL: a RECOVERING pool whose one
+   * turn THIS ticket reserved answers REFUSE / RECOVERING_SPENT. Read naively that
+   * aborts every recovery delivery ever granted - the guard mistaking its own
+   * reservation for someone else's - so that single refusal is permitted, and only
+   * when `holdsGrant` proves the reservation is still ours.
+   *
+   * TWO OF THESE CLAUSES CANNOT FIRE UNDER THE CURRENT CONSTANTS, AND I AM SAYING SO
+   * RATHER THAN LETTING THE TESTS IMPLY OTHERWISE. Deleting the EPOCH clause, and
+   * deleting the GRANT clause, each leaves every test in the suite green: no fixture
+   * distinguishes them from the probe, because reaching either case needs the clock to
+   * move further than a ticket lives. `AUTO_DELIVERY_TTL_MS` is 30 s, while a
+   * reservation is abandoned at `RECOVERY_RESERVATION_TTL_MS` = 60 s and a second limit
+   * epoch needs a recovery and a fresh hard reading — so a ticket is always gone first.
+   *
+   * THEY STAY, AND NOT OUT OF CAUTION. Each guards a case where the PROBE ALONE SAYS
+   * YES and the answer is wrong: a grant abandoned on its TTL and re-taken leaves the
+   * pool ALLOWING, and this ticket would type a turn `confirmLaunch` then refuses to
+   * record, because the grant ids no longer match — a turn spent and not counted. The
+   * relationship that makes that unreachable is between two tunable constants, so it is
+   * one edit away from being reachable, and the clause is what stays correct across
+   * that edit. A guard whose unreachability depends on a constant is not dead code; it
+   * is a guard whose test is owed the day the constant moves.
+   */
+  private stillPermitted(held: PendingDelivery, target: string | null): boolean {
+    if (held.target !== target) return false;
+    if ((this.poolForAgent.get(held.agentId) ?? null) !== held.decision.poolKey) return false;
+    const pool = held.decision.poolKey ? this.tracker.pool(held.decision.poolKey) : null;
+    if ((pool?.limitEpochAt ?? null) !== held.decision.limitEpochAt) return false;
+    if (held.decision.grantId && !this.admission.holdsGrant(held.decision)) return false;
+    const now = this.admission.probe(held.agentId, held.workClass);
+    if (now.verdict !== 'REFUSE') return true;
+    return now.reason === ADMISSION_REASON.RECOVERING_SPENT
+      && this.admission.holdsGrant(held.decision);
   }
 
   /**

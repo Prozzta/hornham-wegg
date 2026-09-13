@@ -3981,9 +3981,10 @@ ipcMain.handle('control:snapshot', (_evt, agentId: unknown) => {
  * opaque ticket, so a window that is reloaded or closed mid-delivery costs one
  * delivery window rather than a permanently swallowed grant.
  */
-ipcMain.handle('capacity:beginAutoDelivery', (_evt, agentId: unknown) => {
+ipcMain.handle('capacity:beginAutoDelivery', (_evt, agentId: unknown, ptyId: unknown) => {
   if (typeof agentId !== 'string') return { ok: false, reason: 'BAD_REQUEST', poolKey: null };
-  return providerCapacity.beginAutomaticDelivery(agentId, 'ORDINARY_TURN');
+  return providerCapacity.beginAutomaticDelivery(agentId, 'ORDINARY_TURN',
+    typeof ptyId === 'string' ? ptyId : null);
 });
 // A15/L0-FIX9: the renderer ASKING whether it may type. Without the record, the expiry
 // cannot tell a window that died mid-send from one that never sent and returns the
@@ -3991,9 +3992,10 @@ ipcMain.handle('capacity:beginAutoDelivery', (_evt, agentId: unknown) => {
 // landed. Without the ANSWER, the record was merely announced and the keystroke could
 // overtake it. Answering false for anything main does not hold is what makes the
 // refusal meaningful: a reclaimed ticket authorises nothing.
-ipcMain.handle('capacity:markAutoDeliveryWriting', (_evt, ticket: unknown) => {
+ipcMain.handle('capacity:markAutoDeliveryWriting', (_evt, ticket: unknown, ptyId: unknown) => {
   if (typeof ticket !== 'string') return false;
-  return providerCapacity.markAutomaticDeliveryWriting(ticket);
+  return providerCapacity.markAutomaticDeliveryWriting(ticket,
+    typeof ptyId === 'string' ? ptyId : null);
 });
 ipcMain.handle('capacity:settleAutoDelivery', (_evt, ticket: unknown, launched: unknown) => {
   if (typeof ticket !== 'string') return;

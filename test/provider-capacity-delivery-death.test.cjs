@@ -43,6 +43,14 @@
  * driven here with fake effects, so "a refusal types NOTHING" is a real arm that fails
  * against the version that leaves the text there. What still cannot be reached from a
  * test is whether the renderer wires the real effects to it correctly.
+ *
+ * L0-TOCTOU — AND THE GATE WAS ANSWERING A QUESTION NOBODY ASKED. It checked only that
+ * the ticket was still in `pending`, while the caller needed "may I spend a turn right
+ * now". A ticket is minted before the terminal is waited for, before the payload is
+ * typed and before the TUI pause, and in that interval the pool can go LIMITED or
+ * RESERVE_ONLY - none of which removes the ticket. The gap became load-bearing at
+ * exactly the moment the mark started being obeyed. It now re-asks ADMISSION'S OWN
+ * question against the CURRENT projection, plus the four bindings a probe cannot see.
  */
 const test = require('node:test');
 const assert = require('node:assert/strict');
@@ -406,4 +414,92 @@ test('L0-STAGED: a failed payload write does not press Enter on text that is not
   const t = typist({ payload: { ok: false, error: 'no pty: pty-1' } });
   await assert.rejects(() => typeAndSubmit('pty-1', t.io), /no pty: pty-1/);
   assert.deepEqual(t.log, ['ask', 'payload'], 'it stopped at the failed stage');
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// L0-TOCTOU — revalidate at the keystroke, against the projection of the moment
+// ═══════════════════════════════════════════════════════════════════════════
+
+/** A healthy pool with one ticket outstanding, ready to have the world change under it. */
+function ticketOnHealthyPool(target = null) {
+  const r = rig();
+  r.runtime.ingest('jim', obs());
+  assert.equal(r.state(), 'AVAILABLE', 'precondition: the delivery was admitted on a healthy pool');
+  const grant = r.runtime.beginAutomaticDelivery('jim', 'ORDINARY_TURN', target);
+  assert.equal(grant.ok, true, 'precondition: the ticket was minted');
+  return { r, grant };
+}
+
+test('L0-TOCTOU: a pool that goes LIMITED after the ticket was minted REFUSES the keystroke', () => {
+  // THE ARM THE FOUR-LINE MARK FAILS. Nothing about the ticket changed - it is still in
+  // `pending`, still unsettled, still the same object - so the old check said yes and the
+  // delivery typed into a pool that had since been refused outright. The window is real:
+  // minting happens before waitForTerminalReady, before the payload write, before the
+  // 140 ms pause.
+  const { r, grant } = ticketOnHealthyPool();
+  assert.equal(r.runtime.markAutomaticDeliveryWriting(grant.ticket), true,
+    'precondition: while the pool is healthy the keystroke is authorised');
+
+  r.runtime.ingest('jim', obs({
+    observedAt: T0 + 1_000, receivedAt: T0 + 1_000,
+    providerReachedType: 'rate_limit_reached', windows: [win('five_hour', 0)]
+  }));
+  assert.equal(r.state(), 'LIMITED', 'the pool really did move');
+  assert.equal(r.runtime.markAutomaticDeliveryWriting(grant.ticket), false,
+    'a ticket minted on a healthy pool authorises NOTHING once that pool is LIMITED');
+});
+
+test('L0-TOCTOU: a pool that goes RESERVE_ONLY refuses an ORDINARY turn the same way', () => {
+  // The other suppression, and not the same code path: RESERVE_ONLY refuses ordinary work
+  // while still allowing a closure turn, so a revalidation that only looked for LIMITED
+  // would pass this and let a spent window be typed into.
+  const { r, grant } = ticketOnHealthyPool();
+  r.runtime.ingest('jim', obs({
+    observedAt: T0 + 1_000, receivedAt: T0 + 1_000, windows: [win('five_hour', 0)]
+  }));
+  assert.equal(r.state(), 'RESERVE_ONLY', 'a fresh numeric zero without attribution');
+  assert.equal(r.runtime.markAutomaticDeliveryWriting(grant.ticket), false,
+    'ordinary work is suppressed, so this keystroke is not authorised');
+});
+
+test('L0-TOCTOU: an agent whose readings have moved to ANOTHER pool is not this decision\'s agent', () => {
+  // The mapping is recorded from readings that actually arrive, so it can move under a
+  // ticket. Both pools here are healthy - the point is not that the new pool refuses, it
+  // is that the decision was taken about a pool this agent no longer draws on.
+  const { r, grant } = ticketOnHealthyPool();
+  r.runtime.ingest('jim', obs({
+    poolKey: 'codex:acct-b:codex', accountScope: 'acct-b',
+    observedAt: T0 + 1_000, receivedAt: T0 + 1_000
+  }));
+  assert.equal(r.runtime.markAutomaticDeliveryWriting(grant.ticket), false,
+    'the grant was for the pool the agent HAD, and it is not transferable to the one it has now');
+});
+
+test('L0-TOCTOU: a grant is bound to ONE terminal - naming another, or none, is refused', () => {
+  // Dwight\u2019s separate point: a handler that trusts a caller-supplied ptyId could spend
+  // agent A\u2019s reservation on agent B\u2019s prompt. The binding is made when the ticket is
+  // minted, which is the only moment main knows it is not being told.
+  const { r, grant } = ticketOnHealthyPool('pty-A');
+  assert.equal(r.runtime.markAutomaticDeliveryWriting(grant.ticket, 'pty-B'), false,
+    'another terminal cannot spend this grant');
+  assert.equal(r.runtime.markAutomaticDeliveryWriting(grant.ticket), false,
+    'and neither can a keystroke that declines to say which terminal it is for');
+  assert.equal(r.runtime.markAutomaticDeliveryWriting(grant.ticket, 'pty-A'), true,
+    'the terminal it was minted for is still authorised - the binding is a match, not a ban');
+});
+
+test('L0-TOCTOU: a RECOVERING ticket is NOT refused by its own reservation', () => {
+  // THE CARVE-OUT, AND IT IS THE PAIR EVERY REFUSAL ABOVE NEEDS. Re-probing a RECOVERING
+  // pool whose single turn THIS ticket reserved answers REFUSE / RECOVERING_SPENT. A
+  // revalidation that read that as a refusal would abort every recovery delivery it had
+  // just legitimately granted - the guard mistaking its own reservation for a stranger\u2019s -
+  // and would pass every other test in this section.
+  const r = rig();
+  recovering(r);
+  const grant = r.runtime.beginAutomaticDelivery('jim');
+  assert.equal(grant.ok, true, 'precondition: the epoch granted its one turn to this ticket');
+  assert.equal(r.runtime.holds('jim'), true,
+    'and the probe DOES refuse right now - that is exactly why a naive revalidation breaks');
+  assert.equal(r.runtime.markAutomaticDeliveryWriting(grant.ticket), true,
+    'the pool refuses everyone ELSE because of this ticket; that is not a refusal of it');
 });
