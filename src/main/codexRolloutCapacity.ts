@@ -129,7 +129,7 @@ function readTail(file: string, bytes = TAIL_BYTES): string {
  */
 export function latestUsableRateLimits<T>(
   tail: string,
-  accept: (rateLimits: unknown, observedAt: number | null) => T | null
+  accept: (rateLimits: unknown, observedAt: number | null, sequence: number | null) => T | null
 ): T | null {
   const lines = tail.split('\n');
   // Backwards: the newest snapshot wins, and the first line of a tail is usually a
@@ -147,7 +147,11 @@ export function latestUsableRateLimits<T>(
     const rateLimits = payload?.rate_limits ?? rec.rate_limits;
     if (!rateLimits) continue;
     const ts = typeof rec.timestamp === 'string' ? Date.parse(rec.timestamp) : NaN;
-    const accepted = accept(rateLimits, Number.isFinite(ts) ? ts : null);
+    // The rollout numbers its own lines. Two events written inside the same
+    // whole-second timestamp are indistinguishable without it, and Codex stamps
+    // whole seconds - so this is the field that makes equal-time events orderable.
+    const ordinal = typeof rec.ordinal === 'number' && Number.isFinite(rec.ordinal) ? rec.ordinal : null;
+    const accepted = accept(rateLimits, Number.isFinite(ts) ? ts : null, ordinal);
     // Not usable - an empty `premium` snapshot, or a line whose time cannot be
     // established. Keep walking back rather than reporting nothing at all.
     if (accepted !== null) return accepted;
@@ -189,9 +193,13 @@ export class CodexRolloutCapacitySource {
     entry.mtimeMs = mtimeMs;
 
     const scope = this.scopeOf(codexHome);
-    return latestUsableRateLimits(readTail(entry.file), (rateLimits, observedAt) => normalizeCodexRateLimits({
+    return latestUsableRateLimits(readTail(entry.file), (rateLimits, observedAt, sequence) => normalizeCodexRateLimits({
       rateLimits,
       accountScope: scope,
+      // The FILE is the stream: `ordinal` restarts at zero in each new session
+      // file, so an ordinal only orders events within the file it came from.
+      streamId: `codex-rollout:${entry.file}`,
+      sourceSequence: sequence,
       // The event's own timestamp, not now: a rollout copy is authoritative at the
       // time it was written, and the tracker orders readings by that. An older
       // `codex` line selected past newer empty ones therefore ages out on the normal

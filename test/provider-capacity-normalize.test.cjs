@@ -250,12 +250,30 @@ test('a NEGATIVE used percentage is rejected, never turned into full headroom', 
   assert.equal(w.usedPercent, null, 'and the nonsense figure is not published either');
 });
 
-test('a used percentage ABOVE 100 stays exhaustion, because that direction is true', () => {
-  const obs = normalizeCodexRateLimits({
-    rateLimits: { limit_id: 'codex', primary: { used_percent: 100.4, window_minutes: 300, resets_at: 1789004151 } },
-    accountScope: 'acct-b', observedAt: OBSERVED, receivedAt: RECEIVED
-  });
-  assert.equal(obs.windows.find((x) => x.kind === 'FIVE_HOUR').remainingPercent, 0);
+test('a used percentage ABOVE 100 is UNKNOWN too - it is a symptom, not an overage', () => {
+  // This test used to assert the opposite, on my reasoning that 100.4% used is a
+  // true reading of a real overage. L0-SEM 36 overrides it and is right: an
+  // out-of-range value is evidence of a parse or protocol problem, and the same
+  // malformed payload that produced 100.4 could as easily have produced 0.4.
+  for (const used of [100.4, 101, 1000]) {
+    const obs = normalizeCodexRateLimits({
+      rateLimits: { limit_id: 'codex', primary: { used_percent: used, window_minutes: 300, resets_at: 1789004151 } },
+      accountScope: 'acct-b', observedAt: OBSERVED, receivedAt: RECEIVED
+    });
+    const w = obs.windows.find((x) => x.kind === 'FIVE_HOUR');
+    assert.equal(w.remainingPercent, null, `${used} must not be clamped to zero remaining`);
+    assert.equal(w.usedPercent, null, `${used} must not be published either`);
+  }
+});
+
+test('the range boundaries THEMSELVES are valid - 0 and 100 are real readings', () => {
+  for (const [used, remaining] of [[0, 100], [100, 0]]) {
+    const obs = normalizeCodexRateLimits({
+      rateLimits: { limit_id: 'codex', primary: { used_percent: used, window_minutes: 300, resets_at: 1789004151 } },
+      accountScope: 'acct-b', observedAt: OBSERVED, receivedAt: RECEIVED
+    });
+    assert.equal(obs.windows.find((x) => x.kind === 'FIVE_HOUR').remainingPercent, remaining, String(used));
+  }
 });
 
 test('claude: a negative used percentage is rejected on that path too', () => {
@@ -295,13 +313,18 @@ test('codex: ordinaryUsageAllowed is tri-state - absent and non-boolean both sta
   assert.equal(junk.ordinaryUsageAllowed, null);
 });
 
-test('codex: over-100 used clamps to zero remaining rather than going negative', () => {
+test('codex: over-100 used yields NO number, and the window survives on its reset time', () => {
+  // The second of my two fixtures that blessed clamping toward exhaustion. The
+  // window is still reported - it has a usable reset time - but it carries no
+  // percentage, so the pool is UNKNOWN on incompleteness rather than RESERVE_ONLY
+  // on a number nobody can trust.
   const obs = normalizeCodexRateLimits({
     rateLimits: { primary: { used_percent: 100.4, window_minutes: 300, resets_at: 1789004151 } },
     accountScope: 'b',
     observedAt: OBSERVED, receivedAt: RECEIVED
   });
-  assert.equal(obs.windows[0].remainingPercent, 0);
+  assert.equal(obs.windows[0].remainingPercent, null);
+  assert.equal(obs.windows[0].resetsAt, 1789004151000);
 });
 
 test('codex: a payload with neither windows nor a reached type yields no observation', () => {

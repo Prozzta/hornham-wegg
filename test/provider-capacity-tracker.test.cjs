@@ -582,17 +582,53 @@ test('SPEC4/172: exceeding the per-pool WINDOW cap is UNKNOWN, not a truncated h
   assert.equal(m.reason(), REASON.CAP_EXCEEDED, 'it must not silently discard an applicable window and stay healthy');
 });
 
-test('SPEC4/172: the pool that exceeds the POOL cap becomes UNKNOWN rather than vanishing', () => {
+test('FIX4/172: the POOL cap actually BOUNDS the map, and the breach is still visible', () => {
   const m = make();
   for (let i = 0; i < RETENTION_CAPS.maxPools; i += 1) {
     m.t.ingest(obs({ poolKey: `codex:acct-${i}:codex`, accountScope: `acct-${i}` }));
   }
-  const overflow = 'codex:acct-over:codex';
-  m.t.ingest(obs({ poolKey: overflow, accountScope: 'acct-over' }));
-  const pool = m.t.pool(overflow);
-  assert.ok(pool, 'the pool is REPORTED, because dropping it is the silent discard 172 forbids');
+  assert.equal(m.t.snapshot().pools.length, RETENTION_CAPS.maxPools);
+
+  // Retaining the 33rd as an UNKNOWN pool made the breach visible and defeated the
+  // cap that was reporting it - a machine seeing a thousand pool identities would
+  // retain a thousand markers. The count is bounded and the breach is reported as a
+  // bounded SUMMARY instead.
+  for (const scope of ['over-a', 'over-b', 'over-c']) {
+    m.t.ingest(obs({ poolKey: `codex:${scope}:codex`, accountScope: scope }));
+  }
+  assert.equal(m.t.snapshot().pools.length, RETENTION_CAPS.maxPools, 'the map does not grow past the cap');
+  assert.equal(m.t.pool('codex:over-a:codex'), null, 'and no 33rd record exists');
+  assert.equal(m.t.snapshot().refusedPools, 3, 'but the refusals are counted, not silently dropped');
+});
+
+test('FIX4/172: a cap breach RETAINS a bounded stand-in, not the oversized reading', () => {
+  const m = make();
+  const many = [];
+  for (let i = 0; i < RETENTION_CAPS.maxWindowsPerPool + 1; i += 1) {
+    many.push({ windowId: `w${i}`, kind: 'FIVE_HOUR', label: '5h', windowMinutes: 300,
+      usedPercent: 10, remainingPercent: 90, resetsAt: RESET_5H });
+  }
+  m.t.ingest(obs({ windows: many }));
+  const pool = m.t.pool(KEY);
   assert.equal(pool.state, 'UNKNOWN');
   assert.equal(pool.stateReason, REASON.CAP_EXCEEDED);
+  // THE CONTRACT THE OLD TEST NAMED AND NEVER CHECKED: classification was right and
+  // all seventeen windows were stored anyway, so the cap announced a bound it did
+  // not impose.
+  assert.equal(pool.windows.length, 0, 'the unbounded field is gone, not merely unreported');
+  assert.ok(
+    JSON.stringify(m.t.snapshot()).length < RETENTION_CAPS.maxPoolBytes,
+    'and the retained collection is genuinely small'
+  );
+});
+
+test('FIX4/172: an OVERSIZED single reading is bounded the same way', () => {
+  const m = make();
+  const fat = win('five_hour', 'FIVE_HOUR', 80, RESET_5H);
+  m.t.ingest(obs({ windows: [{ ...fat, label: 'x'.repeat(RETENTION_CAPS.maxPoolBytes) }] }));
+  assert.equal(m.state(), 'UNKNOWN');
+  assert.equal(m.reason(), REASON.CAP_EXCEEDED);
+  assert.ok(JSON.stringify(m.t.pool(KEY)).length < RETENTION_CAPS.maxPoolBytes, 'retained bounded');
 });
 
 test('SPEC4/172: the cap diagnostic is DEDUPLICATED - repeated breaches publish nothing new', () => {
@@ -623,4 +659,61 @@ test('SPEC4: a pool that breached a cap RECOVERS when a reading fits again', () 
   m.set(t1);
   m.t.ingest(obs({ observedAt: t1, receivedAt: t1 }));
   assert.equal(m.state(), 'AVAILABLE', 'the breach is a property of the reading, not a latch on the pool');
+});
+
+// ── L0-FIX4: ordering identity and acceptance reporting ─────────────────────
+
+test('FIX4/127: two events in the SAME second are ordered by the rollout ordinal', () => {
+  const m = make();
+  const stream = 'codex-rollout:/sessions/a.jsonl';
+  m.t.ingest(obs({ streamId: stream, sourceSequence: 7 }));
+  assert.equal(m.state(), 'AVAILABLE');
+
+  // Codex stamps whole seconds, so this newer event carries the SAME observedAt.
+  // Without a sequence it is indistinguishable from a duplicate and the refusal is
+  // lost; with one it is plainly the later event.
+  const res = m.t.ingestDetailed(obs({
+    streamId: stream, sourceSequence: 8, providerReachedType: 'rate_limit_reached'
+  }));
+  assert.equal(res.accepted, true);
+  assert.equal(m.state(), 'LIMITED', 'the later event at the same timestamp wins');
+});
+
+test('FIX4/127: a LOWER ordinal at the same time is out of order and ignored', () => {
+  const m = make();
+  const stream = 'codex-rollout:/sessions/a.jsonl';
+  m.t.ingest(obs({ streamId: stream, sourceSequence: 8, providerReachedType: 'rate_limit_reached' }));
+  const res = m.t.ingestDetailed(obs({ streamId: stream, sourceSequence: 7 }));
+  assert.equal(res.accepted, false);
+  assert.equal(res.reason, 'OUT_OF_ORDER');
+  assert.equal(m.state(), 'LIMITED', 'an older line cannot undo a refusal');
+});
+
+test('FIX4/127: ordinals from DIFFERENT streams are not compared', () => {
+  // Codex restarts `ordinal` at zero in each new session file, so a brand-new
+  // reading routinely carries a LOWER ordinal than the one before it.
+  const m = make();
+  m.t.ingest(obs({ streamId: 'codex-rollout:/sessions/old.jsonl', sourceSequence: 900 }));
+  const t1 = T0 + 1_000;
+  m.set(t1);
+  const res = m.t.ingestDetailed(obs({
+    observedAt: t1, receivedAt: t1,
+    streamId: 'codex-rollout:/sessions/new.jsonl', sourceSequence: 1,
+    providerReachedType: 'rate_limit_reached'
+  }));
+  assert.equal(res.accepted, true, 'a new session file is not an old event');
+  assert.equal(m.state(), 'LIMITED');
+});
+
+test('FIX4: acceptance and change are DIFFERENT answers', () => {
+  const m = make();
+  assert.deepEqual(m.t.ingestDetailed(obs()), { accepted: true, changed: true, reason: 'ACCEPTED' });
+
+  // A duplicate: valid, and says nothing new.
+  assert.deepEqual(m.t.ingestDetailed(obs()), { accepted: true, changed: false, reason: 'DUPLICATE' });
+
+  // Rejected: also changes nothing, for an entirely different reason.
+  const future = obs({ observedAt: T0 + L0_SEM_POLICY.futureSkewMs + 1 });
+  assert.deepEqual(m.t.ingestDetailed(future), { accepted: false, changed: false, reason: 'FUTURE_SKEW' });
+  assert.equal(m.t.ingest(obs()), false, 'the boolean contract is unchanged for existing callers');
 });

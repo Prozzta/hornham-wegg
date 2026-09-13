@@ -116,6 +116,24 @@ export interface CapacityWindow {
  */
 export interface CapacityObservation {
   poolKey: string;
+  /**
+   * Stable identity of the STREAM this reading came from, and its position in that
+   * stream (L0-SEM 127). The ordering key is `(observedAt, sourceSequence)`.
+   *
+   * WHY A SEQUENCE AND NOT JUST A TIME. A Codex rollout stamps whole-second
+   * timestamps, so two events written inside the same second are indistinguishable
+   * by time alone and the later one looks like a duplicate or an out-of-order
+   * replay. The rollout already numbers its own lines with `ordinal`, which is
+   * exactly the sequence this needs — it was there all along and nothing read it.
+   *
+   * THE STREAM ID MATTERS BECAUSE SEQUENCES ARE ONLY COMPARABLE WITHIN A STREAM.
+   * Codex starts a new rollout file per session and restarts `ordinal` at zero, so
+   * comparing an ordinal from one file against another would make a brand-new
+   * reading look ancient. Both are null for a source that numbers nothing, and a
+   * null sequence simply falls back to ordering by time.
+   */
+  streamId: string | null;
+  sourceSequence: number | null;
   provider: ProviderId;
   /**
    * Account discriminator. Two accounts of one provider MUST produce different
@@ -181,6 +199,17 @@ export interface PoolCapacitySnapshot {
 
 /** The whole collection, with its own revision so a consumer can diff cheaply. */
 export interface CapacityCollectionSnapshot {
+  /**
+   * How many distinct pools have been refused for the cardinality cap (L0-SEM 162).
+   *
+   * A BOUNDED SUMMARY RATHER THAN A 33RD RECORD. The breach has to be visible — a
+   * silently dropped pool is the failure 172 names — but making it visible by
+   * retaining the overflowing pool would defeat the cap it is reporting, and a
+   * machine that sees a thousand pool identities would retain a thousand markers.
+   * One counter is visible, is constant size, and cannot itself overflow the thing
+   * it measures.
+   */
+  refusedPools: number;
   /** Increments when any pool projection changes or a pool is added or removed. */
   collectionRevision: number;
   pools: PoolCapacitySnapshot[];

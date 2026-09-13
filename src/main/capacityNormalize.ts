@@ -57,33 +57,35 @@ function parseEpochMs(v: unknown): number | null {
 }
 
 /**
- * used → remaining, done once here so nothing downstream does arithmetic on
- * provider numbers.
- *
- * THE TWO OUT-OF-RANGE DIRECTIONS ARE NOT SYMMETRIC, AND TREATING THEM AS ONE WAS
- * THE DEFECT. Above 100 is a real reading of a real state: a provider reporting
- * 100.4% used is over its allowance, and clamping to zero remaining reports
- * exhaustion, which is true and is the conservative direction. Below 0 is not a
- * reading at all - no allowance can be negatively consumed - and the old clamp
- * turned that nonsense into 100% REMAINING, which is the one thing this design
- * says must never happen: an invalid number becoming a healthy-looking fact. So an
- * impossible used figure yields NO NUMBER, and the window lands in UNKNOWN with
- * the rest of its incomplete siblings rather than in AVAILABLE.
+ * used → remaining. No clamping in either direction, because there is nothing left
+ * to clamp: `usedPercent` has already rejected anything outside `[0,100]`.
  */
 function remainingFromUsed(used: number | null): number | null {
-  if (used === null) return null;
-  return Math.max(0, 100 - used);
+  return used === null ? null : 100 - used;
 }
 
 /**
- * A used-percentage that is a number but not a possible one. Rejected at the
- * source so the invalid figure never reaches EITHER published field - a window
- * carrying `usedPercent: -50` would be a nonsense number on a surface even with
- * its remainder correctly suppressed.
+ * A used-percentage that is a number and a POSSIBLE one. Validated in `[0,100]`
+ * (L0-SEM 36); anything else is UNKNOWN.
+ *
+ * I ARGUED THE OTHER WAY AND THE SPEC IS RIGHT. My reasoning was that the two
+ * directions are asymmetric: below 0 is nonsense, but 100.4% used is a TRUE reading
+ * of a real overage, so clamping it to zero remaining reports exhaustion, which is
+ * both true and conservative. That is plausible and it is wrong, because it assumes
+ * the number means what it says. AN OUT-OF-RANGE VALUE IS EVIDENCE OF A PARSE OR
+ * PROTOCOL PROBLEM, NOT EVIDENCE OF AN OVERAGE - the same malformed payload that
+ * produced 100.4 could as easily have produced 0.4 - and treating it as a reading
+ * manufactures a fact out of a symptom. Line 36 names both directions and both
+ * clamp destinations: "Out-of-range, non-finite, missing or malformed values are
+ * UNKNOWN; they are not clamped to healthy or zero."
+ *
+ * So the conservative move is not "clamp toward exhaustion", it is "do not pretend
+ * to have a number". The pool lands in UNKNOWN, which suppresses ordinary work just
+ * as RESERVE_ONLY would, without asserting a provider state nobody observed.
  */
 function usedPercent(v: unknown): number | null {
   const n = finiteNumber(v);
-  return n === null || n < 0 ? null : n;
+  return n === null || n < 0 || n > 100 ? null : n;
 }
 
 /** Claude names its windows; the duration is implied by the documented name. */
@@ -105,6 +107,8 @@ export function normalizeClaudeStatusLine(input: {
   accountScope: string;
   observedAt?: number | null;
   receivedAt: number;
+  streamId?: string | null;
+  sourceSequence?: number | null;
 }): CapacityObservation | null {
   const rl = input.rateLimits;
   if (!isDict(rl)) return null;
@@ -152,6 +156,10 @@ export function normalizeClaudeStatusLine(input: {
     provider: 'claude',
     accountScope: input.accountScope,
     limitId: 'subscription',
+    // The status line is a LIVE tick with no numbering of its own: one stream per
+    // account scope, ordered by time alone.
+    streamId: input.streamId ?? `claude-status:${input.accountScope}`,
+    sourceSequence: finiteNumber(input.sourceSequence),
     source: 'claude-status-line' satisfies ObservationSource,
     observedAt: finiteNumber(input.observedAt) ?? input.receivedAt,
     receivedAt: input.receivedAt,
@@ -270,6 +278,8 @@ export function normalizeCodexRateLimits(input: {
   observedAt?: number | null;
   receivedAt: number;
   source?: Extract<ObservationSource, 'codex-rollout' | 'codex-account-read'>;
+  streamId?: string | null;
+  sourceSequence?: number | null;
 }): CapacityObservation | null {
   const rl = input.rateLimits;
   if (!isDict(rl)) return null;
@@ -310,6 +320,10 @@ export function normalizeCodexRateLimits(input: {
     provider: 'codex',
     accountScope: input.accountScope,
     limitId,
+    // A rollout FILE is the stream: Codex restarts `ordinal` at zero in each new
+    // session file, so an ordinal is only meaningful beside the file it came from.
+    streamId: input.streamId ?? null,
+    sourceSequence: finiteNumber(input.sourceSequence),
     source,
     observedAt: observedAt ?? input.receivedAt,
     receivedAt: input.receivedAt,

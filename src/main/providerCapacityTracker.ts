@@ -84,10 +84,17 @@ export const L0_SEM_POLICY: CapacityPolicy = {
  * That is the whole point — truncating to the cap and carrying on would turn a
  * budget breach into a confident answer computed from part of the evidence.
  *
- * The 1 MiB tracker-heap cap from the same line is NOT enforced here: retained heap
- * is not measurable from inside this class without an allocator hook, and a number
- * invented to look enforced would be worse than an honestly absent one. The
- * per-pool and per-collection byte caps bound the same quantity from above.
+ * The 1 MiB tracker-heap figure from the same line is an isolated-Dev ACCEPTANCE
+ * TARGET rather than a runtime cap, per Oscar section 12, so it is measured out of
+ * process and not enforced here.
+ *
+ * THE COLLECTION CAP IS MEASURED ON THE SERIALIZED COLLECTION, WHICH IS THE THING
+ * 162 NAMES. Summing retained observations instead made the cap unreachable: 32
+ * pools x 8,192 bytes is 262,144 exactly, so a collection of legal pools could never
+ * exceed 262,144 and the cap could not fire on any legal input. A published
+ * projection is strictly larger than the observation behind it - labels, reason
+ * codes, freshness, revision, ages - so measuring what is actually published both
+ * matches the words and lets the cap bind.
  */
 export const RETENTION_CAPS = {
   maxPools: 32,
@@ -142,6 +149,8 @@ interface PoolRecord {
   observation: CapacityObservation;
   /** Which retention cap this pool breached, or null. Sticky until a reading fits. */
   capBreach: string | null;
+  /** Serialized size of the published projection, for the collection cap. */
+  projectionBytes: number;
   projection: PoolCapacitySnapshot;
   epoch: LimitEpoch | null;
   /** Same ordering key, different content: facts are invalid until something newer. */
@@ -157,6 +166,39 @@ interface PoolRecord {
    *  wall-clock move as well as the deadline does. */
   ageAtAccept: number;
   acceptedMono: number;
+}
+
+/** What one ingestion did. See `ingestDetailed`. */
+export interface IngestResult {
+  /** The reading was VALID and is now this pool's current evidence, or was a valid
+   *  duplicate of it. False means rejected: future-dated, or out of order. */
+  accepted: boolean;
+  /** The published projection moved. Always false when `accepted` is false. */
+  changed: boolean;
+  reason: 'ACCEPTED' | 'DUPLICATE' | 'FUTURE_SKEW' | 'OUT_OF_ORDER' | 'CAP_POOLS';
+}
+
+/**
+ * Order two readings of one pool by L0-SEM 127's key, `(observedAt, sourceSequence)`.
+ * Negative = `a` is older than `b`, 0 = same position, positive = newer.
+ *
+ * THE SEQUENCE IS ONLY A TIE-BREAK, AND ONLY WITHIN ONE STREAM. Codex restarts
+ * `ordinal` at zero in every new rollout file, so comparing ordinals across files
+ * would make a brand-new reading look ancient; two readings from different streams
+ * are therefore ordered by time alone, which is the only thing they share. Where
+ * times are equal and the stream and both sequences agree to be comparable, the
+ * sequence decides — and that is the whole point, because Codex stamps whole-second
+ * timestamps and two events inside one second are otherwise indistinguishable.
+ */
+function compareOrderingKey(a: CapacityObservation, b: CapacityObservation): number {
+  if (a.observedAt !== b.observedAt) return a.observedAt < b.observedAt ? -1 : 1;
+  const comparable = a.streamId !== null
+    && a.streamId === b.streamId
+    && a.sourceSequence !== null
+    && b.sourceSequence !== null;
+  if (!comparable) return 0;
+  if (a.sourceSequence! === b.sourceSequence!) return 0;
+  return a.sourceSequence! < b.sourceSequence! ? -1 : 1;
 }
 
 /** Hard evidence = typed quota signal or explicit denial. NOT a 429, overload or context error. */
@@ -202,16 +244,27 @@ const sameProjection = (a: PoolCapacitySnapshot, b: PoolCapacitySnapshot): boole
 export class ProviderCapacityTracker {
   private pools = new Map<string, PoolRecord>();
   /**
-   * poolKey → the highest per-pool revision ever published for it, RETAINED ACROSS
-   * REMOVAL. A pool that is forgotten and seen again is the same pool - same
-   * provider, same account, same limit id - so its revision must keep counting.
-   * Without this the re-added pool restarted at 1 and a consumer holding revision 6
-   * discarded every update until the new count caught up, which is a silent stall
-   * rather than a visible error. Revisions are a monotonic identity, not a
-   * population count, and nothing here expires this map: it costs one small integer
-   * per pool key ever seen, against a 32-pool cap.
+   * The highest per-pool revision ever published by ANY pool. A pool that is
+   * forgotten and seen again resumes strictly above it.
+   *
+   * WHY ONE INTEGER AND NOT A MAP PER POOL. The first version kept a high-water mark
+   * keyed by pool, which is the obvious shape and grows without bound: pool identity
+   * includes an account scope and a limit id, so a machine that authenticates several
+   * accounts over its lifetime accumulates an entry per historical identity forever.
+   * That preserved A10's monotonicity by violating A16's bounded-state contract -
+   * capping current pools at 32 while remembering every pool that ever existed.
+   *
+   * A SINGLE GLOBAL FLOOR SATISFIES BOTH, because the property required is monotonic
+   * per stable poolId, NOT dense per poolId. Resuming above the global maximum is
+   * strictly greater than anything that pool ever published, so no consumer can see a
+   * revision go backward; the number simply jumps, and L0-SEM 11.2 already says
+   * revision distance is not a count and a skip is not a gap. One integer, bounded
+   * by construction, and no eviction policy to get wrong.
    */
-  private revisionFloor = new Map<string, number>();
+  private revisionFloor = 0;
+  /** How many pools were refused for the cardinality cap. One diagnostic, not one
+   *  per refusal — 172 requires the diagnosis to be deduplicated. */
+  private poolsRefused = 0;
   private collectionRevision = 0;
   private updatedAt = 0;
 
@@ -234,20 +287,60 @@ export class ProviderCapacityTracker {
    * invalidates the pool's facts to UNKNOWN rather than merging two stories.
    */
   ingest(obs: CapacityObservation): boolean {
+    return this.ingestDetailed(obs).changed;
+  }
+
+  /**
+   * The same ingestion, reporting WHETHER THE READING WAS ACCEPTED as well as
+   * whether the published projection moved. Those are different questions and a
+   * caller that conflates them gets one of them wrong: a duplicate and a renewal
+   * are both ACCEPTED and change nothing, while a future-dated or out-of-order
+   * reading changes nothing because it was REJECTED. Anything deriving state from
+   * "a reading arrived from this agent" — learned pool membership, for one — must
+   * key on acceptance, and `ingest()`'s boolean cannot express it.
+   *
+   * Additive on purpose: `ingest()` keeps its exact contract, so no existing caller
+   * or fixture has to change to accommodate a question it never asked.
+   */
+  ingestDetailed(obs: CapacityObservation): IngestResult {
     const now = this.clock();
     // A timestamp far in the future is invalid, not very fresh (§6).
-    if (obs.observedAt > now + this.policy.futureSkewMs) return false;
+    if (obs.observedAt > now + this.policy.futureSkewMs) {
+      return { accepted: false, changed: false, reason: 'FUTURE_SKEW' };
+    }
 
     const prev = this.pools.get(obs.poolKey);
+    // The pool cardinality cap. A 33rd pool is NOT created: there is no earlier
+    // reading for it, so refusing costs nothing that was previously known, and the
+    // seam answers UNKNOWN for an agent with no pool - which is the conservative
+    // answer rather than a silent healthy one. This is the one cap whose bounded
+    // replacement is a counter rather than a sentinel, because a sentinel would
+    // itself be the 33rd record.
+    if (!prev && this.pools.size >= RETENTION_CAPS.maxPools) {
+      this.poolsRefused += 1;
+      if (this.poolsRefused === 1) {
+        console.warn(`[capacity] pool cap ${RETENTION_CAPS.maxPools} reached; further pools are not tracked`);
+      }
+      return { accepted: false, changed: false, reason: 'CAP_POOLS' };
+    }
+    // The breach is decided on the RAW reading - it is the raw reading that is too
+    // big - but everything downstream compares and stores the bounded stand-in. Two
+    // identical oversized readings must look identical to the duplicate rules, or
+    // the "one deduplicated diagnostic" of 172 becomes one per observation.
+    const breach = this.capBreachFor(obs, prev !== undefined);
+    const reading = breach ? ProviderCapacityTracker.sentinel(obs) : obs;
+
     let conflicted = false;
     let pinAnchor = false;
     if (prev) {
-      if (obs.observedAt < prev.observation.observedAt) return false;
-      const identical = fingerprint(obs) === fingerprint(prev.observation);
-      if (obs.observedAt === prev.observation.observedAt) {
-        // Exact duplicate: same ordering key, same content. A pure no-op (§7).
-        if (identical) return false;
-        if (!hasHardEvidence(obs)) conflicted = true;
+      const order = compareOrderingKey(reading, prev.observation);
+      if (order < 0) return { accepted: false, changed: false, reason: 'OUT_OF_ORDER' };
+      const identical = fingerprint(reading) === fingerprint(prev.observation);
+      if (order === 0) {
+        // Exact duplicate: same ordering key, same content. A pure no-op (§7) —
+        // but an ACCEPTED one: the reading is valid, it simply says nothing new.
+        if (identical) return { accepted: true, changed: false, reason: 'DUPLICATE' };
+        if (!hasHardEvidence(reading)) conflicted = true;
       } else if (identical) {
         // A live RENEWAL: newer reading, identical values. The freshness deadline
         // moves immediately - the reading really is current again - but the
@@ -258,9 +351,10 @@ export class ProviderCapacityTracker {
     }
 
     const rec: PoolRecord = prev ?? {
-      observation: obs,
+      observation: reading,
       capBreach: null,
-      projection: blankProjection(obs, this.revisionFloor.get(obs.poolKey) ?? 0),
+      projectionBytes: 0,
+      projection: blankProjection(reading, this.revisionFloor),
       epoch: null,
       conflicted: false,
       successfulTurnAt: null,
@@ -269,14 +363,14 @@ export class ProviderCapacityTracker {
       ageAtAccept: 0,
       acceptedMono: 0
     };
-    rec.observation = obs;
-    rec.capBreach = this.capBreachFor(obs, prev !== undefined);
-    this.stampDeadline(rec, obs, now);
+    rec.observation = reading;
+    rec.capBreach = breach;
+    this.stampDeadline(rec, reading, now);
     rec.conflicted = conflicted;
-    rec.epoch = this.nextEpoch(rec, obs, now);
+    rec.epoch = this.nextEpoch(rec, reading, now);
     if (!pinAnchor) rec.anchorAt = now;
     this.pools.set(obs.poolKey, rec);
-    return this.reproject(obs.poolKey, now, pinAnchor);
+    return { accepted: true, changed: this.reproject(obs.poolKey, now, pinAnchor), reason: 'ACCEPTED' };
   }
 
   /**
@@ -306,6 +400,7 @@ export class ProviderCapacityTracker {
   snapshot(): CapacityCollectionSnapshot {
     return {
       collectionRevision: this.collectionRevision,
+      refusedPools: this.poolsRefused,
       pools: [...this.pools.values()].map((r) => r.projection),
       updatedAt: this.updatedAt
     };
@@ -363,7 +458,7 @@ export class ProviderCapacityTracker {
   forget(poolKey: string): boolean {
     const rec = this.pools.get(poolKey);
     if (!rec) return false;
-    this.revisionFloor.set(poolKey, rec.projection.revision);
+    this.revisionFloor = Math.max(this.revisionFloor, rec.projection.revision);
     this.pools.delete(poolKey);
     this.collectionRevision += 1;
     this.updatedAt = this.clock();
@@ -435,15 +530,44 @@ export class ProviderCapacityTracker {
    */
   private capBreachFor(obs: CapacityObservation, poolExists: boolean): string | null {
     if (obs.windows.length > RETENTION_CAPS.maxWindowsPerPool) return 'WINDOWS_PER_POOL';
-    if (!poolExists && this.pools.size >= RETENTION_CAPS.maxPools) return 'POOLS';
-    const bytes = byteLength(obs);
-    if (bytes > RETENTION_CAPS.maxPoolBytes) return 'POOL_BYTES';
-    // The collection cap counts what is already retained plus what is arriving, so
-    // the pool that pushes the collection over is the pool that reports it.
-    let total = bytes;
-    for (const [key, rec] of this.pools) if (key !== obs.poolKey) total += byteLength(rec.observation);
-    if (total > RETENTION_CAPS.maxCollectionBytes) return 'COLLECTION_BYTES';
+    if (byteLength(obs) > RETENTION_CAPS.maxPoolBytes) return 'POOL_BYTES';
+    // What is ALREADY published, plus room for this pool's own projection. The
+    // arriving pool is the one that reports the breach, because it is the one whose
+    // arrival caused it.
+    let others = 0;
+    for (const [key, rec] of this.pools) if (key !== obs.poolKey) others += rec.projectionBytes;
+    if (others >= RETENTION_CAPS.maxCollectionBytes) return 'COLLECTION_BYTES';
+    void poolExists;
     return null;
+  }
+
+  /**
+   * A bounded stand-in for a reading that cannot be retained (L0-SEM 172).
+   *
+   * ACCEPT MUST NOT MEAN RETAIN THE UNBOUNDED OBJECT, and my first version did
+   * exactly that: it classified the pool UNKNOWN and then stored all seventeen
+   * windows anyway, so the caps announced a bound they did not impose. The pool keeps
+   * its IDENTITY and its ordering position — both are small, and discarding them
+   * would make the next reading look like a first sighting — and loses every
+   * unbounded field. What is retained is constant-size regardless of what arrived.
+   */
+  private static sentinel(obs: CapacityObservation): CapacityObservation {
+    return {
+      poolKey: obs.poolKey,
+      provider: obs.provider,
+      accountScope: obs.accountScope,
+      limitId: obs.limitId,
+      source: obs.source,
+      streamId: obs.streamId,
+      sourceSequence: obs.sourceSequence,
+      observedAt: obs.observedAt,
+      receivedAt: obs.receivedAt,
+      windows: [],
+      providerAttributedLimitingWindowId: null,
+      providerReachedType: null,
+      ordinaryUsageAllowed: null,
+      planType: null
+    };
   }
 
   private isFresh(obs: CapacityObservation, now: number): boolean {
@@ -468,10 +592,13 @@ export class ProviderCapacityTracker {
       // fields so a pool being actively observed cannot expire on an old timestamp.
       next.revision = rec.projection.revision;
       rec.projection = publish(next);
+      rec.projectionBytes = byteLength(next);
       return false;
     }
     next.revision = rec.projection.revision + 1;
+    this.revisionFloor = Math.max(this.revisionFloor, next.revision);
     rec.projection = publish(next);
+    rec.projectionBytes = byteLength(next);
     this.collectionRevision += 1;
     this.updatedAt = now;
     return true;
@@ -592,7 +719,7 @@ function publish(p: PoolCapacitySnapshot): PoolCapacitySnapshot {
 }
 
 /** Serialized size of one retained reading, which is what the byte caps bound. */
-const byteLength = (obs: CapacityObservation): number => JSON.stringify(obs).length;
+const byteLength = (value: unknown): number => JSON.stringify(value).length;
 
 /** Applicable, known remainders, keyed by window. The baseline a later snapshot is
  *  compared against for improvement. */
@@ -677,8 +804,9 @@ function nextResetBoundary(obs: CapacityObservation, epoch: LimitEpoch): number 
 
 /**
  * Placeholder; the first reproject replaces it and moves to `floor + 1`. The floor
- * is 0 for a pool never seen before and the pool's last published revision for one
- * that was removed and has come back.
+ * is 0 before anything has been published and the collection's revision high-water
+ * mark afterwards, so a removed and re-added pool resumes strictly above whatever it
+ * last published.
  */
 function blankProjection(obs: CapacityObservation, floor = 0): PoolCapacitySnapshot {
   return {
