@@ -1,117 +1,113 @@
 'use strict';
 /**
- * L0-VAL - the L0-SEM §12 tracker-heap measurement harness.
+ * L0-VAL - the L0-SEM §12/§15 tracker-heap acceptance harness.
  *
  * NOT PART OF THE TEST SUITE, deliberately: it lives outside test/*.test.cjs so it
  * cannot move a test count, and it needs a forced GC, which the suite does not pass.
  * It is committed because a reported number nobody can reproduce is an anecdote.
  *
- *   hive-node --expose-gc test/tools/capacity-heap-probe.cjs <root> alone|snap|structured|noise
+ *   hive-node --expose-gc test/tools/capacity-heap-probe.cjs <root> <arm>
  *   hive-node            test/tools/capacity-heap-probe.cjs <root> report
  *
+ *   arms: f31-pad f31-many f32-pad f32-many breach  (+ "-control" on any of them)
+ *
  * ==========================================================================
- * IT ASSERTS NOW, AND IT CAN SAY "I COULD NOT MEASURE THIS".
+ * WHAT §15 REOPENED, AND WHY THE OLD NUMBERS ARE GONE
  * ==========================================================================
- * The audit found the previous version printing numbers that contradicted its own
- * comment and exiting zero either way - a green result that cannot go red, outside
- * the glob so nothing ever noticed. Chasing that produced something worse than a
- * stale comment, so read this before trusting any figure this file prints.
+ * §12's original 32 x 8 KiB fixture is a BREACH fixture, not a maximal valid state, so
+ * the 0.281-0.302 MiB discharge is withdrawn and so is the 243,056-267,928 reclaimed
+ * range measured against it. §15 requires BOTH cap-valid frontier shapes, and neither
+ * substitutes for the other "because serialized size does not prove V8 retained-size
+ * ordering". The breach arm is kept as ADDITIONAL evidence and can discharge nothing.
  *
- * THE OLD ESTIMATOR DOES NOT WORK, AND HERE IS THE MEASUREMENT THAT SHOWS IT.
- * `delta` is heapUsed after building minus heapUsed at an empty-tracker baseline.
- * Run the NOISE arm - identical work, every observation built and sized, NOTHING
- * ingested, so nothing is retained and the honest answer is zero:
- *     pools:0  delta: -554,360 / -2,871,312 / -2,657,680
- * THE NOISE FLOOR IS MULTI-MEGABYTE AND SIGNED, against a quantity of ~0.3 MB. And
- * the sign is not controlled by the subject: adding ONE env-var read inside the build
- * loop - retaining nothing - moved the delta from +322,104, byte-identical across
- * five runs, to -2,395,832. Byte-level reproducibility had made me confident in a
- * number that was reproducible AND confounded, which are not the same thing.
- * THAT IS WHY THE AUDIT SAW FIVE NEGATIVE RUNS PER ARM WHERE THIS MACHINE SAW FIVE
- * POSITIVE ONES. Neither environment was wrong; the estimator has no sign discipline.
+ * THE FRONTIERS ARE DERIVED AT RUN TIME, NOT HARDCODED. Frontier 2 is "the largest
+ * deterministic shape whose post-projection collection remains within 256 KiB" - a
+ * DERIVED quantity that moves when the implementation moves, and it moved once already
+ * when the timer reserve began being subtracted at admission. A hardcoded figure would
+ * silently measure the wrong frontier after the next change, which is the same mistake
+ * as the stale comment this file used to carry. Every report prints the derivation.
  *
- * WHAT IS USABLE IS `reclaimed`: the heap that comes back when the tracker is
- * dropped, across a window in which nothing else is allocated. Same runs:
- *     with 32 maximal pools retained   281,128 / 375,712 / 417,424
- *     with nothing retained (noise)     12,776 /   8,424 / 171,552
- * The signal dominates and the sign is right, so `reclaimed` is what the target is
- * checked against and `delta` is kept only as a printed diagnostic. This is not a
- * comfortable margin - roughly 2-3x over the floor - and §12 predicted exactly that:
- * "heapUsed is process-wide and GC-sensitive; it cannot honestly enforce ownership
- * inside ProviderCapacityTracker." What follows is the measured demonstration of that
- * sentence, not a refutation of it.
+ * TWO SHAPE FAMILIES AT EACH FRONTIER, AND THE REASON IS NOT SYMMETRY. Padding both
+ * shapes to the same serialized size makes the SERIALIZED frontier shape-independent -
+ * measured: one window plus a 7,518-char pad and sixteen windows plus a 5,583-char pad
+ * both retain 8,114 bytes. So the largest fitting SIZE is unique while the SHAPE at
+ * that size is not, and a long ASCII string and sixteen small objects are very
+ * different object graphs at identical byte counts. Rather than pick one, both are
+ * measured and the MAXIMUM is reported, since a target must hold for the worst valid
+ * shape. That is strictly stronger than choosing, so no ruling was needed.
  *
- * A WARM-UP BEFORE THE BASELINE IS THE OBVIOUS FIX AND IT IS WORSE. Measured: the
- * spread across five runs widens from 0 bytes to 245 KB, and a deliberately retained
- * 2 MiB string becomes INVISIBLE (delta 511,480, under target, exit 0). Recorded so
- * that the next person does not spend the afternoon I spent.
+ * ==========================================================================
+ * THE ESTIMATOR: `reclaimed`, NOT A BASELINE DIFFERENCE
+ * ==========================================================================
+ * `delta` - heapUsed after construction minus an empty-tracker baseline - DOES NOT
+ * WORK, and the control arms are what prove it. A control does every byte of the same
+ * construction and ingests NOTHING, so its honest delta is zero; it has measured
+ * -554,360 / -2,871,312 / -2,657,680. The noise floor is multi-megabyte and SIGNED
+ * against a quantity near 0.3 MB, and the sign is not controlled by the subject: adding
+ * one env-var read inside the build loop, retaining nothing, moved a delta from
+ * +322,104 byte-identical across five runs to -2,395,832. That is why the audit saw
+ * five negative runs per arm where this machine saw five positive ones. Neither
+ * environment was wrong. Byte-level reproducibility had made me confident in a number
+ * that was reproducible AND confounded, which are not the same thing.
  *
- * NO ABSOLUTE RANGE IS CLAIMED HERE ANY MORE, and that is a withdrawal, not a
- * correction. This comment used to state 295,028-316,656 bytes as the result. That
- * figure cannot be carried in a committed comment across machines, Node builds and
- * allocator states - re-measured on the machine that produced it, it had already
- * drifted above its own stated top. What replaces it is a BOUND THE TOOL CHECKS
- * wherever it runs, plus dated numbers in the output.
+ * So the estimator is `reclaimed`: the heap that comes back when the tracker and every
+ * tracker-owned reference are released, across a window in which nothing else is
+ * allocated. §12's own words predicted the failure - "heapUsed is process-wide and
+ * GC-sensitive; it cannot honestly enforce ownership inside ProviderCapacityTracker" -
+ * so what follows is the measured demonstration of that sentence, not a refutation.
  *
- * WHAT DOES SURVIVE IS THE RELATIVE FINDING, because a comparison within one run
- * reproduces where an absolute figure does not. Running the three arms in ONE process
- * read ~20% LOW against one arm per process: arms 2 and 3 measured against a warm,
- * fragmented heap arm 1 never saw. A spread that looks like noise can be an ordering
- * artefact. Hence ONE ARM PER PROCESS, and `report` spawns a fresh process per run.
+ * A WARM-UP BEFORE THE BASELINE IS THE OBVIOUS FIX AND IT IS WORSE: the five-run spread
+ * widens from 0 bytes to 245 KB and a deliberately retained 2 MiB string becomes
+ * INVISIBLE (under target, exit 0). Recorded so nobody re-spends that afternoon.
  *
- * §12 ASKS FOR A RANGE OVER AT LEAST FIVE RUNS, so the tool does the five runs. The
- * previous version did one, and the range existed only in prose I typed after running
- * it by hand - the same gap as the stale comment, one level up.
+ * NO ABSOLUTE RANGE IS CLAIMED IN THIS COMMENT. A committed comment cannot carry an
+ * absolute heap figure across machines, Node builds and allocator states - the figure
+ * that used to be here had already drifted above its own stated top on the machine that
+ * produced it. Numbers live in the output, where they are dated.
  *
- * WHICH ARM IS MOST EXPENSIVE IS NOT PREDICTED, BECAUSE THE PREDICTION WAS WRONG.
- * This file used to argue that many small objects "cost far more per serialized byte"
- * than one long ASCII string. Measured, `structured` (16 windows, the per-pool cap)
- * costs LESS than `alone` (one window plus a long ASCII pad). So both shapes are
- * measured because which is worse is not obvious, and `report` takes the MAXIMUM
- * across arms, since a target must hold for the worst valid shape.
- *
- * NO production heap sampling is added and NO size estimator is written. The numbers
- * are process.memoryUsage().heapUsed - V8's own accounting - and an assumed size
- * presented as a measurement would be worse than an honest gap.
+ * ONE ARM PER PROCESS. Three arms in one process read ~20% LOW, because arms 2 and 3
+ * measured against a warm, fragmented heap arm 1 never saw. A spread that looks like
+ * noise can be an ordering artefact. `report` spawns a fresh process per run.
  *
  * THE RECLAIM CONTROL failed three times before it passed:
  *   1. the published snapshot held in a local        308,640 delta / 5,488 reclaimed
  *   2. moved into a { } block, still reachable via the module context   same failure
  *   3. a real function scope, nulled inside the frame   ~316,000 / ~7,000 reclaimed
  * Nulling a local inside a frame still on the stack proves nothing about reachability,
- * so the release happens in the CALLER after the measuring frame RETURNS. Each of
- * those three attempts would have published a number.
+ * so the release happens in the CALLER after the measuring frame RETURNS.
  *
- * EXIT CODES, because "over budget" and "I could not measure" are different answers
- * and printing one number for both is how this file went wrong in the first place:
- *   0  measured, within target
- *   1  a real finding: the fixture is not the maximal valid state, or the target is
- *      exceeded. §12: "report a failed target and choose structure reduction or a
- *      smaller serialized cap from the observed data."
- *   3  VOID: the method could not measure. Nothing is concluded about the tracker.
- *   2  usage.
+ * WHAT A PASS MEANS, AT EXACTLY THE STRENGTH §15 ALLOWS: an EMPIRICAL ISOLATED-DEV
+ * ACCEPTANCE PASS. Never a universal V8 or runtime bound, never a production
+ * enforcement guarantee, and never a claim about any machine but the one that ran it.
+ *
+ * EXIT CODES, because "over budget" and "I could not measure" are different answers:
+ *   0  measured, within target        1  a real finding (fixture wrong, or over target)
+ *   3  VOID: the method could not measure. Nothing is concluded.      2  usage.
  */
 const WT = process.argv[2];
 const which = process.argv[3];
-const ARMS = { alone: [false, false], snap: [true, false], structured: [true, true], noise: [false, false] };
-if (!WT || (which !== 'report' && !(which in ARMS))) {
-  console.error('usage: capacity-heap-probe.cjs <repo-root> alone|snap|structured|noise|report');
+
+/** §12/§15: an isolated-Dev acceptance target for heap attributable to retained state. */
+const HEAP_TARGET_BYTES = 1024 * 1024;
+const RUNS_PER_ARM = 5;
+/** The two cap-VALID frontiers §15 requires. `breach` is extra evidence only. */
+const VALID_ARMS = ['f31-pad', 'f31-many', 'f32-pad', 'f32-many'];
+const ALL_ARMS = [...VALID_ARMS, 'breach'];
+
+const baseArm = typeof which === 'string' ? which.replace(/-control$/, '') : '';
+if (!WT || (which !== 'report' && !ALL_ARMS.includes(baseArm))) {
+  console.error(`usage: capacity-heap-probe.cjs <repo-root> report|${ALL_ARMS.join('|')}[-control]`);
   process.exit(2);
 }
 process.chdir(WT);
 
-/** §12: "1 MiB is an isolated-Dev acceptance target for heap attributable to retained capacity state". */
-const HEAP_TARGET_BYTES = 1024 * 1024;
-const RUNS_PER_ARM = 5;
-const MEASURED_ARMS = ['alone', 'snap', 'structured'];
-
 if (which === 'report') {
   report();
 } else {
-  measure(which);
+  measure(baseArm, which.endsWith('-control'));
 }
 
-function measure(armName) {
+function measure(arm, isControl) {
   const v8 = require('v8');
   const vm = require('vm');
   v8.setFlagsFromString('--expose_gc');
@@ -122,115 +118,150 @@ function measure(armName) {
   const loadTs = require(WT + '/test/load-ts.cjs');
   const { ProviderCapacityTracker, L0_SEM_POLICY, RETENTION_CAPS } = loadTs('src/main/providerCapacityTracker.ts');
   const { T0, win, obs } = require(WT + '/test/fixtures/capacity-corpus.cjs');
-  /** The NOISE arm does every byte of the same work and retains none of it. */
-  const retain = armName !== 'noise';
+  const byteLen = (v) => JSON.stringify(v).length;
 
   /**
-   * `structured` maximises OBJECT COUNT as well as bytes: 16 windows, the per-pool
-   * cap. `alone` is one window plus a long ASCII pad - the friendliest case for V8,
-   * which stores ASCII one byte per character. See the header for why neither is
-   * assumed to be the expensive one.
+   * `pad` is one window plus a long ASCII planType - the friendliest case for V8, which
+   * stores ASCII one byte per character. `many` is sixteen windows, the per-pool cap,
+   * which maximises OBJECT COUNT at the same serialized size. Neither is assumed to be
+   * the expensive one; see the header.
    */
-  function sizedTo(key, scope, bytes, structured) {
-    const windows = structured
+  function sized(key, scope, bytes, shape) {
+    const windows = shape === 'many'
       ? Array.from({ length: RETENTION_CAPS.maxWindowsPerPool },
           (_, i) => win({ windowId: 'w' + i, kind: 'OTHER', windowMinutes: 60 + i }))
       : [win()];
     let pad = 0;
-    for (let guard = 0; guard < 64; guard++) {
+    for (let guard = 0; guard < 200; guard++) {
       const o = obs({
         poolKey: key, accountScope: scope, observedAt: T0, receivedAt: T0,
         windows, planType: 'z'.repeat(pad)
       });
-      const n = JSON.stringify(o).length;
+      const n = byteLen(o);
       if (n === bytes) return o;
-      if (n > bytes) throw new Error('cannot size below ' + n);
+      if (n > bytes) return null;
       pad += bytes - n;
     }
     throw new Error('sizing did not converge');
   }
 
+  /** Does `count` pools of `bytes` each publish within the collection cap, unbounded? */
+  function unboundedAt(count, bytes, shape) {
+    const t = new ProviderCapacityTracker(L0_SEM_POLICY, () => T0, () => 0);
+    for (let i = 0; i < count; i++) {
+      const o = sized(`codex:acct-${i}:limit-1`, `acct-${i}`, bytes, shape);
+      if (!o) return false;
+      t.ingest(o);
+    }
+    return t.snapshot().pools.filter((p) => p.state === 'UNKNOWN').length === 0;
+  }
+
   /**
-   * Build the MAXIMAL VALID retained state and return the delta plus the live objects
-   * so the CALLER decides when they die. Nothing here measures reclaim.
+   * DERIVED, NOT HARDCODED. The largest per-pool size at which `count` pools still
+   * publish inside the cap. Binary search, and the caller asserts the boundary is real
+   * by checking that one byte more does breach.
    */
-  function build(holdSnapshot, structured) {
-    const now = T0;
-    const mono = 0;
-    const tracker = new ProviderCapacityTracker(L0_SEM_POLICY, () => now, () => mono);
+  function largestFitting(count, shape) {
+    let lo = 1;
+    let hi = RETENTION_CAPS.maxPoolBytes;
+    let best = null;
+    while (lo <= hi) {
+      const mid = (lo + hi) >> 1;
+      if (unboundedAt(count, mid, shape)) { best = mid; lo = mid + 1; } else { hi = mid - 1; }
+    }
+    return best;
+  }
+
+  const shape = arm.endsWith('-many') ? 'many' : 'pad';
+  const count = arm === 'breach' ? RETENTION_CAPS.maxPools
+    : arm.startsWith('f31') ? RETENTION_CAPS.maxPools - 1 : RETENTION_CAPS.maxPools;
+  const perPool = arm === 'breach' || arm.startsWith('f31')
+    ? RETENTION_CAPS.maxPoolBytes
+    : largestFitting(RETENTION_CAPS.maxPools, shape);
+  if (perPool === null) {
+    console.error('VOID  no per-pool size fits the collection cap at this pool count');
+    process.exit(3);
+  }
+
+  /**
+   * Build the retained state and hand the live objects back so the CALLER decides when
+   * they die. A CONTROL does every byte of the same construction and ingests nothing.
+   */
+  function build() {
+    const tracker = new ProviderCapacityTracker(L0_SEM_POLICY, () => T0, () => 0);
     settle();
     const base = used();
     let serialized = 0;
-    for (let i = 0; i < RETENTION_CAPS.maxPools; i++) {
-      const o = sizedTo('codex:acct-' + i + ':limit-1', 'acct-' + i, RETENTION_CAPS.maxPoolBytes, structured);
-      serialized += JSON.stringify(o).length;
-      if (retain) tracker.ingest(o);
+    for (let i = 0; i < count; i++) {
+      const o = sized(`codex:acct-${i}:limit-1`, `acct-${i}`, perPool, shape);
+      serialized += byteLen(o);
+      if (!isControl) tracker.ingest(o);
     }
-    let s = tracker.snapshot();
+    const s = tracker.snapshot();
     const pools = s.pools.length;
     const unknown = s.pools.filter((p) => p.state === 'UNKNOWN').length;
-    const keep = { tracker, snapshot: holdSnapshot ? s : null };
-    // THE LOCAL HAD TO GO, OR THE `snap` ARM COULD NOT DIFFER FROM `alone`. `s` was
-    // still in scope when the delta was taken, so both arms held the published
-    // snapshot and both printed the same number TO THE BYTE - a comparison between
-    // two conditions that could not come out differently, invisible for the same
-    // reason as everything else here: nothing asserted that the arms differ.
-    if (!holdSnapshot) s = null;
+    const published = byteLen(s);
+    const keep = { tracker, snapshot: s };
     settle();
-    return { base, delta: used() - base, serialized, pools, unknown, keep };
+    return { base, delta: used() - base, serialized, pools, unknown, published, keep };
   }
 
-  /** Run one arm: build, then release in the CALLER and require the memory back. */
-  function arm(holdSnapshot, structured) {
-    let r = build(holdSnapshot, structured);
-    const { base, delta, serialized, pools, unknown } = r;
-    const before = used();
-    r = null; // the only reference to `keep`, released OUTSIDE the building frame
-    settle();
-    return { base, delta, serialized, pools, unknown, reclaimed: before - used() };
-  }
+  let r = build();
+  const { base, delta, serialized, pools, unknown, published } = r;
+  const before = used();
+  r = null; // the tracker AND its published snapshot, released OUTSIDE the building frame
+  settle();
+  const reclaimed = before - used();
 
-  const r = arm(...ARMS[armName]);
-  const caps = RETENTION_CAPS;
-  console.log(JSON.stringify({ arm: armName, serialized: r.serialized, pools: r.pools,
-    unknown: r.unknown, base: r.base, delta: r.delta, reclaimed: r.reclaimed }));
+  console.log(JSON.stringify({ arm: which, shape, pools, perPool, unknown,
+    serialized, published, base, delta, reclaimed }));
 
-  // The fixture must be the state §12 names. A real number measured against the wrong
-  // fixture is the failure mode this whole file exists to stop.
-  const expectPools = retain ? caps.maxPools : 0;
-  const fixture = [
-    ['serialized collection is exactly the maximal valid size',
-      r.serialized === caps.maxPools * caps.maxPoolBytes, `${r.serialized} != ${caps.maxPools * caps.maxPoolBytes}`],
-    ['the expected pools are retained', r.pools === expectPools, `${r.pools} != ${expectPools}`],
-    ['the fixture is VALID, not a breach fixture', r.unknown === 0, `${r.unknown} pools UNKNOWN`]
+  // The fixture must be the state §15 names. A real number measured against the wrong
+  // fixture is the failure this whole file exists to stop.
+  const expectPools = isControl ? 0 : count;
+  const expectUnknown = isControl ? 0 : (arm === 'breach' ? 1 : 0);
+  const checks = [
+    ['the expected pools are retained', pools === expectPools, `${pools} != ${expectPools}`],
+    ['the fixture is the state the arm names', unknown === expectUnknown, `${unknown} UNKNOWN != ${expectUnknown}`],
+    ['every observation was built at the arm\'s per-pool size',
+      serialized === count * perPool, `${serialized} != ${count * perPool}`]
   ];
-  const failed = fixture.filter(([, ok]) => !ok);
+  if (!isControl && arm !== 'breach') {
+    checks.push(['the published collection is within the cap',
+      published <= RETENTION_CAPS.maxCollectionBytes,
+      `${published} > ${RETENTION_CAPS.maxCollectionBytes}`]);
+    // The derived frontier must BE a frontier: one byte more has to breach, or this arm
+    // is measuring an interior point and calling it the edge.
+    const oneMore = arm.startsWith('f32') && !unboundedAt(count, perPool + 1, shape);
+    if (arm.startsWith('f32')) {
+      checks.push(['the derived frontier is a real edge - one byte more breaches', oneMore,
+        `${perPool + 1} bytes per pool still fits, so ${perPool} is not the largest`]);
+    }
+  }
+  const failed = checks.filter(([, ok]) => !ok);
   for (const [name, , detail] of failed) console.error(`FAIL  ${name}  --  ${detail}`);
   if (failed.length) {
-    console.error(`${failed.length} fixture check(s) FAILED. A measurement against the wrong fixture is not a measurement.`);
+    console.error('A measurement against the wrong fixture is not a measurement.');
     process.exit(1);
   }
-  if (!retain) process.exit(0); // the noise arm is a floor, not a verdict
+  if (isControl) process.exit(0); // a control is a floor, not a verdict
 
-  // VOID rather than FAIL: a heap that shrank while 32 maximal pools were retained
-  // says the process moved under the measurement, and says nothing about the tracker.
-  if (r.delta <= 0 || r.reclaimed <= 0) {
-    console.error(`VOID  delta ${r.delta}, reclaimed ${r.reclaimed}: the heap did not grow while retaining 32 maximal pools.`);
-    console.error('The measurement is confounded, NOT the tracker efficient. Nothing is concluded. See the header.');
+  if (delta <= 0 || reclaimed <= 0) {
+    console.error(`VOID  delta ${delta}, reclaimed ${reclaimed}: the heap did not grow while retaining ${pools} pools.`);
+    console.error('The measurement is confounded, NOT the tracker efficient. Nothing is concluded.');
     process.exit(3);
   }
-  if (r.reclaimed >= HEAP_TARGET_BYTES) {
-    console.error(`FAIL  reclaimed ${r.reclaimed} >= the §12 target of ${HEAP_TARGET_BYTES}.`);
-    console.error('§12: report a failed target and choose structure reduction or a smaller serialized cap from the observed data.');
+  if (reclaimed >= HEAP_TARGET_BYTES) {
+    console.error(`FAIL  reclaimed ${reclaimed} >= the §12 target of ${HEAP_TARGET_BYTES}.`);
+    console.error('§12: report a failed target and choose structure reduction or a smaller serialized cap.');
     process.exit(1);
   }
 }
 
 /**
- * §12's unit is a RANGE OVER AT LEAST FIVE RUNS, and a warm heap changes the answer,
- * so the five runs are five PROCESSES. The NOISE arm runs first and its result is a
- * precondition: if retaining nothing reclaims as much as retaining the maximal state,
- * this method cannot see the tracker and the report is VOID.
+ * §15: at least five runs for EACH valid frontier PLUS the control, with identical
+ * construction work in the tracker and no-ingest arms. A warm heap changes the answer,
+ * so the runs are separate PROCESSES.
  */
 function report() {
   const { spawnSync } = require('child_process');
@@ -239,56 +270,66 @@ function report() {
     const line = (r.stdout || '').trim().split('\n').filter((l) => l.startsWith('{')).pop();
     return { status: r.status, stderr: (r.stderr || '').trim(), row: line ? JSON.parse(line) : null };
   };
-
-  const floorRuns = [];
-  for (let i = 0; i < RUNS_PER_ARM; i++) {
-    const r = run('noise');
-    if (r.status !== 0 || !r.row) {
-      console.error(`VOID  noise run ${i + 1}: exit ${r.status}\n${r.stderr || '(no stderr)'}`);
-      process.exit(3);
-    }
-    floorRuns.push(Math.abs(r.row.reclaimed));
-  }
-  const floor = Math.max(...floorRuns);
-  console.log(JSON.stringify({ arm: 'noise', runs: floorRuns.length, reclaimedFloor: floor }));
-
-  const rows = [];
-  let findings = 0;
-  let voids = 0;
-  for (const name of MEASURED_ARMS) {
+  const series = (name) => {
     const got = [];
     for (let i = 0; i < RUNS_PER_ARM; i++) {
       const r = run(name);
-      if (r.status === 3) { voids++; console.error(`VOID  ${name} run ${i + 1}\n${r.stderr}`); continue; }
-      if (r.status !== 0 || !r.row) { findings++; console.error(`FAIL  ${name} run ${i + 1}: exit ${r.status}\n${r.stderr || '(no stderr)'}`); continue; }
-      got.push(r.row.reclaimed);
+      if (r.status === 3) { console.error(`VOID  ${name} run ${i + 1}\n${r.stderr}`); return { void: true }; }
+      if (r.status !== 0 || !r.row) { console.error(`FAIL  ${name} run ${i + 1}: exit ${r.status}\n${r.stderr || '(no stderr)'}`); return { failed: true }; }
+      got.push(r.row);
     }
-    if (got.length) {
-      rows.push({ arm: name, runs: got.length, reclaimedMin: Math.min(...got), reclaimedMax: Math.max(...got) });
+    const rec = got.map((g) => g.reclaimed);
+    return { runs: got.length, min: Math.min(...rec), max: Math.max(...rec),
+      perPool: got[0].perPool, pools: got[0].pools, published: got[0].published };
+  };
+
+  let voids = 0;
+  let findings = 0;
+  const rows = {};
+  for (const arm of ALL_ARMS) {
+    for (const name of [arm, `${arm}-control`]) {
+      const s = series(name);
+      if (s.void) { voids++; continue; }
+      if (s.failed) { findings++; continue; }
+      rows[name] = s;
+      console.log(JSON.stringify({ arm: name, ...s }));
     }
   }
-  for (const row of rows) console.log(JSON.stringify(row));
 
-  const upper = rows.length ? Math.max(...rows.map((r) => r.reclaimedMax)) : null;
-  const lower = rows.length ? Math.min(...rows.map((r) => r.reclaimedMin)) : null;
-  console.log(JSON.stringify({ estimator: 'reclaimed', runsPerArm: RUNS_PER_ARM, noiseFloor: floor,
-    lowerAcrossArms: lower, upperAcrossArms: upper, targetBytes: HEAP_TARGET_BYTES }));
-
-  if (voids || upper === null) {
-    console.error(`VOID  ${voids} run(s) could not be measured. Report no figure.`);
-    process.exit(3);
+  // §15: "clear control separation". A frontier whose reclaim is not clearly above its
+  // OWN control's floor has not been measured - the control does identical construction,
+  // so anything it reclaims is not attributable to retained state.
+  const separation = [];
+  for (const arm of VALID_ARMS) {
+    const a = rows[arm];
+    const c = rows[`${arm}-control`];
+    if (!a || !c) { voids++; continue; }
+    const clear = c.max < a.min / 2;
+    separation.push({ arm, armMin: a.min, controlMax: c.max, clear });
+    if (!clear) voids++;
   }
-  // The floor is a precondition on the METHOD, so it voids rather than fails. Half is
-  // the line: below that the quantity and its own noise are the same size.
-  if (floor >= lower / 2) {
-    console.error(`VOID  noise floor ${floor} is not small against the smallest measured ${lower}.`);
-    console.error('Retaining nothing reclaims nearly as much as retaining the maximal state, so this method cannot see the tracker.');
+  for (const s of separation) console.log(JSON.stringify(s));
+
+  const valid = VALID_ARMS.map((a) => rows[a]).filter(Boolean);
+  const upper = valid.length ? Math.max(...valid.map((v) => v.max)) : null;
+  console.log(JSON.stringify({
+    estimator: 'reclaimed', runsPerArm: RUNS_PER_ARM,
+    validFrontiers: VALID_ARMS, upperAcrossValidFrontiers: upper,
+    targetBytes: HEAP_TARGET_BYTES,
+    breachArmIsEvidenceOnly: true
+  }));
+
+  if (voids || upper === null || valid.length !== VALID_ARMS.length) {
+    console.error(`VOID  ${voids} condition(s) unmet. REPORT NO FIGURE and discharge nothing.`);
     process.exit(3);
   }
   if (upper >= HEAP_TARGET_BYTES) {
-    console.error(`FAILED TARGET: upper result ${upper} against ${HEAP_TARGET_BYTES}.`);
-    console.error('§12: report a failed target and choose structure reduction or a smaller serialized cap from the observed data.');
+    console.error(`FAILED TARGET: upper result ${upper} across the valid frontiers, against ${HEAP_TARGET_BYTES}.`);
     findings++;
   }
   if (findings) process.exit(1);
+  console.log('RESULT: EMPIRICAL ISOLATED-DEV ACCEPTANCE PASS for heap attributable to retained');
+  console.log('capacity state, on this machine and this Node build, for BOTH §15 cap-valid');
+  console.log('frontiers. NOT a universal V8 or runtime bound. NOT a production enforcement');
+  console.log('guarantee. The breach arm is additional evidence and discharges nothing.');
 }
