@@ -504,14 +504,14 @@ export class ProviderCapacityTracker {
     // its bounded stand-in, because it is the one whose arrival caused the breach;
     // the pools already published keep the readings they were admitted with. The
     // substitution happens BEFORE publication, so this whole ingest is one revision.
-    const changed = this.reproject(
+    const moved = this.reproject(
       obs.poolKey,
       now,
       pinAnchor,
       this.monotonic(),
       breach ? undefined : () => commit(boundedStandIn(), 'COLLECTION_BYTES_EXCEEDED')
     );
-    return { accepted: true, changed, reason: 'ACCEPTED' };
+    return { accepted: true, changed: this.commitPublication(moved, now), reason: 'ACCEPTED' };
   }
 
   /**
@@ -519,9 +519,15 @@ export class ProviderCapacityTracker {
    * no new reading at all, and a consumer must see that happen.
    */
   evaluate(now: number = this.clock(), monoNow: number = this.monotonic()): boolean {
-    let changed = false;
-    for (const key of this.pools.keys()) changed = this.reproject(key, now, false, monoNow) || changed;
-    return changed;
+    // ONE SWEEP IS ONE PUBLICATION (L0-SEM 16). Every pool is re-projected to its
+    // FINAL state for this instant - so a pool crossing two boundaries in the same
+    // sweep collapses into one advance, and an intermediate difference the sweep
+    // overwrites was never a difference - and the collection moves once for the
+    // whole sweep, or not at all. Each pool's OWN revision still moves only if its
+    // own projection differs, so pools this sweep did not affect advance by zero.
+    let moved = false;
+    for (const key of this.pools.keys()) moved = this.reproject(key, now, false, monoNow) || moved;
+    return this.commitPublication(moved, now);
   }
 
   /**
@@ -535,7 +541,8 @@ export class ProviderCapacityTracker {
     const rec = this.pools.get(poolKey);
     if (!rec) return false;
     rec.successfulTurnAt = at;
-    return this.reproject(poolKey, this.clock());
+    const publishedAt = this.clock();
+    return this.commitPublication(this.reproject(poolKey, publishedAt), publishedAt);
   }
 
   snapshot(): CapacityCollectionSnapshot {
@@ -864,6 +871,22 @@ export class ProviderCapacityTracker {
     this.revisionFloor = Math.max(this.revisionFloor, next.revision);
     rec.projection = publish(next);
     rec.projectionBytes = byteLength(next);
+    // THE COLLECTION REVISION IS NOT THIS METHOD'S TO ADVANCE (L0-SEM 16). One pool
+    // moving is not one publication: a timer SWEEP re-projects every pool and is ONE
+    // atomic publication, so a per-pool increment here made five expiring pools move
+    // the collection 5 -> 10 where the correct answer is 5 -> 6. The caller owns the
+    // transaction boundary because only the caller knows where it is; this method
+    // owns the POOL's own revision, which is per-pool by definition.
+    return true;
+  }
+
+  /**
+   * Close one atomic publication. Advances the collection revision AT MOST ONCE, and
+   * not at all when nothing moved - a repeated no-change sweep is a no-op, not an
+   * increment carrying identical content.
+   */
+  private commitPublication(changed: boolean, now: number): boolean {
+    if (!changed) return false;
     this.collectionRevision += 1;
     this.updatedAt = now;
     return true;

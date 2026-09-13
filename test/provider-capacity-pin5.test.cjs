@@ -243,3 +243,109 @@ test('FIX7/3: a wide ageMs really is reachable through the public surface', () =
     `ageMs published as ${JSON.stringify(published)} (${JSON.stringify(published).length} chars)`
   );
 });
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 13.3.3 / L0-SEM 16 — one evaluate() sweep is ONE atomic publication
+// ═══════════════════════════════════════════════════════════════════════════
+
+/**
+ * Oscar section 16: one `evaluate(now)` invocation is one atomic sweep and one
+ * publication. Dwight measured five expiring pools moving the collection 5 -> 10;
+ * the correct answer is 5 -> 6.
+ *
+ * EACH TEST BELOW HAS AN ARM THAT THE OBVIOUS WRONG FIX WOULD BREAK. "Increment the
+ * collection once per sweep, unconditionally" produces the right headline number and
+ * is wrong three ways: it advances on a sweep where nothing moved, it says nothing
+ * about which POOLS advanced, and it would let an unaffected pool move too.
+ */
+const live = (i) => obs({
+  poolKey: `codex:live-${i}:limit-1`, accountScope: `live-${i}`,
+  source: 'codex-rollout', streamId: `codex-rollout:/${i}.jsonl`
+});
+const slow = (i) => obs({
+  poolKey: `codex:slow-${i}:limit-1`, accountScope: `slow-${i}`,
+  source: 'codex-account-read', streamId: `codex-account:/${i}.json`
+});
+
+test('FIX7/4: five expiring pools advance the collection ONCE, not five times', () => {
+  const { t, advance } = tracker();
+  for (let i = 0; i < 5; i += 1) t.ingest(live(i));
+  const before = t.snapshot().collectionRevision;
+  const poolBefore = t.snapshot().pools.map((p) => p.revision);
+
+  advance(L0_SEM_POLICY.liveTtlMs + 1_000);
+  const moved = t.evaluate();
+
+  assert.equal(moved, true, 'the sweep really did publish something');
+  assert.equal(t.snapshot().collectionRevision - before, 1, 'ONE sweep, ONE collection increment');
+  for (const p of t.snapshot().pools) assert.equal(p.freshness, 'STALE', 'all five really expired');
+  // And not the other wrong answer: each AFFECTED pool advances exactly once.
+  const poolAfter = t.snapshot().pools.map((p) => p.revision);
+  for (let i = 0; i < poolAfter.length; i += 1) {
+    assert.equal(poolAfter[i] - poolBefore[i], 1, `pool ${i} advanced exactly once`);
+  }
+});
+
+test('FIX7/4: pools the sweep did NOT affect advance by ZERO', () => {
+  // The arm that "increment everything once per sweep" fails. Five short-TTL pools
+  // expire; three long-TTL pools are untouched and must not move at all.
+  const { t, advance } = tracker();
+  for (let i = 0; i < 5; i += 1) t.ingest(live(i));
+  for (let i = 0; i < 3; i += 1) t.ingest(slow(i));
+  const before = new Map(t.snapshot().pools.map((p) => [p.poolKey, p.revision]));
+  const collectionBefore = t.snapshot().collectionRevision;
+
+  advance(L0_SEM_POLICY.liveTtlMs + 1_000);
+  t.evaluate();
+
+  const after = new Map(t.snapshot().pools.map((p) => [p.poolKey, p.revision]));
+  let advanced = 0;
+  for (const [key, rev] of after) {
+    const delta = rev - before.get(key);
+    if (key.includes('slow-')) {
+      assert.equal(delta, 0, `${key} was not affected and must not advance`);
+      assert.equal(t.pool(key).freshness, 'FRESH', `${key} is still inside its own TTL`);
+    } else {
+      assert.equal(delta, 1, `${key} expired and advances once`);
+      advanced += 1;
+    }
+  }
+  assert.equal(advanced, 5, 'exactly the five short-TTL pools moved');
+  assert.equal(t.snapshot().collectionRevision - collectionBefore, 1, 'still one publication');
+});
+
+test('FIX7/4: one pool crossing TWO boundaries in one sweep advances ONCE', () => {
+  // FINAL projection, not intermediate: freshness expiry and the reset boundary both
+  // pass in the same jump. An implementation that re-published per crossed boundary
+  // would advance twice.
+  const { t, advance } = tracker();
+  t.ingest(obs({
+    providerReachedType: 'rate_limit_reached',
+    windows: [{ ...win(), usedPercent: 100, remainingPercent: 0, resetsAt: T0 + 60_000 }]
+  }));
+  const key = 'codex:acct-a:limit-1';
+  const before = t.pool(key).revision;
+  const collectionBefore = t.snapshot().collectionRevision;
+
+  // Past the live TTL AND past the reset boundary, in one step.
+  advance(L0_SEM_POLICY.liveTtlMs + 120_000);
+  t.evaluate();
+
+  assert.equal(t.pool(key).revision - before, 1, 'two boundaries, one advance');
+  assert.equal(t.snapshot().collectionRevision - collectionBefore, 1, 'and one publication');
+});
+
+test('FIX7/4: a second identical sweep is a TOTAL no-op', () => {
+  // The arm that "increment once per sweep, unconditionally" fails outright.
+  const { t, advance } = tracker();
+  for (let i = 0; i < 3; i += 1) t.ingest(live(i));
+  advance(L0_SEM_POLICY.liveTtlMs + 1_000);
+  assert.equal(t.evaluate(), true, 'the first sweep moved something');
+
+  const collectionAfterFirst = t.snapshot().collectionRevision;
+  const poolsAfterFirst = t.snapshot().pools.map((p) => p.revision);
+
+  assert.equal(t.evaluate(), false, 'the second sweep reports no change');
+  assert.equal(t.snapshot().collectionRevision, collectionAfterFirst, 'no collection increment at all');
+  assert.deepEqual(t.snapshot().pools.map((p) => p.revision), poolsAfterFirst, 'no pool moved');
+});
