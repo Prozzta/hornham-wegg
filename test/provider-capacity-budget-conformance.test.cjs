@@ -309,49 +309,79 @@ test('§15 ONE accepted ingest is ONE publication, even the one the collection c
   // §11 line 210 is NOT in tension with this: five SERIAL ingests are five
   // transactions and legitimately five increments, an accepted L0 scope boundary. This
   // is about ONE ingest publishing twice, which is a different claim entirely.
-  const t = tracker();
-  for (let i = 0; i < RETENTION_CAPS.maxPools - 1; i++) {
-    t.ingest(sizedTo(`codex:acct-${i}:limit-1`, `acct-${i}`, RETENTION_CAPS.maxPoolBytes));
-  }
-  // The 31-pool frontier is VALID (§15): nothing is bounded here, so the breach below
-  // is caused by the arriving pool and not by a fixture that was already over.
-  const atFrontier = t.snapshot();
-  assert.equal(
-    atFrontier.pools.filter((p) => p.state === 'UNKNOWN').length,
-    0,
-    '§15 precondition: 31 per-pool-maximum pools are a VALID frontier, nothing bounded yet'
-  );
+  // TWO FIELDS, NOT ONE — Jim's diagnosis, and it changed how this is measured.
+  // collectionRevision AND the pool's OWN revision both advanced twice from the same
+  // reproject() branch called twice. A pin on the collection alone is half the property,
+  // and the missing half is the one a consumer diffing by POOL revision depends on.
+  //
+  // MEASURED AGAINST A CONTROL RATHER THAN AGAINST A CONSTANT. The arriving pool's
+  // revision is not a from-zero counter, so pinning a literal would be brittle and
+  // would say nothing. Instead the SAME 32nd arrival is made twice — once small enough
+  // to fit, once at the per-pool maximum so the cap bounds it — and the two are
+  // compared. THE ARMS DIFFER ONLY IN WHETHER THE CAP FIRED, so if a breach costs an
+  // extra publication the arms diverge, and if one ingest is one publication they match.
+  const arrival = (maximal) => {
+    const t = tracker();
+    for (let i = 0; i < RETENTION_CAPS.maxPools - 1; i++) {
+      t.ingest(sizedTo(`codex:acct-${i}:limit-1`, `acct-${i}`, RETENTION_CAPS.maxPoolBytes));
+    }
+    const before = t.snapshot().collectionRevision;
+    const KEY = 'codex:acct-last:limit-1';
+    const accepted = t.ingest(maximal
+      ? sizedTo(KEY, 'acct-last', RETENTION_CAPS.maxPoolBytes)
+      : obs({ poolKey: KEY, accountScope: 'acct-last', observedAt: T0, receivedAt: T0, windows: [win()] }));
+    assert.ok(accepted, `the 32nd arrival is ACCEPTED (maximal=${maximal}) — bounded, not rejected`);
+    const snap = t.snapshot();
+    return {
+      bounded: snap.pools.filter((p) => p.state === 'UNKNOWN').length,
+      colAdvance: snap.collectionRevision - before,
+      pool: poolOf(t, KEY)
+    };
+  };
+  const control = arrival(false);
+  const breach = arrival(true);
 
-  const before = atFrontier.collectionRevision;
-  const accepted = t.ingest(sizedTo('codex:acct-last:limit-1', 'acct-last', RETENTION_CAPS.maxPoolBytes));
-  assert.ok(accepted, 'the 32nd maximal reading is ACCEPTED — the cap bounds it, it is not rejected');
-  const snap = t.snapshot();
-
-  // FIRST, because the two revision clauses below pin NOTHING if the breach never
-  // happened. If a later change stops 32 maximal pools breaching, this test must fail
-  // here rather than pass on a fixture that no longer exercises the cap path.
+  // PRECONDITIONS FIRST, because every clause below is comparative and a comparison
+  // between two arms that no longer differ pins nothing. If a later change stops 32
+  // maximal pools breaching, or starts bounding the small arrival, this must fail HERE
+  // rather than pass on a fixture that stopped exercising the cap path.
+  assert.equal(control.bounded, 0, 'control precondition: the small 32nd arrival FITS and is not bounded');
+  assert.equal(breach.bounded, 1, 'the maximal 32nd arrival IS bounded — the candidate-then-stand-in path ran');
+  assert.ok(breach.pool, 'the arriving pool survives the breach as an entity');
+  assert.ok(control.pool, 'and so does the control arrival');
+  // And the control must itself be ONE publication, or two equally wrong arms would
+  // match and this whole comparison would pass by agreeing on the wrong number.
   assert.equal(
-    snap.pools.filter((p) => p.state === 'UNKNOWN').length,
+    control.colAdvance,
     1,
-    'the arriving pool IS bounded, so the candidate-then-stand-in path really was taken'
+    'control precondition: an ordinary accepted arrival is ONE publication, so the ' +
+      'comparison below is against a correct arm rather than against another defect'
   );
 
-  const advanced = snap.collectionRevision - before;
   // Clause one: it ADVANCES. An implementation that froze the revision on the cap path
   // would hide a real membership change from every consumer that diffs by revision.
   assert.ok(
-    advanced > 0,
-    `§15: an accepted ingest is a publication, so the collection revision must ADVANCE; it moved ${advanced}`
+    breach.colAdvance > 0,
+    `§15: an accepted ingest is a publication, so the collection revision must ADVANCE; it moved ${breach.colAdvance}`
   );
-  // Clause two: it does NOT MULTIPLY. Separate from clause one and separately named,
-  // because one equality would go red for both and tell you which for neither.
+  // Clause two: the COLLECTION revision does not multiply. Separate from clause one and
+  // separately named, because one equality would go red for both and say which for neither.
   assert.equal(
-    advanced,
-    1,
-    `§15: ONE accepted ingest is ONE publication, so the collection revision must advance ` +
-      `ONCE; it advanced ${advanced}. The internal candidate-then-bounded-stand-in ` +
-      'projection must not publish twice. This clause is the one that failed at b0646966 ' +
-      'with advanced=2, before L0-FIX6.'
+    breach.colAdvance,
+    control.colAdvance,
+    `§15: a bounded arrival is still ONE publication, so the collection revision must ` +
+      `advance exactly as much as an unbounded one: breach ${breach.colAdvance} against ` +
+      `control ${control.colAdvance}. The candidate-then-bounded-stand-in projection must ` +
+      'not publish twice. FAILED AT b0646966 WITH 2 AGAINST 1, before L0-FIX6.'
+  );
+  // Clause three: the POOL revision does not multiply either. The half a collection-only
+  // pin would have missed.
+  assert.equal(
+    breach.pool.revision,
+    control.pool.revision,
+    `§15: the arriving pool's OWN revision must also advance once — a bounded arrival ` +
+      `reached ${breach.pool.revision} where the same arrival unbounded reached ` +
+      `${control.pool.revision}. FAILED AT b0646966 WITH 33 AGAINST 32.`
   );
 });
 
