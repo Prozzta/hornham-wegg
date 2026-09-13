@@ -76,6 +76,7 @@ export class CapacityRuntime {
     this.admission = new CapacityAdmission({
       poolKeyForAgent: (agentId) => this.poolForAgent.get(agentId) ?? null,
       poolState: (poolKey) => this.tracker.pool(poolKey),
+      collectionAdmission: () => this.tracker.collectionAdmission(),
       now: this.now
     });
   }

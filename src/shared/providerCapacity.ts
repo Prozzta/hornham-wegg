@@ -204,6 +204,19 @@ export interface CollectionOverflowMarker {
   kind: 'POOL_COUNT_EXCEEDED';
   completeness: 'UNKNOWN';
   excess: 'ONE_OR_MORE';
+  /**
+   * An omitted pool was observed stating a hard limit (L0-SEM 14).
+   *
+   * IT RIDES ON THE MARKER BECAUSE THERE IS NOWHERE ELSE FOR IT TO GO: the pool that
+   * stated the refusal is one we are forbidden to remember, so there is no pool
+   * record to mark. The refusal therefore attaches to the only thing we kept, and
+   * applies to exactly the bindings that cannot be resolved — a turn not provably
+   * mapped to one of the retained pools. The retained pools keep their own states
+   * and are NOT relabelled by this.
+   */
+  hardLimitObserved?: boolean;
+  /** Admission verdict for unresolved bindings while this marker stands. */
+  admission?: 'LIMITED';
 }
 
 /**

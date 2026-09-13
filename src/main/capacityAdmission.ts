@@ -74,6 +74,7 @@ export const RECOVERY_RESERVATION_TTL_MS = 60_000;
 
 export const ADMISSION_REASON = {
   NO_POOL: 'NO_CAPACITY_POOL_FOR_AGENT',
+  OMITTED_POOL_LIMITED: 'UNRESOLVED_BINDING_UNDER_OBSERVED_LIMIT',
   NO_STATE: 'NO_CAPACITY_STATE_FOR_POOL',
   LIMITED: 'POOL_LIMITED',
   RESERVE_ORDINARY: 'POOL_RESERVE_ONLY_ORDINARY_WORK_SUPPRESSED',
@@ -110,6 +111,13 @@ export interface AdmissionDeps {
   poolKeyForAgent: (agentId: string) => string | null;
   /** Pool key → the tracker's published projection. */
   poolState: (poolKey: string) => PoolCapacitySnapshot | null;
+  /**
+   * The verdict for a binding this collection cannot resolve (L0-SEM 14). Returns
+   * 'LIMITED' when a pool omitted by the cardinality cap was seen stating a hard
+   * limit. Optional: a caller with no collection-level facts supplies nothing and
+   * an unresolved binding stays UNKNOWN, exactly as before.
+   */
+  collectionAdmission?: () => 'LIMITED' | null;
   /**
    * Wall-clock milliseconds, for the reservation TTL below and nothing else.
    *
@@ -174,7 +182,15 @@ export class CapacityAdmission {
   private decide(agentId: string, workClass: WorkClass): AdmissionDecision {
     const poolKey = this.deps.poolKeyForAgent(agentId);
     if (!poolKey) {
-      // No pool means no capacity FACT, not a free pass and not a refusal.
+      // An unresolvable binding while an OMITTED pool has been seen refusing. The
+      // pool that refused is one the cardinality cap forbids remembering, so the
+      // fact rides on the collection marker - and it applies here, to a turn that
+      // cannot be proved to belong to one of the retained pools, and nowhere else.
+      // The retained pools keep their own verdicts and are not relabelled by it.
+      if (this.deps.collectionAdmission?.() === 'LIMITED') {
+        return decision('REFUSE', ADMISSION_REASON.OMITTED_POOL_LIMITED, null, null, workClass, null);
+      }
+      // Otherwise: no pool means no capacity FACT, not a free pass and not a refusal.
       return decision('UNKNOWN_NOT_INFERRED_SAFE', ADMISSION_REASON.NO_POOL, null, null, workClass, null);
     }
     const pool = this.deps.poolState(poolKey);

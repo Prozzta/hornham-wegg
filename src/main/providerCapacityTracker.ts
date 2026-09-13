@@ -55,6 +55,7 @@ import type {
   PoolCapacitySnapshot
 } from '../shared/providerCapacity';
 import { applicabilityOf } from '../shared/providerCapacity';
+import { admissionEnvelopeOf, ENVELOPE_TYPED_REACHED, type AdmissionEnvelope } from './capacityEnvelope';
 
 /**
  * Operational constants from L0-SEM §6 and §9.2. These are conservative L0
@@ -325,11 +326,26 @@ export class ProviderCapacityTracker {
       // later excess arrival is a semantic no-op rather than a second anything:
       // telling a 34th NEW pool from a repeat of the 33rd would require keeping the
       // identities this cap exists to refuse.
-      if (!this.overflow) {
-        this.overflow = { kind: 'POOL_COUNT_EXCEEDED', completeness: 'UNKNOWN', excess: 'ONE_OR_MORE' };
+      // The envelope is validated even here, where no pool entity may be kept: the
+      // fact that SOMETHING omitted is refusing has to survive, or a turn we cannot
+      // map to a known pool proceeds against a provider that just said no.
+      const envelope = admissionEnvelopeOf(obs);
+      const limited = envelope !== null;
+      const known = this.overflow;
+      if (!known || (limited && !known.hardLimitObserved)) {
+        this.overflow = {
+          kind: 'POOL_COUNT_EXCEEDED',
+          completeness: 'UNKNOWN',
+          excess: 'ONE_OR_MORE',
+          ...(limited || known?.hardLimitObserved
+            ? { hardLimitObserved: true, admission: 'LIMITED' as const }
+            : {})
+        };
         this.collectionRevision += 1;
         this.updatedAt = now;
-        console.warn(`[capacity] pool cap ${RETENTION_CAPS.maxPools} exceeded; the collection is incomplete`);
+        if (!known) {
+          console.warn(`[capacity] pool cap ${RETENTION_CAPS.maxPools} exceeded; the collection is incomplete`);
+        }
       }
       return { accepted: false, changed: false, reason: 'CAP_POOLS' };
     }
@@ -338,7 +354,13 @@ export class ProviderCapacityTracker {
     // identical oversized readings must look identical to the duplicate rules, or
     // the "one deduplicated diagnostic" of 172 becomes one per observation.
     const breach = this.capBreachFor(obs, prev !== undefined);
-    const reading = breach ? ProviderCapacityTracker.sentinel(obs) : obs;
+    // Parsed from the raw reading, independently of the bulk path and before any of
+    // it is retained. Constant-size by construction, so honouring it cannot
+    // reintroduce the unbounded retention the breach just refused.
+    const envelope = breach
+      ? admissionEnvelopeOf(obs, prev?.observation.windows.map((w) => w.windowId) ?? [])
+      : null;
+    const reading = breach ? ProviderCapacityTracker.sentinel(obs, envelope) : obs;
 
     let conflicted = false;
     let pinAnchor = false;
@@ -414,6 +436,15 @@ export class ProviderCapacityTracker {
       pools: [...this.pools.values()].map((r) => r.projection),
       updatedAt: this.updatedAt
     };
+  }
+
+  /**
+   * The admission verdict that applies to a binding this collection cannot resolve —
+   * an agent whose pool was omitted by the cardinality cap. Null when the collection
+   * is complete, or incomplete without any omitted pool having stated a refusal.
+   */
+  collectionAdmission(): 'LIMITED' | null {
+    return this.overflow?.admission ?? null;
   }
 
   pool(poolKey: string): PoolCapacitySnapshot | null {
@@ -591,7 +622,7 @@ export class ProviderCapacityTracker {
    * observed, so the pool could classify on evidence the provider never sent.
    * Neither the 17th window nor any chosen 16 survives (L0-SEM 13).
    */
-  private static sentinel(obs: CapacityObservation): CapacityObservation {
+  private static sentinel(obs: CapacityObservation, envelope: AdmissionEnvelope | null): CapacityObservation {
     return {
       poolKey: obs.poolKey,
       provider: obs.provider,
@@ -603,9 +634,14 @@ export class ProviderCapacityTracker {
       observedAt: obs.observedAt,
       receivedAt: obs.receivedAt,
       windows: [],
-      providerAttributedLimitingWindowId: null,
-      providerReachedType: null,
-      ordinaryUsageAllowed: null,
+      // The one fact that survives a bulk rejection (L0-SEM 14), and only in its
+      // validated, constant-size form: a FIXED discriminator rather than the
+      // provider's own string, and a window id only if it was already an admitted
+      // identity. Without a valid envelope these stay null and section 13's UNKNOWN
+      // stands untouched.
+      providerAttributedLimitingWindowId: envelope?.windowId ?? null,
+      providerReachedType: envelope?.hardLimit === 'TYPED_REACHED' ? ENVELOPE_TYPED_REACHED : null,
+      ordinaryUsageAllowed: envelope?.hardLimit === 'ORDINARY_USE_DENIED' ? false : null,
       planType: null
     };
   }
