@@ -68,7 +68,7 @@ import { validateBaseUrl, buildAuthHeaders, resolveUpstreamUrl, secretRefFor, IN
 import { RosterStore } from './roster';
 import { buildWorkerLaunch } from './workerLaunch';
 import { ControlRegistry } from './control';
-import { WorkerWakeWatchdog, type WorkerWakeFacts } from './workerWake';
+import { WorkerWakeWatchdog, submitWorkerNudge, type WorkerWakeFacts } from './workerWake';
 import { inboxNudgeText } from '../shared/hiveNudge';
 import { fetchHireManifest, readHireManifestFiles } from './hire';
 import { parseHireDeepLink, type HireManifest } from '../shared/hire';
@@ -5118,29 +5118,31 @@ let workerWakeTimer: ReturnType<typeof setInterval> | null = null;
  *  confirmed the launch immediately after the call, spending the epoch's single
  *  attempt on a turn that might never have been typed. Called exactly once, with
  *  true only if BOTH writes succeeded. */
-function nudgeWorker(ptyId: string, ids: string[] = [], onSubmitted?: (ok: boolean) => void): void {
+function nudgeWorker(
+  ptyId: string,
+  ids: string[] = [],
+  onSubmitted?: (ok: boolean) => void,
+  /**
+   * L0-WAKE: re-asked immediately before anything is typed. The admission decision was
+   * taken earlier in the beat, and a limit arriving since then must stop this nudge.
+   */
+  maySubmit?: () => boolean
+): void {
   // Same text the renderer queues (#187's inboxNudgeText), so the two wake paths
   // produce byte-identical nudges: the queue's one-pending rule recognises either
   // via isInboxNudge, and a watchdog nudge names its ids so the agent can still
   // tell "I filed this last turn" from "woken for nothing".
-  const wrote = ptyManager.write(ptyId, inboxNudgeText(ids));
-  if (!wrote.ok) {
-    console.warn(`[worker-wake] write failed for ${ptyId}: ${wrote.error}`);
-    onSubmitted?.(false);
-    return;
-  }
-  setTimeout(() => {
-    try {
-      const submitted = ptyManager.write(ptyId, '\r');
-      if (!submitted.ok) console.warn(`[worker-wake] submit failed for ${ptyId}: ${submitted.error}`);
-      onSubmitted?.(submitted.ok === true);
-    } catch (e) {
-      console.error('[worker-wake] submit threw:', e);
-      // A throw is not a launch. Reporting it as one would spend the recovery grant
-      // on a turn that certainly did not start.
-      onSubmitted?.(false);
-    }
-  }, 140);
+  //
+  // The ORDER lives in workerWake.ts, where a test can reach it, for the same reason
+  // the renderer's lives in queueDelivery.ts: it is the invariant, not the plumbing.
+  submitWorkerNudge({
+    maySubmit,
+    writeText: () => ptyManager.write(ptyId, inboxNudgeText(ids)),
+    delaySubmit: (fn) => { setTimeout(fn, 140); },
+    writeSubmit: () => ptyManager.write(ptyId, '\r'),
+    onSubmitted,
+    warn: (message) => console.warn(`[worker-wake] ${ptyId}: ${message}`)
+  });
 }
 
 /** Main-process inbox-wake beat (issue #151, fix A): the renderer's idle nudge
@@ -5198,10 +5200,15 @@ function runWorkerWakeBeat(): void {
     // tick, so confirming here would spend the epoch's one recovery attempt before
     // anything had been typed - and a dead PTY would spend it on a turn that never
     // happened at all. A failed submission returns the reservation instead.
+    // L0-WAKE. The decision above was taken before the nudge text, the 140 ms pause and
+    // the Enter - a window in which the pool can go LIMITED or RESERVE_ONLY and this
+    // turn would have started anyway. THE SAME CHECK THE RENDERER DELIVERY USES, called
+    // directly because this path holds its decision in-process and needs no ticket.
     nudgeWorker(ptyId, ids, (ok) => {
       if (ok) providerCapacity.confirmLaunch(decision);
       else providerCapacity.cancelGrant(decision);
-    });
+    }, () => providerCapacity.maySubmitNow(
+      { decision, agentId, workClass: 'ORDINARY_TURN', target: ptyId }, ptyId));
   }
 }
 

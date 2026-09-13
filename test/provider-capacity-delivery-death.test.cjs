@@ -63,6 +63,9 @@ const { ADMISSION_REASON } = loadTs('src/main/capacityAdmission.ts');
 // ten other suites already load renderer modules this way, so this is the house
 // pattern rather than new infrastructure.
 const { typeAndSubmit } = loadTs('src/renderer/src/hooks/queueDelivery.ts');
+// The main-process wake path's submission sequence. Same invariant, other process;
+// workerWake.ts says in its own header that it imports no electron for this reason.
+const { submitWorkerNudge } = loadTs('src/main/workerWake.ts');
 
 const T0 = 1_800_000_000_000;
 const POOL = 'codex:acct-a:codex';
@@ -502,4 +505,92 @@ test('L0-TOCTOU: a RECOVERING ticket is NOT refused by its own reservation', () 
     'and the probe DOES refuse right now - that is exactly why a naive revalidation breaks');
   assert.equal(r.runtime.markAutomaticDeliveryWriting(grant.ticket), true,
     'the pool refuses everyone ELSE because of this ticket; that is not a refusal of it');
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// L0-WAKE — the OTHER automatic submit path, asking the same question
+// ═══════════════════════════════════════════════════════════════════════════
+
+/** Records the wake sequence, and runs the delayed submit synchronously. */
+function waker(over = {}) {
+  const log = [];
+  const submitted = [];
+  const steps = {
+    maySubmit: over.maySubmit ?? (() => { log.push('ask'); return true; }),
+    writeText: () => { log.push('text'); return over.text ?? { ok: true }; },
+    delaySubmit: (fn) => { log.push('delay'); fn(); },
+    writeSubmit: () => { log.push('submit'); if (over.throws) throw new Error('pty exploded'); return over.submit ?? { ok: true }; },
+    onSubmitted: (ok) => { submitted.push(ok); },
+    warn: () => {}
+  };
+  if (over.noGate) delete steps.maySubmit;
+  return { log, submitted, steps };
+}
+
+test('L0-WAKE: a refused wake types NOTHING - not the nudge text either', () => {
+  // THE ARM THE CURRENT PATH FAILS. index.ts writes the nudge text, waits 140 ms and
+  // then writes Enter with nothing re-checked in between, so a pool that goes LIMITED
+  // after admission still gets a turn. And gating only the Enter would leave the nudge
+  // STAGED in the worker\u2019s prompt, which is the refusal-that-did-not-refuse again.
+  const w = waker({ maySubmit: () => false });
+  submitWorkerNudge(w.steps);
+  assert.deepEqual(w.log, [], 'nothing typed: no text staged and no keystroke');
+  assert.deepEqual(w.submitted, [false],
+    'and it reports NOT submitted exactly once, so the caller returns the reservation');
+});
+
+test('L0-WAKE: a permitted wake types, in order - the gate is not a blanket refusal', () => {
+  // The pair. "Types nothing when refused" is satisfied perfectly by a wake path that
+  // never nudges anyone, which would silently disable the watchdog #151 exists to be.
+  const w = waker();
+  submitWorkerNudge(w.steps);
+  assert.deepEqual(w.log, ['ask', 'text', 'delay', 'submit'],
+    'asked FIRST, then the nudge, then the TUI delay, then Enter');
+  assert.deepEqual(w.submitted, [true], 'and the turn is reported as started');
+});
+
+test('L0-WAKE: a caller holding no decision is not gated', () => {
+  // Both-sides on the other axis: `maySubmit` is optional and its absence must not be
+  // read as a refusal, or every ungated caller would stop working.
+  const w = waker({ noGate: true });
+  submitWorkerNudge(w.steps);
+  assert.deepEqual(w.log, ['text', 'delay', 'submit']);
+});
+
+test('L0-WAKE: a failed text write never presses Enter, and reports NOT submitted', () => {
+  // Pre-existing behaviour, re-asserted because the extraction could have lost it.
+  const w = waker({ text: { ok: false, error: 'no pty: w1' } });
+  submitWorkerNudge(w.steps);
+  assert.deepEqual(w.log, ['ask', 'text'], 'it stopped at the failed stage');
+  assert.deepEqual(w.submitted, [false]);
+});
+
+test('L0-WAKE: a submit that THROWS is not a launch', () => {
+  // The grant is spent by a turn that started. A throw is the clearest case of one that
+  // did not, and reporting it as started would spend the epoch on nothing.
+  const w = waker({ throws: true });
+  submitWorkerNudge(w.steps);
+  assert.deepEqual(w.submitted, [false], 'reported exactly once, as NOT started');
+});
+
+test('L0-WAKE: the shared check answers for a claim that holds NO ticket', () => {
+  // The wake path has no ticket - it holds its decision in-process. The check is the
+  // SAME one the renderer delivery reaches through `markAutomaticDeliveryWriting`, so a
+  // second copy cannot drift from it, and a future single submit transaction inherits it.
+  const r = rig();
+  r.runtime.ingest('jim', obs());
+  const decision = r.runtime.admit('jim');
+  assert.equal(decision.verdict, 'ALLOW', 'precondition: admitted on a healthy pool');
+  const claim = { decision, agentId: 'jim', workClass: 'ORDINARY_TURN', target: 'pty-A' };
+  assert.equal(r.runtime.maySubmitNow(claim, 'pty-A'), true, 'still permitted while nothing has changed');
+
+  r.runtime.ingest('jim', obs({
+    observedAt: T0 + 1_000, receivedAt: T0 + 1_000,
+    providerReachedType: 'rate_limit_reached', windows: [win('five_hour', 0)]
+  }));
+  assert.equal(r.state(), 'LIMITED', 'the pool moved after the decision was taken');
+  assert.equal(r.runtime.maySubmitNow(claim, 'pty-A'), false,
+    'a decision taken before the limit authorises nothing after it');
+  assert.equal(r.runtime.maySubmitNow(claim, 'pty-B'), false,
+    'and it was never transferable to another terminal either');
 });

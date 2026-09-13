@@ -74,18 +74,29 @@ export interface CapacityRuntimeDeps {
 }
 
 /**
- * A reservation handed to an out-of-process deliverer. Everything here beyond the
- * decision exists so the ticket can be RE-CHECKED at the keystroke rather than merely
- * looked up - see `stillPermitted`.
+ * What an automatic submit presents when it asks to type: the decision it was
+ * admitted under, who it is for, and the terminal it was taken for.
+ *
+ * BOTH AUTOMATIC SUBMIT PATHS PRESENT ONE OF THESE. The renderer delivery holds a
+ * ticket and the main-process worker wake does not, but the question they ask at the
+ * keystroke is identical - so it is asked in one place. A second copy of this check
+ * would drift, and the two copies would disagree exactly when it mattered.
  */
-interface PendingDelivery {
+export interface DeliveryClaim {
   decision: AdmissionDecision;
-  timer: unknown;
-  writeBegan: boolean;
   agentId: string;
   workClass: WorkClass;
-  /** The PTY the grant was minted for. A grant is not transferable. */
+  /** The PTY the decision was taken for. A grant is not transferable. */
   target: string | null;
+}
+
+/**
+ * A claim that was also given a TICKET, because its deliverer is out of process and
+ * cannot be trusted to return the reservation - see `beginAutomaticDelivery`.
+ */
+interface PendingDelivery extends DeliveryClaim {
+  timer: unknown;
+  writeBegan: boolean;
 }
 
 export class CapacityRuntime {
@@ -290,13 +301,18 @@ export class CapacityRuntime {
   markAutomaticDeliveryWriting(ticket: string, target: string | null = null): boolean {
     const held = this.pending.get(ticket);
     if (!held) return false;
-    if (!this.stillPermitted(held, target)) return false;
+    if (!this.maySubmitNow(held, target)) return false;
     held.writeBegan = true;
     return true;
   }
 
   /**
-   * Would this delivery be admitted RIGHT NOW, as the holder of its own grant?
+   * Would this submission be admitted RIGHT NOW, as the holder of its own grant?
+   *
+   * PUBLIC, AND SHARED BY BOTH AUTOMATIC SUBMIT PATHS. The renderer delivery reaches
+   * it through a ticket; the main-process worker wake calls it directly with the
+   * decision it already holds. One check, so the two paths cannot drift apart - and so
+   * that a future single submit transaction INHERITS it rather than reimplementing it.
    *
    * L0-TOCTOU. The old check was "is the ticket still in `pending`", which answers a
    * question nobody asked. A ticket is minted before the terminal is waited for,
@@ -344,7 +360,7 @@ export class CapacityRuntime {
    * that edit. A guard whose unreachability depends on a constant is not dead code; it
    * is a guard whose test is owed the day the constant moves.
    */
-  private stillPermitted(held: PendingDelivery, target: string | null): boolean {
+  maySubmitNow(held: DeliveryClaim, target: string | null): boolean {
     if (held.target !== target) return false;
     if ((this.poolForAgent.get(held.agentId) ?? null) !== held.decision.poolKey) return false;
     const pool = held.decision.poolKey ? this.tracker.pool(held.decision.poolKey) : null;
