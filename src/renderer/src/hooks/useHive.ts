@@ -20,7 +20,7 @@ import { bridgeOf, providerPreset } from '../../../shared/agentProvider';
 import { isDurableRole, preferredAgentRole, roleForHiveSpawn } from '../../../shared/agentRole';
 import { inboxNudgeText } from '../../../shared/hiveNudge';
 import { acquireTerminal, resetTerminal, isTerminalAutomationSafe } from '@/components/terminalPool';
-import { canDeliverToAgent, deliverWithAcknowledgement, checkPrecondition } from './queueDelivery';
+import { canDeliverToAgent, deliverWithAcknowledgement, checkPrecondition, typeAndSubmit } from './queueDelivery';
 import { OFFICE_CAST, DEFAULT_CHARACTER } from '@/scene/office/cast';
 
 const GOD_ID = 'god';
@@ -144,35 +144,24 @@ function submitToPty(
     // commands) is sent raw — some TUIs (Antigravity's agy) treat the paste
     // markers as literal input and never submit, so skipping them is more robust.
     const payload = text.includes('\n') ? `\x1b[200~${text}\x1b[201~` : text;
+    // A15/L0-FIX9/L0-STAGED: ASK main first, AWAIT the answer, and type NOTHING unless
+    // it says yes. The gate used to sit after the payload write, so a refusal left the
+    // message staged in the input box for a retry to append to or a human to send.
+    //
     // writePty NEVER rejects for a dead pty — it resolves { ok:false, error:
-    // 'no pty: …' } — so an unchecked await here made every failed delivery look
-    // successful (the queue-drain then destroyed the message it had already
-    // popped, #36). Surface the failure as a rejection; the chain itself is
-    // immune (the prev.catch above absorbs it for the next writer).
-    const wrote = await window.cth.writePty(ptyId, payload);
-    if (!wrote?.ok) throw new Error(wrote?.error ?? `pty write failed: ${ptyId}`);
-    await new Promise((r) => setTimeout(r, 140));
-    // A15/L0-FIX9: ASK main, AWAIT the answer, and type only if it says yes.
+    // 'no pty: …' } — so an unchecked await made every failed delivery look successful
+    // (the queue-drain then destroyed the message it had already popped, #36). Every
+    // step below surfaces its failure as a rejection; the chain itself is immune (the
+    // prev.catch above absorbs it for the next writer).
     //
-    // This used to be a fire-and-forget announcement, which is not an ordering at all:
-    // the Enter could reach main first, and a window that then died looked exactly like
-    // one that never wrote - the case A15 exists to separate. Whether it did was a
-    // property of the transport rather than of this code (measured clean over 7,060
-    // trials, documented nowhere), and CODE SHOULD NOT NEED AN ANSWER IT IS NOT OWED.
-    // Awaiting makes main's record happen BEFORE the keystroke by causation.
-    //
-    // The ORDER of these two statements is the fix. Awaiting after the write is queued
-    // would read as a fix in review and change nothing at all.
-    //
-    // A refusal or a rejection means NO KEYSTROKE - never "assume it was marked", which
-    // would turn a transport failure into a swallowed recovery turn. Throwing here takes
-    // the same path a failed pty write already takes: the caller settles the ticket as
-    // NOT launched, so the turn goes back and the message stays queued for a retry.
-    if (maySubmit && !(await maySubmit())) {
-      throw new Error(`capacity refused the submit keystroke for ${ptyId}: the ticket is no longer held`);
-    }
-    const submitted = await window.cth.writePty(ptyId, '\r');
-    if (!submitted?.ok) throw new Error(submitted?.error ?? `pty write failed: ${ptyId}`);
+    // The ORDER is the invariant and it lives in typeAndSubmit, where it is testable:
+    // moving the gate below the payload write reads as a fix and restores the defect.
+    await typeAndSubmit(ptyId, {
+      maySubmit,
+      writePayload: () => window.cth.writePty(ptyId, payload),
+      pause: () => new Promise((r) => setTimeout(r, 140)),
+      writeSubmit: () => window.cth.writePty(ptyId, '\r')
+    });
     await new Promise((r) => setTimeout(r, settleMs));
   });
   writeChains.set(ptyId, next);

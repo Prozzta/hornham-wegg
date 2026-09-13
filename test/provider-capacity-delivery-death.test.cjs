@@ -34,6 +34,15 @@
  * infrastructure is held. That gap is named in the commit message rather than papered
  * over — a test file that quietly covers the easy half reads exactly like one that
  * covers both.
+ *
+ * L0-STAGED — AND THE HALF THAT WAS UNPROVABLE IS NOW HALF PROVABLE. Dwight found that
+ * a refusal withheld only the Enter: the message text had already been written into the
+ * input box, where a retry could append to it and a human could send it by pressing
+ * Enter. The repair is an ORDER — ask, then type — and an order is exactly the kind of
+ * thing a pure sequencing unit can pin. `typeAndSubmit` therefore owns the order and is
+ * driven here with fake effects, so "a refusal types NOTHING" is a real arm that fails
+ * against the version that leaves the text there. What still cannot be reached from a
+ * test is whether the renderer wires the real effects to it correctly.
  */
 const test = require('node:test');
 const assert = require('node:assert/strict');
@@ -42,6 +51,10 @@ const loadTs = require('./load-ts.cjs');
 const { ProviderCapacityTracker, L0_SEM_POLICY } = loadTs('src/main/providerCapacityTracker.ts');
 const { CapacityRuntime } = loadTs('src/main/capacityRuntime.ts');
 const { ADMISSION_REASON } = loadTs('src/main/capacityAdmission.ts');
+// The renderer's submission sequence. Pure, effects injected, no DOM and no store —
+// ten other suites already load renderer modules this way, so this is the house
+// pattern rather than new infrastructure.
+const { typeAndSubmit } = loadTs('src/renderer/src/hooks/queueDelivery.ts');
 
 const T0 = 1_800_000_000_000;
 const POOL = 'codex:acct-a:codex';
@@ -316,4 +329,81 @@ test('L0-FIX9: the ANSWER and the RECORD are the same act — a granted ticket i
   never.rendererDies();
   assert.equal(never.runtime.beginAutomaticDelivery('jim').ok, true,
     'and a ticket that never asked is still the abandoned-before-launch case');
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// L0-STAGED — a refusal must leave nothing sendable behind
+// ═══════════════════════════════════════════════════════════════════════════
+
+/** Records what was typed, in order, so the ORDER can be asserted and not just the set. */
+function typist(over = {}) {
+  const log = [];
+  const io = {
+    maySubmit: over.maySubmit ?? (async () => { log.push('ask'); return true; }),
+    writePayload: async () => { log.push('payload'); return over.payload ?? { ok: true }; },
+    pause: async () => { log.push('pause'); },
+    writeSubmit: async () => { log.push('submit'); return over.submit ?? { ok: true }; }
+  };
+  if (over.noGate) delete io.maySubmit;
+  return { log, io };
+}
+
+test('L0-STAGED: a REFUSED submission types nothing at all — not even the payload', async () => {
+  // THE DISCRIMINATOR. Against the shipped-then-fixed version that wrote the payload
+  // first and withheld only the Enter, this arm fails: `payload` is in the log, the
+  // message is staged in the box, and a human pressing Enter sends what capacity just
+  // refused. A refusal that leaves sendable text did not refuse.
+  const t = typist({ maySubmit: async () => { return false; } });
+  await assert.rejects(
+    () => typeAndSubmit('pty-1', t.io),
+    /capacity refused the submit keystroke/,
+    'a refusal is an error, not a silent no-op'
+  );
+  assert.deepEqual(t.log, [], 'NOTHING was written: no payload staged, so there is nothing to send');
+});
+
+test('L0-STAGED: a GRANTED submission types, in order — the gate is not a blanket refusal', async () => {
+  // The pair, and it is load-bearing: "types nothing when refused" is satisfied just as
+  // well by a function that never types anything, which would stop the floor entirely.
+  const t = typist();
+  await typeAndSubmit('pty-1', t.io);
+  assert.deepEqual(t.log, ['ask', 'payload', 'pause', 'submit'],
+    'asked FIRST, then staged, then the TUI pause, then the keystroke');
+});
+
+test('L0-STAGED: a gate that REJECTS types nothing either — a failure is not a yes', async () => {
+  // The named wrong fix, in its other form: treating a transport failure as permission.
+  // Nothing may be staged on an answer that never arrived.
+  const boom = new Error('ipc went away');
+  const t = typist({ maySubmit: async () => { throw boom; } });
+  await assert.rejects(() => typeAndSubmit('pty-1', t.io), /ipc went away/);
+  assert.deepEqual(t.log, [], 'a rejection stages nothing, exactly as a false does');
+});
+
+test('L0-STAGED: repeated refusals leave nothing for a retry to append to', async () => {
+  // Dwight\u2019s second route: a retry that appends to text the previous attempt staged,
+  // building one oversized line out of several messages. With nothing staged there is
+  // nothing to append to, and that is a property of the order rather than of a cleanup.
+  const t = typist({ maySubmit: async () => false });
+  for (let i = 0; i < 4; i += 1) {
+    await assert.rejects(() => typeAndSubmit('pty-1', t.io), /capacity refused/);
+  }
+  assert.deepEqual(t.log, [], 'four refused attempts, zero characters staged');
+});
+
+test('L0-STAGED: a submission with NO ticket still types — a manual send is not gated', async () => {
+  // Both-sides again, on the other axis. `manual` sends hold no reservation and must be
+  // unaffected; a fix that gated them would silently stop the human escape hatch.
+  const t = typist({ noGate: true });
+  await typeAndSubmit('pty-1', t.io);
+  assert.deepEqual(t.log, ['payload', 'pause', 'submit'], 'no gate asked, and it typed');
+});
+
+test('L0-STAGED: a failed payload write does not press Enter on text that is not there', async () => {
+  // Pre-existing behaviour, re-asserted because the refactor could have lost it: the
+  // submit keystroke must never follow a stage that did not land, or the Enter answers
+  // whatever prompt the terminal happens to be showing.
+  const t = typist({ payload: { ok: false, error: 'no pty: pty-1' } });
+  await assert.rejects(() => typeAndSubmit('pty-1', t.io), /no pty: pty-1/);
+  assert.deepEqual(t.log, ['ask', 'payload'], 'it stopped at the failed stage');
 });

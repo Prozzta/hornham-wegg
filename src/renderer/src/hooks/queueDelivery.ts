@@ -90,3 +90,64 @@ export async function checkPrecondition(
     return 'send';
   }
 }
+
+/** One terminal write, as `window.cth.writePty` answers it. */
+export interface PtyWriteResult { ok: boolean; error?: string }
+
+/** The four effects a submission is made of, injected so the ORDER can be tested. */
+export interface SubmitSteps {
+  /**
+   * Asked FIRST, and awaited. `false` - or a rejection - means nothing is typed at
+   * all. Absent for a submission that holds no reservation, e.g. a manual send.
+   */
+  maySubmit?: () => Promise<boolean>;
+  /** Stage the message text in the terminal input box. */
+  writePayload: () => Promise<PtyWriteResult>;
+  /** The gap the TUI needs between a paste and its Enter. */
+  pause: () => Promise<void>;
+  /** The submit keystroke. */
+  writeSubmit: () => Promise<PtyWriteResult>;
+}
+
+/**
+ * Type one message into a terminal and submit it — in the one order that leaves
+ * NOTHING BEHIND when the submission is refused.
+ *
+ * L0-STAGED. The gate used to be asked after the payload had already been written and
+ * the TUI pause had already elapsed, so a refusal withheld only the Enter: THE MESSAGE
+ * TEXT WAS LEFT SITTING IN THE INPUT BOX, where a retry could append to it and where a
+ * human could submit it by pressing Enter without ever knowing capacity had refused.
+ * A REFUSAL THAT LEAVES TEXT A HUMAN CAN SEND IS A REFUSAL THAT DID NOT REFUSE — the
+ * same failure as a turn spent that nothing authorised, arriving by a different route.
+ *
+ * WHY THE ORDER RATHER THAN A CLEANUP. Clearing the box on refusal is the smaller
+ * change and it cannot be made safe: the only cleanup that reaches every character
+ * this delivery staged is one that also wipes whatever a HUMAN had typed into the same
+ * prompt, which turns a capacity refusal into data loss for someone who was not
+ * involved. A bounded cleanup — count the characters back — has to model wrapping,
+ * bracketed paste and TUI redraw to be correct, and it still leaves a window in which
+ * the text is sendable. THE ONLY CLEANUP THAT CANNOT DAMAGE A HUMAN'S TYPING IS THE
+ * ONE THAT NEVER HAS TO HAPPEN. So the residue is not removed; it is never created.
+ *
+ * WHAT THE ORDER COSTS, STATED RATHER THAN GLOSSED. Asking first widens the window
+ * between "main has recorded the write" and "the keystroke goes out" by the payload
+ * write plus the pause. A death in THAT window means main believes a write that never
+ * happened: one missed turn, visible and retryable. The window it removes fails the
+ * other way — text a human can send that nothing authorised, which nobody sees. A
+ * window that fails safe was traded for a window that does not.
+ *
+ * Rejections are not swallowed here. Every failure throws, and the caller settles the
+ * delivery as NOT launched, so the reservation goes back and the message stays queued.
+ */
+export async function typeAndSubmit(ptyId: string, steps: SubmitSteps): Promise<void> {
+  // THE FIRST STATEMENT IS THE FIX. Moving it below the payload write restores the
+  // defect exactly, and would still pass any test that only checks the Enter.
+  if (steps.maySubmit && !(await steps.maySubmit())) {
+    throw new Error(`capacity refused the submit keystroke for ${ptyId}: the ticket is no longer held`);
+  }
+  const wrote = await steps.writePayload();
+  if (!wrote?.ok) throw new Error(wrote?.error ?? `pty write failed: ${ptyId}`);
+  await steps.pause();
+  const submitted = await steps.writeSubmit();
+  if (!submitted?.ok) throw new Error(submitted?.error ?? `pty write failed: ${ptyId}`);
+}
