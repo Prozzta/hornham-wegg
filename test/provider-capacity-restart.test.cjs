@@ -339,8 +339,9 @@ test('STORE: what is written is OBSERVATIONS, with no derived verdict anywhere',
   for (const key of ['state', 'stateReason', 'freshness', 'ageMs', 'revision', 'recoveryPending']) {
     assert.equal(text.includes(`"${key}"`), false, `no derived field ${key} is persisted`);
   }
-  assert.ok(parsed.pools[0].epoch, 'the epoch crosses as continuity identity');
-  assert.equal(parsed.pools[0].epoch.since, p.t.pool(KEY).limitEpochAt, 'and it is the real one');
+  assert.equal(typeof parsed.pools[0].continuitySince, 'number',
+    'the epoch identity crosses as a bounded number');
+  assert.equal(parsed.pools[0].continuitySince, p.t.pool(KEY).limitEpochAt, 'and it is the real one');
 });
 
 test('STORE: no credential material, and the account scope is an identifier not a secret', () => {
@@ -390,21 +391,119 @@ test('STORE: a round trip through the real file restores the pool', () => {
   assert.equal(b.t.pool(KEY).state, 'UNKNOWN');
 });
 
-test('STORE: unconfirmed evidence is not re-persisted, so a fact cannot age forever', () => {
-  // Without this, one observation seen once could survive an unbounded chain of
-  // restarts, each time re-saved under its own restored provenance, and the pool
-  // would claim an identity derived from evidence nobody has confirmed in weeks.
+test('LIFECYCLE: restore, clean quit with NO telemetry, restore again — the pool survives', () => {
+  // THE DEFECT THIS ARM EXISTS FOR, AND IT WAS MINE. An earlier version had
+  // `persistable()` skip restored-unconfirmed pools, to stop one observation
+  // surviving an unbounded chain of restarts unconfirmed. But the store is written
+  // by WHOLE-FILE REPLACEMENT, so a clean quit with no live telemetry in between
+  // rewrote it as `pools: []` and the THIRD start had no pool at all — the exact
+  // known-pool-becomes-absent defect this whole feature exists to fix.
+  //
+  // The guard was also unnecessary: restored evidence is permanently stale and
+  // permanently unconfirmed, so it can never become current truth however many
+  // restarts it survives. The hazard was already discharged by a mechanism in the
+  // same file. AN UNREQUESTED GUARD NEEDS THE SAME QUESTION AS A REQUESTED ONE —
+  // what is ALREADY discharging this?
+  //
+  // The previous arm stopped at `persistable() === []` and never asked what that
+  // filter did to the FILE, so it asserted the filter and missed the defect. This
+  // one goes through the destructive shutdown to a second restart.
+  const file = tmp();
   const a = proc();
   a.t.ingest(obs());
-  const b = acrossRestart(a, T0 + 60_000);
-  assert.equal(b.t.pool(KEY).state, 'UNKNOWN', 'precondition: restored and unconfirmed');
-  assert.deepEqual(b.t.persistable(), [], 'it does not go back into the store');
+  new CapacityStore(file, a.t, 5_000, () => a.at()).saveNow();
 
-  b.advance(1_000);
-  b.t.ingest(obs({ observedAt: b.at(), receivedAt: b.at(), sourceSequence: 5 }));
-  assert.equal(b.t.persistable().length, 1, 'but live evidence is persistable again');
+  // Second process: restore, observe nothing at all, quit cleanly.
+  const b = proc(T0 + 60_000);
+  const storeB = new CapacityStore(file, b.t, 5_000, () => b.at());
+  assert.equal(storeB.restore(), 1, 'the pool came back');
+  assert.equal(b.t.pool(KEY).state, 'UNKNOWN', 'as restored/unconfirmed');
+  storeB.saveNow();                                   // what will-quit does
+  assert.equal(JSON.parse(readFileSync(file, 'utf8')).pools.length, 1,
+    'A CLEAN QUIT WITH NO TELEMETRY MUST NOT EMPTY THE STORE');
+
+  // Third process: the pool is still there.
+  const c = proc(T0 + 120_000);
+  assert.equal(new CapacityStore(file, c.t, 5_000, () => c.at()).restore(), 1);
+  const p = c.t.pool(KEY);
+  assert.notEqual(p, null, 'a known pool is still disclosed after a second restart');
+  assert.equal(p.state, 'UNKNOWN', 'and is still honestly unconfirmed, not promoted by surviving');
+  assert.equal(p.stateReason, REASON.RESTORED);
 });
 
+test('WIRE: only a bounded continuity NUMBER crosses — no classifying epoch field does', () => {
+  // "THE EPOCH CROSSES AS IDENTITY AND IS FORBIDDEN FROM CLASSIFYING" WAS A
+  // STATEMENT ABOUT THE GATE, NOT ABOUT THE PAYLOAD, AND THE GATE IS TEMPORARY.
+  // The first version persisted the whole derived epoch. `restoredUnconfirmed`
+  // suppressed classification only until the first live reading cleared it, and
+  // `nextEpoch` then consumed the restored anchors, remainders, hint, reached type
+  // and permission flag as though this process had observed them.
+  //
+  // So the constraint is asserted ON THE WIRE, as an absence, rather than described
+  // in a comment. A principle is not a payload.
+  const p = proc();
+  p.t.ingest(obs({ providerReachedType: 'rate_limit_reached' }));
+  assert.equal(p.t.pool(KEY).state, 'LIMITED', 'precondition: a real epoch is open');
+
+  const { text } = serializeCapacityStore(p.t, p.at());
+  const entry = JSON.parse(text).pools[0];
+  assert.equal(typeof entry.continuitySince, 'number', 'continuity crosses as a number');
+  assert.equal(entry.continuitySince, p.t.pool(KEY).limitEpochAt, 'and it is the real identity');
+  assert.equal('epoch' in entry, false, 'no epoch object crosses at all');
+  for (const field of ['anchors', 'remaindersAtRefusal', 'hinted', 'evidenceAt',
+    'attributedWindowId', 'permissionDenied', 'reachedType']) {
+    assert.equal(text.includes(`"${field}"`), false, `no classifying field ${field} is on the wire`);
+  }
+});
+
+test('WIRE: a restored identity cannot classify even after the restored gate lifts', () => {
+  // The end-to-end version of the arm above, and the defect Dwight reproduced: a
+  // structurally-accepted epoch publishing RECOVERING off a later INCOMPLETE live
+  // reading that carried no limiting fact at all.
+  const r = proc();
+  // A continuity identity arriving with no epoch behind it — a hand-edited store,
+  // or simply one written by a process whose evidence this one never saw.
+  assert.equal(r.t.restore(obs(), T0 - 999_999).accepted, true);
+  assert.equal(r.t.pool(KEY).limitEpochAt, T0 - 999_999, 'continuity is published');
+
+  r.advance(1_000);
+  r.t.ingest(obs({
+    observedAt: r.at(), receivedAt: r.at(), sourceSequence: 9,
+    windows: [win({ usedPercent: null, remainingPercent: null })]
+  }));
+  const p = r.t.pool(KEY);
+  assert.notEqual(p.state, 'RECOVERING', 'an incomplete reading cannot start a recovery off restored data');
+  assert.notEqual(p.state, 'LIMITED', 'nor re-assert a refusal nothing live has stated');
+  assert.equal(p.stateReason, REASON.NO_NUMBERS, 'it classifies from the LIVE reading alone');
+  assert.equal(p.recoveryPending, false, 'and no restored hint was consumed');
+  assert.equal(p.limitEpochAt, T0 - 999_999, 'while continuity identity survives, unconfirmed');
+});
+
+test('WIRE: live hard evidence adopts the carried identity rather than minting a new one', () => {
+  // The other half: continuity must actually be USED when live evidence re-opens
+  // the refusal, or persisting it bought nothing.
+  const r = proc();
+  r.t.restore(obs(), T0 - 999_999);
+  r.advance(1_000);
+  r.t.ingest(obs({
+    observedAt: r.at(), receivedAt: r.at(), sourceSequence: 9,
+    providerReachedType: 'rate_limit_reached'
+  }));
+  const p = r.t.pool(KEY);
+  assert.equal(p.state, 'LIMITED', 'the live refusal classifies');
+  assert.equal(p.limitEpochAt, T0 - 999_999, 'under the ORIGINAL identity, not a new one');
+});
+
+test('WIRE: affirmative live permission ends the carried identity', () => {
+  // And it must be endable, or a restored number becomes permanent.
+  const r = proc();
+  r.t.restore(obs(), T0 - 999_999);
+  r.advance(1_000);
+  r.t.ingest(obs({
+    observedAt: r.at(), receivedAt: r.at(), sourceSequence: 9, ordinaryUsageAllowed: true
+  }));
+  assert.equal(r.t.pool(KEY).limitEpochAt, null, 'explicit permission closes it');
+});
 test('STORE: the file is bounded by the collection cap, omitting rather than trimming', () => {
   const p = proc();
   for (let i = 0; i < 20; i += 1) {

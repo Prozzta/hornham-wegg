@@ -202,16 +202,15 @@ export const TIMER_GROWTH_RESERVE_COLLECTION = MAX_JSON_NUMBER_CHARS * 2;
 
 /** A sticky limit epoch (§5). Begins at accepted hard evidence; staleness never clears it. */
 /**
- * A sticky limit epoch, exported ONLY so it can be carried across a restart.
+ * A sticky limit epoch (L0-SEM 5).
  *
- * L0-TAIL ruling 4 requires the last known epoch/continuity identity to survive a
- * restart, and continuity is `since`: re-deriving the epoch from the same refusal
- * after a restart would stamp a NEW `since` and publish a different epoch for the
- * same unbroken refusal, which is precisely the continuity the ruling preserves.
- * So this one derived structure is persisted - as IDENTITY, never as verdict.
- * `deriveState` refuses to classify from it while the pool is restored-unconfirmed.
+ * IT DOES NOT CROSS A RESTART, AND AN EARLIER VERSION OF THIS FILE SAID IT DID.
+ * Ruling 4 requires the last known epoch IDENTITY to survive, and that identity is
+ * `since` - a number. Persisting the whole struct handed unverified `anchors`,
+ * `remaindersAtRefusal`, `hinted`, `reachedType` and `permissionDenied` to
+ * `nextEpoch` as soon as the restored gate lifted. See `PoolRecord.continuitySince`.
  */
-export interface CapacityLimitEpoch {
+interface CapacityLimitEpoch {
   since: number;
   /** The observation time of the evidence. A confirmation must be STRICTLY newer. */
   evidenceAt: number;
@@ -262,6 +261,25 @@ interface PoolRecord {
    * same historical line.
    */
   restoredUnconfirmed: boolean;
+  /**
+   * The `since` of a limit epoch that was open when a previous process exited.
+   *
+   * A NUMBER, AND DELIBERATELY ONLY A NUMBER. The first version of this crossed the
+   * whole derived epoch and said it was carried "as identity, forbidden from
+   * classifying" - but that was a property of the GATE, not of the payload, and the
+   * gate is temporary: the first accepted live reading clears `restoredUnconfirmed`
+   * and `nextEpoch` then consumes the restored `anchors`, `remaindersAtRefusal`,
+   * `hinted`, `reachedType` and `permissionDenied` as though this process had
+   * observed them. A structurally-accepted epoch could publish RECOVERING off a
+   * later incomplete reading that carried no limiting fact at all.
+   *
+   * So nothing classifying crosses. `rec.epoch` is null after a restore, and this
+   * number does exactly two things: it keeps `limitEpochAt` continuous for a
+   * consumer, and it becomes the `since` of the next REAL epoch built from live
+   * hard evidence - so a refusal that never ended keeps its identity without any
+   * unverified fact being able to decide a state. A principle is not a payload.
+   */
+  continuitySince: number | null;
 }
 
 /** What one ingestion did. See `ingestDetailed`. */
@@ -300,6 +318,24 @@ function compareOrderingKey(a: CapacityObservation, b: CapacityObservation): num
 /** Hard evidence = typed quota signal or explicit denial. NOT a 429, overload or context error. */
 const hasHardEvidence = (obs: CapacityObservation): boolean =>
   obs.ordinaryUsageAllowed === false || obs.providerReachedType !== null;
+
+/**
+ * Does this reading AFFIRMATIVELY say a limitation is over?
+ *
+ * The same two K forms `nextEpoch` uses to close an epoch it is holding - explicit
+ * provider permission, and a fresh authoritative snapshot with every known window
+ * above zero. Factored out because a restored pool has no epoch object for
+ * `nextEpoch` to close, so the question has to be asked directly of the reading.
+ *
+ * Deliberately NOT "anything that is not a refusal". An incomplete or stale reading
+ * says nothing about whether a limitation ended, and treating silence as clearance
+ * is how a carried identity would quietly disappear on the first empty payload.
+ */
+const clearsLimitation = (obs: CapacityObservation, fresh: boolean): boolean => {
+  if (hasHardEvidence(obs)) return false;
+  if (obs.ordinaryUsageAllowed === true) return true;
+  return fresh && obs.windows.length > 0 && allWindowsPositive(obs);
+};
 
 /** Reset times and limit identity — a change is a re-anchor, which is a recovery HINT (§5). */
 const anchorsOf = (obs: CapacityObservation): string =>
@@ -415,11 +451,11 @@ export class ProviderCapacityTracker {
    * skew, the pool cap, the retention caps, ordering and the collection budget all
    * apply exactly as they do to a live reading (L0-TAIL ruling 6).
    */
-  restore(observation: CapacityObservation, epoch: CapacityLimitEpoch | null = null): IngestResult {
-    return this.ingestDetailed(observation, { epoch });
+  restore(observation: CapacityObservation, continuitySince: number | null = null): IngestResult {
+    return this.ingestDetailed(observation, { continuitySince });
   }
 
-  ingestDetailed(obs: CapacityObservation, restore?: { epoch: CapacityLimitEpoch | null }): IngestResult {
+  ingestDetailed(obs: CapacityObservation, restore?: { continuitySince: number | null }): IngestResult {
     const now = this.clock();
     // IDENTITY IS RETAINED STATE AND MUST BE BOUNDED BEFORE ANYTHING IS RETAINED.
     //
@@ -539,18 +575,34 @@ export class ProviderCapacityTracker {
       staleAt: 0,
       ageAtAccept: 0,
       acceptedMono: 0,
-      restoredUnconfirmed: false
+      restoredUnconfirmed: false,
+      continuitySince: null
     };
     const commit = (stored: CapacityObservation, kind: CapBreachKind | null): void => {
       rec.observation = stored;
       rec.capBreach = kind;
       this.stampDeadline(rec, stored, now, restore !== undefined);
       rec.conflicted = conflicted;
-      // A RESTORE CARRIES ITS EPOCH; IT DOES NOT RE-DERIVE ONE. Re-deriving would
-      // mint a fresh `since` for a refusal that never ended, breaking exactly the
-      // continuity ruling 4 preserves. A LIVE reading takes the normal path, which
-      // is what lets fresh telemetry either confirm this epoch or open a new one.
-      rec.epoch = restore ? restore.epoch : this.nextEpoch(rec, stored, now);
+      // A RESTORE CARRIES NO EPOCH AT ALL - only the `since` that identifies one.
+      // Re-deriving an epoch here would mint a fresh `since` for a refusal that
+      // never ended, and carrying the whole struct would hand unverified classifying
+      // fields to `nextEpoch` the moment the restored gate lifts. A number does
+      // neither. A LIVE reading takes the normal path, which is what lets fresh
+      // telemetry either re-establish this epoch under its old identity or clear it.
+      if (restore) {
+        rec.epoch = null;
+        rec.continuitySince = restore.continuitySince;
+      } else {
+        rec.epoch = this.nextEpoch(rec, stored, now);
+        // Live evidence settles the carried identity one way or the other: a real
+        // epoch ABSORBS it as its own `since`, and an affirmative clearance ends it.
+        // An incomplete reading does neither, so the identity survives unconfirmed -
+        // the same asymmetry the rest of this file uses, because "says nothing" is
+        // not "says it is over".
+        if (rec.epoch || clearsLimitation(stored, this.isFresh(stored, now))) {
+          rec.continuitySince = null;
+        }
+      }
       // Set on every commit rather than only on restore: the first accepted LIVE
       // reading is what clears it, and routing both through one assignment means a
       // future caller cannot forget the clearing half.
@@ -695,21 +747,28 @@ export class ProviderCapacityTracker {
    * current rules decide afresh. Nothing here is fabricated or adjusted: the
    * timestamps are the provider's own.
    *
-   * A POOL WHOSE EVIDENCE IS ITSELF RESTORED IS NOT RE-EXPORTED. Persisting
-   * unconfirmed evidence again would let one live observation, seen once and long
-   * ago, survive an unbounded chain of restarts while never being confirmed - a
-   * fact ageing indefinitely under its own provenance. If nothing live has been
-   * seen since the last restore, the store keeps what it already had.
+   * EVERY RETAINED POOL IS EXPORTED, INCLUDING ONE WHOSE EVIDENCE IS ITSELF
+   * RESTORED. An earlier version skipped those, meaning to stop a single
+   * observation surviving an unbounded chain of restarts while never being
+   * confirmed. THAT GUARD RECREATED THE DEFECT THIS WHOLE FEATURE EXISTS TO FIX:
+   * the store is written by whole-file replacement, so a clean quit with no live
+   * telemetry in between rewrote it as an empty list and the NEXT restart had no
+   * pool at all - known pool becomes absent, exactly as before.
+   *
+   * And the hazard it guarded against was already discharged by a mechanism in this
+   * same file: restored evidence is permanently stale and permanently unconfirmed,
+   * so it can never become current truth however many restarts it survives. The
+   * guard bought nothing and cost the card's purpose. The question an unrequested
+   * guard has to answer first is what is ALREADY discharging this.
    */
-  persistable(): { observation: CapacityObservation; epoch: CapacityLimitEpoch | null }[] {
-    const out: { observation: CapacityObservation; epoch: CapacityLimitEpoch | null }[] = [];
+  persistable(): { observation: CapacityObservation; continuitySince: number | null }[] {
+    const out: { observation: CapacityObservation; continuitySince: number | null }[] = [];
     for (const rec of this.pools.values()) {
-      if (rec.restoredUnconfirmed) continue;
-      // A pool whose retained reading is the bounded stand-in is skipped: its
-      // payload was already refused once for size, and re-admitting the stand-in
-      // after a restart would republish a diagnostic as though it were evidence.
-      if (rec.capBreach) continue;
-      out.push({ observation: rec.observation, epoch: rec.epoch });
+      out.push({
+        observation: rec.observation,
+        // The live epoch's identity, or the one already being carried.
+        continuitySince: rec.epoch?.since ?? rec.continuitySince ?? null
+      });
     }
     return out;
   }
@@ -747,7 +806,7 @@ export class ProviderCapacityTracker {
       // Contradictory same-payload permission cannot confirm recovery (§4): the
       // risk-dominant fact wins and the epoch is (re)opened at this evidence.
       return {
-        since: rec.epoch?.since ?? now,
+        since: rec.epoch?.since ?? rec.continuitySince ?? now,
         evidenceAt: obs.observedAt,
         attributedWindowId: obs.providerAttributedLimitingWindowId,
         reachedType: obs.providerReachedType,
@@ -1056,7 +1115,7 @@ export class ProviderCapacityTracker {
       planType: obs.planType,
       recoveryPending: epoch?.hinted === true,
       capBreach: rec.capBreach,
-      limitEpochAt: epoch?.since ?? null
+      limitEpochAt: epoch?.since ?? rec.continuitySince ?? null
     };
   }
 
