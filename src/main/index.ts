@@ -5068,19 +5068,37 @@ let workerWakeTimer: ReturnType<typeof setInterval> | null = null;
 
 /** Type the renderer's guarded nudge into one worker's PTY — text first, Enter a
  *  tick later (the exact submitToPty pattern: a single-chunk write would land the
- *  "\r" inside the input box and never submit). Best-effort + never throws. */
-function nudgeWorker(ptyId: string, ids: string[] = []): void {
+ *  "\r" inside the input box and never submit). Best-effort + never throws.
+ *
+ *  `onSubmitted` reports whether the turn ACTUALLY STARTED, which the caller cannot
+ *  otherwise know: the Enter write happens on a later tick, so this function has
+ *  already returned by the time either outcome exists. It used to return void, and
+ *  the one caller that needed the answer - the admission seam's recovery grant -
+ *  confirmed the launch immediately after the call, spending the epoch's single
+ *  attempt on a turn that might never have been typed. Called exactly once, with
+ *  true only if BOTH writes succeeded. */
+function nudgeWorker(ptyId: string, ids: string[] = [], onSubmitted?: (ok: boolean) => void): void {
   // Same text the renderer queues (#187's inboxNudgeText), so the two wake paths
   // produce byte-identical nudges: the queue's one-pending rule recognises either
   // via isInboxNudge, and a watchdog nudge names its ids so the agent can still
   // tell "I filed this last turn" from "woken for nothing".
   const wrote = ptyManager.write(ptyId, inboxNudgeText(ids));
-  if (!wrote.ok) { console.warn(`[worker-wake] write failed for ${ptyId}: ${wrote.error}`); return; }
+  if (!wrote.ok) {
+    console.warn(`[worker-wake] write failed for ${ptyId}: ${wrote.error}`);
+    onSubmitted?.(false);
+    return;
+  }
   setTimeout(() => {
     try {
       const submitted = ptyManager.write(ptyId, '\r');
       if (!submitted.ok) console.warn(`[worker-wake] submit failed for ${ptyId}: ${submitted.error}`);
-    } catch (e) { console.error('[worker-wake] submit threw:', e); }
+      onSubmitted?.(submitted.ok === true);
+    } catch (e) {
+      console.error('[worker-wake] submit threw:', e);
+      // A throw is not a launch. Reporting it as one would spend the recovery grant
+      // on a turn that certainly did not start.
+      onSubmitted?.(false);
+    }
   }, 140);
 }
 
@@ -5135,11 +5153,14 @@ function runWorkerWakeBeat(): void {
       continue;
     }
     console.log(`[worker-wake] nudging ${agentId} on ${ptyId} (${ids.length} pending)`);
-    nudgeWorker(ptyId, ids);
-    // The turn really started, so a reserved recovery grant is now spent. Confirming
-    // AFTER the nudge is the point of the two-step: a decision that never became a
-    // turn must not consume the one attempt the epoch is allowed.
-    providerCapacity.confirmLaunch(decision);
+    // Confirm on the SUBMISSION, not on the call. The Enter write lands on a later
+    // tick, so confirming here would spend the epoch's one recovery attempt before
+    // anything had been typed - and a dead PTY would spend it on a turn that never
+    // happened at all. A failed submission returns the reservation instead.
+    nudgeWorker(ptyId, ids, (ok) => {
+      if (ok) providerCapacity.confirmLaunch(decision);
+      else providerCapacity.cancelGrant(decision);
+    });
   }
 }
 

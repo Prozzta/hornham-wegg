@@ -82,13 +82,25 @@ export class CapacityRuntime {
 
   /**
    * A reading arrived from a collector, attributed to the agent whose session
-   * produced it. The agent→pool mapping is recorded BEFORE the ordering rules run,
-   * because an out-of-order or duplicate reading still proves which pool that agent
-   * draws on — which is the only thing the mapping claims.
+   * produced it.
+   *
+   * THE MAPPING COMMITS WITH THE READING, NOT BEFORE IT. It used to be recorded
+   * first, on the reasoning that even a duplicate proves which pool an agent draws
+   * on. That is true of a DUPLICATE and false of a REJECTED reading, and the two
+   * were not distinguished: a future-dated observation — invalid, discarded, and
+   * exactly the shape a clock skew or a forged timestamp produces — still retargeted
+   * the agent, moving it off an accepted LIMITED pool and onto whatever the rejected
+   * reading named. Evidence that was not good enough to change the pool must not be
+   * good enough to change who belongs to it.
+   *
+   * An accepted duplicate or renewal still commits the mapping: it is a valid
+   * reading that happens to say nothing new, which is why acceptance and change are
+   * separate answers here.
    */
   ingest(agentId: string | null, obs: CapacityObservation): void {
-    if (agentId) this.poolForAgent.set(agentId, obs.poolKey);
-    if (this.tracker.ingest(obs)) this.publish();
+    const result = this.tracker.ingestDetailed(obs);
+    if (agentId && result.accepted) this.poolForAgent.set(agentId, obs.poolKey);
+    if (result.changed) this.publish();
     this.rearm();
   }
 

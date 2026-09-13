@@ -218,3 +218,73 @@ test('the runtime reaches no renderer', () => {
     assert.equal(src.includes(banned), false, `the runtime must not reference "${banned}"`);
   }
 });
+
+// ── L0-FIX4: membership commits with the reading, not before it ─────────────
+
+test('FIX4: a REJECTED future observation cannot retarget an agent off its pool', () => {
+  const r = rig();
+  r.runtime.ingest('dwight', obs({ providerReachedType: 'rate_limit_reached' }));
+  assert.equal(r.runtime.admit('dwight').reason, ADMISSION_REASON.LIMITED);
+
+  // Invalid, discarded by the tracker - and exactly the shape a clock skew or a
+  // forged timestamp produces. It names a DIFFERENT pool. Under the old order it
+  // moved Dwight onto that pool and his refusal stopped applying to him.
+  const elsewhere = 'codex:acct-z:codex';
+  r.runtime.ingest('dwight', obs({
+    poolKey: elsewhere, accountScope: 'acct-z',
+    observedAt: T0 + 10 * 60_000, receivedAt: T0 + 10 * 60_000
+  }));
+
+  const after = r.runtime.admit('dwight');
+  assert.equal(after.poolKey, POOL, 'still on the pool that actually refused him');
+  assert.equal(after.reason, ADMISSION_REASON.LIMITED);
+  assert.equal(r.tracker.pool(elsewhere), null, 'and the rejected reading created nothing');
+});
+
+test('FIX4: an accepted DUPLICATE still commits membership - it is a valid reading', () => {
+  const r = rig();
+  r.runtime.ingest('dwight', obs());
+  r.runtime.ingest('meredith', obs());   // same reading, now a duplicate
+  assert.equal(r.runtime.admit('meredith').poolKey, POOL, 'a duplicate proves membership');
+});
+
+test('FIX4: an OUT-OF-ORDER reading commits no membership at all', () => {
+  const r = rig();
+  r.runtime.ingest('dwight', obs({ observedAt: T0 + 1_000, receivedAt: T0 + 1_000 }));
+
+  // Meredith's only reading is an older one for that same pool, so the tracker
+  // rejects it as out of order. It is not evidence of anything, membership included.
+  r.runtime.ingest('meredith', obs({ observedAt: T0, receivedAt: T0 }));
+
+  const d = r.runtime.admit('meredith');
+  assert.equal(d.poolKey, null);
+  assert.equal(d.reason, ADMISSION_REASON.NO_POOL, 'rejected evidence proves no membership');
+  assert.equal(d.verdict, 'UNKNOWN_NOT_INFERRED_SAFE', 'and UNKNOWN is the conservative answer');
+});
+
+// ── L0-FIX4: a grant is spent by a SUBMISSION, not by a call that returns ───
+
+test('FIX4: a launch that FAILS to submit returns the recovery grant', () => {
+  const r = rig();
+  r.runtime.ingest('dwight', obs());
+  r.runtime.ingest('dwight', obs({
+    observedAt: T0 + 1_000, receivedAt: T0 + 1_000,
+    providerReachedType: 'rate_limit_reached',
+    windows: [win('five_hour', 'FIVE_HOUR', 0, RESET_5H)]
+  }));
+  for (let i = 0; i < 8 && r.state() !== 'RECOVERING'; i += 1) r.fire();
+  assert.equal(r.state(), 'RECOVERING');
+
+  // The production caller reports the outcome of the ENTER write, which lands a tick
+  // after the call returns. A dead PTY reports false.
+  const first = r.runtime.admit('dwight');
+  assert.equal(first.reason, ADMISSION_REASON.RECOVERING_GRANT);
+  r.runtime.cancelGrant(first);            // what onSubmitted(false) does
+
+  const second = r.runtime.admit('dwight');
+  assert.equal(
+    second.reason,
+    ADMISSION_REASON.RECOVERING_GRANT,
+    'a turn that was never typed must not consume the epoch its one attempt'
+  );
+});
