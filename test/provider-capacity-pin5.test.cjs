@@ -349,3 +349,89 @@ test('FIX7/4: a second identical sweep is a TOTAL no-op', () => {
   assert.equal(t.snapshot().collectionRevision, collectionAfterFirst, 'no collection increment at all');
   assert.deepEqual(t.snapshot().pools.map((p) => p.revision), poolsAfterFirst, 'no pool moved');
 });
+
+// ═══════════════════════════════════════════════════════════════════════════
+// L0-REVBOUND — every publication path advances the collection EXACTLY once
+// ═══════════════════════════════════════════════════════════════════════════
+
+/**
+ * WHAT THIS DOES AND DOES NOT ESTABLISH, STATED PLAINLY. The at-most-once rule lived
+ * inside commitPublication() while three other sites advanced `collectionRevision`
+ * directly - the excess-pool marker, noteCompleteInventory and forget. Each was a
+ * genuinely distinct publication, so the BEHAVIOUR was already correct and NOTHING
+ * HERE FAILED BEFORE. Routing them through the one writer is a structural change,
+ * not a bug fix, and no test can discriminate it.
+ *
+ * So this pins the thing that CAN regress: the per-path counts themselves. A fourth
+ * writer, or a path that publishes twice, fails here by name.
+ */
+test('REVBOUND: each publishing path advances the collection by exactly ONE', () => {
+  const paths = {
+    'an ordinary changing ingest': (t) => t.ingest(obs()),
+    'the excess-pool marker': (t) => {
+      for (let i = 0; i < RETENTION_CAPS.maxPools; i += 1) {
+        t.ingest(obs({ poolKey: `codex:p-${i}:limit-1`, accountScope: `p-${i}` }));
+      }
+      return () => t.ingest(obs({ poolKey: 'codex:excess:limit-1', accountScope: 'excess' }));
+    },
+    'noteCompleteInventory clearing the marker': (t) => {
+      for (let i = 0; i < RETENTION_CAPS.maxPools; i += 1) {
+        t.ingest(obs({ poolKey: `codex:p-${i}:limit-1`, accountScope: `p-${i}` }));
+      }
+      t.ingest(obs({ poolKey: 'codex:excess:limit-1', accountScope: 'excess' }));
+      return () => t.noteCompleteInventory(['codex:p-0:limit-1']);
+    },
+    'forget': (t) => {
+      t.ingest(obs());
+      return () => t.forget('codex:acct-a:limit-1');
+    }
+  };
+  for (const [name, setup] of Object.entries(paths)) {
+    const { t } = tracker();
+    const act = setup(t);
+    if (typeof act !== 'function') continue; // the ingest case acted during setup
+    const before = t.snapshot().collectionRevision;
+    act();
+    assert.equal(t.snapshot().collectionRevision - before, 1, name);
+  }
+
+  // The ingest case measured on its own, since its action IS the setup.
+  const { t } = tracker();
+  const before = t.snapshot().collectionRevision;
+  t.ingest(obs());
+  assert.equal(t.snapshot().collectionRevision - before, 1, 'an ordinary changing ingest');
+});
+
+test('REVBOUND: the PAIR — a path that publishes nothing advances by ZERO', () => {
+  // Without this, "exactly one" is satisfied by a counter that advances on every
+  // call, which is the wrong fix one level up from the sweep defect.
+  const { t } = tracker();
+  t.ingest(obs());
+
+  const noops = {
+    'an exact duplicate ingest': () => t.ingest(obs()),
+    'a sweep with nothing to do': () => t.evaluate(),
+    'noteCompleteInventory with no marker': () => t.noteCompleteInventory(['codex:acct-a:limit-1']),
+    'forgetting a pool that does not exist': () => t.forget('codex:nobody:limit-1')
+  };
+  for (const [name, act] of Object.entries(noops)) {
+    const before = t.snapshot().collectionRevision;
+    act();
+    assert.equal(t.snapshot().collectionRevision - before, 0, name);
+  }
+});
+
+test('REVBOUND: a SECOND excess arrival does not multiply the marker publication', () => {
+  // L0-SEM 13: later excess arrivals are semantic no-ops. Asserted as === 0 rather
+  // than <= 1, because <= 1 passes an implementation that publishes nothing at all -
+  // and the first arrival above already proved it publishes once.
+  const { t } = tracker();
+  for (let i = 0; i < RETENTION_CAPS.maxPools; i += 1) {
+    t.ingest(obs({ poolKey: `codex:p-${i}:limit-1`, accountScope: `p-${i}` }));
+  }
+  t.ingest(obs({ poolKey: 'codex:excess-1:limit-1', accountScope: 'excess-1' }));
+  const after = t.snapshot().collectionRevision;
+  t.ingest(obs({ poolKey: 'codex:excess-2:limit-1', accountScope: 'excess-2' }));
+  assert.equal(t.snapshot().collectionRevision - after, 0, 'a second excess pool is a no-op');
+  assert.equal(t.snapshot().overflow.excess, 'ONE_OR_MORE', 'and still carries no count');
+});

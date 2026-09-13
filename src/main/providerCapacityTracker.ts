@@ -430,8 +430,9 @@ export class ProviderCapacityTracker {
             ? { hardLimitObserved: true, admission: 'LIMITED' as const }
             : {})
         });
-        this.collectionRevision += 1;
-        this.updatedAt = now;
+        // Its own publication, and exclusive with the reproject path below by the
+        // unconditional return at the end of this branch.
+        this.commitPublication(true, now);
         if (!known) {
           console.warn(`[capacity] pool cap ${RETENTION_CAPS.maxPools} exceeded; the collection is incomplete`);
         }
@@ -627,8 +628,7 @@ export class ProviderCapacityTracker {
     if (!this.overflow) return false;
     if (poolKeys.length > RETENTION_CAPS.maxPools) return false;
     this.overflow = null;
-    this.collectionRevision += 1;
-    this.updatedAt = this.clock();
+    this.commitPublication(true, this.clock());
     return true;
   }
 
@@ -642,8 +642,7 @@ export class ProviderCapacityTracker {
     if (!rec) return false;
     this.revisionFloor = Math.max(this.revisionFloor, rec.projection.revision);
     this.pools.delete(poolKey);
-    this.collectionRevision += 1;
-    this.updatedAt = this.clock();
+    this.commitPublication(true, this.clock());
     return true;
   }
 
@@ -884,6 +883,15 @@ export class ProviderCapacityTracker {
    * Close one atomic publication. Advances the collection revision AT MOST ONCE, and
    * not at all when nothing moved - a repeated no-change sweep is a no-op, not an
    * increment carrying identical content.
+   *
+   * THE SOLE WRITER OF `collectionRevision`, DELIBERATELY. The at-most-once rule was
+   * enforced here while three other sites advanced the same counter directly: the
+   * excess-pool marker, `noteCompleteInventory` and `forget`. Each of those really is
+   * a distinct publication, so the behaviour was right - but an invariant that lives
+   * in one function while four places can break it is a convention, not a boundary,
+   * and nothing structural stopped a fifth writer appearing. Routing every one of
+   * them through here makes the rule true by construction instead of by inspection,
+   * and leaves exactly one line to review when it is next questioned.
    */
   private commitPublication(changed: boolean, now: number): boolean {
     if (!changed) return false;
