@@ -316,7 +316,24 @@ test('FIX6/2: the reserve is charged per RETAINED pool, so it scales with the co
  */
 const RESERVE_AT_32 = TIMER_GROWTH_RESERVE_PER_POOL * 32 + TIMER_GROWTH_RESERVE_COLLECTION;
 
-/** 31 maximal pools, then one probe pool of exactly `target` observation bytes. */
+/**
+ * 31 maximal pools, then one probe pool of exactly `target` observation bytes.
+ *
+ * THE TRANSITION BELOW IS PINNED AT ONE BYTE, SO THE FIXTURE'S SHAPE IS PART OF THE
+ * TEST. The account scope is carried TWICE in a retained projection - in `poolKey`
+ * and in `accountScope` - so it has 2x leverage on published size, and a fixture that
+ * pads to an exact INPUT size can hold the input constant while the OUTPUT moves.
+ * "Same input size" is not "same fixture."
+ *
+ * These fixtures are immune to that by construction rather than by luck, and it is
+ * worth saying which: `sizedTo` builds the poolKey AROUND the scope, so the scope is
+ * carried twice on the way in as well as on the way out and the padding compensates
+ * symmetrically - measured identical projection bytes across scopes of length 1, 2,
+ * 4 and 8. Change the identities so the poolKey stops embedding the scope and the
+ * transition point moves without the input size moving, which would read as a flaky
+ * test rather than a changed fixture. Both the input size and the published size are
+ * asserted exactly, so such a change fails loudly - this note is here to say why.
+ */
 function withProbe(target) {
   const { t } = tracker();
   for (let i = 0; i < RETENTION_CAPS.maxPools - 1; i += 1) {
