@@ -139,44 +139,64 @@ test('HARNESS: it supports the READS C2.11 #14 needs — and #14 is still unobse
     'but IS present in the accessibility tree, which is where a scan must read');
 });
 
-test('HARNESS: a first-run trust dialog is refused, not measured', async () => {
-  // PAID FOR BY A VOID RUN. A fresh cwd is an untrusted cwd, so all three installed
-  // TUIs open on "do you trust this folder?" rather than an input box. The failure
-  // does not announce itself — it produces a PASSING row, which is why the
-  // precondition belongs in the instrument instead of in someone's memory.
+test('HARNESS: the measurement is refused unless the screen is POSITIVELY a composer', async () => {
+  // PAID FOR BY A VOID RUN, AND THEN CORRECTED BY A SECOND FINDING. The first
+  // version of this detector enumerated the trust modals it knew about and measured
+  // anything else. Andy's capture showed there are at least FOUR non-composer
+  // states rather than one — which you land on depends on whether the CWD or the
+  // CONFIG is fresh — but the count is not the argument.
+  //
+  // THE ARGUMENT IS THAT A DETECTOR WHICH ENUMERATES WHAT TO REFUSE FAILS OPEN ON
+  // EVERYTHING IT HAS NOT MET, so the list is always one screen behind the
+  // installer. Inverted to refuse by default and admit only what is recognised.
   const r = await runScenario(scenario('tui-preconditions'), { timeoutMs: 60_000 });
   assert.equal(r.ok, true, `scenario failed: ${r.error ?? ''}`);
 
-  for (const tui of ['claude', 'codex', 'agy']) {
-    const s = r.trustScreens[tui];
-    assert.equal(s.detectedAsDialog, true, `${tui}: its real boot screen is recognised as a dialog`);
-    // THE COST OF SKIPPING THE PRECONDITION, made visible rather than argued: a
-    // naive measurement reports "the box is empty and nothing was submitted"
-    // against a dialog that has no box at all. Every row of the void run looked
-    // like this one.
-    assert.equal(s.naiveHasDraft, false, `${tui}: a naive read would have passed on a modal`);
+  for (const [name, s] of Object.entries(r.nonComposer)) {
+    assert.equal(s.measurable, false, `${name}: not a composer, so not measurable`);
+    // THE COST OF SKIPPING THE PRECONDITION, visible rather than argued: a naive
+    // read reports "the box is empty and nothing was submitted" against a screen
+    // that has no box at all. Every row of the void run looked like this one.
+    assert.equal(s.naiveHasDraft, false, `${name}: a naive read would have passed on it`);
   }
 
   // And it does not refuse everything, which would be the cheap way to pass above.
-  assert.equal(r.promptBoxIsNotADialog, true, 'an ordinary prompt box is still measurable');
+  assert.equal(r.composer.emptyMeasurable, true, 'an empty composer IS measurable');
+  assert.equal(r.composer.filledMeasurable, true, 'and so is one with text in it');
 });
 
-test('HARNESS: nothing in production blocks automation while a trust modal owns the screen', async () => {
-  // A PRODUCTION FINDING, REPORTED NOT PATCHED. `opensInteractiveTerminalUi` matches
-  // what the USER TYPED against a set of bare slash-commands; a first-run dialog is
-  // opened by the PROGRAM, so no input ever passes through that check and the
-  // picker block cannot latch. The modal is invisible to the automation seam BY
-  // CONSTRUCTION, not by oversight.
+test('HARNESS: a screen nobody enumerated is refused too — the detector fails closed', async () => {
+  // THE ARM THAT MATTERS, and the only one that distinguishes the two designs: a
+  // blocklist passes every test built from the screens it was written against. This
+  // fixture is a made-up dialog nobody has ever met.
   //
-  // What this establishes is the PRECONDITION for the swallowed-text hazard — that
-  // the app believes it is safe to type while a modal is up. It does not show the
-  // Enter answering the modal; that needs a live TUI, which this environment cannot
-  // spawn (see the report). Stating the weaker claim because it is the one measured.
+  // WHAT FAILING OPEN COSTS HERE IS NOT A VOID ROW. Andy's driver met the
+  // Antigravity consent screen, where Enter accepts a Terms of Service and a
+  // data-collection agreement ON THE HUMAN'S BEHALF — and a measurement means
+  // pressing keys. A wrong refusal costs a re-run; a wrong admission presses Enter
+  // on a contract. Those are not the same mistake.
   const r = await runScenario(scenario('tui-preconditions'), { timeoutMs: 60_000 });
   assert.equal(r.ok, true);
-  for (const tui of ['claude', 'codex', 'agy']) {
-    assert.equal(r.trustScreens[tui].automationBlock, null,
-      `${tui}: the automation seam sees no reason to wait`);
+  assert.equal(r.nonComposer['a screen nobody has met'].measurable, false,
+    'an unknown screen is refused because it is not recognised, not because it is listed');
+  assert.equal(r.nonComposer['agy consent'].measurable, false,
+    'and so is the consent screen, where Enter accepts a ToS');
+});
+
+test('HARNESS: nothing in production blocks automation while any of these owns the screen', async () => {
+  // A PRODUCTION FINDING, REPORTED NOT PATCHED. `opensInteractiveTerminalUi` matches
+  // what the USER TYPED against a set of bare slash-commands; every screen here is
+  // opened by the PROGRAM, so no input passes through that check and the picker
+  // block cannot latch. Invisible to the automation seam BY CONSTRUCTION.
+  //
+  // This establishes the PRECONDITION for the swallowed-text hazard — that the app
+  // believes it is safe to type while a modal is up. It does not show the Enter
+  // answering the modal; that needs a live TUI, which this environment cannot spawn.
+  // Stating the weaker claim because it is the one measured.
+  const r = await runScenario(scenario('tui-preconditions'), { timeoutMs: 60_000 });
+  assert.equal(r.ok, true);
+  for (const [name, s] of Object.entries(r.nonComposer)) {
+    assert.equal(s.automationBlock, null, `${name}: the automation seam sees no reason to wait`);
   }
 });
 
