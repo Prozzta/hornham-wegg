@@ -152,11 +152,30 @@ test('§8 WINDOWS PER POOL: the cap is 16 — sixteen windows are healthy, seven
   const over = tracker();
   over.ingest(obs({ observedAt: T0, receivedAt: T0, windows: windows(RETENTION_CAPS.maxWindowsPerPool + 1) }));
   const p = poolOf(over, key);
+  // FIRST, and deliberately before anything dereferences it: a breach must not become
+  // a disappearance. Placed here because the version of this assertion that sat at the
+  // END of the test could never fire - when the pool is genuinely dropped, the
+  // classification lines above dereference null and the test dies on a TypeError
+  // instead. A kill is not the same as a kill FOR THE NAMED REASON, and an assertion
+  // that cannot be reached is not pinning anything.
+  assert.ok(p, 'the pool entity itself survives the breach');
   assert.equal(p.state, 'UNKNOWN', 'the seventeenth window breaches');
   assert.equal(p.stateReason, 'RETENTION_CAP_EXCEEDED');
   // §8 line 172's actual words. A truncate-to-16-and-carry-on implementation would
   // also report healthy, and that is the outcome the clause forbids by name.
   assert.notEqual(p.state, 'AVAILABLE', 'it must not silently discard a window and remain healthy');
+
+  // AND THE SIZE HALF, which classification cannot reach. FOUND BY MUTATION: padding
+  // the retained stand-in with 64 KiB ON THE WINDOW-COUNT PATH ONLY left all 821 tests
+  // green, while the same padding on the per-pool BYTE path is caught at once. The two
+  // breach kinds had one half each — the byte kind a size assertion, the window kind a
+  // visibility assertion — and each half is passable by an implementation that fails
+  // the other. Classification-only proves visibility without boundedness; size-only
+  // proves boundedness without visibility; §8 line 172 states both.
+  assert.ok(
+    JSON.stringify(p).length < RETENTION_CAPS.maxPoolBytes,
+    'what is RETAINED after a window-count breach is bounded, not merely classified'
+  );
 });
 
 test('§8 the three retention caps are ARITHMETICALLY CONSISTENT, or the collection cap cannot fire', () => {
