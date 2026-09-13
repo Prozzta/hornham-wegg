@@ -9,8 +9,11 @@
  *   hive-node --expose-gc test/tools/capacity-heap-probe.cjs <root> <arm>
  *   hive-node            test/tools/capacity-heap-probe.cjs <root> report
  *
- *   arms: f31-pad f31-many f31-exh f32-pad f32-many f32-exh breach
+ *   arms: f1-pad f1-many f1-exh f2-pad f2-many f2-exh breach
  *         (+ "-control" on any of them)
+ *
+ * f1 is the PER-POOL-CEILING frontier and f2 the POOL-COUNT-CEILING frontier. The
+ * names carry the frontier KIND and no count, because §18 derives the count.
  *
  * ==========================================================================
  * WHAT §15 REOPENED, AND WHY THE OLD NUMBERS ARE GONE
@@ -21,12 +24,27 @@
  * substitutes for the other "because serialized size does not prove V8 retained-size
  * ordering". The breach arm is kept as ADDITIONAL evidence and can discharge nothing.
  *
- * THE FRONTIERS ARE DERIVED AT RUN TIME, NOT HARDCODED. Frontier 2 is "the largest
- * deterministic shape whose post-projection collection remains within 256 KiB" - a
- * DERIVED quantity that moves when the implementation moves, and it moved once already
- * when the timer reserve began being subtracted at admission. A hardcoded figure would
- * silently measure the wrong frontier after the next change, which is the same mistake
- * as the stale comment this file used to carry. Every report prints the derivation.
+ * BOTH FRONTIERS ARE DERIVED AT RUN TIME, AND §18 IS WHY BOTH HAVE TO BE. §15's fixed
+ * phrase "31 pools at the per-pool maximum" is SUPERSEDED: a cap-valid frontier is the
+ * boundary of the INTERSECTION of every independent cap, including the derived timer-
+ * growth reserve, for the particular shape family being measured.
+ *   f1  PER-POOL CEILING:   every observation at the 8 KiB per-pool cap, then derive the
+ *                           greatest pool count N <= 32 that stays valid. N+1 is proven
+ *                           to breach whenever N < 32.
+ *   f2  POOL-COUNT CEILING: hold 32 pools, then derive the largest per-pool size that
+ *                           stays valid. The next byte is proven to breach.
+ * N IS NOT 31 FOR EVERY FAMILY AND THAT IS THE POINT OF DERIVING IT. The corrected
+ * 24-character finite-JSON-number premise widened the reserve (L0-FIX7, a82eaca5) and
+ * the ceiling moved with it, so a family that fitted 31 maximal pools under the old
+ * under-derived reserve may fit fewer now. A name or a constant encoding 31 would
+ * silently measure the wrong fixture and report a number for it.
+ *
+ * VALID MEANS MORE THAN "WITHIN THE CAP". §18: a fixture with ANY pool replaced by a
+ * breach sentinel is not a valid-state heap fixture even though every pool identity is
+ * still present. So validity here is all three at once - every pool retained, NO pool
+ * sentinelled, and the published collection PLUS ITS FULL RESERVE inside 256 KiB. The
+ * reserve is in that sum deliberately: leaving it out measures a state the runtime
+ * would not itself admit.
  *
  * THREE SHAPE FAMILIES AT EACH FRONTIER, AND THE REASON IS NOT SYMMETRY. For families
  * that pay on input for every byte they publish, padding to the same serialized size
@@ -46,16 +64,19 @@
  * `exh` is the third family and it exists because of a gap in the first version of this
  * harness. `numericallyExhaustedWindowIds` is OUTPUT-ONLY - derived, present in the
  * projection, absent from the observation - so an exhausted reading publishes bytes that
- * cost NOTHING on input. At 31 x 8,192 that is 259,600 published against 259,104 for the
- * default windows: A TIGHTER VALID SHAPE THAN THE ONE THE FIRST ACCEPTANCE PASS
- * MEASURED, margin 280 rather than 776. Its heap cost is 388 bytes, so the verdict did
- * not move - but an acceptance pass whose coverage is knowingly incomplete, excused by a
- * residual note, is the same "claim one notch stronger than its evidence" failure in a
- * quieter form. A residual is for what cannot be closed cheaply, not for what can.
+ * cost NOTHING on input, so it reaches the ceiling on FEWER pools or SMALLER pools than
+ * a family that pays on input for everything it publishes. Under the pre-L0-FIX7 reserve
+ * that showed up as a tighter margin at the same 31 pools; under the corrected reserve it
+ * can show up as a smaller derived N. EITHER WAY THE FIGURE IS DERIVED IN THE RUN AND
+ * PRINTED - no margin or pool count from a superseded reserve is quoted here, because a
+ * number measured correctly against the wrong ceiling is the exact failure this file has
+ * already produced once. An acceptance pass whose coverage is knowingly incomplete,
+ * excused by a residual note, is a "claim one notch stronger than its evidence" failure
+ * in a quieter form: a residual is for what cannot be closed cheaply, not for what can.
  *
  * AND THE CLAIM IS NOT UPGRADED TO MATCH. Adding this family makes the coverage BETTER,
- * NOT COMPLETE. The tightest shape constructed here reaches margin 280; an adversarial
- * fixture elsewhere reaches 94; a sixteen-window exhausted fixture at the per-pool
+ * NOT COMPLETE. Adversarial fixtures elsewhere have reached tighter margins than
+ * anything constructed here, and a sixteen-window exhausted fixture at the per-pool
  * maximum BREACHES and is therefore not a valid shape at all. THE WORST VALID SHAPE
  * REMAINS UNDERIVED, and finding it would need a derived maximum over legal shapes,
  * which is analysis nobody has done. So the printed wording is TIGHTEST VALID SHAPE
@@ -117,8 +138,12 @@ const which = process.argv[3];
 /** §12/§15: an isolated-Dev acceptance target for heap attributable to retained state. */
 const HEAP_TARGET_BYTES = 1024 * 1024;
 const RUNS_PER_ARM = 5;
-/** The two cap-VALID frontiers §15 requires. `breach` is extra evidence only. */
-const VALID_ARMS = ['f31-pad', 'f31-many', 'f31-exh', 'f32-pad', 'f32-many', 'f32-exh'];
+/**
+ * The two cap-VALID frontier KINDS §15 requires, across the three shape families §18
+ * names. `breach` is extra evidence only and discharges nothing.
+ */
+const FAMILIES = ['pad', 'many', 'exh'];
+const VALID_ARMS = [...FAMILIES.map((f) => `f1-${f}`), ...FAMILIES.map((f) => `f2-${f}`)];
 const ALL_ARMS = [...VALID_ARMS, 'breach'];
 
 const baseArm = typeof which === 'string' ? which.replace(/-control$/, '') : '';
@@ -143,7 +168,10 @@ function measure(arm, isControl) {
   const used = () => process.memoryUsage().heapUsed;
 
   const loadTs = require(WT + '/test/load-ts.cjs');
-  const { ProviderCapacityTracker, L0_SEM_POLICY, RETENTION_CAPS } = loadTs('src/main/providerCapacityTracker.ts');
+  const {
+    ProviderCapacityTracker, L0_SEM_POLICY, RETENTION_CAPS,
+    TIMER_GROWTH_RESERVE_PER_POOL, TIMER_GROWTH_RESERVE_COLLECTION
+  } = loadTs('src/main/providerCapacityTracker.ts');
   const { T0, win, obs } = require(WT + '/test/fixtures/capacity-corpus.cjs');
   const byteLen = (v) => JSON.stringify(v).length;
 
@@ -177,21 +205,45 @@ function measure(arm, isControl) {
     throw new Error('sizing did not converge');
   }
 
-  /** Does `count` pools of `bytes` each publish within the collection cap, unbounded? */
-  function unboundedAt(count, bytes, shape) {
+  /**
+   * Is `count` pools of `bytes` each a VALID state, in §18's sense rather than merely a
+   * state the cap tolerates? Every pool actually retained - a dropped pool is a different
+   * collection - and NO pool sentinelled, because §18 is explicit that surviving identity
+   * is not enough and a sentinel discards the very content whose heap cost is being
+   * measured.
+   *
+   * §18'S RESERVE CONDITION IS ASSERTED ON THE MEASURED FIXTURE, NOT EVALUATED HERE, AND
+   * THE REASON IS A CONFOUND I PUT IN MYSELF. Serializing the collection inside the search
+   * allocates a ~259 KB string on every probe, and the CONTROL arms run the identical
+   * derivation - so the controls began reclaiming a quarter-megabyte that had nothing to
+   * do with any retained state, and the separation the acceptance depends on collapsed on
+   * five of six arms. The check itself is right and it is still made; it is made once, on
+   * the fixture that is actually measured, AFTER the measuring window has closed. A
+   * validity check that changes the measurement is not free, and this one cost a whole
+   * report before the controls said so.
+   */
+  function validAt(count, bytes, shape) {
     const t = new ProviderCapacityTracker(L0_SEM_POLICY, () => T0, () => 0);
     for (let i = 0; i < count; i++) {
       const o = sized(`codex:acct-${i}:limit-1`, `acct-${i}`, bytes, shape);
       if (!o) return false;
       t.ingest(o);
     }
-    return t.snapshot().pools.filter((p) => p.state === 'UNKNOWN').length === 0;
+    const s = t.snapshot();
+    if (s.pools.length !== count) return false;
+    return s.pools.filter((p) => p.state === 'UNKNOWN').length === 0;
+  }
+
+  /** The growth reserve the runtime charges for a collection of `count` pools. */
+  function reserveFor(count) {
+    return TIMER_GROWTH_RESERVE_PER_POOL * count + TIMER_GROWTH_RESERVE_COLLECTION;
   }
 
   /**
-   * DERIVED, NOT HARDCODED. The largest per-pool size at which `count` pools still
-   * publish inside the cap. Binary search, and the caller asserts the boundary is real
-   * by checking that one byte more does breach.
+   * DERIVED, NOT HARDCODED. The largest per-pool size at which `count` pools are still a
+   * valid state. Binary search, and the caller asserts the boundary is REAL by checking
+   * that one byte more breaches - a search over a predicate that is not monotone returns
+   * a number with no meaning and no error.
    */
   function largestFitting(count, shape) {
     let lo = 1;
@@ -199,19 +251,41 @@ function measure(arm, isControl) {
     let best = null;
     while (lo <= hi) {
       const mid = (lo + hi) >> 1;
-      if (unboundedAt(count, mid, shape)) { best = mid; lo = mid + 1; } else { hi = mid - 1; }
+      if (validAt(count, mid, shape)) { best = mid; lo = mid + 1; } else { hi = mid - 1; }
+    }
+    return best;
+  }
+
+  /**
+   * §18 frontier 1, DERIVED PER FAMILY: with every observation at the per-pool ceiling,
+   * the greatest pool count that is still valid. This used to be the literal 31 and it is
+   * not a constant - output-only bytes let one family reach the ceiling on fewer pools
+   * than another at the identical per-pool size.
+   */
+  function largestCount(shape) {
+    let lo = 1;
+    let hi = RETENTION_CAPS.maxPools;
+    let best = null;
+    while (lo <= hi) {
+      const mid = (lo + hi) >> 1;
+      if (validAt(mid, RETENTION_CAPS.maxPoolBytes, shape)) { best = mid; lo = mid + 1; } else { hi = mid - 1; }
     }
     return best;
   }
 
   const shape = arm.endsWith('-many') ? 'many' : arm.endsWith('-exh') ? 'exh' : 'pad';
+  const isF1 = arm.startsWith('f1');
   const count = arm === 'breach' ? RETENTION_CAPS.maxPools
-    : arm.startsWith('f31') ? RETENTION_CAPS.maxPools - 1 : RETENTION_CAPS.maxPools;
-  const perPool = arm === 'breach' || arm.startsWith('f31')
+    : isF1 ? largestCount(shape) : RETENTION_CAPS.maxPools;
+  const perPool = arm === 'breach' || isF1
     ? RETENTION_CAPS.maxPoolBytes
     : largestFitting(RETENTION_CAPS.maxPools, shape);
+  if (count === null) {
+    console.error('VOID  no pool count at the per-pool ceiling is a valid state for this family');
+    process.exit(3);
+  }
   if (perPool === null) {
-    console.error('VOID  no per-pool size fits the collection cap at this pool count');
+    console.error('VOID  no per-pool size makes this pool count a valid state');
     process.exit(3);
   }
 
@@ -262,11 +336,23 @@ function measure(arm, isControl) {
     checks.push(['the published collection is within the cap',
       published <= RETENTION_CAPS.maxCollectionBytes,
       `${published} > ${RETENTION_CAPS.maxCollectionBytes}`]);
-    // The derived frontier must BE a frontier: one byte more has to breach, or this arm
-    // is measuring an interior point and calling it the edge.
-    const oneMore = arm.startsWith('f32') && !unboundedAt(count, perPool + 1, shape);
-    if (arm.startsWith('f32')) {
-      checks.push(['the derived frontier is a real edge - one byte more breaches', oneMore,
+    // §18: within the cap is not enough - the post-projection collection PLUS ITS FULL
+    // RESERVE has to fit, because that is what the runtime itself admits against. Asserted
+    // on the fixture that was measured, and only after the measuring window has closed.
+    checks.push(['the collection plus its full growth reserve is within the cap',
+      published + reserveFor(pools) <= RETENTION_CAPS.maxCollectionBytes,
+      `${published} + ${reserveFor(pools)} > ${RETENTION_CAPS.maxCollectionBytes}`]);
+    // EVERY derived frontier must BE a frontier, on both axes. An arm that measures an
+    // interior point and calls it the edge reports a real number for the wrong fixture,
+    // which is the failure this whole file exists to stop.
+    if (isF1 && count < RETENTION_CAPS.maxPools) {
+      checks.push(['the derived pool count is a real edge - one more pool breaches',
+        !validAt(count + 1, perPool, shape),
+        `${count + 1} pools at ${perPool} bytes is still valid, so ${count} is not the greatest`]);
+    }
+    if (!isF1) {
+      checks.push(['the derived per-pool size is a real edge - one byte more breaches',
+        !validAt(count, perPool + 1, shape),
         `${perPool + 1} bytes per pool still fits, so ${perPool} is not the largest`]);
     }
   }
@@ -362,7 +448,8 @@ function report() {
   if (findings) process.exit(1);
   console.log('RESULT: EMPIRICAL ISOLATED-DEV ACCEPTANCE PASS for heap attributable to retained');
   console.log('capacity state, on this machine and this Node build, for BOTH §15 cap-valid');
-  console.log('frontiers, across the TIGHTEST VALID SHAPE CONSTRUCTED in each.');
+  console.log('frontier KINDS, across the TIGHTEST VALID SHAPE CONSTRUCTED in each family,');
+  console.log('with every pool count and per-pool size DERIVED in this run and its edge proved.');
   console.log('NOT the worst valid shape - that remains UNDERIVED, and deriving it needs a');
   console.log('maximum over legal shapes that nobody has computed. NOT a universal V8 or');
   console.log('runtime bound. NOT a production enforcement guarantee. The breach arm is');
