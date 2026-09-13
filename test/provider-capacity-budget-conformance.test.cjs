@@ -178,23 +178,41 @@ test('§8 WINDOWS PER POOL: the cap is 16 — sixteen windows are healthy, seven
   );
 });
 
-test('§8 the three retention caps are ARITHMETICALLY CONSISTENT, or the collection cap cannot fire', () => {
-  // A TRIPWIRE, NOT A BEHAVIOUR. maxPools x maxPoolBytes is EXACTLY maxCollectionBytes
-  // at these values, and the collection check fires on STRICTLY MORE — so with every
-  // pool legal and the count legal the collection cap can never fire. That is a fact
-  // about the three numbers, measured: 32 pools at 8,192 bytes serialize to 262,144,
-  // which is the cap, with zero headroom.
+test('§15 the three cap CONSTANTS are unchanged — and this proves NOTHING about the collection ceiling', () => {
+  // THIS ASSERTION IS UNINFORMATIVE ABOUT THE COLLECTION CAP, AND IT ALWAYS WAS. That
+  // is the point of the comment, so it is stated first rather than derived at the end.
   //
-  // This is pinned rather than left in prose because the reachability of the third cap
-  // is a consequence of the other two, so changing ANY of the three silently changes
-  // whether it is dead. This assertion fails at exactly that moment and says why.
+  // It used to say: the product is exactly maxCollectionBytes and the check fires on
+  // strictly more, "so the collection cap can never fire", with "zero headroom". When
+  // L0-FIX5 made the cap fire on 32 maximal pools I was about to replace that with the
+  // OPPOSITE reading — that the two caps overshoot the collection cap. BOTH READINGS ARE
+  // WRONG, and L0-SEM §15 says why in one sentence: "the same equality can accompany
+  // either an unreachable cap under input-only summing or an exceeded cap under actual
+  // post-projection measurement". An equality that held in both worlds was never
+  // evidence for either. The product of two INDEPENDENT CEILINGS says nothing about the
+  // third: it counts input budget and omits collection and projection overhead, and only
+  // the serialized post-projection collection decides that ceiling.
+  //
+  // SO WHY KEEP IT. Not as a statement about behaviour. §15 rules that no cap constant
+  // moves, so this is a CHANGE DETECTOR on three frozen numbers and nothing more. If it
+  // fires, a constant moved without a ruling, and the response is to RE-MEASURE the
+  // frontiers — never to infer reachability or headroom from the arithmetic in either
+  // direction. The behavioural properties are below and in provider-capacity-pin3.test.cjs,
+  // where they are measured rather than computed.
+  //
+  // AND THE LESSON I RECORDED HERE BEFORE WAS ITSELF ONE NOTCH TOO STRONG. I wrote that
+  // the name had been "honest all along" and that only the METHOD was a proxy. The name's
+  // second clause was "or the collection cap cannot fire" — the unsupportable inference,
+  // sitting in the one part of a test everyone reads. It is gone from the NAME, not just
+  // from the prose.
   const product = RETENTION_CAPS.maxPools * RETENTION_CAPS.maxPoolBytes;
   assert.equal(
     product,
     RETENTION_CAPS.maxCollectionBytes,
-    'the per-pool and pool-count caps bound the collection to exactly the collection cap; ' +
-      'if this ever differs, re-examine whether COLLECTION_BYTES is reachable and whether ' +
-      'a retained cap-breaching pool can put the collection over budget unreported'
+    'a §8 cap constant has MOVED, which §15 does not authorise. This says nothing about ' +
+      'whether the collection cap is reachable or how much headroom exists — it never ' +
+      'could, in either direction. Re-measure the two valid frontiers instead of reading ' +
+      'an implication off this equality.'
   );
 
   // ── THE MEASURED HALF, RETARGETED AFTER L0-FIX5 (Jim, 64023382) ──────────────
@@ -207,14 +225,13 @@ test('§8 the three retention caps are ARITHMETICALLY CONSISTENT, or the collect
   // collection published 267,460 bytes against a 262,144 cap and reported nothing.
   //
   // The property did not go away, IT MOVED — from arithmetic about inputs to the
-  // RETAINED REPRESENTATION, which is the only place a byte cap means anything. My
-  // own tripwire above predicted this in the other clause of its message: "whether a
-  // retained cap-breaching pool can put the collection over budget unreported". It
-  // could, it did, and the answer is now asserted rather than assumed.
+  // RETAINED REPRESENTATION, which is the only place a byte cap means anything.
   //
-  // THE NAME OF THIS TEST WAS HONEST THROUGHOUT. It says ARITHMETICALLY CONSISTENT and
-  // that is exactly what it checked. The error was not a mislabelled test, it was
-  // treating arithmetic over inputs as a stand-in for the cap.
+  // I USED TO CREDIT THE TRIPWIRE ABOVE WITH PREDICTING THIS, and that credit is
+  // withdrawn: an equality that holds whether or not the cap can fire cannot have
+  // predicted which. What actually caught it was this fixture being run against a
+  // changed implementation. The error was treating arithmetic over inputs as a stand-in
+  // for the cap — in the METHOD and, as it turned out, in the test's own NAME.
   const t = tracker();
   let inputBytes = 0;
   for (let i = 0; i < RETENTION_CAPS.maxPools; i++) {
