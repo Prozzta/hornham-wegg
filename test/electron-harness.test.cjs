@@ -138,3 +138,56 @@ test('HARNESS: it supports the READS C2.11 #14 needs — and #14 is still unobse
   assert.ok(r.duplicateScan.accessibleTokens > 0,
     'but IS present in the accessibility tree, which is where a scan must read');
 });
+
+test('HARNESS: a first-run trust dialog is refused, not measured', async () => {
+  // PAID FOR BY A VOID RUN. A fresh cwd is an untrusted cwd, so all three installed
+  // TUIs open on "do you trust this folder?" rather than an input box. The failure
+  // does not announce itself — it produces a PASSING row, which is why the
+  // precondition belongs in the instrument instead of in someone's memory.
+  const r = await runScenario(scenario('tui-preconditions'), { timeoutMs: 60_000 });
+  assert.equal(r.ok, true, `scenario failed: ${r.error ?? ''}`);
+
+  for (const tui of ['claude', 'codex', 'agy']) {
+    const s = r.trustScreens[tui];
+    assert.equal(s.detectedAsDialog, true, `${tui}: its real boot screen is recognised as a dialog`);
+    // THE COST OF SKIPPING THE PRECONDITION, made visible rather than argued: a
+    // naive measurement reports "the box is empty and nothing was submitted"
+    // against a dialog that has no box at all. Every row of the void run looked
+    // like this one.
+    assert.equal(s.naiveHasDraft, false, `${tui}: a naive read would have passed on a modal`);
+  }
+
+  // And it does not refuse everything, which would be the cheap way to pass above.
+  assert.equal(r.promptBoxIsNotADialog, true, 'an ordinary prompt box is still measurable');
+});
+
+test('HARNESS: nothing in production blocks automation while a trust modal owns the screen', async () => {
+  // A PRODUCTION FINDING, REPORTED NOT PATCHED. `opensInteractiveTerminalUi` matches
+  // what the USER TYPED against a set of bare slash-commands; a first-run dialog is
+  // opened by the PROGRAM, so no input ever passes through that check and the
+  // picker block cannot latch. The modal is invisible to the automation seam BY
+  // CONSTRUCTION, not by oversight.
+  //
+  // What this establishes is the PRECONDITION for the swallowed-text hazard — that
+  // the app believes it is safe to type while a modal is up. It does not show the
+  // Enter answering the modal; that needs a live TUI, which this environment cannot
+  // spawn (see the report). Stating the weaker claim because it is the one measured.
+  const r = await runScenario(scenario('tui-preconditions'), { timeoutMs: 60_000 });
+  assert.equal(r.ok, true);
+  for (const tui of ['claude', 'codex', 'agy']) {
+    assert.equal(r.trustScreens[tui].automationBlock, null,
+      `${tui}: the automation seam sees no reason to wait`);
+  }
+});
+
+test('HARNESS: a reaction with no control is a repaint, and is caught as one', async () => {
+  // Codex answers Ctrl-U with exactly the same bytes it answers a harmless arrow
+  // key with: a repaint frame, not a clear. Without a control key that reaction
+  // reads as a pass — "a falsifier with no control passes on everything".
+  const r = await runScenario(scenario('tui-preconditions'), { timeoutMs: 60_000 });
+  assert.equal(r.ok, true);
+  assert.equal(r.control.ctrlUChanged, true, 'the screen moved after Ctrl-U');
+  assert.equal(r.control.arrowChanged, true, 'and moved identically after a key that should do nothing');
+  assert.equal(r.control.identicalReaction, true, 'the two reactions are the same frame');
+  assert.equal(r.control.verdict, 'REPAINT_NOT_EFFECT', 'so what was observed is not an effect');
+});
