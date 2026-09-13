@@ -316,30 +316,61 @@ test('an exact duplicate is a no-op and does not move the revision', () => {
   );
 });
 
-test('one transaction over several pools increments the collection once, not once per pool', () => {
+test('§11 five serial one-pool ingests are FIVE transactions, so the collection advances five times', () => {
+  // RENAMED, AND THE OLD NAME WAS QUOTING A SUPERSEDED CLAUSE. It read "one transaction
+  // over several pools increments the collection once, not once per pool", which is §7
+  // line 141 — and §11 line 210 supersedes it for L0: "The current tracker exposes no
+  // batch-ingest API. Each accepted one-pool ingest is its own atomic transaction;
+  // therefore five serial pool ingests increment collectionRevision five times. This is
+  // an accepted L0 scope boundary, not a semantic defect." §11 line 214 then replaces
+  // §10's "five-pool atomic collection update" fixture with exactly this shape.
+  //
+  // SO THE NAME PROMISED A SCENARIO NOTHING CAN BUILD — there is no multi-pool
+  // transaction on the public surface, only ingest and ingestDetailed, one observation
+  // each — AND IT NAMED THE OPPOSITE OF THE RULING EXPECTATION. Had I "fixed" the body
+  // to match the old name it would have gone red against an accepted scope boundary.
+  //
+  // The invariant that IS real here is per-ingest and it is the same one §15 line 276
+  // states: one accepted ingest is one publication. Asserted below as two separate
+  // clauses so a frozen revision and a multiplying one fail on different messages.
   const h = makeTracker(T0);
-  const before = h.tracker.snapshot().collectionRevision;
+  const first = h.tracker.snapshot().collectionRevision;
 
   for (let i = 0; i < 5; i += 1) {
-    h.tracker.ingest(
+    const before = h.tracker.snapshot().collectionRevision;
+    const poolKey = `codex:acct-${i}:limit-1`;
+    const accepted = h.tracker.ingest(
       obs({
-        poolKey: `codex:acct-${i}:limit-1`,
+        poolKey,
         accountScope: `acct-${i}`,
         windows: [win()]
       })
+    );
+    assert.ok(accepted, `ingest ${i} was accepted`);
+    const after = h.tracker.snapshot().collectionRevision;
+    assert.ok(after > before, `§11: accepted ingest ${i} is a publication, so it ADVANCES the collection`);
+    assert.equal(
+      after - before,
+      1,
+      `§15: accepted ingest ${i} is ONE publication and must not MULTIPLY the revision, ` +
+        `advanced by ${after - before}`
+    );
+    // Replaces a `typeof p.revision === 'number'` check that asserted nothing — it
+    // passed against an implementation whose every revision stayed 0 forever.
+    assert.ok(
+      h.pool(poolKey).revision > 0,
+      `${poolKey} carries its OWN revision and it has moved, not merely exists`
     );
   }
 
   const snap = h.tracker.snapshot();
   assert.equal(snap.pools.length, 5, 'five distinct pools, keyed by account scope');
-  assert.ok(
-    snap.collectionRevision > before,
-    '§7: adding pools advances the collection revision'
+  assert.equal(
+    snap.collectionRevision - first,
+    5,
+    '§11: five serial ingests are five transactions, so five increments — the accepted L0 ' +
+      'scope boundary, NOT the superseded "once, not five times"'
   );
-  // Each pool is independently revisioned.
-  for (const p of snap.pools) {
-    assert.equal(typeof p.revision, 'number', 'every pool carries its own revision');
-  }
 });
 
 test('two accounts of one provider never merge into one pool', () => {

@@ -288,6 +288,73 @@ test('§15 the three cap CONSTANTS are unchanged — and this proves NOTHING abo
   );
 });
 
+test('§15 ONE accepted ingest is ONE publication, even the one the collection cap bounds', () => {
+  // L0-SEM §15 line 276: "one accepted one-pool ingest is one atomic transaction/
+  // publication and advances collectionRevision ONCE, EVEN IF implementation internally
+  // projects a candidate and then its bounded stand-in."
+  //
+  // WRITTEN AS A DECLARED RED AND IT IS GREEN, BECAUSE THE FIX LANDED WHILE I WAS
+  // WRITING IT. I measured the nonconformance myself at b0646966 — a plain ingest
+  // advanced by 1 and the breaching ingest by 2, because the cap path projected, then
+  // re-projected the bounded stand-in, and published both. Jim's L0-FIX6 (b00ca4e2)
+  // then made one ingest one publication. So this is NOT an expected-red and the red
+  // list stays at nine.
+  //
+  // THE RED-TO-GREEN EVIDENCE EXISTS ANYWAY, and it is better than a mutant: this exact
+  // test fails at b0646966 on the does-not-multiply clause with advanced=2 and passes at
+  // b00ca4e2, so the pair across Jim's commit is what proves his fix did what it claims
+  // rather than merely that the behaviour is correct now. Recorded here because that
+  // pair is not visible in any single run of the suite.
+  //
+  // §11 line 210 is NOT in tension with this: five SERIAL ingests are five
+  // transactions and legitimately five increments, an accepted L0 scope boundary. This
+  // is about ONE ingest publishing twice, which is a different claim entirely.
+  const t = tracker();
+  for (let i = 0; i < RETENTION_CAPS.maxPools - 1; i++) {
+    t.ingest(sizedTo(`codex:acct-${i}:limit-1`, `acct-${i}`, RETENTION_CAPS.maxPoolBytes));
+  }
+  // The 31-pool frontier is VALID (§15): nothing is bounded here, so the breach below
+  // is caused by the arriving pool and not by a fixture that was already over.
+  const atFrontier = t.snapshot();
+  assert.equal(
+    atFrontier.pools.filter((p) => p.state === 'UNKNOWN').length,
+    0,
+    '§15 precondition: 31 per-pool-maximum pools are a VALID frontier, nothing bounded yet'
+  );
+
+  const before = atFrontier.collectionRevision;
+  const accepted = t.ingest(sizedTo('codex:acct-last:limit-1', 'acct-last', RETENTION_CAPS.maxPoolBytes));
+  assert.ok(accepted, 'the 32nd maximal reading is ACCEPTED — the cap bounds it, it is not rejected');
+  const snap = t.snapshot();
+
+  // FIRST, because the two revision clauses below pin NOTHING if the breach never
+  // happened. If a later change stops 32 maximal pools breaching, this test must fail
+  // here rather than pass on a fixture that no longer exercises the cap path.
+  assert.equal(
+    snap.pools.filter((p) => p.state === 'UNKNOWN').length,
+    1,
+    'the arriving pool IS bounded, so the candidate-then-stand-in path really was taken'
+  );
+
+  const advanced = snap.collectionRevision - before;
+  // Clause one: it ADVANCES. An implementation that froze the revision on the cap path
+  // would hide a real membership change from every consumer that diffs by revision.
+  assert.ok(
+    advanced > 0,
+    `§15: an accepted ingest is a publication, so the collection revision must ADVANCE; it moved ${advanced}`
+  );
+  // Clause two: it does NOT MULTIPLY. Separate from clause one and separately named,
+  // because one equality would go red for both and tell you which for neither.
+  assert.equal(
+    advanced,
+    1,
+    `§15: ONE accepted ingest is ONE publication, so the collection revision must advance ` +
+      `ONCE; it advanced ${advanced}. The internal candidate-then-bounded-stand-in ` +
+      'projection must not publish twice. This clause is the one that failed at b0646966 ' +
+      'with advanced=2, before L0-FIX6.'
+  );
+});
+
 // ---------------------------------------------------------------------------
 // §8 Codex file processing — "max 256 KiB appended bytes per read".
 // ---------------------------------------------------------------------------
