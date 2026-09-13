@@ -186,6 +186,8 @@ export interface PoolCapacitySnapshot {
   planType: string | null;
   /** A reset boundary has passed but recovery is NOT yet evidenced. Never implies AVAILABLE. */
   recoveryPending: boolean;
+  /** Fixed metadata for a retention-cap breach, or null. See `CapBreachKind`. */
+  capBreach: CapBreachKind | null;
   /**
    * Identity of the current limit epoch — the moment hard evidence opened it — or
    * null when none is open. It exists because two consumers need to tell ONE refusal
@@ -197,19 +199,39 @@ export interface PoolCapacitySnapshot {
   limitEpochAt: number | null;
 }
 
+/** Fixed-size evidence that the collection is missing pools. See `overflow`. */
+export interface CollectionOverflowMarker {
+  kind: 'POOL_COUNT_EXCEEDED';
+  completeness: 'UNKNOWN';
+  excess: 'ONE_OR_MORE';
+}
+
+/**
+ * Which retention cap a pool breached. Fixed metadata (L0-SEM 13) — it records the
+ * SHAPE of the breach and never any part of what breached it.
+ */
+export type CapBreachKind =
+  | 'WINDOW_COUNT_EXCEEDED'
+  | 'POOL_BYTES_EXCEEDED'
+  | 'COLLECTION_BYTES_EXCEEDED';
+
 /** The whole collection, with its own revision so a consumer can diff cheaply. */
 export interface CapacityCollectionSnapshot {
   /**
-   * How many distinct pools have been refused for the cardinality cap (L0-SEM 162).
+   * Present once the pool-count cap has been breached, and latched (L0-SEM 13).
    *
-   * A BOUNDED SUMMARY RATHER THAN A 33RD RECORD. The breach has to be visible — a
-   * silently dropped pool is the failure 172 names — but making it visible by
-   * retaining the overflowing pool would defeat the cap it is reporting, and a
-   * machine that sees a thousand pool identities would retain a thousand markers.
-   * One counter is visible, is constant size, and cannot itself overflow the thing
-   * it measures.
+   * NOT A POOL AND NOT A COUNT. It carries no identity, no windows, no percentages
+   * and no reset data, because retaining any of those about the excess pools is the
+   * very thing the cap forbids. And it says ONE_OR_MORE rather than a number: under
+   * a one-pool ingest API you cannot tell a 34th NEW pool from a repeat of the 33rd
+   * without retaining the identities you are specifically refusing to retain, so
+   * counting would itself be unbounded. `ONE_OR_MORE` is the honest bounded fact.
+   *
+   * Its presence means the COLLECTION is incomplete. The retained pools keep their
+   * own valid states; what a consumer may not do is treat the collection as whole,
+   * and any reference to an omitted pool resolves UNKNOWN rather than AVAILABLE.
    */
-  refusedPools: number;
+  overflow: CollectionOverflowMarker | null;
   /** Increments when any pool projection changes or a pool is added or removed. */
   collectionRevision: number;
   pools: PoolCapacitySnapshot[];

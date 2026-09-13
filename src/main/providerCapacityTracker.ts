@@ -49,6 +49,8 @@ import type {
   CapacityObservation,
   CapacityState,
   CapacityWindow,
+  CapBreachKind,
+  CollectionOverflowMarker,
   ObservationSource,
   PoolCapacitySnapshot
 } from '../shared/providerCapacity';
@@ -148,7 +150,7 @@ interface LimitEpoch {
 interface PoolRecord {
   observation: CapacityObservation;
   /** Which retention cap this pool breached, or null. Sticky until a reading fits. */
-  capBreach: string | null;
+  capBreach: CapBreachKind | null;
   /** Serialized size of the published projection, for the collection cap. */
   projectionBytes: number;
   projection: PoolCapacitySnapshot;
@@ -237,6 +239,7 @@ const sameProjection = (a: PoolCapacitySnapshot, b: PoolCapacitySnapshot): boole
   && a.ordinaryUsageAllowed === b.ordinaryUsageAllowed
   && a.planType === b.planType
   && a.recoveryPending === b.recoveryPending
+  && a.capBreach === b.capBreach
   && a.limitEpochAt === b.limitEpochAt
   && a.numericallyExhaustedWindowIds.join('|') === b.numericallyExhaustedWindowIds.join('|')
   && JSON.stringify(a.windows) === JSON.stringify(b.windows);
@@ -262,9 +265,9 @@ export class ProviderCapacityTracker {
    * by construction, and no eviction policy to get wrong.
    */
   private revisionFloor = 0;
-  /** How many pools were refused for the cardinality cap. One diagnostic, not one
-   *  per refusal — 172 requires the diagnosis to be deduplicated. */
-  private poolsRefused = 0;
+  /** Latched once the pool-count cap is breached (L0-SEM 13). Not a pool, not a
+   *  count, and cleared only by proof — never by arrivals merely stopping. */
+  private overflow: CollectionOverflowMarker | null = null;
   private collectionRevision = 0;
   private updatedAt = 0;
 
@@ -317,9 +320,16 @@ export class ProviderCapacityTracker {
     // replacement is a counter rather than a sentinel, because a sentinel would
     // itself be the 33rd record.
     if (!prev && this.pools.size >= RETENTION_CAPS.maxPools) {
-      this.poolsRefused += 1;
-      if (this.poolsRefused === 1) {
-        console.warn(`[capacity] pool cap ${RETENTION_CAPS.maxPools} reached; further pools are not tracked`);
+      // Retain NOTHING about the excess pool - not the entity, not its identity, not
+      // its payload (L0-SEM 13). The breach is recorded as one fixed marker, and a
+      // later excess arrival is a semantic no-op rather than a second anything:
+      // telling a 34th NEW pool from a repeat of the 33rd would require keeping the
+      // identities this cap exists to refuse.
+      if (!this.overflow) {
+        this.overflow = { kind: 'POOL_COUNT_EXCEEDED', completeness: 'UNKNOWN', excess: 'ONE_OR_MORE' };
+        this.collectionRevision += 1;
+        this.updatedAt = now;
+        console.warn(`[capacity] pool cap ${RETENTION_CAPS.maxPools} exceeded; the collection is incomplete`);
       }
       return { accepted: false, changed: false, reason: 'CAP_POOLS' };
     }
@@ -400,7 +410,7 @@ export class ProviderCapacityTracker {
   snapshot(): CapacityCollectionSnapshot {
     return {
       collectionRevision: this.collectionRevision,
-      refusedPools: this.poolsRefused,
+      overflow: this.overflow,
       pools: [...this.pools.values()].map((r) => r.projection),
       updatedAt: this.updatedAt
     };
@@ -448,6 +458,31 @@ export class ProviderCapacityTracker {
       if (at !== null && at > now) consider(at - now);
     }
     return soonest;
+  }
+
+  /**
+   * An authoritative COMPLETE inventory of the pools that exist. Clears the
+   * pool-count overflow marker if it proves the collection fits (L0-SEM 13).
+   *
+   * WHY THIS EXISTS AS AN EXPLICIT CALL RATHER THAN A CONSEQUENCE. The marker says
+   * "pools are missing from this collection", and nothing that happens inside this
+   * tracker can disprove that: excess arrivals stopping is not proof, time passing
+   * is not proof, and a pool being forgotten frees a SLOT without showing that the
+   * omitted pool is gone. Only an enumeration from outside — something that can see
+   * every pool that exists, not only the ones that happened to be offered — can
+   * establish it. That is the same discipline as recovery never being inferred from
+   * a reset time passing: absence of evidence must not clear a fact, and evidence
+   * must.
+   *
+   * Returns true if the marker was cleared.
+   */
+  noteCompleteInventory(poolKeys: readonly string[]): boolean {
+    if (!this.overflow) return false;
+    if (poolKeys.length > RETENTION_CAPS.maxPools) return false;
+    this.overflow = null;
+    this.collectionRevision += 1;
+    this.updatedAt = this.clock();
+    return true;
   }
 
   /**
@@ -528,15 +563,15 @@ export class ProviderCapacityTracker {
    * reported as current, which is the silent-discard outcome 172 forbids by another
    * route.
    */
-  private capBreachFor(obs: CapacityObservation, poolExists: boolean): string | null {
-    if (obs.windows.length > RETENTION_CAPS.maxWindowsPerPool) return 'WINDOWS_PER_POOL';
-    if (byteLength(obs) > RETENTION_CAPS.maxPoolBytes) return 'POOL_BYTES';
+  private capBreachFor(obs: CapacityObservation, poolExists: boolean): CapBreachKind | null {
+    if (obs.windows.length > RETENTION_CAPS.maxWindowsPerPool) return 'WINDOW_COUNT_EXCEEDED';
+    if (byteLength(obs) > RETENTION_CAPS.maxPoolBytes) return 'POOL_BYTES_EXCEEDED';
     // What is ALREADY published, plus room for this pool's own projection. The
     // arriving pool is the one that reports the breach, because it is the one whose
     // arrival caused it.
     let others = 0;
     for (const [key, rec] of this.pools) if (key !== obs.poolKey) others += rec.projectionBytes;
-    if (others >= RETENTION_CAPS.maxCollectionBytes) return 'COLLECTION_BYTES';
+    if (others >= RETENTION_CAPS.maxCollectionBytes) return 'COLLECTION_BYTES_EXCEEDED';
     void poolExists;
     return null;
   }
@@ -546,10 +581,15 @@ export class ProviderCapacityTracker {
    *
    * ACCEPT MUST NOT MEAN RETAIN THE UNBOUNDED OBJECT, and my first version did
    * exactly that: it classified the pool UNKNOWN and then stored all seventeen
-   * windows anyway, so the caps announced a bound they did not impose. The pool keeps
-   * its IDENTITY and its ordering position — both are small, and discarding them
-   * would make the next reading look like a first sighting — and loses every
-   * unbounded field. What is retained is constant-size regardless of what arrived.
+   * windows anyway, so the caps announced a bound they did not impose. The REAL pool
+   * stays — it keeps its identity and its ordering position, both small, and
+   * discarding them would make the next reading look like a first sighting.
+   *
+   * THE OFFENDING WINDOW SET IS REJECTED WHOLE, AND THAT IS NOT THE SAME AS
+   * TRUNCATING. Keeping sixteen of seventeen windows would be bounded and would be
+   * WORSE than the breach: a selected subset is a COMPLETE-LOOKING SET that nobody
+   * observed, so the pool could classify on evidence the provider never sent.
+   * Neither the 17th window nor any chosen 16 survives (L0-SEM 13).
    */
   private static sentinel(obs: CapacityObservation): CapacityObservation {
     return {
@@ -644,6 +684,7 @@ export class ProviderCapacityTracker {
       ordinaryUsageAllowed: obs.ordinaryUsageAllowed,
       planType: obs.planType,
       recoveryPending: epoch?.hinted === true,
+      capBreach: rec.capBreach,
       limitEpochAt: epoch?.since ?? null
     };
   }
@@ -828,6 +869,7 @@ function blankProjection(obs: CapacityObservation, floor = 0): PoolCapacitySnaps
     ordinaryUsageAllowed: null,
     planType: null,
     recoveryPending: false,
+    capBreach: null,
     limitEpochAt: null
   };
 }

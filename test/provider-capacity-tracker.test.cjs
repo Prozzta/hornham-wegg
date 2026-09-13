@@ -582,54 +582,142 @@ test('SPEC4/172: exceeding the per-pool WINDOW cap is UNKNOWN, not a truncated h
   assert.equal(m.reason(), REASON.CAP_EXCEEDED, 'it must not silently discard an applicable window and stay healthy');
 });
 
-test('FIX4/172: the POOL cap actually BOUNDS the map, and the breach is still visible', () => {
+test('FIX4/13: the 33rd pool retains NOTHING - one fixed marker, no identity, no count', () => {
   const m = make();
   for (let i = 0; i < RETENTION_CAPS.maxPools; i += 1) {
     m.t.ingest(obs({ poolKey: `codex:acct-${i}:codex`, accountScope: `acct-${i}` }));
   }
-  assert.equal(m.t.snapshot().pools.length, RETENTION_CAPS.maxPools);
+  assert.equal(m.t.snapshot().overflow, null, 'a collection at the cap is complete');
 
-  // Retaining the 33rd as an UNKNOWN pool made the breach visible and defeated the
-  // cap that was reporting it - a machine seeing a thousand pool identities would
-  // retain a thousand markers. The count is bounded and the breach is reported as a
-  // bounded SUMMARY instead.
-  for (const scope of ['over-a', 'over-b', 'over-c']) {
-    m.t.ingest(obs({ poolKey: `codex:${scope}:codex`, accountScope: scope }));
-  }
-  assert.equal(m.t.snapshot().pools.length, RETENTION_CAPS.maxPools, 'the map does not grow past the cap');
-  assert.equal(m.t.pool('codex:over-a:codex'), null, 'and no 33rd record exists');
-  assert.equal(m.t.snapshot().refusedPools, 3, 'but the refusals are counted, not silently dropped');
-});
-
-test('FIX4/172: a cap breach RETAINS a bounded stand-in, not the oversized reading', () => {
-  const m = make();
-  const many = [];
-  for (let i = 0; i < RETENTION_CAPS.maxWindowsPerPool + 1; i += 1) {
-    many.push({ windowId: `w${i}`, kind: 'FIVE_HOUR', label: '5h', windowMinutes: 300,
-      usedPercent: 10, remainingPercent: 90, resetsAt: RESET_5H });
-  }
-  m.t.ingest(obs({ windows: many }));
-  const pool = m.t.pool(KEY);
-  assert.equal(pool.state, 'UNKNOWN');
-  assert.equal(pool.stateReason, REASON.CAP_EXCEEDED);
-  // THE CONTRACT THE OLD TEST NAMED AND NEVER CHECKED: classification was right and
-  // all seventeen windows were stored anyway, so the cap announced a bound it did
-  // not impose.
-  assert.equal(pool.windows.length, 0, 'the unbounded field is gone, not merely unreported');
-  assert.ok(
-    JSON.stringify(m.t.snapshot()).length < RETENTION_CAPS.maxPoolBytes,
-    'and the retained collection is genuinely small'
+  m.t.ingest(obs({ poolKey: 'codex:over-a:codex', accountScope: 'over-a' }));
+  const snap = m.t.snapshot();
+  assert.deepEqual(snap.overflow, {
+    kind: 'POOL_COUNT_EXCEEDED', completeness: 'UNKNOWN', excess: 'ONE_OR_MORE'
+  }, 'a fixed marker, and ONE_OR_MORE rather than a number');
+  assert.equal(snap.pools.length, RETENTION_CAPS.maxPools, 'the excess pool is not an entry');
+  assert.equal(m.t.pool('codex:over-a:codex'), null, 'and its identity is not retained anywhere');
+  assert.equal(
+    JSON.stringify(snap).includes('over-a'),
+    false,
+    'THE CONTENT ASSERTION: no trace of the excess identity survives in the collection'
   );
 });
 
-test('FIX4/172: an OVERSIZED single reading is bounded the same way', () => {
+test('FIX4/13: the marker does not MULTIPLY - exactly one after further excess arrivals', () => {
+  const m = make();
+  for (let i = 0; i < RETENTION_CAPS.maxPools; i += 1) {
+    m.t.ingest(obs({ poolKey: `codex:acct-${i}:codex`, accountScope: `acct-${i}` }));
+  }
+  m.t.ingest(obs({ poolKey: 'codex:over-a:codex', accountScope: 'over-a' }));
+  const afterFirst = m.t.snapshot().collectionRevision;
+
+  for (const scope of ['over-b', 'over-c']) {
+    m.t.ingest(obs({ poolKey: `codex:${scope}:codex`, accountScope: scope }));
+  }
+  const snap = m.t.snapshot();
+  // STRICTLY ONE, not "at most one": "at most one" is satisfied by an implementation
+  // that emits no marker at all.
+  assert.equal(snap.overflow === null ? 0 : 1, 1, 'exactly one marker, not zero and not three');
+  assert.equal(snap.pools.length, RETENTION_CAPS.maxPools);
+  assert.equal(snap.collectionRevision, afterFirst, 'further excess arrivals are semantic no-ops');
+});
+
+test('FIX4/13: arrivals stopping and time passing do NOT clear the marker', () => {
+  const m = make();
+  for (let i = 0; i < RETENTION_CAPS.maxPools; i += 1) {
+    m.t.ingest(obs({ poolKey: `codex:acct-${i}:codex`, accountScope: `acct-${i}` }));
+  }
+  m.t.ingest(obs({ poolKey: 'codex:over-a:codex', accountScope: 'over-a' }));
+
+  m.set(T0 + 3_600_000);
+  m.t.evaluate();
+  assert.ok(m.t.snapshot().overflow, 'silence is not proof that no omitted pool remains');
+
+  // Freeing a SLOT is not proof either: the omitted pool is still omitted.
+  m.t.forget('codex:acct-0:codex');
+  assert.ok(m.t.snapshot().overflow, 'a free slot is not an inventory');
+});
+
+test('FIX4/13: an authoritative complete inventory DOES clear it', () => {
+  // The other half, and the half whose absence would let "never clears" pass
+  // forever. Absence of evidence must not clear the marker; evidence must.
+  const m = make();
+  for (let i = 0; i < RETENTION_CAPS.maxPools; i += 1) {
+    m.t.ingest(obs({ poolKey: `codex:acct-${i}:codex`, accountScope: `acct-${i}` }));
+  }
+  m.t.ingest(obs({ poolKey: 'codex:over-a:codex', accountScope: 'over-a' }));
+  assert.ok(m.t.snapshot().overflow);
+
+  const tooMany = Array.from({ length: RETENTION_CAPS.maxPools + 1 }, (_, i) => `codex:acct-${i}:codex`);
+  assert.equal(m.t.noteCompleteInventory(tooMany), false, 'an inventory that does NOT fit proves nothing');
+  assert.ok(m.t.snapshot().overflow, 'so the marker stays');
+
+  const fits = Array.from({ length: RETENTION_CAPS.maxPools }, (_, i) => `codex:acct-${i}:codex`);
+  assert.equal(m.t.noteCompleteInventory(fits), true);
+  assert.equal(m.t.snapshot().overflow, null, 'proof clears it');
+});
+
+const windowSet = (n) => Array.from({ length: n }, (_, i) => ({
+  windowId: `w${i}`, kind: 'FIVE_HOUR', label: '5h', windowMinutes: 300,
+  usedPercent: 10, remainingPercent: 90, resetsAt: RESET_5H
+}));
+
+test('FIX4/13 both sides: a LEGAL window set is retained IN FULL', () => {
+  // Without this half, "no fabricated 16-member set" is satisfied by an
+  // implementation that retains nothing at all, ever.
+  const m = make();
+  m.t.ingest(obs({ windows: windowSet(RETENTION_CAPS.maxWindowsPerPool) }));
+  const pool = m.t.pool(KEY);
+  assert.equal(pool.state, 'AVAILABLE', 'exactly at the cap is within budget');
+  assert.equal(pool.windows.length, RETENTION_CAPS.maxWindowsPerPool, 'all 16 retained, not a subset');
+  assert.equal(pool.capBreach, null);
+});
+
+test('FIX4/13: a 17-window set is rejected WHOLE - no 17th, and no chosen 16', () => {
+  const m = make();
+  const seventeen = windowSet(RETENTION_CAPS.maxWindowsPerPool + 1);
+  m.t.ingest(obs({ windows: seventeen }));
+  const pool = m.t.pool(KEY);
+
+  assert.equal(pool.state, 'UNKNOWN');
+  assert.equal(pool.stateReason, REASON.CAP_EXCEEDED);
+  assert.equal(pool.capBreach, 'WINDOW_COUNT_EXCEEDED', 'fixed metadata, not the payload');
+
+  // THE CONTENT ASSERTION. Classification cannot distinguish "rejected whole" from
+  // "truncated to a healthy-looking 16" - and a selected subset is WORSE than the
+  // breach, because it is a complete-looking set nobody observed.
+  assert.equal(pool.windows.length, 0, 'not 17, and not 16 either');
+  for (const w of seventeen) {
+    assert.equal(
+      JSON.stringify(pool.windows).includes(w.windowId),
+      false,
+      `no member of the offending set survives: ${w.windowId}`
+    );
+  }
+});
+
+test('FIX4/13: a per-pool BYTE breach uses the same reject-whole shape', () => {
   const m = make();
   const fat = win('five_hour', 'FIVE_HOUR', 80, RESET_5H);
   m.t.ingest(obs({ windows: [{ ...fat, label: 'x'.repeat(RETENTION_CAPS.maxPoolBytes) }] }));
-  assert.equal(m.state(), 'UNKNOWN');
-  assert.equal(m.reason(), REASON.CAP_EXCEEDED);
-  assert.ok(JSON.stringify(m.t.pool(KEY)).length < RETENTION_CAPS.maxPoolBytes, 'retained bounded');
+  const pool = m.t.pool(KEY);
+  assert.equal(pool.state, 'UNKNOWN');
+  assert.equal(pool.capBreach, 'POOL_BYTES_EXCEEDED');
+  assert.equal(pool.windows.length, 0, 'the offending observation is rejected whole');
+  assert.ok(JSON.stringify(pool).length < RETENTION_CAPS.maxPoolBytes, 'and what is kept is bounded');
 });
+
+test('FIX4: the affected pool STAYS - a breach must not become a disappearance', () => {
+  const m = make();
+  m.t.ingest(obs({ windows: windowSet(RETENTION_CAPS.maxWindowsPerPool + 1) }));
+  assert.ok(m.t.pool(KEY), 'the real pool entity is retained and visible');
+  const t1 = T0 + 1_000;
+  m.set(t1);
+  m.t.ingest(obs({ observedAt: t1, receivedAt: t1 }));
+  assert.equal(m.state(), 'AVAILABLE', 'and a reading that fits classifies it again');
+  assert.equal(m.t.pool(KEY).capBreach, null);
+});
+
 
 test('SPEC4/172: the cap diagnostic is DEDUPLICATED - repeated breaches publish nothing new', () => {
   const m = make();
