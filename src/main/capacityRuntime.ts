@@ -104,6 +104,14 @@ export class CapacityRuntime {
     this.rearm();
   }
 
+  /**
+   * Would this agent be refused right now? Asks WITHOUT taking the epoch's recovery
+   * turn, so it is safe to call on every queue tick. See `CapacityAdmission.probe`.
+   */
+  holds(agentId: string, workClass: WorkClass = 'ORDINARY_TURN'): boolean {
+    return this.admission.probe(agentId, workClass).verdict === 'REFUSE';
+  }
+
   /** May this agent start this unit of work? See `CapacityAdmission`. */
   admit(agentId: string, workClass: WorkClass = 'ORDINARY_TURN'): AdmissionDecision {
     return this.admission.admit(agentId, workClass);

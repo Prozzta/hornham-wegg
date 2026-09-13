@@ -25,6 +25,20 @@
 const MAX_PENDING_STEERS = 20;
 
 export interface AgentControlSnapshot {
+  /**
+   * Provider capacity refuses an ORDINARY automatic turn for this agent's pool.
+   *
+   * MAIN COMPUTES THIS; NOTHING ELSE DERIVES IT. It is filled in at the IPC boundary
+   * from the admission seam, never stored on the control record and never set by a
+   * caller — a consumer that computed its own would be a second capacity
+   * implementation with no evidence behind it.
+   *
+   * It is deliberately SEPARATE from `autoDeliveryPaused`: that flag means a person
+   * paused this agent and is shown as such, so folding capacity into it would tell a
+   * user they paused something they did not. This one gates automatic delivery and
+   * is not rendered.
+   */
+  capacityHold?: boolean;
   paused: boolean;
   halted: boolean;
   autoDeliveryPaused: boolean;

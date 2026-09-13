@@ -3958,8 +3958,17 @@ ipcMain.handle('control:halt', (_evt, agentId: unknown) => {
   control.halt(agentId);
   return control.snapshot(agentId);
 });
-ipcMain.handle('control:snapshot', (_evt, agentId: unknown) =>
-  typeof agentId === 'string' ? control.snapshot(agentId) : null);
+ipcMain.handle('control:snapshot', (_evt, agentId: unknown) => {
+  if (typeof agentId !== 'string') return null;
+  // L0-SEAM on the renderer's automatic queued dispatch. That path already consults
+  // this snapshot and already has a no-penalty early return for a held agent, so the
+  // gate costs no send attempt and drops no queued message - which the other
+  // candidate seam, refusing the pty write, would do after three attempts.
+  //
+  // `holds` PROBES rather than admits: this handler runs on every queue tick, and
+  // admitting would spend the epoch's single recovery turn on the question.
+  return { ...control.snapshot(agentId), capacityHold: providerCapacity.holds(agentId, 'ORDINARY_TURN') };
+});
 
 // ─── IPC: scheduled missions (recurring auto-dispatch) ──────────────────────
 ipcMain.handle('missions:list', () => readConfig().missions ?? []);

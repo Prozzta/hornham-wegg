@@ -483,6 +483,14 @@ export interface ClosingTimeEvent {
 
 /** Per-agent operator-control state (#7C.1–7C.3). */
 export interface AgentControlSnapshot {
+  /**
+   * Provider capacity refuses an ORDINARY automatic turn for this agent's pool.
+   * Computed in MAIN at the IPC boundary from the admission seam; never derived on
+   * this side. Separate from `autoDeliveryPaused`, which means a person paused the
+   * agent and is rendered as such — this one gates automatic delivery and is not
+   * shown anywhere.
+   */
+  capacityHold?: boolean;
   paused: boolean;
   halted: boolean;
   autoDeliveryPaused: boolean;

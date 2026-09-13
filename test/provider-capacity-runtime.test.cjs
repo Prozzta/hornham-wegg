@@ -288,3 +288,51 @@ test('FIX4: a launch that FAILS to submit returns the recovery grant', () => {
     'a turn that was never typed must not consume the epoch its one attempt'
   );
 });
+
+// ── L0-FIX4D: the renderer dispatch gate. Asking must not cost the answer ───
+
+test('FIX4: holds() reports a refusal WITHOUT spending the recovery turn', () => {
+  const r = rig();
+  r.runtime.ingest('dwight', obs());
+  r.runtime.ingest('dwight', obs({
+    observedAt: T0 + 1_000, receivedAt: T0 + 1_000,
+    providerReachedType: 'rate_limit_reached',
+    windows: [win('five_hour', 'FIVE_HOUR', 0, RESET_5H)]
+  }));
+  for (let i = 0; i < 8 && r.state() !== 'RECOVERING'; i += 1) r.fire();
+  assert.equal(r.state(), 'RECOVERING');
+
+  // The control snapshot is read on every queue tick. If asking consumed the grant,
+  // the epoch's one attempt would be spent by the first poll and never by a turn.
+  for (let i = 0; i < 20; i += 1) assert.equal(r.runtime.holds('dwight'), false, 'RECOVERING allows one turn');
+
+  assert.equal(
+    r.runtime.admit('dwight').reason,
+    ADMISSION_REASON.RECOVERING_GRANT,
+    'twenty questions later the turn is still available'
+  );
+});
+
+test('FIX4: holds() is true exactly when an ordinary automatic start is refused', () => {
+  const r = rig();
+  r.runtime.ingest('dwight', obs({ providerReachedType: 'rate_limit_reached' }));
+  assert.equal(r.runtime.holds('dwight'), true, 'LIMITED holds');
+
+  const fresh = rig();
+  fresh.runtime.ingest('dwight', obs());
+  assert.equal(fresh.runtime.holds('dwight'), false, 'AVAILABLE does not');
+
+  // UNKNOWN is NOT a refusal: the seam declines to infer safety and the caller
+  // proceeds, so an agent we have never observed behaves as it did before.
+  assert.equal(fresh.runtime.holds('nobody'), false, 'an unknown agent is not held');
+});
+
+test('FIX4: a RESERVE_ONLY pool holds ordinary work but not closure work', () => {
+  const r = rig();
+  r.runtime.ingest('dwight', obs({
+    windows: [win('five_hour', 'FIVE_HOUR', 0, RESET_5H), win('seven_day', 'SEVEN_DAY', 60, T0 + 86_400_000)]
+  }));
+  assert.equal(r.state(), 'RESERVE_ONLY');
+  assert.equal(r.runtime.holds('dwight', 'ORDINARY_TURN'), true);
+  assert.equal(r.runtime.holds('dwight', 'CLOSURE_TURN'), false, 'finishing safely is never held');
+});

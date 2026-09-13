@@ -806,6 +806,13 @@ export function useHive(config: HarnessConfig | null): void {
       // the queue with no escape hatch at all. Idle/draft/picker safety below
       // still applies to manual messages; only the pause is bypassed.
       if (control?.autoDeliveryPaused && !next.manual) return { sent: false };
+      // Provider capacity refuses an automatic turn on this agent's pool. MAIN
+      // decides this — the flag arrives computed and is never derived here — and the
+      // message stays at the head of the queue: this early return costs no send
+      // attempt, so a limited provider delays work instead of destroying it. `manual`
+      // bypasses it for the same reason it bypasses the pause: a person pressing
+      // "send now" is not an automatic start.
+      if (control?.capacityHold && !next.manual) return { sent: false };
       // Hold queued messages until the target finishes its boot sequence.
       if ((bootGraceUntil.current[target.id] ?? 0) >= now) return { sent: false };
       // The user owns the prompt: a draft they are writing, or a menu they

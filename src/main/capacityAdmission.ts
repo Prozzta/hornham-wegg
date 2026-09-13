@@ -137,7 +137,41 @@ export class CapacityAdmission {
     private readonly reservationTtlMs: number = RECOVERY_RESERVATION_TTL_MS
   ) {}
 
+  /**
+   * The verdict WITHOUT taking anything. Use this to ASK - to render a gate, to
+   * answer a snapshot, to decide whether to offer work - and `admit()` only when
+   * something is about to start.
+   *
+   * IT EXISTS BECAUSE ASKING MUST NOT COST THE ANSWER. `admit()` reserves the
+   * epoch's single recovery turn when it returns one, so a caller that polled it to
+   * find out whether work WOULD be allowed would spend the one attempt on the
+   * question - and a snapshot that is read on every queue tick would spend it
+   * immediately and permanently.
+   */
+  probe(agentId: string, workClass: WorkClass = 'ORDINARY_TURN'): AdmissionDecision {
+    return this.decide(agentId, workClass);
+  }
+
   admit(agentId: string, workClass: WorkClass = 'ORDINARY_TURN'): AdmissionDecision {
+    const decision = this.decide(agentId, workClass);
+    // The one verdict that costs something to give. Reserving here, rather than
+    // inside the decision, is what lets `probe()` share this logic instead of
+    // duplicating it - a second copy of the state table is exactly the drift this
+    // module cannot afford.
+    if (decision.reason === ADMISSION_REASON.RECOVERING_GRANT && decision.poolKey) {
+      const grantId = `${decision.poolKey}#${decision.limitEpochAt ?? 0}#${++this.grantSeq}`;
+      this.recoveryGrants.set(decision.poolKey, {
+        epoch: decision.limitEpochAt ?? 0,
+        grantId,
+        confirmed: false,
+        reservedAt: this.deps.now()
+      });
+      return { ...decision, grantId };
+    }
+    return decision;
+  }
+
+  private decide(agentId: string, workClass: WorkClass): AdmissionDecision {
     const poolKey = this.deps.poolKeyForAgent(agentId);
     if (!poolKey) {
       // No pool means no capacity FACT, not a free pass and not a refusal.
@@ -163,9 +197,7 @@ export class CapacityAdmission {
         if (held && held.epoch === epoch && !this.abandoned(held)) {
           return at('REFUSE', ADMISSION_REASON.RECOVERING_SPENT);
         }
-        const grantId = `${poolKey}#${epoch}#${++this.grantSeq}`;
-        this.recoveryGrants.set(poolKey, { epoch, grantId, confirmed: false, reservedAt: this.deps.now() });
-        return { ...at('ALLOW', ADMISSION_REASON.RECOVERING_GRANT), grantId };
+        return at('ALLOW', ADMISSION_REASON.RECOVERING_GRANT);
       }
 
       case 'RESERVE_ONLY':
