@@ -320,16 +320,66 @@ test('§15 ONE accepted ingest is ONE publication, even the one the collection c
   // to fit, once at the per-pool maximum so the cap bounds it — and the two are
   // compared. THE ARMS DIFFER ONLY IN WHETHER THE CAP FIRED, so if a breach costs an
   // extra publication the arms diverge, and if one ingest is one publication they match.
+  // THE 31 FILLERS ARE DERIVED, NOT MAXIMAL, AND THE REASON IS MEASURED RATHER THAN
+  // ASSUMED. At `maxPoolBytes` each, 31 fillers publish 259,104 bytes on their own —
+  // already 80 over the 259,024 ceiling that applies ONCE A 32ND POOL EXISTS, because
+  // the growth reserve is charged PER POOL and the 32nd pool's share is taken before
+  // any of its content is. So no 32nd arrival of any size fits, and the control arm
+  // could not have been repaired by shrinking the arrival: the FILLERS are what had to
+  // give. That ceiling moved once already (L0-FIX7 at a82eaca5 widened the number
+  // reserve) and L0-FRONTIER may move it again, so the size is DERIVED against the live
+  // caps every run. A fixture that carries the next move is worth more than one that is
+  // correct today.
+  //
+  // DERIVED BY SEARCH RATHER THAN BY ARITHMETIC ON THE RESERVE, DELIBERATELY. The
+  // obvious closed form — overshoot divided across 31 fillers — reads the overshoot off
+  // the PUBLISHED size, and on a breach the arriving pool is replaced by a sentinel that
+  // discards its content, so the published size is SMALLER than the candidate that
+  // actually broke the cap and the arithmetic understates the trim. Asking the
+  // implementation "does a minimal 32nd arrival still fit?" cannot be wrong about that,
+  // or about any framing overhead a future change introduces.
+  const KEY = 'codex:acct-last:limit-1';
+  const smallArrival = () =>
+    obs({ poolKey: KEY, accountScope: 'acct-last', observedAt: T0, receivedAt: T0, windows: [win()] });
+  const controlFits = (fillerBytes) => {
+    const t = tracker();
+    for (let i = 0; i < RETENTION_CAPS.maxPools - 1; i++) {
+      t.ingest(sizedTo(`codex:acct-${i}:limit-1`, `acct-${i}`, fillerBytes));
+    }
+    t.ingest(smallArrival());
+    return t.snapshot().pools.filter((p) => p.state === 'UNKNOWN').length === 0;
+  };
+  let lo = JSON.stringify(smallArrival()).length;
+  let hi = RETENTION_CAPS.maxPoolBytes;
+  let FILLER_BYTES = -1;
+  while (lo <= hi) {
+    const mid = (lo + hi) >> 1;
+    if (controlFits(mid)) { FILLER_BYTES = mid; lo = mid + 1; } else { hi = mid - 1; }
+  }
+  assert.ok(
+    FILLER_BYTES > 0,
+    'no filler size leaves room for a 32nd arrival at all, so this fixture can no longer ' +
+      'construct the case §15 is about — that is a report about the FIXTURE, not about the property'
+  );
+  assert.ok(FILLER_BYTES <= RETENTION_CAPS.maxPoolBytes, 'a filler cannot exceed the per-pool cap');
+  // THE EDGE IS REAL, not merely where the search stopped. A binary search over a
+  // predicate that is not monotone returns a number with no meaning and no error, so
+  // both sides of the boundary are checked directly.
+  assert.ok(controlFits(FILLER_BYTES), 'the derived size really does leave room');
+  if (FILLER_BYTES < RETENTION_CAPS.maxPoolBytes) {
+    assert.equal(controlFits(FILLER_BYTES + 1), false,
+      `and it is the LARGEST such size: one byte more per filler and the 32nd arrival is bounded (derived ${FILLER_BYTES})`);
+  }
+
   const arrival = (maximal) => {
     const t = tracker();
     for (let i = 0; i < RETENTION_CAPS.maxPools - 1; i++) {
-      t.ingest(sizedTo(`codex:acct-${i}:limit-1`, `acct-${i}`, RETENTION_CAPS.maxPoolBytes));
+      t.ingest(sizedTo(`codex:acct-${i}:limit-1`, `acct-${i}`, FILLER_BYTES));
     }
     const before = t.snapshot().collectionRevision;
-    const KEY = 'codex:acct-last:limit-1';
     const accepted = t.ingest(maximal
       ? sizedTo(KEY, 'acct-last', RETENTION_CAPS.maxPoolBytes)
-      : obs({ poolKey: KEY, accountScope: 'acct-last', observedAt: T0, receivedAt: T0, windows: [win()] }));
+      : smallArrival());
     assert.ok(accepted, `the 32nd arrival is ACCEPTED (maximal=${maximal}) — bounded, not rejected`);
     const snap = t.snapshot();
     return {
