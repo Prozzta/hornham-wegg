@@ -197,20 +197,77 @@ test('§8 the three retention caps are ARITHMETICALLY CONSISTENT, or the collect
       'a retained cap-breaching pool can put the collection over budget unreported'
   );
 
-  // And the measured half of the same claim: 32 maximal legal pools reach the cap and
-  // do not cross it, so none of them reports a collection breach.
+  // ── THE MEASURED HALF, RETARGETED AFTER L0-FIX5 (Jim, 64023382) ──────────────
+  // WHAT THIS USED TO ASSERT, so nobody reads the change as the budget property being
+  // abandoned: that 32 maximal legal pools produce ZERO UNKNOWN pools — "a collection
+  // exactly at its budget is within budget". THAT ASSERTION ENCODED THE DEFECT IT WAS
+  // WRITTEN BESIDE. 262,144 bytes of INPUT do not make a 262,144-byte COLLECTION: the
+  // old check summed the other pools' projections, charging neither the arriving pool
+  // nor the wrapper nor the punctuation between 32 array elements, so the maximal
+  // collection published 267,460 bytes against a 262,144 cap and reported nothing.
+  //
+  // The property did not go away, IT MOVED — from arithmetic about inputs to the
+  // RETAINED REPRESENTATION, which is the only place a byte cap means anything. My
+  // own tripwire above predicted this in the other clause of its message: "whether a
+  // retained cap-breaching pool can put the collection over budget unreported". It
+  // could, it did, and the answer is now asserted rather than assumed.
+  //
+  // THE NAME OF THIS TEST WAS HONEST THROUGHOUT. It says ARITHMETICALLY CONSISTENT and
+  // that is exactly what it checked. The error was not a mislabelled test, it was
+  // treating arithmetic over inputs as a stand-in for the cap.
   const t = tracker();
-  let total = 0;
+  let inputBytes = 0;
   for (let i = 0; i < RETENTION_CAPS.maxPools; i++) {
     const o = sizedTo(`codex:acct-${i}:limit-1`, `acct-${i}`, RETENTION_CAPS.maxPoolBytes);
-    total += JSON.stringify(o).length;
+    inputBytes += JSON.stringify(o).length;
     t.ingest(o);
   }
-  assert.equal(total, RETENTION_CAPS.maxCollectionBytes, 'the maximal legal collection lands ON the cap');
+  assert.equal(inputBytes, RETENTION_CAPS.maxCollectionBytes, 'the maximal legal INPUTS sum to exactly the cap');
+
+  const snap = t.snapshot();
+  const published = JSON.stringify(snap).length;
+  assert.ok(
+    published <= RETENTION_CAPS.maxCollectionBytes,
+    `the RETAINED collection serialized to ${published} against a cap of ` +
+      `${RETENTION_CAPS.maxCollectionBytes}. Measured on the published representation, ` +
+      'not summed from inputs — summing here would re-commit the defect inside the test ' +
+      'that exists to pin it.'
+  );
+
+  // AND THE CAP IS REACHABLE ON LEGAL INPUT, which is the half this test is named for.
+  // While it was unreachable, `published <= cap` was true for a reason unrelated to
+  // the cap: nothing measured the collection at all. A bound nothing can reach is not
+  // a bound, so the fixture has to show the cap ACTING.
+  const bounded = snap.pools.filter((p) => p.state === 'UNKNOWN').length;
+  assert.ok(
+    bounded >= 1,
+    'thirty-two INDIVIDUALLY LEGAL maximal pools exhaust the collection budget, so the ' +
+      'collection cap must fire on legal input. Zero bounded pools here means the cap is ' +
+      'dead again and the tripwire above is the place to start.'
+  );
+  assert.ok(
+    bounded < RETENTION_CAPS.maxPools,
+    'but a full collection is not a blanked one: the cap binds the arrivals it cannot fit'
+  );
+
+  // The other side, because "the cap fires" is trivially true of a tracker that bounds
+  // everything, exactly as "within budget" was trivially true of one that measured
+  // nothing. HALF the pools must spend the budget and keep every reading.
+  const half = tracker();
+  const halfCount = RETENTION_CAPS.maxPools / 2;
+  for (let i = 0; i < halfCount; i++) {
+    half.ingest(sizedTo(`codex:acct-${i}:limit-1`, `acct-${i}`, RETENTION_CAPS.maxPoolBytes));
+  }
+  const halfSnap = half.snapshot();
   assert.equal(
-    t.snapshot().pools.filter((p) => p.state === 'UNKNOWN').length,
+    halfSnap.pools.filter((p) => p.state === 'UNKNOWN').length,
     0,
-    'a collection exactly at its budget is within budget'
+    'a collection with room bounds nothing — the cap is not firing on everything'
+  );
+  assert.ok(
+    JSON.stringify(halfSnap).length > halfCount * RETENTION_CAPS.maxPoolBytes,
+    'and the retained bytes are really there, so "within budget" is not being satisfied ' +
+      'by a collection that quietly kept less than it was given'
   );
 });
 
