@@ -10,7 +10,10 @@
  *   - ENTER IS NEVER SENT. Not to a modal, not to a box, not once. If the screen is
  *     anything but a composer the run ABORTS without a keystroke, so a trust or ToS
  *     gate is refused by never being answered rather than by being recognised.
- *   - Env still via the product's buildPtyEnv + devIsolation STABLE_ENV_KEYS, gated.
+ *   - Env via the product's OWN two mechanisms and no predicate of mine: buildPtyEnv
+ *     for the parent Claude session, scrubInheritedEnv for Stable's injection. The
+ *     gate is scrubInheritedEnv used as its own oracle - a second pass over the
+ *     scrubbed env must remove NOTHING - so the check cannot drift from the list.
  *
  * The clear key and the harmless key are applied FROM THE SAME STAGED BASELINE.
  */
@@ -19,16 +22,22 @@ const REPO = 'C:/Dunder/MunderDev';
 const pty = require(REPO + '/node_modules/node-pty');
 const loadTs = require(REPO + '/test/load-ts.cjs');
 const { buildPtyEnv } = loadTs('src/main/ptyEnv.ts');
-const { STABLE_ENV_KEYS } = loadTs('src/main/devIsolation.ts');
+const { scrubInheritedEnv } = loadTs('src/main/devIsolation.ts');
 
 const CWD = process.argv[2];
 const OUT = process.argv[3];
 
-const baseEnv = buildPtyEnv(process.env, process.env.PATH || '', {});
-const ENV = {};
-for (const [k, v] of Object.entries(baseEnv)) if (!STABLE_ENV_KEYS.includes(k)) ENV[k] = v;
-const leak = Object.keys(ENV).filter((k) => STABLE_ENV_KEYS.includes(k));
-if (leak.length) { console.error('LEAK CHECK FAILED: ' + leak.join(',')); process.exit(2); }
+const ENV = buildPtyEnv(process.env, process.env.PATH || '', {});
+// `scrubInheritedEnv` removes STABLE_ENV_KEYS *and* STABLE_ENV_PREFIXES in place and
+// returns what it took. A hand-written filter here would miss the prefixes and would
+// go stale the day someone adds a key - the list is maintained, my predicate is not.
+const removed = scrubInheritedEnv(ENV);
+// The gate: run it again over a copy. If anything is still removable, the first pass
+// did not do what this tool claims, and nothing is spawned. A check that reports and
+// proceeds is not a check.
+const residue = scrubInheritedEnv({ ...ENV });
+if (residue.length) { console.error('LEAK CHECK FAILED, refusing to spawn: ' + residue.join(',')); process.exit(2); }
+console.error('[capture] scrubbed ' + removed.length + ' Stable keys: ' + removed.join(','));
 
 const plainOf = (s) => s.replace(/\x1b\[[0-9;?]*[a-zA-Z]/g, '').replace(/\x1b\][^\x07]*\x07/g, '');
 
