@@ -835,6 +835,15 @@ export function useHive(config: HarnessConfig | null): void {
       if (inFlight.has(flightKey)) return { sent: false };
       inFlight.add(flightKey);
       lastFlush.current[target.id] = now;
+      // The gate above only ASKED. This RESERVES, and it is main that reserves: the
+      // snapshot flag is read on every queue tick and must not spend anything, so on
+      // its own it lets two agents on one recovering pool both pass and both send.
+      // `manual` skips it for the same reason it skips the gate — a person pressing
+      // "send now" is not an automatic start. The ticket is opaque; no capacity
+      // state is derived on this side.
+      const grant = next.manual ? null : await window.cth.capacityBeginAutoDelivery(target.id);
+      if (grant && !grant.ok) { inFlight.delete(flightKey); return { sent: false }; }
+      let launched = false;
       try {
         const sent = await deliverWithAcknowledgement(
           // `instruction` (when present) is the authoritative text to type into
@@ -861,6 +870,7 @@ export function useHive(config: HarnessConfig | null): void {
             }
           }
         );
+        launched = sent;
         if (sent) {
           delete sendFailures[next.id];
           return { sent: true, message: next };
@@ -881,6 +891,9 @@ export function useHive(config: HarnessConfig | null): void {
         return { sent: false };
       } finally {
         inFlight.delete(flightKey);
+        // Always settled, on every exit including a throw: an unreported ticket
+        // holds a recovery turn until main's own expiry returns it.
+        if (grant?.ok) void window.cth.capacitySettleAutoDelivery(grant.ticket, launched);
       }
     };
 

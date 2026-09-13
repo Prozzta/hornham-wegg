@@ -3970,6 +3970,26 @@ ipcMain.handle('control:snapshot', (_evt, agentId: unknown) => {
   return { ...control.snapshot(agentId), capacityHold: providerCapacity.holds(agentId, 'ORDINARY_TURN') };
 });
 
+/**
+ * L0-SEAM, the half the probe could not do. `capacityHold` above answers a question
+ * and reserves nothing - correct for a per-tick snapshot read, and not an admission.
+ * The automatic delivery itself goes through THIS pair, so the dispatch the gate
+ * waved through is the thing that actually spends the epoch's single recovery turn.
+ * Without it two agents on one RECOVERING pool both read "not held" and both send.
+ *
+ * Main owns the decision, the reservation and its expiry; the renderer holds only an
+ * opaque ticket, so a window that is reloaded or closed mid-delivery costs one
+ * delivery window rather than a permanently swallowed grant.
+ */
+ipcMain.handle('capacity:beginAutoDelivery', (_evt, agentId: unknown) => {
+  if (typeof agentId !== 'string') return { ok: false, reason: 'BAD_REQUEST', poolKey: null };
+  return providerCapacity.beginAutomaticDelivery(agentId, 'ORDINARY_TURN');
+});
+ipcMain.handle('capacity:settleAutoDelivery', (_evt, ticket: unknown, launched: unknown) => {
+  if (typeof ticket !== 'string') return;
+  providerCapacity.settleAutomaticDelivery(ticket, launched === true);
+});
+
 // ─── IPC: scheduled missions (recurring auto-dispatch) ──────────────────────
 ipcMain.handle('missions:list', () => readConfig().missions ?? []);
 ipcMain.handle('missions:save', (_evt, missions) => {

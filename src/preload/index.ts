@@ -482,6 +482,14 @@ export interface ClosingTimeEvent {
 }
 
 /** Per-agent operator-control state (#7C.1–7C.3). */
+/**
+ * The answer to a capacity reservation request. A refusal carries no ticket, so
+ * there is nothing to settle and nothing for a caller to forget to release.
+ */
+export type CapacityDeliveryGrant =
+  | { ok: true; ticket: string }
+  | { ok: false; reason: string; poolKey: string | null };
+
 export interface AgentControlSnapshot {
   /**
    * Provider capacity refuses an ORDINARY automatic turn for this agent's pool.
@@ -1045,6 +1053,20 @@ const api = {
   /** Read an agent's current control snapshot. */
   controlSnapshot: (agentId: string): Promise<AgentControlSnapshot | null> =>
     ipcRenderer.invoke('control:snapshot', agentId),
+  /**
+   * Reserve provider capacity for ONE automatic delivery, atomically.
+   *
+   * The `capacityHold` flag on a control snapshot answers "would this be refused?"
+   * without reserving anything, which is what makes it safe to read on every queue
+   * tick - and useless as the thing that authorises the send. This takes the
+   * reservation. Main owns the decision, the grant and its expiry; what comes back
+   * is an opaque ticket carrying no capacity state at all.
+   */
+  capacityBeginAutoDelivery: (agentId: string): Promise<CapacityDeliveryGrant> =>
+    ipcRenderer.invoke('capacity:beginAutoDelivery', agentId),
+  /** Report whether the authorised delivery actually started. Always call it. */
+  capacitySettleAutoDelivery: (ticket: string, launched: boolean): Promise<void> =>
+    ipcRenderer.invoke('capacity:settleAutoDelivery', ticket, launched),
   /** Subscribe to gate/deny events (a tool was blocked); returns unsubscribe fn. */
   onApprovalRequest: (cb: (e: { agentId: string; tool?: string; reason?: string }) => void): (() => void) => {
     const listener = (_e: IpcRendererEvent, payload: { agentId: string; tool?: string; reason?: string }) => cb(payload);

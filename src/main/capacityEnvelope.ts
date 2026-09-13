@@ -16,6 +16,10 @@
  * a record with no provider-supplied strings in it at all — no reached text, no
  * percentages, no reset data, no unknown fields. Honouring it cannot reintroduce
  * unbounded retention because there is nowhere for unbounded data to go.
+ * EVERY VARIABLE-WIDTH FIELD IS BOUNDED HERE, BY THIS PARSER - the account scope
+ * and the attributed window id both go through `boundedIdentity` rather than being
+ * copied verbatim, because "the normalizers only ever send short ones" is a fact
+ * about today's callers and not a property of the envelope.
  *
  * THE DISQUALIFICATION LIST IS THE IMPORTANT HALF. A generic 429, overload or
  * refusal text, a SUBSTRING of an allowlisted value, the string "false", a missing
@@ -42,11 +46,43 @@ export interface AdmissionEnvelope {
   /** Effective observation time and order value, so it orders like any reading. */
   observedAt: number;
   sourceSequence: number | null;
-  /** Already a truncated hash of a path. Bounded, and never a credential. */
-  accountScope: string;
+  /**
+   * A VALIDATED account scope, or null when the arriving one is not one.
+   *
+   * Nullable for the same reason `windowId` is: an identity this parser cannot
+   * validate is not an identity, and a weaker true claim beats a confident wrong
+   * one. It is never truncated to fit - a truncated scope is a DIFFERENT scope and
+   * could collide with a real one.
+   */
+  accountScope: string | null;
   /** A validated CURRENT window identity, or null. Never a relabelling. */
   windowId: string | null;
 }
+
+/**
+ * The widest any identity field in this envelope may be, and the only characters it
+ * may contain.
+ *
+ * WHY THIS PARSER ENFORCES IT RATHER THAN TRUSTING THE CALLER. Production
+ * normalizers supply a 12-character truncated hash, so in the tree as it stands
+ * these fields are already small - and that is exactly the argument that does not
+ * hold. A PROPERTY THAT HOLDS BECAUSE OF WHAT CALLERS HAPPEN TO PASS IS NOT A
+ * PROPERTY: this module's whole authorisation is that it parses independently and
+ * emits a fixed size, and an independent parser that inherits its bound from the
+ * pipeline it was written to be independent of has neither. A 20,000-character
+ * scope produced a 20,143-byte "fixed size" envelope, which is the counterexample.
+ *
+ * The width is generous relative to every identity the codebase actually produces,
+ * because the job here is to bound the field, not to re-specify the hash.
+ */
+const MAX_IDENTITY_CHARS = 64;
+const IDENTITY_SHAPE = /^[A-Za-z0-9_.:@+-]{1,64}$/;
+
+/** A bounded identity, or null. Never a truncation: a shortened id is another id. */
+const boundedIdentity = (value: unknown): string | null =>
+  typeof value === 'string' && value.length <= MAX_IDENTITY_CHARS && IDENTITY_SHAPE.test(value)
+    ? value
+    : null;
 
 /**
  * The sources an envelope may arrive through. A closed set: an observation whose
@@ -103,8 +139,12 @@ export function admissionEnvelopeOf(
     && TYPED_REACHED.includes(obs.providerReachedType);
   if (!denied && !reached) return null;
 
-  const attributed = obs.providerAttributedLimitingWindowId;
-  const windowId = typeof attributed === 'string' && currentWindowIds.includes(attributed)
+  // Bounded FIRST, then checked for admission: a window id that is already an
+  // admitted identity is still only as bounded as the payload that admitted it, and
+  // the per-pool byte cap is a budget for a whole reading rather than a width for
+  // one field. Both tests have to pass.
+  const attributed = boundedIdentity(obs.providerAttributedLimitingWindowId);
+  const windowId = attributed !== null && currentWindowIds.includes(attributed)
     ? attributed
     : null;
 
@@ -117,7 +157,7 @@ export function admissionEnvelopeOf(
     sourceSequence: typeof obs.sourceSequence === 'number' && Number.isFinite(obs.sourceSequence)
       ? obs.sourceSequence
       : null,
-    accountScope: obs.accountScope,
+    accountScope: boundedIdentity(obs.accountScope),
     windowId
   };
 }

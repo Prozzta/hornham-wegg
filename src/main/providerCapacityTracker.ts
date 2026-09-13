@@ -333,14 +333,22 @@ export class ProviderCapacityTracker {
       const limited = envelope !== null;
       const known = this.overflow;
       if (!known || (limited && !known.hardLimitObserved)) {
-        this.overflow = {
-          kind: 'POOL_COUNT_EXCEEDED',
-          completeness: 'UNKNOWN',
-          excess: 'ONE_OR_MORE',
+        // FROZEN AT PUBLICATION, for the same reason every pool projection is, and
+        // more urgently. `snapshot()` hands out this exact object and
+        // `collectionAdmission()` reads the same one, so an unfrozen marker let a
+        // consumer delete `admission` and neutralize the section 14 safety fact -
+        // with no tracker operation, no evidence, and no revision to notice it by.
+        // Freezing at PUBLICATION rather than copying at each accessor is what
+        // closes BOTH readers at once; a copy on one accessor still leaves the
+        // other handing out the live object.
+        this.overflow = Object.freeze({
+          kind: 'POOL_COUNT_EXCEEDED' as const,
+          completeness: 'UNKNOWN' as const,
+          excess: 'ONE_OR_MORE' as const,
           ...(limited || known?.hardLimitObserved
             ? { hardLimitObserved: true, admission: 'LIMITED' as const }
             : {})
-        };
+        });
         this.collectionRevision += 1;
         this.updatedAt = now;
         if (!known) {
@@ -353,14 +361,17 @@ export class ProviderCapacityTracker {
     // big - but everything downstream compares and stores the bounded stand-in. Two
     // identical oversized readings must look identical to the duplicate rules, or
     // the "one deduplicated diagnostic" of 172 becomes one per observation.
-    const breach = this.capBreachFor(obs, prev !== undefined);
+    const breach = this.capBreachFor(obs);
+    // Captured BEFORE anything is mutated: once the arriving reading is committed,
+    // `prev` and the record being written are the same object, and the admitted
+    // identities this validates against would be the ones that just arrived.
+    const admittedWindowIds = prev?.observation.windows.map((w) => w.windowId) ?? [];
     // Parsed from the raw reading, independently of the bulk path and before any of
     // it is retained. Constant-size by construction, so honouring it cannot
     // reintroduce the unbounded retention the breach just refused.
-    const envelope = breach
-      ? admissionEnvelopeOf(obs, prev?.observation.windows.map((w) => w.windowId) ?? [])
-      : null;
-    const reading = breach ? ProviderCapacityTracker.sentinel(obs, envelope) : obs;
+    const boundedStandIn = (): CapacityObservation =>
+      ProviderCapacityTracker.sentinel(obs, admissionEnvelopeOf(obs, admittedWindowIds));
+    const reading = breach ? boundedStandIn() : obs;
 
     let conflicted = false;
     let pinAnchor = false;
@@ -395,14 +406,32 @@ export class ProviderCapacityTracker {
       ageAtAccept: 0,
       acceptedMono: 0
     };
-    rec.observation = reading;
-    rec.capBreach = breach;
-    this.stampDeadline(rec, reading, now);
-    rec.conflicted = conflicted;
-    rec.epoch = this.nextEpoch(rec, reading, now);
-    if (!pinAnchor) rec.anchorAt = now;
+    const commit = (stored: CapacityObservation, kind: CapBreachKind | null): void => {
+      rec.observation = stored;
+      rec.capBreach = kind;
+      this.stampDeadline(rec, stored, now);
+      rec.conflicted = conflicted;
+      rec.epoch = this.nextEpoch(rec, stored, now);
+      if (!pinAnchor) rec.anchorAt = now;
+    };
+    commit(reading, breach);
     this.pools.set(obs.poolKey, rec);
-    return { accepted: true, changed: this.reproject(obs.poolKey, now, pinAnchor), reason: 'ACCEPTED' };
+    let changed = this.reproject(obs.poolKey, now, pinAnchor);
+
+    // THE COLLECTION CAP IS ENFORCED ON THE PUBLISHED COLLECTION, which means after
+    // this reading has been projected into it: the retained representation is the
+    // only thing that can be measured rather than estimated, and estimating is what
+    // let a legal-looking 32-pool collection publish 267,460 bytes against a 262,144
+    // byte cap. If the collection is over budget the ARRIVING pool is the one
+    // replaced by its bounded stand-in - it is the one whose arrival caused the
+    // breach - and the pools already published keep the readings they were admitted
+    // with. Re-projecting advances the revision a second time, which is correct and
+    // harmless: revisions are required to STRICTLY INCREASE, never to be dense.
+    if (!breach && this.overCollectionBudget()) {
+      commit(boundedStandIn(), 'COLLECTION_BYTES_EXCEEDED');
+      changed = this.reproject(obs.poolKey, now, pinAnchor) || changed;
+    }
+    return { accepted: true, changed, reason: 'ACCEPTED' };
   }
 
   /**
@@ -594,17 +623,35 @@ export class ProviderCapacityTracker {
    * reported as current, which is the silent-discard outcome 172 forbids by another
    * route.
    */
-  private capBreachFor(obs: CapacityObservation, poolExists: boolean): CapBreachKind | null {
+  private capBreachFor(obs: CapacityObservation): CapBreachKind | null {
     if (obs.windows.length > RETENTION_CAPS.maxWindowsPerPool) return 'WINDOW_COUNT_EXCEEDED';
     if (byteLength(obs) > RETENTION_CAPS.maxPoolBytes) return 'POOL_BYTES_EXCEEDED';
-    // What is ALREADY published, plus room for this pool's own projection. The
-    // arriving pool is the one that reports the breach, because it is the one whose
-    // arrival caused it.
-    let others = 0;
-    for (const [key, rec] of this.pools) if (key !== obs.poolKey) others += rec.projectionBytes;
-    if (others >= RETENTION_CAPS.maxCollectionBytes) return 'COLLECTION_BYTES_EXCEEDED';
-    void poolExists;
+    // The COLLECTION cap is not decided here. See `overCollectionBudget`: it is a
+    // property of the collection, not of the reading, so it cannot be answered
+    // before the reading has been projected into the collection.
     return null;
+  }
+
+  /**
+   * Is the PUBLISHED collection over its byte budget?
+   *
+   * MEASURED, NOT SUMMED, AND THAT IS THE WHOLE POINT. The previous version added up
+   * `projectionBytes` for every pool EXCEPT the arriving one and compared that. Both
+   * halves were wrong and each one alone was enough to let the cap be exceeded:
+   * omitting the arriving pool checks the collection that existed a moment ago
+   * rather than the one about to be published, and a sum of per-pool sizes is not
+   * the size of the collection - the wrapper fields and the array punctuation
+   * between 32 elements are real retained bytes that no per-pool figure contains.
+   * Thirty-two individually legal 8,192-byte readings summed to exactly the cap and
+   * serialized to 267,460 bytes; the 5,316-byte difference is precisely the part a
+   * sum cannot see.
+   *
+   * So this serializes the thing the cap actually bounds - the published collection,
+   * as a consumer receives it - and there is nothing left to be approximately right
+   * about.
+   */
+  private overCollectionBudget(): boolean {
+    return byteLength(this.snapshot()) > RETENTION_CAPS.maxCollectionBytes;
   }
 
   /**

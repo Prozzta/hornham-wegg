@@ -48,6 +48,22 @@ const MIN_DELAY_MS = 250;
  */
 const MAX_DELAY_MS = 6 * 60 * 60 * 1000;
 
+/**
+ * How long a delivery ticket may stay unsettled before its reservation is returned.
+ *
+ * Generous against the real path it covers - a renderer write chain waits for the
+ * terminal, types, waits 140ms, submits, then settles - and short against the thing
+ * it protects, which is a recovery turn reserved forever by a caller that went away.
+ * Expiring EARLY only ever releases a grant that can be taken again; expiring never
+ * loses it permanently, so the failure directions are not symmetric.
+ */
+const AUTO_DELIVERY_TTL_MS = 30_000;
+
+/** What a deliverer receives. On refusal, no ticket exists to settle. */
+export type AutomaticDeliveryGrant =
+  | { ok: true; ticket: string }
+  | { ok: false; reason: string; poolKey: string | null };
+
 export interface CapacityRuntimeDeps {
   /** Deliver decided transitions. Called only with a non-empty list. */
   deliver: (intents: CapacityNotifyIntent[]) => void;
@@ -67,6 +83,9 @@ export class CapacityRuntime {
   private readonly clearTimer: (handle: unknown) => void;
   private timer: unknown = null;
   private stopped = false;
+  /** Reservations handed out to an out-of-process deliverer, keyed by ticket. */
+  private readonly pending = new Map<string, { decision: AdmissionDecision; timer: unknown }>();
+  private ticketSeq = 0;
 
   constructor(private readonly deps: CapacityRuntimeDeps, tracker = new ProviderCapacityTracker()) {
     this.tracker = tracker;
@@ -128,6 +147,57 @@ export class CapacityRuntime {
     this.admission.cancelGrant(decision);
   }
 
+  /**
+   * Begin an AUTOMATIC delivery that another process will perform.
+   *
+   * WHY THIS EXISTS AND WHY `holds()` WAS NOT ENOUGH. `holds()` probes: it answers
+   * without reserving, which is right for a snapshot read that happens on every
+   * queue tick and wrong for the dispatch that snapshot authorises. A gate's job is
+   * not only to avoid spending the epoch's single recovery turn on a question - it
+   * is to make the dispatch it authorises BE THE THING THAT SPENDS IT. With only a
+   * probe in front of it, two agents on one RECOVERING pool both read "not held" and
+   * both launch, and so do two deliveries to one agent before either is confirmed:
+   * nothing reserved, so there was nothing for the second to find taken.
+   *
+   * THE RENDERER MUST NOT HOLD HALF A TRANSACTION. It cannot be trusted to return a
+   * reservation - it can be reloaded, occluded, throttled or closed between the two
+   * calls - so what it receives is an opaque ticket and nothing else: no decision,
+   * no pool, no capacity state. THE EXPIRY IS OWNED HERE. An unsettled ticket
+   * returns its grant on a main-process timer, so the worst a vanished caller can
+   * cost is one delivery window, never a permanently swallowed recovery turn.
+   */
+  beginAutomaticDelivery(
+    agentId: string,
+    workClass: WorkClass = 'ORDINARY_TURN'
+  ): AutomaticDeliveryGrant {
+    const decision = this.admission.admit(agentId, workClass);
+    if (decision.verdict === 'REFUSE') {
+      return { ok: false, reason: decision.reason, poolKey: decision.poolKey ?? null };
+    }
+    const ticket = `cap-${(this.ticketSeq += 1)}`;
+    const timer = this.setTimer(() => this.settleAutomaticDelivery(ticket, false), AUTO_DELIVERY_TTL_MS);
+    if (timer && typeof (timer as NodeJS.Timeout).unref === 'function') (timer as NodeJS.Timeout).unref();
+    this.pending.set(ticket, { decision, timer });
+    return { ok: true, ticket };
+  }
+
+  /**
+   * The delivery this ticket authorised either happened or did not.
+   *
+   * Idempotent, and deliberately silent about an unknown ticket: the expiry above
+   * and a late renderer answer race by construction, and the settled-first winner is
+   * always correct because both say the same thing about a grant that is already
+   * back. `launched` confirms; anything else returns the reservation.
+   */
+  settleAutomaticDelivery(ticket: string, launched: boolean): void {
+    const held = this.pending.get(ticket);
+    if (!held) return;
+    this.pending.delete(ticket);
+    this.clearTimer(held.timer);
+    if (launched) this.admission.confirmLaunch(held.decision);
+    else this.admission.cancelGrant(held.decision);
+  }
+
   snapshot(): CapacityCollectionSnapshot {
     return this.tracker.snapshot();
   }
@@ -145,6 +215,9 @@ export class CapacityRuntime {
   stop(): void {
     this.stopped = true;
     this.disarm();
+    // Outstanding delivery tickets are returned rather than abandoned: a grant that
+    // outlived the runtime holding it would be spent on a turn that cannot now start.
+    for (const ticket of [...this.pending.keys()]) this.settleAutomaticDelivery(ticket, false);
   }
 
   /**
