@@ -31,6 +31,7 @@ import {
 import { HiveManager, type AgentMeta, type HiveMessage, type HiveTask } from './hive';
 import { HookServer } from './hooks';
 import { CapacityRuntime } from './capacityRuntime';
+import { CapacityStore } from './capacityPersistence';
 import type { CapacityNotifyIntent } from './capacityNotify';
 import { CircuitBreaker, type BreakerInput } from './breaker';
 import type { UsageProvider } from './usage';
@@ -365,6 +366,19 @@ const providerCapacity = new CapacityRuntime({
     }
   }
 });
+// Durable capacity observations (L0-TAIL). Restored BEFORE any live reading can
+// arrive, so ordering resolves naturally: every live observation is newer than the
+// one that crossed the restart and simply replaces it. `userData` is already the
+// Dev-isolated root by this point, so F1 holds with nothing special done here.
+// Restored pools are UNKNOWN/restored-unconfirmed, never the verdict they had.
+const capacityStore = new CapacityStore(
+  join(app.getPath('userData'), 'capacity-observations.json'),
+  providerCapacity.tracker
+);
+{
+  const restored = capacityStore.restore();
+  if (restored) console.log(`[capacity] restored ${restored} pool(s) from the durable store as UNKNOWN/unconfirmed`);
+}
 const hookServer = new HookServer(
   hive,
   () => liveWebContents(),
@@ -373,7 +387,7 @@ const hookServer = new HookServer(
   breaker,
   standingGoalFromRoster,
   (agentId, event, message) => workerWake.noteHook(agentId, event, message),
-  (agentId, obs) => { providerCapacity.ingest(agentId, obs); }
+  (agentId, obs) => { providerCapacity.ingest(agentId, obs); capacityStore.scheduleSave(); }
 );
 const memory = new MemoryManager(
   () => readConfig().harnessHome,
@@ -5425,6 +5439,11 @@ app.on('before-quit', (e) => {
     mainWindow.webContents.send('app:closeRequested', { ptyCount: count });
   }
 });
+
+// The last chance to flush a coalesced capacity write. `before-quit` can be
+// preventDefault-ed by the running-terminals warning above, so the flush hangs off
+// `will-quit`, which only fires once the quit is actually going ahead.
+app.on('will-quit', () => { capacityStore.saveNow(); });
 
 app.on('window-all-closed', () => {
   if (process.platform !== 'darwin') {

@@ -128,6 +128,18 @@ export const REASON = {
   UNKNOWN_APPLICABILITY: 'UNKNOWN_APPLICABILITY',
   CAP_EXCEEDED: 'RETENTION_CAP_EXCEEDED',
   PROVIDER_ADVISORY: 'PROVIDER_NATIVE_ADVISORY',
+  /**
+   * Evidence that survived a process restart and has not yet been confirmed by a
+   * live provider reading. It is the pool's EXISTENCE and its last-known detail,
+   * never its last-known verdict.
+   *
+   * WIDTH IS LOAD-BEARING HERE. `TIMER_GROWTH_RESERVE_PER_POOL` is derived from
+   * `widthSpread(REASON)`, so a member outside the existing [10, 29] character
+   * range would move the reserve, move the collection ceiling, and silently
+   * invalidate every budget figure this floor has measured. 20 characters sits
+   * inside both ends; a test pins the spread rather than trusting this comment.
+   */
+  RESTORED: 'RESTORED_UNCONFIRMED',
   FRESH: 'FRESH_READING'
 } as const;
 
@@ -189,7 +201,17 @@ export const TIMER_GROWTH_RESERVE_PER_POOL =
 export const TIMER_GROWTH_RESERVE_COLLECTION = MAX_JSON_NUMBER_CHARS * 2;
 
 /** A sticky limit epoch (§5). Begins at accepted hard evidence; staleness never clears it. */
-interface LimitEpoch {
+/**
+ * A sticky limit epoch, exported ONLY so it can be carried across a restart.
+ *
+ * L0-TAIL ruling 4 requires the last known epoch/continuity identity to survive a
+ * restart, and continuity is `since`: re-deriving the epoch from the same refusal
+ * after a restart would stamp a NEW `since` and publish a different epoch for the
+ * same unbroken refusal, which is precisely the continuity the ruling preserves.
+ * So this one derived structure is persisted - as IDENTITY, never as verdict.
+ * `deriveState` refuses to classify from it while the pool is restored-unconfirmed.
+ */
+export interface CapacityLimitEpoch {
   since: number;
   /** The observation time of the evidence. A confirmation must be STRICTLY newer. */
   evidenceAt: number;
@@ -208,6 +230,9 @@ interface LimitEpoch {
   /** Latched once a recovery HINT appears. Hints never confirm; they only de-escalate. */
   hinted: boolean;
 }
+
+/** The internal spelling, unchanged, so exporting the type moved no call site. */
+type LimitEpoch = CapacityLimitEpoch;
 
 interface PoolRecord {
   observation: CapacityObservation;
@@ -230,6 +255,13 @@ interface PoolRecord {
    *  wall-clock move as well as the deadline does. */
   ageAtAccept: number;
   acceptedMono: number;
+  /**
+   * This pool's current evidence came from the durable store and no live provider
+   * reading has arrived since. It is cleared by the first accepted LIVE ingestion
+   * and by nothing else - not by time, not by a clock move, not by a re-read of the
+   * same historical line.
+   */
+  restoredUnconfirmed: boolean;
 }
 
 /** What one ingestion did. See `ingestDetailed`. */
@@ -367,7 +399,27 @@ export class ProviderCapacityTracker {
    * Additive on purpose: `ingest()` keeps its exact contract, so no existing caller
    * or fixture has to change to accommodate a question it never asked.
    */
-  ingestDetailed(obs: CapacityObservation): IngestResult {
+  /**
+   * Re-admit one observation that outlived the process that collected it.
+   *
+   * WHY THIS IS A SEPARATE ENTRY POINT RATHER THAN A FLAG ON THE OBSERVATION.
+   * "Restored" is a property of the INGESTION EVENT, not of the reading: the bytes
+   * that were persisted are the same bytes that were collected, and the provider
+   * said nothing different. Putting a marker on the payload would also have spent
+   * the 8 KiB per-pool INPUT budget on a field that appears nowhere in the output -
+   * the input-only-fields hazard this floor has now met four times - so a maximal
+   * observation that fitted when it was collected could fail to fit when restored,
+   * and be replaced by its bounded stand-in for no reason a provider caused.
+   *
+   * Everything else is the normal boundary, deliberately: identity bounding, future
+   * skew, the pool cap, the retention caps, ordering and the collection budget all
+   * apply exactly as they do to a live reading (L0-TAIL ruling 6).
+   */
+  restore(observation: CapacityObservation, epoch: CapacityLimitEpoch | null = null): IngestResult {
+    return this.ingestDetailed(observation, { epoch });
+  }
+
+  ingestDetailed(obs: CapacityObservation, restore?: { epoch: CapacityLimitEpoch | null }): IngestResult {
     const now = this.clock();
     // IDENTITY IS RETAINED STATE AND MUST BE BOUNDED BEFORE ANYTHING IS RETAINED.
     //
@@ -486,14 +538,23 @@ export class ProviderCapacityTracker {
       anchorAt: 0,
       staleAt: 0,
       ageAtAccept: 0,
-      acceptedMono: 0
+      acceptedMono: 0,
+      restoredUnconfirmed: false
     };
     const commit = (stored: CapacityObservation, kind: CapBreachKind | null): void => {
       rec.observation = stored;
       rec.capBreach = kind;
-      this.stampDeadline(rec, stored, now);
+      this.stampDeadline(rec, stored, now, restore !== undefined);
       rec.conflicted = conflicted;
-      rec.epoch = this.nextEpoch(rec, stored, now);
+      // A RESTORE CARRIES ITS EPOCH; IT DOES NOT RE-DERIVE ONE. Re-deriving would
+      // mint a fresh `since` for a refusal that never ended, breaking exactly the
+      // continuity ruling 4 preserves. A LIVE reading takes the normal path, which
+      // is what lets fresh telemetry either confirm this epoch or open a new one.
+      rec.epoch = restore ? restore.epoch : this.nextEpoch(rec, stored, now);
+      // Set on every commit rather than only on restore: the first accepted LIVE
+      // reading is what clears it, and routing both through one assignment means a
+      // future caller cannot forget the clearing half.
+      rec.restoredUnconfirmed = restore !== undefined;
       if (!pinAnchor) rec.anchorAt = now;
     };
     commit(reading, breach);
@@ -624,6 +685,35 @@ export class ProviderCapacityTracker {
    *
    * Returns true if the marker was cleared.
    */
+  /**
+   * Everything that may cross a restart: the OBSERVATIONS this collection currently
+   * holds, each with its epoch continuity identity.
+   *
+   * OBSERVATIONS, NOT PROJECTIONS (L0-TAIL ruling 1). The projection is a derived
+   * verdict and persisting it would make the restore a replay of a conclusion; the
+   * observation is what the provider actually said, and re-admitting it lets the
+   * current rules decide afresh. Nothing here is fabricated or adjusted: the
+   * timestamps are the provider's own.
+   *
+   * A POOL WHOSE EVIDENCE IS ITSELF RESTORED IS NOT RE-EXPORTED. Persisting
+   * unconfirmed evidence again would let one live observation, seen once and long
+   * ago, survive an unbounded chain of restarts while never being confirmed - a
+   * fact ageing indefinitely under its own provenance. If nothing live has been
+   * seen since the last restore, the store keeps what it already had.
+   */
+  persistable(): { observation: CapacityObservation; epoch: CapacityLimitEpoch | null }[] {
+    const out: { observation: CapacityObservation; epoch: CapacityLimitEpoch | null }[] = [];
+    for (const rec of this.pools.values()) {
+      if (rec.restoredUnconfirmed) continue;
+      // A pool whose retained reading is the bounded stand-in is skipped: its
+      // payload was already refused once for size, and re-admitting the stand-in
+      // after a restart would republish a diagnostic as though it were evidence.
+      if (rec.capBreach) continue;
+      out.push({ observation: rec.observation, epoch: rec.epoch });
+    }
+    return out;
+  }
+
   noteCompleteInventory(poolKeys: readonly string[]): boolean {
     if (!this.overflow) return false;
     if (poolKeys.length > RETENTION_CAPS.maxPools) return false;
@@ -692,12 +782,31 @@ export class ProviderCapacityTracker {
    * clock cannot move it. A reading that was ALREADY past its TTL when it arrived
    * gets a deadline in the past and is stale immediately, which is correct.
    */
-  private stampDeadline(rec: PoolRecord, obs: CapacityObservation, now: number): void {
+  private stampDeadline(
+    rec: PoolRecord,
+    obs: CapacityObservation,
+    now: number,
+    restored = false
+  ): void {
     const mono = this.monotonic();
     const age = Math.max(0, now - obs.observedAt);
     rec.ageAtAccept = age;
     rec.acceptedMono = mono;
-    rec.staleAt = mono + (ttlFor(obs.source, this.policy) - age);
+    // A RESTORED READING IS NEVER FRESH, AT ANY AGE (L0-TAIL ruling 3).
+    //
+    // The monotonic clock this deadline is measured against did not survive the
+    // restart, so there is no deadline to restore and none may be reconstructed.
+    // The tempting alternative - compute the remaining TTL from wall-clock age - is
+    // ruled out in terms: "do not use wall-clock age alone to promote a restored
+    // observation to a current/healthy verdict". A reading persisted one second
+    // before the restart is therefore stale on arrival, which is not pessimism: we
+    // genuinely do not know what happened while the process was down, and the only
+    // thing that can tell us is a live provider reading.
+    //
+    // This is also what makes the backwards-clock case uninteresting for restored
+    // evidence: nothing about a restored pool is derived from wall-clock age, so
+    // moving the clock in either direction cannot promote it.
+    rec.staleAt = restored ? mono - 1 : mono + (ttlFor(obs.source, this.policy) - age);
   }
 
   /**
@@ -915,7 +1024,13 @@ export class ProviderCapacityTracker {
       epoch = null;
       rec.epoch = null;
     }
-    if (epoch && !epoch.hinted && resetPassed(obs, epoch, now)) {
+    // NOT WHILE RESTORED-UNCONFIRMED. The reset-passage hint is computed from the
+    // observation's own reset boundary and the wall clock, so on restored evidence
+    // it would manufacture "recovery is likely" out of nothing but elapsed downtime
+    // - wall-clock age promoting a restored reading toward a healthier verdict,
+    // which ruling 3 forbids by name. The hint is not lost: it is re-evaluated the
+    // moment live evidence confirms the pool, against a reading we can believe.
+    if (epoch && !epoch.hinted && !rec.restoredUnconfirmed && resetPassed(obs, epoch, now)) {
       epoch = { ...epoch, hinted: true };
       rec.epoch = epoch;
     }
@@ -964,6 +1079,24 @@ export class ProviderCapacityTracker {
     obs: CapacityObservation,
     ctx: { freshness: CapacityFreshness; exhausted: string[]; epoch: LimitEpoch | null }
   ): { state: CapacityState; stateReason: string } {
+    // RESTORED EVIDENCE IS NOT CURRENT TRUTH, AND THIS GATE SITS ABOVE THE EPOCH
+    // BRANCH BECAUSE THE EPOCH BRANCH OUTRANKS EVERYTHING ELSE.
+    //
+    // That ordering is the whole defect the ruling exists to prevent. A pool that
+    // was LIMITED before the restart carries its epoch across, and the epoch branch
+    // below would republish LIMITED - the pre-restart verdict reinstated as current
+    // truth, with no provider having said anything since. The human's own example
+    // is the test: pre-restart epoch 42 / LIMITED, post-restart epoch 42 / UNKNOWN.
+    // The epoch still reaches the projection as `limitEpochAt`, so continuity is
+    // preserved and published; what it may not do is decide the state.
+    //
+    // It is equally the other half of the two-sided rule: UNKNOWN is not AVAILABLE,
+    // so a restart cannot clear a real provider limitation either. The pool is
+    // honestly unknown until something live says otherwise, which is the only
+    // answer the evidence supports.
+    if (rec.restoredUnconfirmed) {
+      return { state: 'UNKNOWN', stateReason: REASON.RESTORED };
+    }
     if (ctx.epoch) {
       if (ctx.epoch.hinted) return { state: 'RECOVERING', stateReason: REASON.RECOVERY_HINT_UNCONFIRMED };
       if (ctx.epoch.permissionDenied) return { state: 'LIMITED', stateReason: REASON.ORDINARY_USE_DENIED };
