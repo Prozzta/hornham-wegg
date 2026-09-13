@@ -83,8 +83,17 @@ export class CapacityRuntime {
   private readonly clearTimer: (handle: unknown) => void;
   private timer: unknown = null;
   private stopped = false;
-  /** Reservations handed out to an out-of-process deliverer, keyed by ticket. */
-  private readonly pending = new Map<string, { decision: AdmissionDecision; timer: unknown }>();
+  /**
+   * Reservations handed out to an out-of-process deliverer, keyed by ticket.
+   *
+   * `writeBegan` IS THE FACT A15 FOUND MISSING, and it is the only new state here:
+   * without it a ticket that dies AFTER the submit keystroke is byte-for-byte the
+   * same object as one that dies BEFORE it. See `markAutomaticDeliveryWriting`.
+   */
+  private readonly pending = new Map<
+    string,
+    { decision: AdmissionDecision; timer: unknown; writeBegan: boolean }
+  >();
   private ticketSeq = 0;
 
   constructor(private readonly deps: CapacityRuntimeDeps, tracker = new ProviderCapacityTracker()) {
@@ -162,9 +171,12 @@ export class CapacityRuntime {
    * THE RENDERER MUST NOT HOLD HALF A TRANSACTION. It cannot be trusted to return a
    * reservation - it can be reloaded, occluded, throttled or closed between the two
    * calls - so what it receives is an opaque ticket and nothing else: no decision,
-   * no pool, no capacity state. THE EXPIRY IS OWNED HERE. An unsettled ticket
-   * returns its grant on a main-process timer, so the worst a vanished caller can
-   * cost is one delivery window, never a permanently swallowed recovery turn.
+   * no pool, no capacity state. THE EXPIRY IS OWNED HERE. An unsettled ticket that
+   * never reported a write returns its grant on a main-process timer, so the worst a
+   * vanished caller can cost is one delivery window. An unsettled ticket that DID
+   * report one keeps its turn spent, because the write may have landed — see
+   * `markAutomaticDeliveryWriting`, where that asymmetry is argued. In neither case
+   * is a reservation swallowed by a caller that never used it.
    */
   beginAutomaticDelivery(
     agentId: string,
@@ -175,9 +187,9 @@ export class CapacityRuntime {
       return { ok: false, reason: decision.reason, poolKey: decision.poolKey ?? null };
     }
     const ticket = `cap-${(this.ticketSeq += 1)}`;
-    const timer = this.setTimer(() => this.settleAutomaticDelivery(ticket, false), AUTO_DELIVERY_TTL_MS);
+    const timer = this.setTimer(() => this.expireAutomaticDelivery(ticket), AUTO_DELIVERY_TTL_MS);
     if (timer && typeof (timer as NodeJS.Timeout).unref === 'function') (timer as NodeJS.Timeout).unref();
-    this.pending.set(ticket, { decision, timer });
+    this.pending.set(ticket, { decision, timer, writeBegan: false });
     return { ok: true, ticket };
   }
 
@@ -198,6 +210,64 @@ export class CapacityRuntime {
     else this.admission.cancelGrant(held.decision);
   }
 
+  /**
+   * The deliverer is ABOUT TO WRITE the submit keystroke this ticket authorised.
+   *
+   * A15 — WHAT WAS MISSING WAS A FACT, NOT A CHECK. A deliverer that dies after the
+   * Enter lands but before it settles leaves a ticket in EXACTLY the state a death
+   * BEFORE the write leaves it in: minted, unsettled, silent. The expiry then
+   * returned the grant as if nothing had started, permitting a SECOND recovery turn
+   * in an epoch whose single turn a write that really did land had already spent.
+   * Nothing distinguished the two, and no amount of waiting could: A TIMEOUT CANNOT
+   * MANUFACTURE A FACT THAT WAS NEVER RECORDED. So the repair is to record it, and
+   * that is the whole of the fix — the expiry and the TTL are untouched.
+   *
+   * WHY IT IS RECORDED BEFORE THE WRITE AND NOT AFTER IT. Either ordering leaves a
+   * gap of one IPC round trip, and they fail in OPPOSITE directions. Marked BEFORE,
+   * a death in the gap makes main believe a write that never happened: ONE MISSED
+   * TURN, which is visible — the instruction sits unsent in the agent's prompt — and
+   * a human can retry it. Marked AFTER, a death in the gap makes main believe no
+   * write happened: a SECOND SEND of an instruction that already landed, which
+   * nobody sees and nobody can undo. The gap does not close; it is pointed at the
+   * recoverable failure.
+   *
+   * THE MARK GOVERNS ONLY THE SILENT CASE, NEVER AN ANSWER. If the deliverer is
+   * still alive and reports a failed write, `settleAutomaticDelivery(ticket, false)`
+   * returns the grant exactly as before: a live report is better evidence than an
+   * inference drawn from silence, and a mark that overrode it would turn every
+   * failed PTY write into a permanently swallowed turn.
+   *
+   * IT CARRIES NO CAPACITY MEANING. The deliverer says "I am about to type", just as
+   * it already says "it started" or "it did not". It derives nothing, is told
+   * nothing, and still holds only an opaque ticket; main keeps every decision,
+   * including what an unmarked expiry is taken to mean.
+   *
+   * Idempotent, and silent about an unknown ticket for the same reason `settle` is:
+   * a late mark and the expiry race by construction, and a ticket that is already
+   * closed has nothing left to learn. In particular a mark can neither resurrect a
+   * reclaimed reservation nor attach itself to the next one.
+   */
+  markAutomaticDeliveryWriting(ticket: string): void {
+    const held = this.pending.get(ticket);
+    if (held) held.writeBegan = true;
+  }
+
+  /**
+   * The TTL ran out with this ticket still unsettled: the deliverer went away.
+   *
+   * The grant resolves to WHAT WAS RECORDED rather than to a constant `false`.
+   * Unmarked, the write had not begun, nothing was spent, and the turn goes back —
+   * the abandoned-before-launch case this expiry was built for, unchanged. Marked,
+   * the write MAY have landed, so the turn is treated as SPENT: where the evidence
+   * genuinely runs out we fail toward ALREADY LAUNCHED, because a missed turn is
+   * visible and recoverable and a duplicate send is neither.
+   */
+  private expireAutomaticDelivery(ticket: string): void {
+    const held = this.pending.get(ticket);
+    if (!held) return;
+    this.settleAutomaticDelivery(ticket, held.writeBegan);
+  }
+
   snapshot(): CapacityCollectionSnapshot {
     return this.tracker.snapshot();
   }
@@ -215,9 +285,13 @@ export class CapacityRuntime {
   stop(): void {
     this.stopped = true;
     this.disarm();
-    // Outstanding delivery tickets are returned rather than abandoned: a grant that
-    // outlived the runtime holding it would be spent on a turn that cannot now start.
-    for (const ticket of [...this.pending.keys()]) this.settleAutomaticDelivery(ticket, false);
+    // Outstanding delivery tickets are resolved rather than abandoned: a grant that
+    // outlived the runtime holding it would be spent on a turn that cannot now start
+    // — UNLESS its write had already begun, in which case the turn started before we
+    // stopped and returning the grant would authorise a second one. Same fact and the
+    // same reading of it as the expiry, deliberately: A SHUTDOWN IS NOT NEW EVIDENCE
+    // about which side of the write a delivery got to.
+    for (const ticket of [...this.pending.keys()]) this.expireAutomaticDelivery(ticket);
   }
 
   /**

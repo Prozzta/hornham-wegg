@@ -1064,6 +1064,15 @@ const api = {
    */
   capacityBeginAutoDelivery: (agentId: string): Promise<CapacityDeliveryGrant> =>
     ipcRenderer.invoke('capacity:beginAutoDelivery', agentId),
+  /**
+   * Report that the authorised delivery is ABOUT TO type its submit keystroke.
+   *
+   * Sent before the Enter rather than after it, because after it a window that dies
+   * looks exactly like one that never wrote. Main uses it ONLY to decide what an
+   * expiring, unanswered ticket meant; a settle that does arrive still wins.
+   */
+  capacityMarkAutoDeliveryWriting: (ticket: string): Promise<void> =>
+    ipcRenderer.invoke('capacity:markAutoDeliveryWriting', ticket),
   /** Report whether the authorised delivery actually started. Always call it. */
   capacitySettleAutoDelivery: (ticket: string, launched: boolean): Promise<void> =>
     ipcRenderer.invoke('capacity:settleAutoDelivery', ticket, launched),

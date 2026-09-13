@@ -1,0 +1,226 @@
+'use strict';
+
+/**
+ * L0-FIX8 / A15 — main could not tell a renderer death AFTER the submit keystroke
+ * from one BEFORE it. Research `b4268520`, Dwight's section 13.
+ *
+ * THE DEFECT IS MISSING INFORMATION, NOT A MISSING CHECK. A deliverer that sent
+ * Enter and then died left a ticket in exactly the state a deliverer that died
+ * before writing anything left: minted, unsettled, silent. The expiry read both as
+ * "never launched", returned the grant, and let a SECOND recovery turn be taken in
+ * an epoch whose one turn a write that really did land had already spent. None of
+ * that could be fixed by waiting longer or by checking harder, because main held no
+ * fact that separated the two cases — so the repair records one.
+ *
+ * EVERY TEST BELOW IS PAIRED, AND THE PAIRING IS THE POINT. "No second turn after a
+ * marked death" is satisfied just as well by a runtime that never grants a second
+ * turn at all, and "the turn comes back" by one that never spends it. The arms are
+ * therefore run against each other rather than against a remembered constant: what
+ * is asserted is that the SAME sequence reaches DIFFERENT outcomes, and that the
+ * only difference between the two runs is the recorded fact.
+ */
+const test = require('node:test');
+const assert = require('node:assert/strict');
+const loadTs = require('./load-ts.cjs');
+
+const { ProviderCapacityTracker, L0_SEM_POLICY } = loadTs('src/main/providerCapacityTracker.ts');
+const { CapacityRuntime } = loadTs('src/main/capacityRuntime.ts');
+const { ADMISSION_REASON } = loadTs('src/main/capacityAdmission.ts');
+
+const T0 = 1_800_000_000_000;
+const POOL = 'codex:acct-a:codex';
+const RESET_5H = T0 + 3_600_000;
+
+const win = (id, remaining, resetsAt = RESET_5H) => ({
+  windowId: id, kind: 'FIVE_HOUR', label: '5h', windowMinutes: 300,
+  usedPercent: remaining === null ? null : 100 - remaining,
+  remainingPercent: remaining, resetsAt
+});
+
+const obs = (over = {}) => ({
+  poolKey: POOL, provider: 'codex', accountScope: 'acct-a', limitId: 'codex',
+  source: 'codex-rollout', streamId: 'codex-rollout:/s/a.jsonl', sourceSequence: 1,
+  observedAt: T0, receivedAt: T0, windows: [win('five_hour', 80)],
+  providerAttributedLimitingWindowId: null, providerReachedType: null,
+  ordinaryUsageAllowed: null, planType: 'plus', ...over
+});
+
+function rig() {
+  let now = T0;
+  let mono = 0;
+  let seq = 0;
+  const timers = new Map();
+  const t = new ProviderCapacityTracker(L0_SEM_POLICY, () => now, () => mono);
+  const runtime = new CapacityRuntime({
+    deliver: () => {},
+    now: () => now,
+    setTimer: (fn, ms) => { const id = (seq += 1); timers.set(id, { fn, ms }); return { id, unref() { return this; } }; },
+    clearTimer: (h) => { if (h && typeof h === 'object') timers.delete(h.id); }
+  }, t);
+  return {
+    tracker: t, runtime,
+    state: () => t.pool(POOL)?.state,
+    fire: () => {
+      assert.ok(timers.size, 'expected an armed timer');
+      let pick = null;
+      for (const [id, v] of timers) if (!pick || v.ms < pick.v.ms) pick = { id, v };
+      timers.delete(pick.id);
+      now += pick.v.ms;
+      mono += pick.v.ms;
+      pick.v.fn();
+    },
+    ticketTimers: () => [...timers.values()].filter((v) => v.ms === 30_000).length,
+    /** The renderer is gone: nobody settles, and main's own TTL fires. */
+    rendererDies: () => {
+      for (const [id, v] of [...timers]) {
+        if (v.ms === 30_000) { timers.delete(id); v.fn(); }
+      }
+    }
+  };
+}
+
+/** Drive the pool into RECOVERING through the production path. */
+function recovering(r) {
+  r.runtime.ingest('jim', obs());
+  r.runtime.ingest('jim', obs({
+    observedAt: T0 + 1_000, receivedAt: T0 + 1_000,
+    providerReachedType: 'rate_limit_reached',
+    windows: [win('five_hour', 0)]
+  }));
+  assert.equal(r.state(), 'LIMITED');
+  for (let i = 0; i < 12 && r.state() !== 'RECOVERING'; i += 1) r.fire();
+  assert.equal(r.state(), 'RECOVERING', 'the rig reached the state the counterexample needs');
+}
+
+/**
+ * One automatic delivery on a RECOVERING pool, killed at a chosen instant.
+ * `markedWriting` is the ONLY thing that differs between the two arms.
+ */
+function deathDuringDelivery(markedWriting) {
+  const r = rig();
+  recovering(r);
+  const grant = r.runtime.beginAutomaticDelivery('jim');
+  assert.equal(grant.ok, true, 'precondition: the epoch really does grant one turn');
+  if (markedWriting) r.runtime.markAutomaticDeliveryWriting(grant.ticket);
+  r.rendererDies();
+  return r.runtime.beginAutomaticDelivery('jim');
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// A15 — the two deaths, and that they are told apart
+// ═══════════════════════════════════════════════════════════════════════════
+
+test('A15: a death AFTER the submit keystroke does NOT hand out a second recovery turn', () => {
+  // The Enter landed; the agent is already working on that instruction. Granting
+  // again here is the duplicate send, and it is the failure nobody sees or undoes.
+  const second = deathDuringDelivery(true);
+  assert.equal(second.ok, false,
+    'the write may have landed, so the epoch turn is SPENT — this returned ok:true before L0-FIX8');
+  assert.equal(second.reason, ADMISSION_REASON.RECOVERING_SPENT,
+    'and refused for the right reason: the turn was taken, not the pool re-limited');
+});
+
+test('A15: a death BEFORE the write DOES return the turn — the expiry still does its old job', () => {
+  // The pair. Nothing was typed, so nothing was spent, and holding the grant here
+  // would cost a delivery window for a renderer that merely closed its window.
+  const second = deathDuringDelivery(false);
+  assert.equal(second.ok, true,
+    'an unmarked ticket is the abandoned-before-launch case, and it is unchanged');
+});
+
+test('A15: the two deaths reach DIFFERENT outcomes, and the recorded fact is the only difference', () => {
+  // THE DISCRIMINATING FORM. Each arm alone is satisfied by a runtime that always
+  // refuses or always grants; run together, the same sequence must diverge — and it
+  // can only diverge on the one call that separates the two runs.
+  const after = deathDuringDelivery(true);
+  const before = deathDuringDelivery(false);
+  assert.notEqual(after.ok, before.ok,
+    'if both arms agree, this proves NOTHING about A15: main is still blind to the write');
+  assert.equal(before.ok, true, 'and they diverge in the direction the defect names');
+  assert.equal(after.ok, false, 'not merely in some direction');
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// What the mark is NOT
+// ═══════════════════════════════════════════════════════════════════════════
+
+test('A15: a LIVE report of a failed write beats the inference drawn from silence', () => {
+  // The renderer marked, then the PTY write failed, then it said so. It is alive and
+  // answering: honouring the mark over the answer would turn every failed write into
+  // a permanently swallowed turn, which is the opposite defect.
+  const r = rig();
+  recovering(r);
+  const grant = r.runtime.beginAutomaticDelivery('jim');
+  r.runtime.markAutomaticDeliveryWriting(grant.ticket);
+  r.runtime.settleAutomaticDelivery(grant.ticket, false);
+  assert.equal(r.runtime.beginAutomaticDelivery('jim').ok, true,
+    'a mark governs the SILENT case only; an answer that arrives still decides');
+});
+
+test('A15: a mark is not a confirm — on its own it spends nothing and closes nothing', () => {
+  // Marking must not become a back door to confirmLaunch. While the ticket is still
+  // outstanding the grant is held by the TICKET, exactly as before, and settling it
+  // as failed gives it back.
+  const r = rig();
+  recovering(r);
+  const grant = r.runtime.beginAutomaticDelivery('jim');
+  r.runtime.markAutomaticDeliveryWriting(grant.ticket);
+  assert.equal(r.ticketTimers(), 1, 'still outstanding: the mark did not close the ticket');
+  r.runtime.settleAutomaticDelivery(grant.ticket, false);
+  assert.equal(r.ticketTimers(), 0, 'and the settle is what closed it');
+});
+
+test('A15: a mark for a RECLAIMED ticket cannot reach the reservation that replaced it', () => {
+  // The late-answer race, in the new channel. An expired ticket is somebody else's
+  // grant now, and a mark that attached to it would spend a turn its owner is using.
+  const r = rig();
+  recovering(r);
+  const orphan = r.runtime.beginAutomaticDelivery('jim');
+  r.rendererDies();
+  const fresh = r.runtime.beginAutomaticDelivery('jim');
+  assert.equal(fresh.ok, true, 'precondition: the abandoned turn came back');
+
+  r.runtime.markAutomaticDeliveryWriting(orphan.ticket);
+  r.runtime.markAutomaticDeliveryWriting('cap-no-such-ticket');
+  r.runtime.settleAutomaticDelivery(fresh.ticket, false);
+  assert.equal(r.runtime.beginAutomaticDelivery('jim').ok, true,
+    'the stale marks touched nothing: the live ticket settled as failed and gave its turn back');
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// The same fact, read everywhere it is read
+// ═══════════════════════════════════════════════════════════════════════════
+
+test('A15: stopping the runtime reads the mark too — a shutdown is not new evidence', () => {
+  const marked = rig();
+  recovering(marked);
+  const held = marked.runtime.beginAutomaticDelivery('jim');
+  marked.runtime.markAutomaticDeliveryWriting(held.ticket);
+  marked.runtime.stop();
+  assert.equal(marked.ticketTimers(), 0, 'stop still disarms the expiry rather than leaving it to fire');
+  assert.equal(marked.runtime.beginAutomaticDelivery('jim').ok, false,
+    'the write may have landed before we stopped, so the turn stays spent');
+
+  const unmarked = rig();
+  recovering(unmarked);
+  unmarked.runtime.beginAutomaticDelivery('jim');
+  unmarked.runtime.stop();
+  assert.equal(unmarked.runtime.beginAutomaticDelivery('jim').ok, true,
+    'and an unmarked ticket is still returned, exactly as before');
+});
+
+test('A15: on an AVAILABLE pool the fix refuses nothing — it is a gate, not a throttle', () => {
+  // The broadest pair. A runtime that read every mark as "spent" for every pool
+  // would pass every assertion above and stop a healthy floor sending anything.
+  const r = rig();
+  r.runtime.ingest('jim', obs());
+  assert.equal(r.state(), 'AVAILABLE');
+  for (let i = 0; i < 5; i += 1) {
+    const g = r.runtime.beginAutomaticDelivery('jim');
+    assert.equal(g.ok, true, `delivery ${i} authorised`);
+    r.runtime.markAutomaticDeliveryWriting(g.ticket);
+    r.rendererDies();
+  }
+  assert.equal(r.runtime.beginAutomaticDelivery('jim').ok, true,
+    'five marked deaths on a healthy pool cost it nothing');
+});

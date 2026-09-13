@@ -129,7 +129,8 @@ function submitToPty(
   ptyId: string,
   text: string,
   provider: AgentProvider,
-  settleMs = 250
+  settleMs = 250,
+  onBeforeSubmit?: () => void
 ): Promise<void> {
   const prev = writeChains.get(ptyId) ?? Promise.resolve();
   const next = prev.catch(() => { /* a failed prior write must not stall the chain */ }).then(async () => {
@@ -147,6 +148,14 @@ function submitToPty(
     const wrote = await window.cth.writePty(ptyId, payload);
     if (!wrote?.ok) throw new Error(wrote?.error ?? `pty write failed: ${ptyId}`);
     await new Promise((r) => setTimeout(r, 140));
+    // A15: announce the submit keystroke BEFORE it goes out, never after. From this
+    // instant on, a renderer that dies is indistinguishable from one that sent
+    // successfully, so main has to be holding the fact ALREADY - it cannot be
+    // reconstructed later from a ticket that simply went quiet. See
+    // CapacityRuntime.markAutomaticDeliveryWriting for why this ordering and not the
+    // other one. Best-effort and never awaited: it must not delay the Enter, and an
+    // announcement that fails to arrive is exactly the silence main already reads.
+    onBeforeSubmit?.();
     const submitted = await window.cth.writePty(ptyId, '\r');
     if (!submitted?.ok) throw new Error(submitted?.error ?? `pty write failed: ${ptyId}`);
     await new Promise((r) => setTimeout(r, settleMs));
@@ -854,7 +863,14 @@ export function useHive(config: HarnessConfig | null): void {
               target,
               wrap ? wrap(next) : (next.instruction ?? next.text)
             ),
-            inferAgentProvider(target.command, target.provider)
+            inferAgentProvider(target.command, target.provider),
+            undefined,
+            // The one thing main cannot observe for itself: which side of the Enter
+            // this window was on when it died. Reported, not derived - the ticket is
+            // still opaque and no capacity state crosses back.
+            () => {
+              if (grant?.ok) void window.cth.capacityMarkAutoDeliveryWriting(grant.ticket);
+            }
           ),
           () => {
             removeQueuedMessage(srcId, next.id);
