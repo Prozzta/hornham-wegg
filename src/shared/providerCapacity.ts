@@ -23,7 +23,8 @@
  */
 
 /** Provider families L0 collects from. */
-export type ProviderId = 'claude' | 'codex';
+export const PROVIDER_IDS = ['claude', 'codex'] as const;
+export type ProviderId = (typeof PROVIDER_IDS)[number];
 
 /**
  * Tracker states (scheduling audit section 8). HANDOFF_REQUIRED is deliberately
@@ -55,7 +56,8 @@ export type CapacityState = (typeof CAPACITY_STATES)[number];
  * naming: Codex reports `primary`/`secondary`, which are slots rather than windows,
  * and a plan change can move which slot holds which duration.
  */
-export type WindowKind = 'FIVE_HOUR' | 'SEVEN_DAY' | 'OTHER';
+export const WINDOW_KINDS = ['FIVE_HOUR', 'SEVEN_DAY', 'OTHER'] as const;
+export type WindowKind = (typeof WINDOW_KINDS)[number];
 
 /** Whether the snapshot is still inside its freshness budget. */
 export type CapacityFreshness = 'FRESH' | 'STALE';
@@ -94,7 +96,8 @@ export type ObservationSource = (typeof OBSERVATION_SOURCES)[number];
  * provider states that a window does not apply to an account. It exists so a future
  * provider fact has somewhere true to land, and NOT as a place to put a guess.
  */
-export type WindowApplicability = 'APPLICABLE' | 'INAPPLICABLE' | 'UNKNOWN';
+export const WINDOW_APPLICABILITIES = ['APPLICABLE', 'INAPPLICABLE', 'UNKNOWN'] as const;
+export type WindowApplicability = (typeof WINDOW_APPLICABILITIES)[number];
 
 /**
  * Applicability of a window, STATED if the payload said so and DERIVED otherwise.

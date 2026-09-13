@@ -27,7 +27,7 @@ const { join } = require('node:path');
 const { tmpdir } = require('node:os');
 const loadTs = require('./load-ts.cjs');
 
-const { ProviderCapacityTracker, L0_SEM_POLICY, REASON, TIMER_GROWTH_RESERVE_PER_POOL } =
+const { ProviderCapacityTracker, L0_SEM_POLICY, REASON, RETENTION_CAPS, TIMER_GROWTH_RESERVE_PER_POOL } =
   loadTs('src/main/providerCapacityTracker.ts');
 const {
   CapacityStore, loadCapacityStore, saveCapacityStore, serializeCapacityStore,
@@ -549,4 +549,161 @@ test('TAIL-BLINDNESS: a known pool going unobserved degrades to UNKNOWN, never t
   assert.notEqual(pool, null, 'the pool is still disclosed');
   assert.equal(pool.state, 'UNKNOWN');
   assert.equal(pool.stateReason, REASON.STALE, 'as stale, which is a different fact from restored');
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// The DECLARED schema, enforced — asserted by writing FILES, not by calling
+// the validator
+// ═══════════════════════════════════════════════════════════════════════════
+
+/** Write a store file whose single pool is a valid observation with `patch` applied,
+ *  and return what the loader makes of it. `patch` may delete keys with `undefined`. */
+function loadWith(patch = {}, windowPatch = {}, poolPatch = {}) {
+  const file = tmp();
+  const observation = { ...obs(), ...patch };
+  if (Object.keys(windowPatch).length) {
+    observation.windows = [{ ...win(), ...windowPatch }];
+    for (const [k, v] of Object.entries(windowPatch)) if (v === undefined) delete observation.windows[0][k];
+  }
+  for (const [k, v] of Object.entries(patch)) if (v === undefined) delete observation[k];
+  const pool = { observation, continuitySince: null, ...poolPatch };
+  for (const [k, v] of Object.entries(poolPatch)) if (v === undefined) delete pool[k];
+  writeFileSync(file, JSON.stringify({
+    version: CAPACITY_STORE_VERSION, savedAt: T0, pools: [pool]
+  }), 'utf8');
+  return loadCapacityStore(file);
+}
+
+test('SCHEMA: a control file with nothing wrong with it loads', () => {
+  // WITHOUT THIS ARM EVERY REFUSAL BELOW IS SATISFIED BY A VALIDATOR THAT REFUSES
+  // EVERYTHING. Same shape as the composer arm in the harness: the cheap way to
+  // pass a set of refusal tests is to refuse more.
+  const loaded = loadWith();
+  assert.equal(loaded.length, 1, 'a well-formed file still loads');
+  assert.equal(loaded[0].observation.provider, 'codex');
+});
+
+test('SCHEMA: a closed-domain value outside its set is refused', () => {
+  // THE REPRODUCTION. `provider: 'not-a-provider'` was length-bounded and therefore
+  // "valid": it loaded, restore accepted it, and the published pool reported it.
+  // The fields were hand-written type unions with no runtime counterpart, so a
+  // string check was all this file could do.
+  assert.deepEqual(loadWith({ provider: 'not-a-provider' }), [], 'provider must be in its set');
+  assert.deepEqual(loadWith({ source: 'not-a-source' }), [], 'source must be in its set');
+  assert.deepEqual(loadWith({}, { kind: 'not-a-kind' }), [], 'window kind must be in its set');
+  assert.deepEqual(loadWith({}, { applicability: 'not-applicable' }), [],
+    'applicability must be in its set when stated');
+});
+
+test('SCHEMA: OMITTING a required-nullable field is refused — absent is not null', () => {
+  // The second cause. One `nullableBounded` that also accepted `undefined` was used
+  // for required-nullable AND optional fields, so omission passed and the DTO that
+  // came out simply had no such key. Absent and null are different statements.
+  for (const key of ['planType', 'providerReachedType', 'streamId', 'sourceSequence',
+    'providerAttributedLimitingWindowId', 'ordinaryUsageAllowed']) {
+    assert.deepEqual(loadWith({ [key]: undefined }), [], `${key} omitted must be refused`);
+    assert.equal(loadWith({ [key]: null }).length, 1, `but ${key}: null is legal`);
+  }
+  for (const key of ['windowMinutes', 'usedPercent', 'remainingPercent', 'resetsAt']) {
+    assert.deepEqual(loadWith({}, { [key]: undefined }), [], `window ${key} omitted must be refused`);
+  }
+});
+
+test('SCHEMA: `applicability` is the ONE field whose absence is legal', () => {
+  // And it must stay legal, because absent means "derive it" via `applicabilityOf`,
+  // which is a different statement from any of the three values. Tightening this
+  // one along with the others would have broken every observation the normalisers
+  // actually produce.
+  const loaded = loadWith({}, { applicability: undefined });
+  assert.equal(loaded.length, 1, 'an absent applicability is legal');
+  assert.equal('applicability' in loaded[0].observation.windows[0], false,
+    'and stays absent rather than being invented as a value');
+});
+
+test('SCHEMA: unknown keys do not survive into retained state', () => {
+  // The third cause. The validator type-asserted the parsed object and returned it,
+  // so every key the schema does not mention came through into retained state. It
+  // now rebuilds field by field, which makes the declared schema the thing actually
+  // produced rather than a description of what was checked.
+  const loaded = loadWith({ smuggled: 'payload', state: 'AVAILABLE' },
+    { smuggledWindowKey: 'also here' });
+  assert.equal(loaded.length, 1, 'extra keys do not fail the file');
+  assert.equal('smuggled' in loaded[0].observation, false, 'but they do not survive it');
+  assert.equal('state' in loaded[0].observation, false, 'nor does a derived-looking one');
+  assert.equal('smuggledWindowKey' in loaded[0].observation.windows[0], false,
+    'and not inside a window either');
+});
+
+test('SCHEMA: the whole file is refused, not the bad pool — all or nothing', () => {
+  // The documented contract, asserted end to end: one bad pool discards the file
+  // rather than leaving a collection that silently knows about fewer pools than it
+  // has. A missing pool reads as never-seen, which is a claim we are not entitled
+  // to make.
+  const file = tmp();
+  const good = { observation: obs(), continuitySince: null };
+  const bad = { observation: { ...obs(), poolKey: 'codex:b:codex', provider: 'nope' }, continuitySince: null };
+  writeFileSync(file, JSON.stringify({
+    version: CAPACITY_STORE_VERSION, savedAt: T0, pools: [good, bad]
+  }), 'utf8');
+  assert.deepEqual(loadCapacityStore(file), [], 'one bad pool discards the whole store');
+});
+
+test('SCHEMA: a refused file leaves no pool in the tracker at all', () => {
+  // THE ARM THAT ANSWERS THE DEFENCE BEFORE IT IS OFFERED. "Permanent UNKNOWN limits
+  // classification severity but does not make the DTO valid": a pool being harmless
+  // is not the same as a file being valid, and this is the file a user can edit. So
+  // the assertion is about what reaches the tracker, not about how it classifies.
+  const file = tmp();
+  writeFileSync(file, JSON.stringify({
+    version: CAPACITY_STORE_VERSION, savedAt: T0,
+    pools: [{ observation: { ...obs(), provider: 'not-a-provider' }, continuitySince: null }]
+  }), 'utf8');
+  const p = proc(T0 + 60_000);
+  assert.equal(new CapacityStore(file, p.t, 5_000, () => p.at()).restore(), 0, 'nothing restored');
+  assert.equal(p.t.pool(KEY), null, 'and no pool exists to report a bogus provider');
+  assert.equal(p.t.snapshot().pools.length, 0);
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Cap-breach round trips — the stand-in really does cross, and stays inert
+// ═══════════════════════════════════════════════════════════════════════════
+
+test('CAP-BREACH: a NON-LIMITING stand-in round-trips and restores unconfirmed', () => {
+  // Removing the cap-breach skip was unrequested and was accepted on test rather
+  // than on argument. These arms hold the property it was accepted for: the pool is
+  // genuinely observed, its identity and timestamps are real, the rejected bulk
+  // windows do not cross, and the restore is permanently unconfirmed.
+  const a = proc();
+  a.t.ingest(obs({
+    windows: Array.from({ length: RETENTION_CAPS.maxWindowsPerPool + 1 }, (_, i) => win({ windowId: `w${i}` }))
+  }));
+  assert.equal(a.t.pool(KEY).capBreach, 'WINDOW_COUNT_EXCEEDED', 'precondition: it breached');
+
+  const b = acrossRestart(a, T0 + 60_000);
+  assert.equal(b.restored, 1, 'the stand-in crossed rather than the pool vanishing');
+  const p = b.t.pool(KEY);
+  assert.equal(p.state, 'UNKNOWN');
+  assert.equal(p.stateReason, REASON.RESTORED, 'and is permanently unconfirmed');
+  assert.ok(p.windows.length <= RETENTION_CAPS.maxWindowsPerPool,
+    'the rejected bulk windows did not cross');
+});
+
+test('CAP-BREACH: a HARD-ENVELOPE stand-in restores UNKNOWN, and its refusal cannot replay', () => {
+  // The dangerous half: the breaching observation carried a real provider refusal,
+  // so its stand-in holds a hard-limit envelope. It must come back as a pool and
+  // NOT as a refusal — a replayed envelope would be a provider statement this
+  // process never received.
+  const a = proc();
+  a.t.ingest(obs({
+    providerReachedType: 'rate_limit_reached',
+    windows: Array.from({ length: RETENTION_CAPS.maxWindowsPerPool + 1 }, (_, i) => win({ windowId: `w${i}` }))
+  }));
+  assert.equal(a.t.pool(KEY).state, 'LIMITED', 'precondition: a real refusal was observed');
+
+  const b = acrossRestart(a, T0 + 60_000);
+  const p = b.t.pool(KEY);
+  assert.notEqual(p, null, 'the pool survives');
+  assert.equal(p.state, 'UNKNOWN', 'as UNKNOWN, not as the refusal it was');
+  assert.equal(p.stateReason, REASON.RESTORED);
+  assert.equal(p.limitEpochAt, a.t.pool(KEY).limitEpochAt, 'continuity identity is preserved');
 });

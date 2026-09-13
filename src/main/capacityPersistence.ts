@@ -42,8 +42,10 @@
  * holds without this module knowing anything about it.
  */
 import { existsSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
-import type { CapacityObservation } from '../shared/providerCapacity';
-import { OBSERVATION_SOURCES } from '../shared/providerCapacity';
+import type { CapacityObservation, CapacityWindow } from '../shared/providerCapacity';
+import {
+  OBSERVATION_SOURCES, PROVIDER_IDS, WINDOW_APPLICABILITIES, WINDOW_KINDS
+} from '../shared/providerCapacity';
 import { IDENTITY_LIMITS } from './capacityEnvelope';
 import type { ProviderCapacityTracker } from './providerCapacityTracker';
 import { RETENTION_CAPS } from './providerCapacityTracker';
@@ -98,18 +100,50 @@ const isDict = (v: unknown): v is Record<string, unknown> =>
   typeof v === 'object' && v !== null && !Array.isArray(v);
 
 const num = (v: unknown): v is number => typeof v === 'number' && Number.isFinite(v);
-const str = (v: unknown): v is string => typeof v === 'string';
 const nullableNum = (v: unknown): v is number | null => v === null || num(v);
 
-/** The ceiling for retained strings that are not identities - `kind`, `label`,
- *  `planType`, `providerReachedType`. Generous enough for any real provider value
- *  and far short of anything that could matter to the per-pool byte cap. */
+/** The ceiling for retained strings that are not identities - `label`, `planType`,
+ *  `providerReachedType`. Generous enough for any real provider value and far short
+ *  of anything that could matter to the per-pool byte cap. */
 const FIELD_CHARS = 128;
 
 const bounded = (v: unknown, max: number): v is string =>
   typeof v === 'string' && v.length > 0 && v.length <= max;
-const nullableBounded = (v: unknown, max: number): v is string | null =>
-  v === null || v === undefined || bounded(v, max);
+
+/**
+ * REQUIRED-NULLABLE versus OPTIONAL, as two functions rather than one.
+ *
+ * A single `nullableBounded` that also accepted `undefined` was reused for both, so
+ * OMITTING a required field passed validation - `planType` and `providerReachedType`
+ * absent from a hand-written file were "valid", and the DTO that came out had no
+ * such keys. Absent and null are different statements and the validator has to be
+ * able to tell them apart. There is deliberately NO general permissive helper left
+ * in this file: an unused `optionalBounded` sitting beside the strict one is an
+ * invitation to reach for the wrong one, which is how the defect happened. The one
+ * field where absence is genuinely legal - `applicability`, meaning "derive it" -
+ * is handled inline where that fact is visible.
+ */
+const presentNullableBounded = (host: Record<string, unknown>, key: string, max: number): boolean => {
+  if (!(key in host)) return false;
+  const v = host[key];
+  return v === null || bounded(v, max);
+};
+const presentNullableNum = (host: Record<string, unknown>, key: string): boolean =>
+  key in host && nullableNum(host[key]);
+
+/**
+ * A closed set, checked against THE SAME ARRAY THE TYPE IS DERIVED FROM.
+ *
+ * `ProviderId`, `WindowKind` and `WindowApplicability` were hand-written unions with
+ * no runtime counterpart, so a length-bounded string check was the only thing this
+ * file could do and `provider: 'not-a-provider'` was structurally valid. They are
+ * now runtime arrays with the types derived from them, exactly as `CAPACITY_STATES`
+ * and `OBSERVATION_SOURCES` already were - a closed set a runtime check validates
+ * against must BE the type, or the second list agrees with the first only until
+ * somebody adds a member.
+ */
+const inSet = (v: unknown, set: readonly string[]): boolean =>
+  typeof v === 'string' && set.includes(v);
 
 /**
  * Structural validation of one persisted pool.
@@ -130,44 +164,90 @@ function validPool(value: unknown): PersistedCapacityPool | null {
   if (!isDict(value)) return null;
   const o = value.observation;
   if (!isDict(o)) return null;
-  // Identity and every other retained string is LENGTH-BOUNDED here, not merely
-  // typed. The tracker refuses an unbounded identity, but `provider`, `kind`,
-  // `label`, `planType` and `providerReachedType` are retained and published
-  // without being identities, so an open string check on this file - the one input
-  // a person can edit - left a 300,000-character `kind` structurally "valid".
+
+  // IDENTITIES: length-bounded, because the tracker refuses an unbounded identity
+  // and this file must not hand it one to refuse.
   if (!bounded(o.poolKey, IDENTITY_LIMITS.poolKeyChars)) return null;
-  if (!bounded(o.provider, IDENTITY_LIMITS.identityChars)) return null;
   if (!bounded(o.accountScope, IDENTITY_LIMITS.identityChars)) return null;
   if (!bounded(o.limitId, IDENTITY_LIMITS.identityChars)) return null;
-  if (!str(o.source) || !(OBSERVATION_SOURCES as readonly string[]).includes(o.source)) return null;
+
+  // CLOSED DOMAINS: checked against the set, not merely for being a short string.
+  // `provider: 'not-a-provider'` used to pass here and reach the published pool.
+  if (!inSet(o.provider, PROVIDER_IDS)) return null;
+  if (!inSet(o.source, OBSERVATION_SOURCES)) return null;
+
   if (!num(o.observedAt) || !num(o.receivedAt)) return null;
-  if (!nullableBounded(o.streamId, IDENTITY_LIMITS.streamIdChars)) return null;
-  if (!nullableNum(o.sourceSequence)) return null;
-  if (!nullableBounded(o.providerAttributedLimitingWindowId, IDENTITY_LIMITS.identityChars)) return null;
-  if (!nullableBounded(o.providerReachedType, FIELD_CHARS)) return null;
-  if (!nullableBounded(o.planType, FIELD_CHARS)) return null;
+  // REQUIRED, and nullable: the key must be THERE. Omission is not null.
+  if (!presentNullableBounded(o, 'streamId', IDENTITY_LIMITS.streamIdChars)) return null;
+  if (!presentNullableNum(o, 'sourceSequence')) return null;
+  if (!presentNullableBounded(o, 'providerAttributedLimitingWindowId', IDENTITY_LIMITS.identityChars)) return null;
+  if (!presentNullableBounded(o, 'providerReachedType', FIELD_CHARS)) return null;
+  if (!presentNullableBounded(o, 'planType', FIELD_CHARS)) return null;
+  if (!('ordinaryUsageAllowed' in o)) return null;
   if (!(o.ordinaryUsageAllowed === null || typeof o.ordinaryUsageAllowed === 'boolean')) return null;
   if (!Array.isArray(o.windows) || o.windows.length > RETENTION_CAPS.maxWindowsPerPool) return null;
+
+  // REBUILT FIELD BY FIELD, NOT CAST. The previous version type-asserted the parsed
+  // object and returned it, so every key the schema does not mention survived into
+  // retained state - a file could carry anything it liked alongside a valid DTO.
+  // Reconstruction makes the declared schema the thing that is actually produced,
+  // rather than a description of what was checked.
+  const windows: CapacityWindow[] = [];
   for (const w of o.windows) {
     if (!isDict(w)) return null;
-    if (!bounded(w.windowId, IDENTITY_LIMITS.identityChars) || !nullableNum(w.resetsAt)) return null;
-    if (!nullableNum(w.usedPercent) || !nullableNum(w.remainingPercent)) return null;
-    if (!nullableNum(w.windowMinutes) || !nullableBounded(w.label, FIELD_CHARS)) return null;
-    if (w.kind !== undefined && !nullableBounded(w.kind, FIELD_CHARS)) return null;
-    if (w.applicability !== undefined && !nullableBounded(w.applicability, FIELD_CHARS)) return null;
+    if (!bounded(w.windowId, IDENTITY_LIMITS.identityChars)) return null;
+    if (!inSet(w.kind, WINDOW_KINDS)) return null;
+    if (!bounded(w.label, FIELD_CHARS)) return null;
+    if (!presentNullableNum(w, 'windowMinutes')) return null;
+    if (!presentNullableNum(w, 'usedPercent')) return null;
+    if (!presentNullableNum(w, 'remainingPercent')) return null;
+    if (!presentNullableNum(w, 'resetsAt')) return null;
+    // GENUINELY OPTIONAL - absent means "derive it" (`applicabilityOf`), which is a
+    // different statement from any of the three values. The one field where the
+    // permissive validator is correct.
+    if (!('applicability' in w) || w.applicability === undefined) {
+      // nothing to check
+    } else if (!inSet(w.applicability, WINDOW_APPLICABILITIES)) {
+      return null;
+    }
+    const window: CapacityWindow = {
+      windowId: w.windowId as string,
+      kind: w.kind as CapacityWindow['kind'],
+      label: w.label as string,
+      windowMinutes: (w.windowMinutes as number | null) ?? null,
+      usedPercent: (w.usedPercent as number | null) ?? null,
+      remainingPercent: (w.remainingPercent as number | null) ?? null,
+      resetsAt: (w.resetsAt as number | null) ?? null
+    };
+    if (typeof w.applicability === 'string') {
+      window.applicability = w.applicability as CapacityWindow['applicability'];
+    }
+    windows.push(window);
   }
 
   // CONTINUITY IS A NUMBER, AND THAT IS THE WHOLE OF IT. There is no epoch object
   // to validate any more, which is the point: the fields a v1 file carried here -
   // attribution, reached type, anchors, remainders, the recovery hint - are exactly
   // the unverified classifying facts that must not cross a restart.
-  const since = value.continuitySince;
-  if (!nullableNum(since)) return null;
+  if (!presentNullableNum(value, 'continuitySince')) return null;
 
-  return {
-    observation: o as unknown as CapacityObservation,
-    continuitySince: (since as number | null) ?? null
+  const observation: CapacityObservation = {
+    poolKey: o.poolKey as string,
+    provider: o.provider as CapacityObservation['provider'],
+    accountScope: o.accountScope as string,
+    limitId: o.limitId as string,
+    source: o.source as CapacityObservation['source'],
+    streamId: (o.streamId as string | null) ?? null,
+    sourceSequence: (o.sourceSequence as number | null) ?? null,
+    observedAt: o.observedAt,
+    receivedAt: o.receivedAt,
+    windows,
+    providerAttributedLimitingWindowId: (o.providerAttributedLimitingWindowId as string | null) ?? null,
+    providerReachedType: (o.providerReachedType as string | null) ?? null,
+    ordinaryUsageAllowed: (o.ordinaryUsageAllowed as boolean | null) ?? null,
+    planType: (o.planType as string | null) ?? null
   };
+  return { observation, continuitySince: (value.continuitySince as number | null) ?? null };
 }
 
 /**
