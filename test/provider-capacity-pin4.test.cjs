@@ -297,3 +297,72 @@ test('FIX6/2: the reserve is charged per RETAINED pool, so it scales with the co
     );
   }
 });
+
+// ═══════════════════════════════════════════════════════════════════════════
+// §15 item 2 — is the reserve APPLIED, or only computed?
+// ═══════════════════════════════════════════════════════════════════════════
+
+/**
+ * THE GAP THESE CLOSE, STATED PLAINLY BECAUSE IT WAS MINE. Every other reserve test
+ * in this file passes whether or not the reserve is actually subtracted: they assert
+ * the CONSTANT's value, and bounds on fixtures that sit far outside the narrow band
+ * where the subtraction can change a verdict. The subtraction could be deleted from
+ * `wouldOverflowCollection` and all of them would stay green — the whole property
+ * unpinned, in the file written to pin it.
+ *
+ * A TEST THAT PROVES A QUANTITY IS CORRECT IS NOT A TEST THAT IT IS USED. What
+ * discriminates is an input whose VERDICT turns on the reserve: the hard cap alone
+ * would admit it, and the reserved ceiling must refuse it.
+ */
+const RESERVE_AT_32 = TIMER_GROWTH_RESERVE_PER_POOL * 32 + TIMER_GROWTH_RESERVE_COLLECTION;
+
+/** 31 maximal pools, then one probe pool of exactly `target` observation bytes. */
+function withProbe(target) {
+  const { t } = tracker();
+  for (let i = 0; i < RETENTION_CAPS.maxPools - 1; i += 1) {
+    t.ingest(sizedTo(`codex:acct-${i}:limit-1`, `acct-${i}`, RETENTION_CAPS.maxPoolBytes));
+  }
+  t.ingest(sizedTo('codex:probe:limit-1', 'probe', target));
+  return { pool: t.pool('codex:probe:limit-1'), published: JSON.stringify(t.snapshot()).length };
+}
+
+test('FIX6/2: the reserve is SUBTRACTED, not merely computed — a verdict turns on it', () => {
+  // The transition, found by binary search and pinned here at one-byte precision.
+  const admitted = withProbe(1_628);
+  const refused = withProbe(1_629);
+
+  assert.notEqual(admitted.pool.state, 'UNKNOWN', 'the larger legal input is admitted');
+  assert.equal(admitted.pool.windows.length, 1, 'and retained whole');
+  assert.equal(
+    admitted.published,
+    RETENTION_CAPS.maxCollectionBytes - RESERVE_AT_32,
+    'the admitted collection lands ON the reserved ceiling, to the byte'
+  );
+
+  assert.equal(refused.pool.state, 'UNKNOWN', 'one byte more of input is refused');
+  assert.equal(refused.pool.windows.length, 0, 'and its reading is not retained');
+
+  // THE CLAUSE THAT DOES THE WORK. The refusal happened with the entire reserve
+  // still free beneath the HARD cap, so only the subtraction can explain it. Without
+  // this assertion the test would pass with the reserve deleted, and would be a
+  // fourth test of a property nothing exercises.
+  assert.ok(
+    RETENTION_CAPS.maxCollectionBytes - admitted.published >= RESERVE_AT_32,
+    `only the reserve explains the refusal: ${RETENTION_CAPS.maxCollectionBytes - admitted.published} `
+      + `bytes were still free under the hard cap ${RETENTION_CAPS.maxCollectionBytes}`
+  );
+});
+
+test('FIX6/2: it refuses a BAND, not a direction — everything below the ceiling is admitted', () => {
+  // The pair. "Refuses at the edge" is trivially true of an implementation that
+  // refuses more widely, which would silently shrink the usable collection.
+  for (const target of [800, 1_200, 1_628]) {
+    const r = withProbe(target);
+    assert.notEqual(r.pool.state, 'UNKNOWN', `${target} bytes should be admitted`);
+    assert.equal(r.pool.windows.length, 1, `${target} bytes should be retained whole`);
+    assert.ok(
+      r.published <= RETENTION_CAPS.maxCollectionBytes - RESERVE_AT_32,
+      `${target} bytes must stay within the reserved ceiling`
+    );
+  }
+});
