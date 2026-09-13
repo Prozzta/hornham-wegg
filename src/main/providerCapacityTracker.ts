@@ -43,6 +43,7 @@
  * of the display threshold. The display threshold decides display and nothing else;
  * nothing in this file can see it.
  */
+import { CAPACITY_STATES } from '../shared/providerCapacity';
 import type {
   CapacityCollectionSnapshot,
   CapacityFreshness,
@@ -126,6 +127,48 @@ export const REASON = {
   PROVIDER_ADVISORY: 'PROVIDER_NATIVE_ADVISORY',
   FRESH: 'FRESH_READING'
 } as const;
+
+/**
+ * Bytes held back from the collection budget so that TIMER-ONLY growth can never
+ * put a published collection over the section 8 ceiling.
+ *
+ * WHY A RESERVE AND NOT A TIMER CHECK. The cap applies to EVERY publication
+ * (L0-SEM 15), including re-projection on a timer - but a timer must not sentinel a
+ * pool that was already admitted, because that destroys a reading with no arrival
+ * causing it. Those two hold together only if the room a timer could ever need was
+ * already subtracted when the pool was admitted. So arrival is still the only place
+ * anything is refused, and the refusal now accounts for what time can add afterwards.
+ *
+ * WHY THIS IS A PROOF AND NOT A MEASUREMENT. The observed headroom on one fixture is
+ * not a bound on growth - that was the residual Oscar rejected, and it is my own
+ * "approximately right about a cap" one field over. With the observation fixed, a
+ * re-projection can only move fields DERIVED from it, and each one is drawn from a
+ * closed set or is a number: `state` and `stateReason` from the enumerations below,
+ * `ageMs`/`revision`/`limitEpochAt` as JSON numbers, `freshness` between two equal
+ * length words, `recoveryPending` from `false` to the SHORTER `true`. Every other
+ * field is copied from the observation and cannot move without a new reading. So the
+ * per-pool maximum is the sum of the widths below, and the collection maximum is
+ * that times the pool ceiling - arithmetic over constants, not a sample.
+ */
+const MAX_JSON_NUMBER_CHARS = 16; // Number.MAX_SAFE_INTEGER is 16 digits.
+
+/** Widest minus narrowest member of a closed set of strings. */
+const widthSpread = (values: readonly string[]): number => {
+  const lengths = values.map((v) => v.length);
+  return Math.max(...lengths) - Math.min(...lengths);
+};
+
+export const TIMER_GROWTH_RESERVE_PER_POOL =
+  widthSpread(CAPACITY_STATES)
+  + widthSpread(Object.values(REASON))
+  // `ageMs` climbs from one digit; `revision` climbs; `limitEpochAt` can go from
+  // `null` to a timestamp. Each is charged its full width rather than its realistic
+  // one, because a reserve that is too generous costs capacity and a reserve that is
+  // too tight costs the guarantee.
+  + MAX_JSON_NUMBER_CHARS * 3;
+
+/** The same allowance for the two collection-level fields that move on their own. */
+export const TIMER_GROWTH_RESERVE_COLLECTION = MAX_JSON_NUMBER_CHARS * 2;
 
 /** A sticky limit epoch (§5). Begins at accepted hard evidence; staleness never clears it. */
 interface LimitEpoch {
@@ -416,21 +459,20 @@ export class ProviderCapacityTracker {
     };
     commit(reading, breach);
     this.pools.set(obs.poolKey, rec);
-    let changed = this.reproject(obs.poolKey, now, pinAnchor);
 
-    // THE COLLECTION CAP IS ENFORCED ON THE PUBLISHED COLLECTION, which means after
-    // this reading has been projected into it: the retained representation is the
-    // only thing that can be measured rather than estimated, and estimating is what
-    // let a legal-looking 32-pool collection publish 267,460 bytes against a 262,144
-    // byte cap. If the collection is over budget the ARRIVING pool is the one
-    // replaced by its bounded stand-in - it is the one whose arrival caused the
-    // breach - and the pools already published keep the readings they were admitted
-    // with. Re-projecting advances the revision a second time, which is correct and
-    // harmless: revisions are required to STRICTLY INCREASE, never to be dense.
-    if (!breach && this.overCollectionBudget()) {
-      commit(boundedStandIn(), 'COLLECTION_BYTES_EXCEEDED');
-      changed = this.reproject(obs.poolKey, now, pinAnchor) || changed;
-    }
+    // THE COLLECTION CAP IS ENFORCED ON THE CANDIDATE PUBLISHED COLLECTION - the
+    // retained representation, which is the only thing that can be measured rather
+    // than estimated. If it will not fit, the ARRIVING pool is the one replaced by
+    // its bounded stand-in, because it is the one whose arrival caused the breach;
+    // the pools already published keep the readings they were admitted with. The
+    // substitution happens BEFORE publication, so this whole ingest is one revision.
+    const changed = this.reproject(
+      obs.poolKey,
+      now,
+      pinAnchor,
+      this.monotonic(),
+      breach ? undefined : () => commit(boundedStandIn(), 'COLLECTION_BYTES_EXCEEDED')
+    );
     return { accepted: true, changed, reason: 'ACCEPTED' };
   }
 
@@ -650,8 +692,31 @@ export class ProviderCapacityTracker {
    * as a consumer receives it - and there is nothing left to be approximately right
    * about.
    */
-  private overCollectionBudget(): boolean {
-    return byteLength(this.snapshot()) > RETENTION_CAPS.maxCollectionBytes;
+  private wouldOverflowCollection(
+    poolKey: string,
+    candidate: PoolCapacitySnapshot,
+    now: number,
+    candidateRevision: number
+  ): boolean {
+    const projected = { ...candidate, revision: candidateRevision };
+    const pools: PoolCapacitySnapshot[] = [];
+    let substituted = false;
+    for (const [key, rec] of this.pools) {
+      if (key === poolKey) { pools.push(projected); substituted = true; } else pools.push(rec.projection);
+    }
+    if (!substituted) pools.push(projected);
+    // Built in the exact shape `snapshot()` publishes, with the values a changed
+    // re-projection is about to assign, so this is the retained representation and
+    // not a model of it.
+    const bytes = byteLength({
+      collectionRevision: this.collectionRevision + 1,
+      overflow: this.overflow,
+      pools,
+      updatedAt: now
+    });
+    return bytes > RETENTION_CAPS.maxCollectionBytes
+      - TIMER_GROWTH_RESERVE_COLLECTION
+      - TIMER_GROWTH_RESERVE_PER_POOL * pools.length;
   }
 
   /**
@@ -702,14 +767,36 @@ export class ProviderCapacityTracker {
    * internal reading moves on. It is the coalescing half of §7, and it is why an
    * identical renewal can refresh freshness without publishing anything.
    */
-  private reproject(poolKey: string, now: number, pinAnchor = false, monoNow: number = this.monotonic()): boolean {
+  private reproject(
+    poolKey: string,
+    now: number,
+    pinAnchor = false,
+    monoNow: number = this.monotonic(),
+    onOverBudget?: () => void
+  ): boolean {
     const rec = this.pools.get(poolKey);
     if (!rec) return false;
-    const next = this.project(rec, now, monoNow);
-    if (pinAnchor && rec.projection.observedAt > 0) {
-      next.observedAt = rec.projection.observedAt;
-      next.ageMs = Math.max(0, now - rec.projection.observedAt);
+    const build = (): PoolCapacitySnapshot => {
+      const p = this.project(rec, now, monoNow);
+      if (pinAnchor && rec.projection.observedAt > 0) {
+        p.observedAt = rec.projection.observedAt;
+        p.ageMs = Math.max(0, now - rec.projection.observedAt);
+      }
+      return p;
+    };
+    let next = build();
+
+    // ONE ACCEPTED INGEST IS ONE PUBLICATION (L0-SEM 15). The budget is decided on
+    // the CANDIDATE, before any revision moves, so a reading that has to be replaced
+    // by its bounded stand-in still advances `collectionRevision` and this pool's
+    // revision exactly once. The previous shape published the full projection, found
+    // the collection over budget, and published again - two increments for one
+    // ingest, and a phantom intermediate revision that no consumer asked for.
+    if (onOverBudget && this.wouldOverflowCollection(poolKey, next, now, rec.projection.revision + 1)) {
+      onOverBudget();
+      next = build();
     }
+
     if (sameProjection(rec.projection, next)) {
       // Nothing semantic moved; keep the revision and store the refreshed clock
       // fields so a pool being actively observed cannot expire on an old timestamp.

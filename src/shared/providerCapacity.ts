@@ -30,13 +30,25 @@ export type ProviderId = 'claude' | 'codex';
  * absent at L0: it is a property of in-flight work, not of provider capacity, and
  * the admission seam that owns it is a separate card.
  */
-export type CapacityState =
-  | 'UNKNOWN'
-  | 'AVAILABLE'
-  | 'APPROACHING'
-  | 'RESERVE_ONLY'
-  | 'LIMITED'
-  | 'RECOVERING';
+/**
+ * Every state a pool projection can publish.
+ *
+ * A RUNTIME ARRAY WITH THE TYPE DERIVED FROM IT, rather than a hand-written union
+ * beside a hand-written list. L0-SEM 15 requires a PROVED bound on how much a
+ * projection can grow with no new reading, and that proof enumerates the closed sets
+ * this field is drawn from - so the enumeration has to be the same object the type
+ * is, or the bound silently stops covering a state somebody added later.
+ */
+export const CAPACITY_STATES = [
+  'UNKNOWN',
+  'AVAILABLE',
+  'APPROACHING',
+  'RESERVE_ONLY',
+  'LIMITED',
+  'RECOVERING'
+] as const;
+
+export type CapacityState = (typeof CAPACITY_STATES)[number];
 
 /**
  * Window identity is derived from DURATION, never from the provider's positional
