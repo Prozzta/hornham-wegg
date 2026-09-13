@@ -87,7 +87,7 @@ test('§8 PER-POOL BYTES: 8 KiB exactly is accepted and one byte more is UNKNOWN
   assert.equal(p.stateReason, 'RETENTION_CAP_EXCEEDED', 'and says why, once');
 });
 
-test('§8 POOL COUNT: the cap is 32 — the 32nd pool is healthy and the 33rd breaches', () => {
+test('§8 POOL COUNT: the 32nd pool is healthy, and the 33rd leaves ONE MARKER AND NO IDENTITY', () => {
   assert.equal(RETENTION_CAPS.maxPools, 32, '§8 says max 32 pools');
   const t = tracker();
   const key = (i) => `codex:acct-${i}:limit-1`;
@@ -98,16 +98,44 @@ test('§8 POOL COUNT: the cap is 32 — the 32nd pool is healthy and the 33rd br
   // satisfied, so the 32nd pool being healthy is what pins the number itself.
   assert.equal(t.snapshot().pools.length, RETENTION_CAPS.maxPools, 'all 32 retained');
   assert.equal(poolOf(t, key(RETENTION_CAPS.maxPools - 1)).state, 'AVAILABLE', 'the 32nd pool is within budget');
+  // And the marker must be ABSENT here, because "exactly one marker after the breach"
+  // is trivially satisfied by an implementation that never produces one at all.
+  assert.equal(t.snapshot().overflow, null, 'no breach yet, so no overflow marker');
 
   t.ingest(small(RETENTION_CAPS.maxPools));
-  const p = poolOf(t, key(RETENTION_CAPS.maxPools));
-  assert.ok(p, 'the 33rd pool is retained rather than dropped, so the breach is visible');
-  assert.equal(p.state, 'UNKNOWN', 'the 33rd pool breaches the count cap');
-  assert.equal(p.stateReason, 'RETENTION_CAP_EXCEEDED');
+  const after = t.snapshot();
+
+  // RETARGETED to L0-SEM §13 (Oscar, research b408e69), which resolved a question this
+  // file previously left open. The earlier version asserted the 33rd pool was RETAINED,
+  // "so the breach is visible" - the visibility half of §8 line 172, and correct as far
+  // as it went. §13 rules that for the COUNT cap the breach IS the count, so retaining a
+  // 33rd entry is itself the violation: visibility MOVES to one fixed non-pool marker
+  // instead. The property survives; what carries it changed.
+  assert.equal(after.pools.length, RETENTION_CAPS.maxPools, 'the 33rd pool is NOT retained');
+  assert.equal(poolOf(t, key(RETENTION_CAPS.maxPools)), null, 'and has no retained identity');
+  // Asserted against the SERIALIZED collection rather than against the fields I thought
+  // to check: an identity that survives somewhere I did not look is exactly the leak the
+  // cap forbids, and a field-by-field check only proves the fields I remembered.
+  assert.ok(
+    !JSON.stringify(after).includes(`acct-${RETENTION_CAPS.maxPools}`),
+    'no trace of the excess pool anywhere in the published collection'
+  );
+
+  assert.deepEqual(
+    after.overflow,
+    { kind: 'POOL_COUNT_EXCEEDED', completeness: 'UNKNOWN', excess: 'ONE_OR_MORE' },
+    '§13: ONE fixed marker, carrying no identity and no count'
+  );
+  // NOT A COUNT, and not assertable as one: under a one-pool ingest API you cannot tell
+  // a 34th NEW pool from a repeat of the 33rd without retaining the identities the cap
+  // refuses to retain, so a counter would itself be unbounded. A test asserting k=2
+  // would assert something the system cannot honestly know.
+  assert.equal(after.overflow.excess, 'ONE_OR_MORE', 'the excess is a bounded fact, never a number');
+
   assert.equal(
     poolOf(t, key(0)).state,
     'AVAILABLE',
-    'and the breach is charged to the pool that caused it, not to the pools already inside budget'
+    'and the pools already inside budget keep their own valid states'
   );
 });
 
