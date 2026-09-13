@@ -130,7 +130,11 @@ function submitToPty(
   text: string,
   provider: AgentProvider,
   settleMs = 250,
-  onBeforeSubmit?: () => void
+  /**
+   * Asked immediately before the submit keystroke and AWAITED. Resolving `false` (or
+   * rejecting) aborts the submission without typing anything. See the call site.
+   */
+  maySubmit?: () => Promise<boolean>
 ): Promise<void> {
   const prev = writeChains.get(ptyId) ?? Promise.resolve();
   const next = prev.catch(() => { /* a failed prior write must not stall the chain */ }).then(async () => {
@@ -148,14 +152,25 @@ function submitToPty(
     const wrote = await window.cth.writePty(ptyId, payload);
     if (!wrote?.ok) throw new Error(wrote?.error ?? `pty write failed: ${ptyId}`);
     await new Promise((r) => setTimeout(r, 140));
-    // A15: announce the submit keystroke BEFORE it goes out, never after. From this
-    // instant on, a renderer that dies is indistinguishable from one that sent
-    // successfully, so main has to be holding the fact ALREADY - it cannot be
-    // reconstructed later from a ticket that simply went quiet. See
-    // CapacityRuntime.markAutomaticDeliveryWriting for why this ordering and not the
-    // other one. Best-effort and never awaited: it must not delay the Enter, and an
-    // announcement that fails to arrive is exactly the silence main already reads.
-    onBeforeSubmit?.();
+    // A15/L0-FIX9: ASK main, AWAIT the answer, and type only if it says yes.
+    //
+    // This used to be a fire-and-forget announcement, which is not an ordering at all:
+    // the Enter could reach main first, and a window that then died looked exactly like
+    // one that never wrote - the case A15 exists to separate. Whether it did was a
+    // property of the transport rather than of this code (measured clean over 7,060
+    // trials, documented nowhere), and CODE SHOULD NOT NEED AN ANSWER IT IS NOT OWED.
+    // Awaiting makes main's record happen BEFORE the keystroke by causation.
+    //
+    // The ORDER of these two statements is the fix. Awaiting after the write is queued
+    // would read as a fix in review and change nothing at all.
+    //
+    // A refusal or a rejection means NO KEYSTROKE - never "assume it was marked", which
+    // would turn a transport failure into a swallowed recovery turn. Throwing here takes
+    // the same path a failed pty write already takes: the caller settles the ticket as
+    // NOT launched, so the turn goes back and the message stays queued for a retry.
+    if (maySubmit && !(await maySubmit())) {
+      throw new Error(`capacity refused the submit keystroke for ${ptyId}: the ticket is no longer held`);
+    }
     const submitted = await window.cth.writePty(ptyId, '\r');
     if (!submitted?.ok) throw new Error(submitted?.error ?? `pty write failed: ${ptyId}`);
     await new Promise((r) => setTimeout(r, settleMs));
@@ -865,12 +880,13 @@ export function useHive(config: HarnessConfig | null): void {
             ),
             inferAgentProvider(target.command, target.provider),
             undefined,
-            // The one thing main cannot observe for itself: which side of the Enter
-            // this window was on when it died. Reported, not derived - the ticket is
-            // still opaque and no capacity state crosses back.
-            () => {
-              if (grant?.ok) void window.cth.capacityMarkAutoDeliveryWriting(grant.ticket);
-            }
+            // The one thing main cannot observe for itself: which side of the Enter this
+            // window was on when it died. ASKED AND AWAITED, not announced - the ticket
+            // is still opaque and no capacity state crosses back, only a yes or a no.
+            // A manual send holds no ticket, so it is not gated and types as before.
+            grant?.ok
+              ? () => window.cth.capacityMarkAutoDeliveryWriting(grant.ticket)
+              : undefined
           ),
           () => {
             removeQueuedMessage(srcId, next.id);

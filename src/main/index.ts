@@ -3985,13 +3985,15 @@ ipcMain.handle('capacity:beginAutoDelivery', (_evt, agentId: unknown) => {
   if (typeof agentId !== 'string') return { ok: false, reason: 'BAD_REQUEST', poolKey: null };
   return providerCapacity.beginAutomaticDelivery(agentId, 'ORDINARY_TURN');
 });
-// A15: the renderer telling main which side of the Enter it was on. Without this the
-// expiry cannot tell a window that died mid-send from one that never sent, and it
-// returned the recovery turn for both - authorising a second send of an instruction
-// that had already landed.
+// A15/L0-FIX9: the renderer ASKING whether it may type. Without the record, the expiry
+// cannot tell a window that died mid-send from one that never sent and returns the
+// recovery turn for both - authorising a second send of an instruction that already
+// landed. Without the ANSWER, the record was merely announced and the keystroke could
+// overtake it. Answering false for anything main does not hold is what makes the
+// refusal meaningful: a reclaimed ticket authorises nothing.
 ipcMain.handle('capacity:markAutoDeliveryWriting', (_evt, ticket: unknown) => {
-  if (typeof ticket !== 'string') return;
-  providerCapacity.markAutomaticDeliveryWriting(ticket);
+  if (typeof ticket !== 'string') return false;
+  return providerCapacity.markAutomaticDeliveryWriting(ticket);
 });
 ipcMain.handle('capacity:settleAutoDelivery', (_evt, ticket: unknown, launched: unknown) => {
   if (typeof ticket !== 'string') return;

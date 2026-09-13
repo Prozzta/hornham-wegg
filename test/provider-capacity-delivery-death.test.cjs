@@ -18,6 +18,22 @@
  * therefore run against each other rather than against a remembered constant: what
  * is asserted is that the SAME sequence reaches DIFFERENT outcomes, and that the
  * only difference between the two runs is the recorded fact.
+ *
+ * L0-FIX9 — THE MARK WAS AN ANNOUNCEMENT AND IS NOW A PRECONDITION. Dwight found that
+ * the deliverer discarded the mark's promise, so the submit keystroke could reach main
+ * before the mark did and the two deaths collapsed back together. Measuring that the
+ * transport happens to preserve the order answered a different question from whether
+ * the code is entitled to assume it, so the repair removes the dependency: the mark now
+ * ANSWERS, the deliverer awaits that answer, and it types only on `true`.
+ *
+ * WHAT THESE TESTS REACH AND WHAT THEY DO NOT, STATED HERE RATHER THAN IMPLIED. Main's
+ * half — what the answer is for a live, reclaimed, settled or unknown ticket — is pinned
+ * below and every case is reachable. THE DELIVERER'S OBEDIENCE TO THE ANSWER IS NOT:
+ * awaiting before the write rather than after it, and refusing to type on `false`, are
+ * renderer-side and no test in this suite can exercise them while renderer test
+ * infrastructure is held. That gap is named in the commit message rather than papered
+ * over — a test file that quietly covers the easy half reads exactly like one that
+ * covers both.
  */
 const test = require('node:test');
 const assert = require('node:assert/strict');
@@ -180,8 +196,10 @@ test('A15: a mark for a RECLAIMED ticket cannot reach the reservation that repla
   const fresh = r.runtime.beginAutomaticDelivery('jim');
   assert.equal(fresh.ok, true, 'precondition: the abandoned turn came back');
 
-  r.runtime.markAutomaticDeliveryWriting(orphan.ticket);
-  r.runtime.markAutomaticDeliveryWriting('cap-no-such-ticket');
+  assert.equal(r.runtime.markAutomaticDeliveryWriting(orphan.ticket), false,
+    'and it says so: a reclaimed ticket REFUSES, which is what stops the deliverer typing');
+  assert.equal(r.runtime.markAutomaticDeliveryWriting('cap-no-such-ticket'), false,
+    'so does a ticket that never existed');
   r.runtime.settleAutomaticDelivery(fresh.ticket, false);
   assert.equal(r.runtime.beginAutomaticDelivery('jim').ok, true,
     'the stale marks touched nothing: the live ticket settled as failed and gave its turn back');
@@ -223,4 +241,79 @@ test('A15: on an AVAILABLE pool the fix refuses nothing — it is a gate, not a 
   }
   assert.equal(r.runtime.beginAutomaticDelivery('jim').ok, true,
     'five marked deaths on a healthy pool cost it nothing');
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// L0-FIX9 — the mark answers, and the answer is the precondition
+// ═══════════════════════════════════════════════════════════════════════════
+
+test('L0-FIX9: a LIVE ticket is granted permission to type — the gate is not a blanket refusal', () => {
+  // The both-sides pair for every refusal below, and it is not decoration: a mark that
+  // answered false for everything would satisfy all of them and stop the floor sending
+  // anything at all, because the deliverer types only on true.
+  const r = rig();
+  recovering(r);
+  const grant = r.runtime.beginAutomaticDelivery('jim');
+  assert.equal(r.runtime.markAutomaticDeliveryWriting(grant.ticket), true,
+    'main holds this ticket, so the submit keystroke is authorised');
+});
+
+test('L0-FIX9: a ticket main has already SETTLED refuses — its reservation is gone', () => {
+  // The hazard the old fire-and-forget mark could not even report. A deliverer that woke
+  // up late and typed against a closed ticket would be sending with nothing reserving it.
+  const r = rig();
+  recovering(r);
+  const grant = r.runtime.beginAutomaticDelivery('jim');
+  r.runtime.settleAutomaticDelivery(grant.ticket, false);
+  assert.equal(r.runtime.markAutomaticDeliveryWriting(grant.ticket), false,
+    'settled is closed: no reservation, so no authorised keystroke');
+});
+
+test('L0-FIX9: a ticket main EXPIRED refuses, and the refusal does not disturb its successor', () => {
+  const r = rig();
+  recovering(r);
+  const orphan = r.runtime.beginAutomaticDelivery('jim');
+  r.rendererDies();
+  const fresh = r.runtime.beginAutomaticDelivery('jim');
+  assert.equal(fresh.ok, true, 'precondition: the abandoned turn came back');
+
+  assert.equal(r.runtime.markAutomaticDeliveryWriting(orphan.ticket), false,
+    'the expired ticket is refused');
+  assert.equal(r.runtime.markAutomaticDeliveryWriting(fresh.ticket), true,
+    'and the live one that replaced it is still granted — a refusal is local to its ticket');
+});
+
+test('L0-FIX9: granting permission twice is granting it once — idempotent, and it spends nothing', () => {
+  // A deliverer may legitimately ask again (a retried chain, a re-entered write). Two
+  // grants must not become two spends, and must not close the ticket either.
+  const r = rig();
+  recovering(r);
+  const grant = r.runtime.beginAutomaticDelivery('jim');
+  assert.equal(r.runtime.markAutomaticDeliveryWriting(grant.ticket), true);
+  assert.equal(r.runtime.markAutomaticDeliveryWriting(grant.ticket), true, 'asked twice, granted twice');
+  assert.equal(r.ticketTimers(), 1, 'and still outstanding: a grant is not a settle');
+
+  r.runtime.settleAutomaticDelivery(grant.ticket, false);
+  assert.equal(r.runtime.beginAutomaticDelivery('jim').ok, true,
+    'two grants cost exactly what one costs, which is nothing');
+});
+
+test('L0-FIX9: the ANSWER and the RECORD are the same act — a granted ticket is a marked ticket', () => {
+  // The join between the two halves of the fix, and the one a reader would otherwise have
+  // to take on trust: it would be possible to answer `true` and record nothing, which
+  // reads correctly at the call site and restores the original A15 defect underneath.
+  const granted = rig();
+  recovering(granted);
+  const a = granted.runtime.beginAutomaticDelivery('jim');
+  assert.equal(granted.runtime.markAutomaticDeliveryWriting(a.ticket), true);
+  granted.rendererDies();
+  assert.equal(granted.runtime.beginAutomaticDelivery('jim').ok, false,
+    'permission granted means the write may have landed, so the expiry holds the turn');
+
+  const never = rig();
+  recovering(never);
+  never.runtime.beginAutomaticDelivery('jim');
+  never.rendererDies();
+  assert.equal(never.runtime.beginAutomaticDelivery('jim').ok, true,
+    'and a ticket that never asked is still the abandoned-before-launch case');
 });

@@ -1065,13 +1065,16 @@ const api = {
   capacityBeginAutoDelivery: (agentId: string): Promise<CapacityDeliveryGrant> =>
     ipcRenderer.invoke('capacity:beginAutoDelivery', agentId),
   /**
-   * Report that the authorised delivery is ABOUT TO type its submit keystroke.
+   * ASK whether this authorised delivery may type its submit keystroke.
    *
-   * Sent before the Enter rather than after it, because after it a window that dies
-   * looks exactly like one that never wrote. Main uses it ONLY to decide what an
-   * expiring, unanswered ticket meant; a settle that does arrive still wins.
+   * AWAIT IT AND WRITE ONLY ON `true`. It is not an announcement: resolving is what
+   * makes main's record of the keystroke happen BEFORE the keystroke, rather than
+   * relying on two invokes arriving in the order they were sent — which Electron does
+   * not guarantee for any pair of channels. `false` means main has already reclaimed
+   * the ticket, so nothing authorises the send; a rejection means the same thing and
+   * must never be treated as a yes.
    */
-  capacityMarkAutoDeliveryWriting: (ticket: string): Promise<void> =>
+  capacityMarkAutoDeliveryWriting: (ticket: string): Promise<boolean> =>
     ipcRenderer.invoke('capacity:markAutoDeliveryWriting', ticket),
   /** Report whether the authorised delivery actually started. Always call it. */
   capacitySettleAutoDelivery: (ticket: string, launched: boolean): Promise<void> =>

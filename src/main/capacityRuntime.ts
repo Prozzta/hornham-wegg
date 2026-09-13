@@ -176,7 +176,9 @@ export class CapacityRuntime {
    * vanished caller can cost is one delivery window. An unsettled ticket that DID
    * report one keeps its turn spent, because the write may have landed — see
    * `markAutomaticDeliveryWriting`, where that asymmetry is argued. In neither case
-   * is a reservation swallowed by a caller that never used it.
+   * is a reservation swallowed by a caller that never used it. That report is a
+   * PRECONDITION the deliverer waits on, so "may have landed" is a statement about
+   * causation here and not about message ordering.
    */
   beginAutomaticDelivery(
     agentId: string,
@@ -211,7 +213,17 @@ export class CapacityRuntime {
   }
 
   /**
-   * The deliverer is ABOUT TO WRITE the submit keystroke this ticket authorised.
+   * MAY the deliverer write the submit keystroke this ticket authorised?
+   *
+   * L0-FIX9 — THIS USED TO BE AN ANNOUNCEMENT AND IT IS NOW A PRECONDITION, because an
+   * announcement nobody waits for is not an ordering. The first version was sent and
+   * discarded, so the Enter could reach main first and a renderer that then died looked
+   * exactly like one that never wrote — the very case A15 exists to separate. Whether
+   * that actually happened was a property of the transport: measured at 7,060 trials on
+   * Electron 32.3.3 with zero counterexamples, and documented nowhere, so the code was
+   * entitled to nothing. THE REPAIR IS NOT BETTER EVIDENCE FOR THE ORDERING, IT IS NOT
+   * NEEDING ONE: the deliverer waits for this answer and writes only on `true`, so the
+   * mark HAPPENED-BEFORE the keystroke by causation rather than by luck.
    *
    * A15 — WHAT WAS MISSING WAS A FACT, NOT A CHECK. A deliverer that dies after the
    * Enter lands but before it settles leaves a ticket in EXACTLY the state a death
@@ -242,14 +254,25 @@ export class CapacityRuntime {
    * nothing, and still holds only an opaque ticket; main keeps every decision,
    * including what an unmarked expiry is taken to mean.
    *
-   * Idempotent, and silent about an unknown ticket for the same reason `settle` is:
-   * a late mark and the expiry race by construction, and a ticket that is already
-   * closed has nothing left to learn. In particular a mark can neither resurrect a
-   * reclaimed reservation nor attach itself to the next one.
+   * FALSE IS A REFUSAL, NOT AN ERROR, AND IT IS THE HALF THAT DOES REAL WORK. An
+   * unknown ticket is one main has already reclaimed — expired, settled, or never
+   * issued — so its reservation belongs to somebody else now and writing against it
+   * would be an unauthorised send that no reservation covers. The old fire-and-forget
+   * version permitted exactly that and could not have reported it.
+   *
+   * AND A REFUSAL MUST NEVER BE READ AS A MARK. Treating a failed or rejected answer as
+   * though the ticket were marked converts a transport failure into a swallowed turn —
+   * the opposite defect, and the one the live-settle carve-out below exists to prevent.
+   * No answer means no keystroke.
+   *
+   * Idempotent: marking a live ticket twice answers `true` twice and spends nothing. A
+   * mark can neither resurrect a reclaimed reservation nor attach itself to the next.
    */
-  markAutomaticDeliveryWriting(ticket: string): void {
+  markAutomaticDeliveryWriting(ticket: string): boolean {
     const held = this.pending.get(ticket);
-    if (held) held.writeBegan = true;
+    if (!held) return false;
+    held.writeBegan = true;
+    return true;
   }
 
   /**
