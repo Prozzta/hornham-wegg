@@ -71,13 +71,14 @@ function tracker() {
 // §15 item 1 — one accepted ingest is ONE publication
 // ═══════════════════════════════════════════════════════════════════════════
 
-/** 31 maximal pools plus one small pool: full, legal, and one growth from the edge. */
+/** 31 maximal pools plus one small pool: full, legal, and one growth from the edge.
+ *  The small pool is sized under the reserved ceiling's admitted transition. */
 function nearFull() {
   const { t } = tracker();
   for (let i = 0; i < RETENTION_CAPS.maxPools - 1; i += 1) {
     t.ingest(sizedTo(`codex:acct-${i}:limit-1`, `acct-${i}`, RETENTION_CAPS.maxPoolBytes));
   }
-  t.ingest(sizedTo('codex:target:limit-1', 'target', 1_500));
+  t.ingest(sizedTo('codex:target:limit-1', 'target', 700));
   assert.equal(t.pool('codex:target:limit-1').state, 'AVAILABLE', 'the small pool was admitted whole');
   return t;
 }
@@ -214,7 +215,15 @@ test('FIX6/2: the reserve is DERIVED from the enumerations, not a magic number',
     const lengths = values.map((v) => v.length);
     return Math.max(...lengths) - Math.min(...lengths);
   };
-  const expected = spread(CAPACITY_STATES) + spread(Object.values(REASON)) + 16 * 3;
+  // The number allowance is SEARCHED over the finite double domain rather than
+  // written as a literal. The old literal was 16, justified by MAX_SAFE_INTEGER,
+  // and that justification was false - the runtime publishes finite doubles, and
+  // JSON.stringify(-Number.MAX_VALUE) is 24 characters.
+  const widestNumber = Math.max(...[
+    Number.MAX_VALUE, -Number.MAX_VALUE, Number.MIN_VALUE, -Number.MIN_VALUE,
+    Number.MAX_SAFE_INTEGER, -Number.MAX_SAFE_INTEGER, 1 / 3, -1 / 3, 1e21, -1e21
+  ].map((n) => JSON.stringify(n).length));
+  const expected = spread(CAPACITY_STATES) + spread(Object.values(REASON)) + widestNumber * 3;
   assert.equal(TIMER_GROWTH_RESERVE_PER_POOL, expected);
   assert.ok(TIMER_GROWTH_RESERVE_PER_POOL > 0, 'a zero reserve would reserve nothing');
   assert.ok(TIMER_GROWTH_RESERVE_COLLECTION > 0);
@@ -345,8 +354,11 @@ function withProbe(target) {
 
 test('FIX6/2: the reserve is SUBTRACTED, not merely computed — a verdict turns on it', () => {
   // The transition, found by binary search and pinned here at one-byte precision.
-  const admitted = withProbe(1_628);
-  const refused = withProbe(1_629);
+  // It MOVES when the reserve moves - it did when the number-width premise was
+  // corrected from 16 to 24 characters - which is why the assertions below are
+  // written against RESERVE_AT_32 rather than against a remembered byte count.
+  const admitted = withProbe(844);
+  const refused = withProbe(845);
 
   assert.notEqual(admitted.pool.state, 'UNKNOWN', 'the larger legal input is admitted');
   assert.equal(admitted.pool.windows.length, 1, 'and retained whole');
@@ -373,7 +385,7 @@ test('FIX6/2: the reserve is SUBTRACTED, not merely computed — a verdict turns
 test('FIX6/2: it refuses a BAND, not a direction — everything below the ceiling is admitted', () => {
   // The pair. "Refuses at the edge" is trivially true of an implementation that
   // refuses more widely, which would silently shrink the usable collection.
-  for (const target of [800, 1_200, 1_628]) {
+  for (const target of [500, 700, 844]) {
     const r = withProbe(target);
     assert.notEqual(r.pool.state, 'UNKNOWN', `${target} bytes should be admitted`);
     assert.equal(r.pool.windows.length, 1, `${target} bytes should be retained whole`);

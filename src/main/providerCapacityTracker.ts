@@ -43,7 +43,7 @@
  * of the display threshold. The display threshold decides display and nothing else;
  * nothing in this file can see it.
  */
-import { CAPACITY_STATES } from '../shared/providerCapacity';
+import { CAPACITY_STATES, OBSERVATION_SOURCES } from '../shared/providerCapacity';
 import type {
   CapacityCollectionSnapshot,
   CapacityFreshness,
@@ -56,7 +56,10 @@ import type {
   PoolCapacitySnapshot
 } from '../shared/providerCapacity';
 import { applicabilityOf } from '../shared/providerCapacity';
-import { admissionEnvelopeOf, ENVELOPE_TYPED_REACHED, type AdmissionEnvelope } from './capacityEnvelope';
+import {
+  admissionEnvelopeOf, ENVELOPE_TYPED_REACHED, boundedIdentity, boundedPoolKey, boundedStreamId,
+  type AdmissionEnvelope
+} from './capacityEnvelope';
 
 /**
  * Operational constants from L0-SEM §6 and §9.2. These are conservative L0
@@ -150,7 +153,22 @@ export const REASON = {
  * per-pool maximum is the sum of the widths below, and the collection maximum is
  * that times the pool ceiling - arithmetic over constants, not a sample.
  */
-const MAX_JSON_NUMBER_CHARS = 16; // Number.MAX_SAFE_INTEGER is 16 digits.
+/**
+ * The widest any finite JSON number can serialize to.
+ *
+ * THIS WAS 16, JUSTIFIED BY `Number.MAX_SAFE_INTEGER`, AND THE JUSTIFICATION WAS
+ * FALSE: the name claims the domain of every JSON number while the derivation
+ * covered only safe integers. The runtime publishes finite doubles, not safe
+ * integers - `JSON.stringify(Number.MAX_VALUE)` is 23 characters and the negative is
+ * 24 - and an injected monotonic clock published a 23-character `ageMs` through the
+ * public `evaluate()`. The reserve may have held anyway on accidental slack, but
+ * ACCIDENTAL SLACK IS NOT THE PROOF, and a constant whose stated justification is
+ * false is not defensible even where it happens to hold.
+ *
+ * 24 is the measured maximum over the extremes of the finite double domain, pinned
+ * by a test that searches them rather than asserting the constant.
+ */
+const MAX_JSON_NUMBER_CHARS = 24;
 
 /** Widest minus narrowest member of a closed set of strings. */
 const widthSpread = (values: readonly string[]): number => {
@@ -221,7 +239,7 @@ export interface IngestResult {
   accepted: boolean;
   /** The published projection moved. Always false when `accepted` is false. */
   changed: boolean;
-  reason: 'ACCEPTED' | 'DUPLICATE' | 'FUTURE_SKEW' | 'OUT_OF_ORDER' | 'CAP_POOLS';
+  reason: 'ACCEPTED' | 'DUPLICATE' | 'FUTURE_SKEW' | 'OUT_OF_ORDER' | 'CAP_POOLS' | 'UNBOUNDED_IDENTITY';
 }
 
 /**
@@ -351,6 +369,26 @@ export class ProviderCapacityTracker {
    */
   ingestDetailed(obs: CapacityObservation): IngestResult {
     const now = this.clock();
+    // IDENTITY IS RETAINED STATE AND MUST BE BOUNDED BEFORE ANYTHING IS RETAINED.
+    //
+    // The bounded stand-in bounds the PAYLOAD and copied identity through raw, so a
+    // 300,000-character limitId was published inside the very object whose job is to
+    // bound what a breach retains - the same defect as the first sentinel, which
+    // classified the pool UNKNOWN and then stored all seventeen windows anyway, one
+    // field-class over. The pool key is checked too, not just its parts: it is the
+    // Map key this record is retained under, and bounding only the parts would leave
+    // the key free to be anything the provider sent.
+    //
+    // REFUSED RATHER THAN TRUNCATED, and that is forced rather than chosen. A
+    // shortened identity is a DIFFERENT identity - the rule that keeps the envelope
+    // from relabelling - so truncating a poolKey could silently merge two real pools
+    // into one. Nothing can be retained for a reading whose identity cannot be
+    // believed, so nothing is: no record is created, no previous reading is
+    // disturbed, and an agent with no resolvable pool already gets the seam's
+    // UNKNOWN, which declines to infer safety.
+    if (!ProviderCapacityTracker.identityIsBounded(obs)) {
+      return { accepted: false, changed: false, reason: 'UNBOUNDED_IDENTITY' };
+    }
     // A timestamp far in the future is invalid, not very fresh (§6).
     if (obs.observedAt > now + this.policy.futureSkewMs) {
       return { accepted: false, changed: false, reason: 'FUTURE_SKEW' };
@@ -734,6 +772,23 @@ export class ProviderCapacityTracker {
    * observed, so the pool could classify on evidence the provider never sent.
    * Neither the 17th window nor any chosen 16 survives (L0-SEM 13).
    */
+  /**
+   * Is every identity this reading would have us RETAIN within its bound?
+   *
+   * These are the fields the stand-in copies through, so they are exactly the ones a
+   * breach cannot shrink. `sourceSequence` and the timestamps are numbers and bounded
+   * by their own serialization; `source` is checked against the closed set because an
+   * unknown source is not a source.
+   */
+  private static identityIsBounded(obs: CapacityObservation): boolean {
+    return boundedPoolKey(obs.poolKey) !== null
+      && boundedIdentity(obs.provider) !== null
+      && boundedIdentity(obs.accountScope) !== null
+      && boundedIdentity(obs.limitId) !== null
+      && (OBSERVATION_SOURCES as readonly string[]).includes(obs.source)
+      && (obs.streamId === null || obs.streamId === undefined || boundedStreamId(obs.streamId) !== null);
+  }
+
   private static sentinel(obs: CapacityObservation, envelope: AdmissionEnvelope | null): CapacityObservation {
     return {
       poolKey: obs.poolKey,
@@ -929,8 +984,23 @@ function publish(p: PoolCapacitySnapshot): PoolCapacitySnapshot {
   return Object.freeze(p);
 }
 
-/** Serialized size of one retained reading, which is what the byte caps bound. */
-const byteLength = (value: unknown): number => JSON.stringify(value).length;
+/**
+ * Serialized size of one retained reading, in UTF-8 BYTES, which is what the byte
+ * caps bound.
+ *
+ * `JSON.stringify(value).length` counts UTF-16 CODE UNITS and that is a different
+ * quantity. Oscar section 12 states the ceilings on UTF-8 serialization, and the
+ * normalizers retain provider strings, so the gap is reachable rather than
+ * theoretical: a character above U+07FF is one code unit and three bytes, and a
+ * supplementary character is two code units and four bytes, so the undercount
+ * reaches 3x. A plan type of 3,500 supplementary characters measured 7,508 and was
+ * 14,508; thirty-two such pools published 468,572 bytes while the code read 244,572
+ * and sentinelled none of them.
+ *
+ * Pure ASCII is arithmetically unchanged - one code unit is one byte - so every
+ * ASCII fixture keeps its existing numbers.
+ */
+const byteLength = (value: unknown): number => Buffer.byteLength(JSON.stringify(value), 'utf8');
 
 /** Applicable, known remainders, keyed by window. The baseline a later snapshot is
  *  compared against for improvement. */

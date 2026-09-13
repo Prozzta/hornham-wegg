@@ -65,10 +65,20 @@ export type CapacityFreshness = 'FRESH' | 'STALE';
  * authoritative for current capacity, a rollout copy is authoritative at its event
  * time, and nothing else is authoritative at all.
  */
-export type ObservationSource =
-  | 'claude-status-line'
-  | 'codex-rollout'
-  | 'codex-account-read';
+/**
+ * Every collector a reading can arrive from.
+ *
+ * A runtime array with the type derived from it, for the same reason
+ * `CAPACITY_STATES` is one: a closed set that a runtime check validates against
+ * must BE the type, not a second list that agrees with it today.
+ */
+export const OBSERVATION_SOURCES = [
+  'claude-status-line',
+  'codex-rollout',
+  'codex-account-read'
+] as const;
+
+export type ObservationSource = (typeof OBSERVATION_SOURCES)[number];
 
 /** One normalised allowance window. Every numeric field is nullable on purpose. */
 /**

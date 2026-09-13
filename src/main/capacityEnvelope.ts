@@ -78,11 +78,46 @@ export interface AdmissionEnvelope {
 const MAX_IDENTITY_CHARS = 64;
 const IDENTITY_SHAPE = /^[A-Za-z0-9_.:@+-]{1,64}$/;
 
-/** A bounded identity, or null. Never a truncation: a shortened id is another id. */
-const boundedIdentity = (value: unknown): string | null =>
+/**
+ * A bounded identity, or null. Never a truncation: a shortened id is another id.
+ *
+ * EXPORTED because the tracker needs the SAME check, not a second one like it. The
+ * bound was written here for the envelope and the retained observation had none, so
+ * a 300,000-character `limitId` rode into the published collection through the very
+ * stand-in whose job is to bound what a breach retains. One predicate, two callers.
+ */
+export const boundedIdentity = (value: unknown): string | null =>
   typeof value === 'string' && value.length <= MAX_IDENTITY_CHARS && IDENTITY_SHAPE.test(value)
     ? value
     : null;
+
+/**
+ * A pool key is three bounded identities and two separators, so it has its own
+ * ceiling rather than an identity's. It is checked as well as its parts because it
+ * is the Map key the tracker retains a record under - bounding only the parts would
+ * leave the key itself free to be anything the provider sent.
+ */
+const MAX_POOL_KEY_CHARS = MAX_IDENTITY_CHARS * 3 + 2;
+
+/** A stream id is a PATH, not an identity: different charset, wider ceiling. */
+const MAX_STREAM_ID_CHARS = 512;
+
+export const boundedPoolKey = (value: unknown): string | null =>
+  typeof value === 'string'
+    && value.length >= 1
+    && value.length <= MAX_POOL_KEY_CHARS
+    && /^[A-Za-z0-9_.:@+\/-]+$/.test(value)
+    ? value
+    : null;
+
+export const boundedStreamId = (value: unknown): string | null =>
+  typeof value === 'string' && value.length >= 1 && value.length <= MAX_STREAM_ID_CHARS ? value : null;
+
+export const IDENTITY_LIMITS = {
+  identityChars: MAX_IDENTITY_CHARS,
+  poolKeyChars: MAX_POOL_KEY_CHARS,
+  streamIdChars: MAX_STREAM_ID_CHARS
+} as const;
 
 /**
  * The sources an envelope may arrive through. A closed set: an observation whose
