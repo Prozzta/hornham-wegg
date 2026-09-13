@@ -1,0 +1,157 @@
+/**
+ * SCENARIO — L0-TERMMATRIX. Does the candidate clear control actually empty a REAL
+ * provider TUI's input box?
+ *
+ * THE FRAMES BELOW ARE REAL CAPTURES, not hand-written TUI shapes. They were taken
+ * from each provider's own binary over a real PTY, in an ALREADY-TRUSTED cwd with
+ * the provider's real config, so no consent was given and none was asked. Enter was
+ * never sent. A provider whose first screen was not positively a composer was
+ * aborted WITHOUT A KEYSTROKE and has no row here — absence is UNKNOWN, never a pass.
+ *
+ * Replay is the right instrument rather than a concession: a capture is a FIXTURE and
+ * re-runs identically, where a live TUI does not. The predicate reads xterm's buffer,
+ * and the screen does not know what produced its bytes.
+ *
+ * WHAT EACH ROW MUST SHOW, and why it takes two terminals:
+ *   A. boot → empty → staged            the marker is ON SCREEN  (hasDraft true)
+ *      + afterClear                      the box is EMPTY        (hasDraft false)
+ *   B. boot → empty → staged → afterClear → restaged   staged again (hasDraft true)
+ *      + afterNoop                       a HARMLESS key changes nothing
+ * Both branches are measured FROM A STAGED BASELINE. Measuring the two keys in
+ * sequence on one terminal lets the first key's repaint make the second look inert,
+ * which is an order artifact that happens to support the conclusion.
+ */
+import {
+  acquireTerminal, attachTerminal, hasTerminalDraft, disposeTerminal
+} from '../../../src/renderer/src/components/terminalPool';
+
+declare global {
+  interface Window {
+    __harnessRun: () => Promise<void>;
+    harness: { report: (payload: unknown) => void };
+    cth: Record<string, unknown>;
+  }
+}
+
+function installBridgeStub(): void {
+  const unsub = () => () => { /* nothing subscribed */ };
+  window.cth = {
+    onPtyData: unsub(), onPtyExit: unsub(), onPtyRelaunch: unsub(),
+    writePty: () => { /* no pty */ }, redrawPty: () => { /* no pty */ },
+    resizePty: () => { /* no pty */ }, copyToClipboard: () => { /* unused */ },
+    readClipboard: () => Promise.resolve(''), readClipboardSync: () => '',
+    statAbs: () => Promise.resolve(null), revealPath: () => Promise.resolve()
+  };
+}
+
+const write = (term: { write: (d: string, cb?: () => void) => void }, data: string): Promise<void> =>
+  new Promise((resolve) => term.write(data, () => resolve()));
+
+const ECHO_GRACE_MS = 1000;
+
+/** Real per-provider captures. Deltas, in capture order: replaying them in
+ *  sequence reconstructs the screen, because a terminal is a state machine. */
+const CAPTURES: Record<string, {
+  mark: string; boot: string; empty: string; staged: string;
+  afterClear: string; restaged: string; afterNoop: string;
+}> = {
+  claude: {
+    mark: "ZQS44JHAQZ",
+    boot: "\u001b[2J\u001b[m\u001b[H\u001b]0;C:\\nvm4w\\nodejs\\node_modules\\@anthropic-ai\\claude-code\\bin\\claude.exe\u0007\u001b[?25h\u001b]0;claude\u0007\u001b[?2004h\u001b[?2031h\u001b[?1004h\u001b[?9001l\u001b[?25l\u001b]11;?\u0007\u001b[>0q\u001b[?u\u001b[>4m\u001b[?1004l\u001b[?2031l\u001b[?2004l\u001b[?2004h\u001b[?2031h\u001b[?1004h\u001b[?9001l\u001b]0;✳ Claude Code\u0007\u001b[38;2;215;119;87m ▐\u001b[48;2;0;0;0m▛███▛█\u001b[m   \u001b[1m\u001b[97mClaude\u001b[m \u001b[1m\u001b[97mCode\u001b[m \u001b[38;2;102;102;102mv2.1.270\u001b[m\u001b[K\u001b[38;2;215;119;87m\r\n▝▜\u001b[48;2;0;0;0m█████\u001b[49m█▀\u001b[m  \u001b[38;2;102;102;102mOpus\u001b[m \u001b[38;2;102;102;102m5\u001b[m \u001b[38;2;102;102;102m(1M\u001b[m \u001b[38;2;102;102;102mcontext)\u001b[m \u001b[38;2;102;102;102mwith\u001b[m \u001b[38;2;102;102;102mhigh\u001b[m \u001b[38;2;102;102;102meffort\u001b[m \u001b[38;2;102;102;102m·\u001b[m \u001b[38;2;102;102;102mClaude\u001b[m \u001b[38;2;102;102;102mMax\u001b[m\u001b[K\u001b[38;2;215;119;87m\r\n \u001b[m \u001b[38;2;215;119;87m▝▝\u001b[m \u001b[38;2;215;119;87m▝▝\u001b[m    \u001b[38;2;102;102;102mC:\\PrzEdit\u001b[m\u001b[K\r\n\u001b[K\u001b[38;2;215;119;87m\r\n▎\u001b[m \u001b[1m\u001b[97mAuto\u001b[m \u001b[1m\u001b[97mmode\u001b[m \u001b[1m\u001b[97mis\u001b[m \u001b[1m\u001b[97mnow\u001b[m \u001b[1m\u001b[97mClaude\u001b[m \u001b[1m\u001b[97mCode's\u001b[m \u001b[1m\u001b[97mdefault\u001b[m \u001b[1m\u001b[97mpermission\u001b[m \u001b[1m\u001b[97mmode.\u001b[m\u001b[K\u001b[38;2;215;119;87m\r\n▎\u001b[m \u001b[38;2;102;102;102mAuto\u001b[m \u001b[38;2;102;102;102mmode\u001b[m \u001b[38;2;102;102;102mlets\u001b[m \u001b[38;2;102;102;102mClaude\u001b[m \u001b[38;2;102;102;102mhandle\u001b[m \u001b[38;2;102;102;102mpermission\u001b[m \u001b[38;2;102;102;102mprompts\u001b[m \u001b[38;2;102;102;102mautomatically.\u001b[m \u001b[38;2;102;102;102mClaude\u001b[m \u001b[38;2;102;102;102mchecks\u001b[m \u001b[38;2;102;102;102meach\u001b[m \u001b[38;2;102;102;102mtool\u001b[m \u001b[38;2;102;102;102mcall\u001b[m \u001b[38;2;102;102;102mfor\u001b[m   \u001b[38;2;215;119;87m\r\n▎\u001b[m \u001b[38;2;102;102;102mrisky\u001b[m \u001b[38;2;102;102;102mactions\u001b[m \u001b[38;2;102;102;102mand\u001b[m \u001b[38;2;102;102;102mprompt\u001b[m \u001b[38;2;102;102;102minjection\u001b[m \u001b[38;2;102;102;102mbefore\u001b[m \u001b[38;2;102;102;102mexecuting,\u001b[m \u001b[38;2;102;102;102mruns\u001b[m \u001b[38;2;102;102;102mthe\u001b[m \u001b[38;2;102;102;102mones\u001b[m \u001b[38;2;102;102;102mit\u001b[m \u001b[38;2;102;102;102massesses\u001b[m \u001b[38;2;102;102;102mas\u001b[m \u001b[38;2;102;102;102mlower-risk,\u001b[m \u001b[38;2;102;102;102mand\u001b[m \u001b[38;2;215;119;87m\r\n▎\u001b[m \u001b[38;2;102;102;102mblocks\u001b[m \u001b[38;2;102;102;102mthe\u001b[m \u001b[38;2;102;102;102mrest.\u001b[m\u001b[K\u001b[38;2;215;119;87m\r\n▎\u001b[m \u001b[38;2;102;102;102mhttps://code.claude.com/docs/en/permission-modes\u001b[m\u001b[K\r\n\u001b[K\u001b[38;2;153;153;153m\r\n────────────────────────────────────────────────────────────────────────────────────────────────────\u001b[m\r\n❯ Try \"fix lint errors\"\u001b[K\u001b[38;2;153;153;153m\r\n────────────────────────────────────────────────────────────────────────────────────────────────────\u001b[m\r\n  \u001b[38;2;150;108;30m⏵⏵\u001b[m \u001b[38;2;150;108;30mauto\u001b[m \u001b[38;2;150;108;30mmode\u001b[m \u001b[38;2;150;108;30mon\u001b[38;2;102;102;102m (shift+tab\u001b[m \u001b[38;2;102;102;102mto\u001b[m \u001b[38;2;102;102;102mcycle)\u001b[m \u001b[38;2;102;102;102m·\u001b[m \u001b[38;2;102;102;102m←\u001b[m \u001b[38;2;102;102;102mfor\u001b[m \u001b[38;2;102;102;102magents\u001b[m\u001b[29X\u001b[38;2;102;102;102m\u001b[29C●\u001b[m \u001b[38;2;102;102;102mhigh\u001b[m \u001b[38;2;102;102;102m·\u001b[m \u001b[38;2;102;102;102m/effort\u001b[m  \r\n\u001b[83X\u001b[38;2;150;108;30m\u001b[83C/rc\u001b[m \u001b[38;2;150;108;30mconnecting…\u001b[m  \u001b[12;3H\u001b[?25h\u001b[25l\u001b[>0q\u001b[15;84H\u001b[12X\u001b[38;2;44;122;57m\u001b[12C/rc\u001b[12;3H\u001b[?25h\u001b[m",
+    empty: "",
+    staged: "\u001b[25lZQS44JHAQZ\u001b[K\u001b[38;2;153;153;153m\u001b[13;3H──────────────────────────────────────────────────────────────────────────────────────────────────\u001b[38;2;150;108;30m\u001b[14;3H⏵⏵\u001b[m \u001b[38;2;150;108;30mauto\u001b[m \u001b[38;2;150;108;30mmode\u001b[m \u001b[38;2;150;108;30mon\u001b[38;2;102;102;102m (shift+tab\u001b[m \u001b[38;2;102;102;102mto\u001b[m \u001b[38;2;102;102;102mcycle)\u001b[m\u001b[15X\u001b[15C\u001b[29X\u001b[38;2;102;102;102m\u001b[29C●\u001b[m \u001b[38;2;102;102;102mhigh\u001b[m \u001b[38;2;102;102;102m·\u001b[m \u001b[38;2;102;102;102m/effort\u001b[m  \u001b[12;13H\u001b[?25h",
+    afterClear: "\u001b[25l\u001b[12;3HTry \"fix lint errors\"\u001b[74X\u001b[38;2;153;153;153m\u001b[13;3H───────────────────────────────────────────────────────────────────────────────────────────────\u001b[38;2;150;108;30m\u001b[14;3H⏵⏵\u001b[m \u001b[38;2;150;108;30mauto\u001b[m \u001b[38;2;150;108;30mmode\u001b[m \u001b[38;2;150;108;30mon\u001b[38;2;102;102;102m (shift+tab\u001b[m \u001b[38;2;102;102;102mto\u001b[m \u001b[38;2;102;102;102mcycle) · ← for agents\u001b[m\u001b[17X\u001b[38;2;102;102;102m\u001b[17CCtrl+Y to paste deleted tex\u001b[12;3H\u001b[?25h\u001b[m",
+    restaged: "\u001b[25lZQS44JHAQZ\u001b[K\u001b[38;2;153;153;153m\u001b[13;3H──────────────────────────────────────────────────────────────────────────────────────────────────\u001b[38;2;150;108;30m\u001b[14;3H⏵⏵\u001b[m \u001b[38;2;150;108;30mauto\u001b[m \u001b[38;2;150;108;30mmode\u001b[m \u001b[38;2;150;108;30mon\u001b[38;2;102;102;102m (shift+tab\u001b[m \u001b[38;2;102;102;102mto\u001b[m \u001b[38;2;102;102;102mcycle)\u001b[m\u001b[15X\u001b[15C\u001b[17X\u001b[38;2;102;102;102m\u001b[17CCtrl+Y to paste deleted text\u001b[m  \u001b[12;13H\u001b[?25h",
+    afterNoop: ""
+  },
+  codex: {
+    mark: "ZQTYUG8NQZ",
+    boot: "\u001b[?2004h\u001b[?1004l\u001b[?2026h\u001b[2J\u001b[m\u001b[H\u001b]0;C:\\nvm4w\\nodejs\\node.exe\u0007\u001b[?25h\u001b[25l\u001b[0 q\u001b[?2026l\u001b[?2026h\u001b[0 q\u001b[?2026l\u001b[?2026h\u001b[0 q\u001b[?2026l\u001b[?2026h\u001b[0 q\u001b[?2026l\u001b[?2026h\u001b[0 q\u001b[?2026l\u001b[?2026h\u001b[0 q\u001b[?2026l\u001b[?2026h\u001b[0 q\u001b[?2026l\u001b[?2026h\u001b[0 q\u001b[?2026l\u001b[?2026h\u001b[0 q\u001b[?2026l╭───────────────────────────────────────╮\u001b[K\r\n│ >_ \u001b[1m\u001b[97mOpenAI Codex\u001b[m (v0.154.0)            │\u001b[K\r\n│                                       │\u001b[K\r\n│ model:     \u001b[3mloading\u001b[23m   \u001b[36m/model\u001b[m to change │\u001b[K\r\n│ directory: C:\\PrzEdit                 │\u001b[K\r\n╰───────────────────────────────────────╯\u001b[K\r\n\u001b[K\r\n\u001b[K\u001b[1m\u001b[97m\r\n›\u001b[m Ask Codex to do anything\u001b[K\r\n\u001b[K\r\n  ? for shortcuts\u001b[K\r\n\u001b[K\r\n\u001b[K\r\n\u001b[K\r\n\u001b[K\r\n\u001b[K\r\n\u001b[K\r\n\u001b[K\r\n\u001b[K\r\n\u001b[K\r\n\u001b[K\r\n\u001b[K\r\n\u001b[K\r\n\u001b[K\r\n\u001b[K\r\n\u001b[K\r\n\u001b[K\r\n\u001b[K\r\n\u001b[K\r\n\u001b[K\u001b[9;3H\u001b[?25h\u001b[25l\u001b[?2026h\u001b[0 q\u001b[?2026l\u001b[H╭\u001b[9;3H\u001b[?25h\u001b[25l\u001b[?2026h\u001b[H\u001b[?25h\u001b[25l\u001b[0 q\u001b[?2026l\u001b[?2026h\u001b[0 q\u001b[?2026l\u001b[?2026h\u001b[0 q\u001b[?2026l\u001b[?2026h\u001b[0 q\u001b[?2026l\u001b[?2026h\u001b[0 q\u001b[?2026l\u001b[?2026h\u001b[0 q\u001b[?2026l╭\u001b[9;3H\u001b[?25h\u001b[25l\u001b[?2026h\u001b[0 q\u001b[?2026l\u001b[H╭\u001b[9;3H\u001b[?25h\u001b[25l\u001b[?2026h\u001b[H\u001b[?25h\u001b[25l\u001b[0 q\u001b[?2026l\u001b[?2026h\u001b[0 q\u001b[?2026l\u001b[?2026h\u001b[0 q\u001b[?2026l\u001b]10;?\u001b\\\u001b]11;?\u001b\\╭\u001b[9;3H\u001b]0;PrzEdit\u0007\u001b[?25h\u001b[25l\u001b[?2026h\u001b[38;2;246;226;183m\u001b[11;3Hgpt-6-astra default\u001b[m · \u001b[38;2;171;223;167mC:\\PrzEdit\u001b[H\u001b[?25h\u001b[25l\u001b[0 q\u001b[?2026l\u001b[m╭\u001b[9;3H\u001b[?25h\u001b[25l\u001b[?2026h\u001b[H\u001b[?25h\u001b[25l\u001b[0 q\u001b[?2026l╭\u001b[9;3H\u001b[?25h\u001b]0;⠹ PrzEdit\u0007\u001b]0;⠸ PrzEdit\u0007\u001b[25l\u001b[?2026h\u001b[H\u001b[K\r\n╭────────────────────────────────────────────────╮\u001b[K\r\n│ >_ \u001b[1m\u001b[97mOpenAI Codex\u001b[m (v0.154.0)                     │\u001b[K\r\n│                                                │\u001b[K\r\n│ model:     gpt-6-astra high   \u001b[36m/model\u001b[m to change │\u001b[K\r\n│ directory: C:\\PrzEdit                          │\u001b[K\r\n╰────────────────────────────────────────────────╯\u001b[K\r\n\u001b[K\r\n\u001b[K\r\n\u001b[K\r\n\u001b[K\r\n\u001b[K\r\n\u001b[K\r\n\u001b[K\r\n\u001b[K\r\n\u001b[K\r\n\u001b[K\r\n\u001b[K\r\n\u001b[K\r\n\u001b[K\r\n\u001b[K\r\n\u001b[K\r\n\u001b[K\r\n\u001b[K\r\n\u001b[K\r\n\u001b[K\r\n\u001b[K\r\n\u001b[K\r\n\u001b[K\r\n\u001b[K\u001b[8;1H\u001b[?25h\u001b[25l\u001b[0 q\u001b[?2026l\u001b[?2026h\u001b[0 q\u001b[?2026l\u001b[H╭────────────────────────────────────────────────╮\u001b[K\r\n│ >_ \u001b[1m\u001b[97mOpenAI Codex\u001b[m (v0.154.0)                     │\u001b[K\r\n│                                                │\u001b[K\r\n│ model:     gpt-6-astra high   \u001b[36m/model\u001b[m to change │\u001b[K\r\n│ directory: C:\\PrzEdit                          │\u001b[K\r\n╰────────────────────────────────────────────────╯\u001b[K\r\n\u001b[K\r\n  \u001b[1m\u001b[97mTip:\u001b[m Try the \u001b[1m\u001b[97mDesktop app\u001b[m. Run 'codex app' or visit https://chatgpt.com/codex?app-landing-page=true\r\n\u001b[K\r\n\u001b[K\u001b[1m\u001b[97m\r\n›\u001b[m Ask Codex to do anything\u001b[K\r\n\u001b[K\r\n  \u001b[38;2;246;226;183mgpt-6-astra high\u001b[m · \u001b[38;2;171;223;167mC:\\PrzEdit\u001b[m\u001b[K\r\n\u001b[K\r\n\u001b[K\r\n\u001b[K\r\n\u001b[K\r\n\u001b[K\r\n\u001b[K\r\n\u001b[K\r\n\u001b[K\r\n\u001b[K\r\n\u001b[K\r\n\u001b[K\r\n\u001b[K\r\n\u001b[K\r\n\u001b[K\r\n\u001b[K\r\n\u001b[K\r\n\u001b[K\u001b[11;3H\u001b[?25h\u001b]0;⠼ PrzEdit\u0007\u001b]0;⠴ PrzEdit\u0007\u001b[25l\u001b[?2026h\u001b[0 q\u001b[?2026l\u001b[9;1H \u001b[11;3H\u001b[?25h\u001b[25l\u001b[?2026h\u001b[9;1H\u001b[K\r\n\u001b[K\r\n\u001b[K\r\n\u001b[K\r\n\u001b[K\r\n\u001b[K\r\n\u001b[K\r\n\u001b[K\u001b[1m\u001b[97m\r\n›\u001b[m Ask Codex to do anything\u001b[K\r\n\u001b[K\r\n  \u001b[38;2;246;226;183mgpt-6-astra high\u001b[m · \u001b[38;2;171;223;167mC:\\PrzEdit\u001b[m\u001b[K\r\n\u001b[K\r\n\u001b[K\r\n\u001b[K\r\n\u001b[K\r\n\u001b[K\r\n\u001b[K\r\n\u001b[K\r\n\u001b[K\r\n\u001b[K\r\n\u001b[K\r\n\u001b[K\u001b[8;1H\u001b[?25h\u001b[25l\u001b[0 q\u001b[?2026l\r\n\u001b[K\r\n• You have 1 usage limit reset available. Run /usage to use one.\u001b[K\r\n\u001b[K\u001b[33m\r\n⚠ Heads up, you have less than 25% of your weekly limit left. Run /status for a breakdown.\u001b[m\u001b[K\r\n\u001b[K\u001b[33m\r\n⚠ Heads up, you have less than 50% of your 5h limit left. Run /status for a breakdown.\u001b[m\u001b[K\r\n\u001b[K\u001b[17;3H\u001b[?25h\u001b]0;⠦ PrzEdit\u0007\u001b]0;PrzEdit\u0007\u001b[25l\u001b[?2026h\u001b[0 q\u001b[?2026l\u001b[15;1H \u001b[17;3H\u001b[?25h\u001b[25l\u001b[?2026h\u001b[0 q\u001b[?2026l\u001b[15;1H \u001b[17;3H\u001b[?25h\u001b[25l\u001b[?2026h\u001b[15;1H\u001b[?25h\u001b[25l\u001b[0 q\u001b[?2026l \u001b[17;3H\u001b[?25h",
+    empty: "",
+    staged: "\u001b[25l\u001b[?2026hZQTYUG8NQZ\u001b[K\u001b[15;1H\u001b[?25h\u001b[25l\u001b[0 q\u001b[?2026l \u001b[17;13H\u001b[?25h",
+    afterClear: "\u001b[25l\u001b[?2026h\u001b[17;3HAsk Codex to do anything\u001b[15;1H\u001b[?25h\u001b[25l\u001b[0 q\u001b[?2026l \u001b[17;3H\u001b[?25h",
+    restaged: "\u001b[25l\u001b[?2026hZQTYUG8NQZ\u001b[K\u001b[15;1H\u001b[?25h\u001b[25l\u001b[0 q\u001b[?2026l \u001b[17;13H\u001b[?25h",
+    afterNoop: "\u001b[25l\u001b[?2026h\u001b[15;1H\u001b[?25h\u001b[25l\u001b[0 q\u001b[?2026l \u001b[17;13H\u001b[?25h"
+  }
+};
+
+/** The row the production predicate reads: baseY + cursorY. Where the cursor sits
+ *  IS which line is the prompt, so this is the prompt line and not a guess. */
+function promptRow(entry: { term: { buffer: { active: any } } }): string {
+  const buf = entry.term.buffer.active;
+  const line = buf.getLine(buf.baseY + buf.cursorY);
+  return line ? line.translateToString(true) : '';
+}
+
+/** The whole screen, so a failure shows what was rendered and not only a boolean. */
+function screen(entry: { term: { buffer: { active: any }; rows: number } }): string[] {
+  const buf = entry.term.buffer.active;
+  const out: string[] = [];
+  for (let y = 0; y < entry.term.rows; y += 1) {
+    const line = buf.getLine(buf.baseY + y);
+    const s = line ? line.translateToString(true) : '';
+    if (s.trim()) out.push(s);
+  }
+  return out;
+}
+
+window.__harnessRun = async () => {
+  const result: Record<string, unknown> = { providers: {} };
+  try {
+    installBridgeStub();
+    const root = document.getElementById('root')!;
+
+    for (const [name, cap] of Object.entries(CAPTURES)) {
+      // ---- branch A: staged, then the candidate clear
+      const a = acquireTerminal('A-' + name);
+      attachTerminal(a, root);
+      await write(a.term, cap.boot);
+      await write(a.term, cap.empty);
+      await write(a.term, cap.staged);
+      const stagedNow = Date.now() + ECHO_GRACE_MS + 50;
+      const stagedScreen = screen(a);
+      const stagedHasDraft = hasTerminalDraft('A-' + name, stagedNow);
+      const stagedShowsMark = stagedScreen.some((l) => l.includes(cap.mark));
+      const stagedPromptRow = promptRow(a);
+
+      await write(a.term, cap.afterClear);
+      const clearedNow = Date.now() + ECHO_GRACE_MS + 50;
+      const clearedScreen = screen(a);
+      const clearedHasDraft = hasTerminalDraft('A-' + name, clearedNow);
+      const clearedShowsMark = clearedScreen.some((l) => l.includes(cap.mark));
+      const clearedPromptRow = promptRow(a);
+
+      // ---- branch B: staged again, then a harmless key
+      const b = acquireTerminal('B-' + name);
+      attachTerminal(b, root);
+      await write(b.term, cap.boot);
+      await write(b.term, cap.empty);
+      await write(b.term, cap.staged);
+      await write(b.term, cap.afterClear);
+      await write(b.term, cap.restaged);
+      const reNow = Date.now() + ECHO_GRACE_MS + 50;
+      const reHasDraft = hasTerminalDraft('B-' + name, reNow);
+      const reShowsMark = screen(b).some((l) => l.includes(cap.mark));
+
+      await write(b.term, cap.afterNoop);
+      const noopNow = Date.now() + ECHO_GRACE_MS + 50;
+      const noopScreen = screen(b);
+      const noopHasDraft = hasTerminalDraft('B-' + name, noopNow);
+      const noopShowsMark = noopScreen.some((l) => l.includes(cap.mark));
+      const noopPromptRow = promptRow(b);
+
+      (result.providers as Record<string, unknown>)[name] = {
+        opened: a.opened && b.opened,
+        staged: { hasDraft: stagedHasDraft, showsMark: stagedShowsMark, onPromptRow: stagedPromptRow.includes(cap.mark), promptRow: stagedPromptRow, screen: stagedScreen.slice(-6) },
+        afterClear: { hasDraft: clearedHasDraft, showsMark: clearedShowsMark, onPromptRow: clearedPromptRow.includes(cap.mark), promptRow: clearedPromptRow, screen: clearedScreen.slice(-6) },
+        restaged: { hasDraft: reHasDraft, showsMark: reShowsMark },
+        afterNoop: { hasDraft: noopHasDraft, showsMark: noopShowsMark, onPromptRow: noopPromptRow.includes(cap.mark), promptRow: noopPromptRow, screen: noopScreen.slice(-6) }
+      };
+      disposeTerminal('A-' + name);
+      disposeTerminal('B-' + name);
+    }
+    window.harness.report({ ok: true, ...result });
+  } catch (e) {
+    window.harness.report({ ok: false, error: String((e as Error)?.stack || e), partial: result });
+  }
+};
