@@ -9,7 +9,8 @@
  *   hive-node --expose-gc test/tools/capacity-heap-probe.cjs <root> <arm>
  *   hive-node            test/tools/capacity-heap-probe.cjs <root> report
  *
- *   arms: f31-pad f31-many f32-pad f32-many breach  (+ "-control" on any of them)
+ *   arms: f31-pad f31-many f31-exh f32-pad f32-many f32-exh breach
+ *         (+ "-control" on any of them)
  *
  * ==========================================================================
  * WHAT §15 REOPENED, AND WHY THE OLD NUMBERS ARE GONE
@@ -27,14 +28,40 @@
  * silently measure the wrong frontier after the next change, which is the same mistake
  * as the stale comment this file used to carry. Every report prints the derivation.
  *
- * TWO SHAPE FAMILIES AT EACH FRONTIER, AND THE REASON IS NOT SYMMETRY. Padding both
- * shapes to the same serialized size makes the SERIALIZED frontier shape-independent -
- * measured: one window plus a 7,518-char pad and sixteen windows plus a 5,583-char pad
- * both retain 8,114 bytes. So the largest fitting SIZE is unique while the SHAPE at
- * that size is not, and a long ASCII string and sixteen small objects are very
- * different object graphs at identical byte counts. Rather than pick one, both are
- * measured and the MAXIMUM is reported, since a target must hold for the worst valid
- * shape. That is strictly stronger than choosing, so no ruling was needed.
+ * THREE SHAPE FAMILIES AT EACH FRONTIER, AND THE REASON IS NOT SYMMETRY. For families
+ * that pay on input for every byte they publish, padding to the same serialized size
+ * makes the SERIALIZED frontier shape-independent - measured: one window plus a
+ * 7,518-char pad and sixteen windows plus a 5,583-char pad both retain 8,114 bytes, and
+ * both derive the same frontier 2 size of 7,952. So within those families the largest
+ * fitting SIZE is unique while the SHAPE at that size is not, and a long ASCII string
+ * and sixteen small objects are very different object graphs at identical byte counts.
+ *
+ * THAT SHAPE-INDEPENDENCE IS NOT GENERAL, AND `exh` IS THE COUNTEREXAMPLE: it derives
+ * 7,936, sixteen bytes lower per pool, BECAUSE OUTPUT-ONLY BYTES ARE NOT CHARGED ON
+ * INPUT. An earlier version of this comment stated the independence without that
+ * qualification; the exhausted family falsified it. Every family therefore derives its
+ * OWN frontier 2 size rather than inheriting one, and the MAXIMUM across families is
+ * reported, which is strictly stronger than choosing.
+ *
+ * `exh` is the third family and it exists because of a gap in the first version of this
+ * harness. `numericallyExhaustedWindowIds` is OUTPUT-ONLY - derived, present in the
+ * projection, absent from the observation - so an exhausted reading publishes bytes that
+ * cost NOTHING on input. At 31 x 8,192 that is 259,600 published against 259,104 for the
+ * default windows: A TIGHTER VALID SHAPE THAN THE ONE THE FIRST ACCEPTANCE PASS
+ * MEASURED, margin 280 rather than 776. Its heap cost is 388 bytes, so the verdict did
+ * not move - but an acceptance pass whose coverage is knowingly incomplete, excused by a
+ * residual note, is the same "claim one notch stronger than its evidence" failure in a
+ * quieter form. A residual is for what cannot be closed cheaply, not for what can.
+ *
+ * AND THE CLAIM IS NOT UPGRADED TO MATCH. Adding this family makes the coverage BETTER,
+ * NOT COMPLETE. The tightest shape constructed here reaches margin 280; an adversarial
+ * fixture elsewhere reaches 94; a sixteen-window exhausted fixture at the per-pool
+ * maximum BREACHES and is therefore not a valid shape at all. THE WORST VALID SHAPE
+ * REMAINS UNDERIVED, and finding it would need a derived maximum over legal shapes,
+ * which is analysis nobody has done. So the printed wording is TIGHTEST VALID SHAPE
+ * CONSTRUCTED and must never become "worst valid shape": an arm added and a claim
+ * upgraded to match would be the same failure in the opposite direction, and harder to
+ * catch precisely because the coverage genuinely improved.
  *
  * ==========================================================================
  * THE ESTIMATOR: `reclaimed`, NOT A BASELINE DIFFERENCE
@@ -91,7 +118,7 @@ const which = process.argv[3];
 const HEAP_TARGET_BYTES = 1024 * 1024;
 const RUNS_PER_ARM = 5;
 /** The two cap-VALID frontiers §15 requires. `breach` is extra evidence only. */
-const VALID_ARMS = ['f31-pad', 'f31-many', 'f32-pad', 'f32-many'];
+const VALID_ARMS = ['f31-pad', 'f31-many', 'f31-exh', 'f32-pad', 'f32-many', 'f32-exh'];
 const ALL_ARMS = [...VALID_ARMS, 'breach'];
 
 const baseArm = typeof which === 'string' ? which.replace(/-control$/, '') : '';
@@ -127,10 +154,15 @@ function measure(arm, isControl) {
    * the expensive one; see the header.
    */
   function sized(key, scope, bytes, shape) {
+    // `exh`: one window read as numerically exhausted, so the OUTPUT-ONLY
+    // numericallyExhaustedWindowIds list is non-empty and publishes bytes that cost
+    // nothing on input. Sixteen exhausted windows are NOT offered: at the per-pool
+    // maximum that fixture breaches, so it is not a valid shape to measure.
     const windows = shape === 'many'
       ? Array.from({ length: RETENTION_CAPS.maxWindowsPerPool },
           (_, i) => win({ windowId: 'w' + i, kind: 'OTHER', windowMinutes: 60 + i }))
-      : [win()];
+      : shape === 'exh' ? [win({ usedPercent: 100, remainingPercent: 0 })]
+        : [win()];
     let pad = 0;
     for (let guard = 0; guard < 200; guard++) {
       const o = obs({
@@ -172,7 +204,7 @@ function measure(arm, isControl) {
     return best;
   }
 
-  const shape = arm.endsWith('-many') ? 'many' : 'pad';
+  const shape = arm.endsWith('-many') ? 'many' : arm.endsWith('-exh') ? 'exh' : 'pad';
   const count = arm === 'breach' ? RETENTION_CAPS.maxPools
     : arm.startsWith('f31') ? RETENTION_CAPS.maxPools - 1 : RETENTION_CAPS.maxPools;
   const perPool = arm === 'breach' || arm.startsWith('f31')
@@ -330,6 +362,9 @@ function report() {
   if (findings) process.exit(1);
   console.log('RESULT: EMPIRICAL ISOLATED-DEV ACCEPTANCE PASS for heap attributable to retained');
   console.log('capacity state, on this machine and this Node build, for BOTH §15 cap-valid');
-  console.log('frontiers. NOT a universal V8 or runtime bound. NOT a production enforcement');
-  console.log('guarantee. The breach arm is additional evidence and discharges nothing.');
+  console.log('frontiers, across the TIGHTEST VALID SHAPE CONSTRUCTED in each.');
+  console.log('NOT the worst valid shape - that remains UNDERIVED, and deriving it needs a');
+  console.log('maximum over legal shapes that nobody has computed. NOT a universal V8 or');
+  console.log('runtime bound. NOT a production enforcement guarantee. The breach arm is');
+  console.log('additional evidence and discharges nothing.');
 }
