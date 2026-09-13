@@ -60,8 +60,11 @@ const { ProviderCapacityTracker, L0_SEM_POLICY } = loadTs('src/main/providerCapa
 const { CapacityRuntime } = loadTs('src/main/capacityRuntime.ts');
 const { ADMISSION_REASON } = loadTs('src/main/capacityAdmission.ts');
 // The renderer's submission sequence. Pure, effects injected, no DOM and no store —
-// ten other suites already load renderer modules this way, so this is the house
-// pattern rather than new infrastructure.
+// This is the house pattern, not new infrastructure: 15 suites under test/ already
+// referenced a src/renderer path BEFORE this file existed (measured at bca135b7; 16
+// including this one). The figure carried here first said "ten", which was read off a
+// `grep | head -10` -- a pipe capped at ten cannot be evidence of ten. Re-derive it by
+// search against a named revision, never by memory and never off a truncated pipe.
 const { typeAndSubmit } = loadTs('src/renderer/src/hooks/queueDelivery.ts');
 // The main-process wake path's submission sequence. Same invariant, other process;
 // workerWake.ts says in its own header that it imports no electron for this reason.
