@@ -1,27 +1,25 @@
 /**
- * SCENARIO — the two preconditions that make a TUI measurement mean anything, and
- * a production hazard that falls out of the first.
+ * SCENARIO — the two preconditions that make a TUI measurement mean anything.
  *
- * BOTH OF THESE WERE PAID FOR BY A VOID RUN. Andy's whole clear/erase matrix was
- * discarded because every row measured a first-run trust dialog instead of an input
- * box, and because a "reaction" to Ctrl-U turned out to be the same repaint frame a
- * harmless arrow key produces. Neither failure announces itself: both produce a
- * PASSING row. So they belong in the instrument, where they cost one run to find and
- * nothing thereafter, rather than in a checklist someone has to remember.
+ * BOTH WERE PAID FOR BY A VOID RUN. Andy's whole clear/erase matrix was discarded
+ * because every row measured a first-run dialog instead of an input box, and because
+ * a "reaction" to Ctrl-U turned out to be the same repaint frame a harmless arrow key
+ * produces. Neither failure announces itself: both produce a PASSING row. So they
+ * belong in the instrument, where they cost one run to find and nothing after.
  *
- *   1. A TRUST MODAL IS NOT AN INPUT BOX. A fresh cwd is an untrusted cwd, so all
- *      three installed TUIs open on "do you trust this folder?". Measuring "the box
- *      is empty and nothing was submitted" against a dialog that HAS no box answers
- *      a question nobody asked. The harness must REFUSE, not report.
+ *   1. THE SCREEN MUST BE POSITIVELY IDENTIFIED AS A COMPOSER, OR THE MEASUREMENT
+ *      IS REFUSED. See `isMeasurableComposer` for why this is not a list of dialogs.
  *   2. A FALSIFIER WITH NO CONTROL PASSES ON EVERYTHING. Any claim that a key did
- *      something must be paired with a key that should do nothing. If the two
- *      reactions are identical, what was observed is a repaint, not an effect.
+ *      something must be paired with a key that should do nothing; if the two
+ *      reactions are identical, what was seen is a repaint, not an effect.
  *
- * The bytes below are the real boot tails, quoted from the void run rather than
- * invented, so the detector is matched against what these programs actually print.
+ * Every non-composer frame below is REAL BYTES, captured by Andy from the installed
+ * TUIs with isolated provider homes and quoted rather than invented.
  */
-import { acquireTerminal, attachTerminal, hasTerminalDraft, disposeTerminal } from '../../../src/renderer/src/components/terminalPool';
-import { terminalAutomationBlockFor } from '../../../src/renderer/src/components/terminalPool';
+import {
+  acquireTerminal, attachTerminal, hasTerminalDraft, disposeTerminal,
+  terminalAutomationBlockFor
+} from '../../../src/renderer/src/components/terminalPool';
 
 declare global {
   interface Window {
@@ -45,54 +43,89 @@ function installBridgeStub(): void {
 const write = (term: { write: (d: string, cb?: () => void) => void }, data: string): Promise<void> =>
   new Promise((resolve) => term.write(data, () => resolve()));
 
-/** The real first-run trust screens, as the three installed TUIs print them. */
-const TRUST_SCREENS: Record<string, string> = {
-  claude: '\x1b[2J\x1b[H Do you trust the files in this folder?\r\n\r\n   Yes, I trust this folder\r\n   Enter to confirm - Esc to cancel\r\n',
-  codex: '\x1b[2J\x1b[H You are running Codex in a new folder.\r\n\r\n   1. Yes, continue\r\n   2. No, quit\r\n',
-  agy: '\x1b[2J\x1b[H Trust this workspace?\r\n\r\n   Yes, I trust this folder\r\n   No\r\n'
+const clear = '\x1b[2J\x1b[H';
+
+/**
+ * NON-COMPOSER SCREENS, REAL BYTES. Which one a fresh start lands on depends on
+ * WHICH THING IS FRESH: a fresh cwd with an existing config gives the trust modal;
+ * a fresh CONFIG gives onboarding, which is several screens.
+ *
+ * These are fixtures for the refusal arms. They are deliberately NOT the detector's
+ * input - nothing below is matched against this list.
+ */
+const NON_COMPOSER: Record<string, string> = {
+  'claude trust': `${clear} Do you trust the files in this folder?\r\n\r\n   Yes, I trust this folder\r\n   Enter to confirm - Esc to cancel\r\n`,
+  'codex trust': `${clear} You are running Codex in a new folder.\r\n\r\n   1. Yes, continue\r\n   2. No, quit\r\n`,
+  'agy trust': `${clear} Trust this workspace?\r\n\r\n   Yes, I trust this folder\r\n   No\r\n`,
+  'claude onboarding theme': `${clear} Choose the text style that looks best with your terminal\r\n\r\n   1. Auto (match terminal)\r\n   2. Dark mode\r\n   3. Light mode\r\n   4. Dark mode (colorblind-friendly)\r\n\r\n To change this later, run /theme\r\n`,
+  'claude onboarding login': `${clear} Select login method:\r\n\r\n   1. Claude account with subscription\r\n   2. Anthropic Console account\r\n   3. 3rd-party platform\r\n`,
+  'codex sign-in': `${clear} Sign in with ChatGPT to use Codex as part of your paid plan\r\n\r\n   1. Sign in with ChatGPT\r\n   2. Sign in with Device Code\r\n   3. Provide your own API key\r\n\r\n Press enter to continue\r\n`,
+  'agy onboarding theme': `${clear} solarized dark\r\n colorblind-friendly dark\r\n tokyo night\r\n`,
+  // THE ONE THAT IS DIFFERENT IN KIND. Enter on a trust modal consents to a folder.
+  // Enter on this one ACCEPTS A TERMS OF SERVICE AND A DATA-COLLECTION AGREEMENT ON
+  // THE HUMAN'S BEHALF. It is the reason the detector must fail closed.
+  'agy consent': `${clear} ...to collect and use my Interactions data, subject to the\r\n Google Antigravity CLI Terms of Service and Google Privacy Policy\r\n\r\n [Previous]      [Done]\r\n\r\n Navigate - enter Toggle\r\n`,
+  // NOT A REAL SCREEN, AND THAT IS ITS ENTIRE PURPOSE. Nobody has enumerated this
+  // one, so it is the arm that proves the detector fails CLOSED rather than open.
+  'a screen nobody has met': `${clear} Select your region\r\n\r\n   1. United States\r\n   2. European Union\r\n   3. Other\r\n`
 };
 
 /** An ordinary prompt box - the thing a measurement is actually entitled to read. */
-const PROMPT_BOX = [
-  '\x1b[2J\x1b[H',
+const composerFrame = (text: string): string => [
+  clear,
   '╭──────────────────────────────────────╮\r\n',
-  '│ ❯                                    │\r\n',
+  `│ ❯ ${text.padEnd(35, ' ')}│\r\n`,
   '╰──────────────────────────────────────╯\r\n',
   '\x1b[2;1H'
 ].join('');
 
 /**
- * Is the screen a first-run trust dialog rather than an input surface?
+ * Is the cursor sitting on something that is POSITIVELY a composer input line?
  *
- * TEST-SIDE ON PURPOSE. This is a precondition on a MEASUREMENT, not a fix: adding a
- * detector to production would be implementing a remedy nobody has asked for, on a
- * hazard that has not been designed yet. It lives here so the harness can refuse to
- * report, and the production gap is reported rather than quietly patched.
+ * THIS IS AN ALLOWLIST OF ONE SHAPE, NOT A BLOCKLIST OF DIALOGS, AND THE INVERSION
+ * IS THE WHOLE POINT. The first version of this function enumerated the trust
+ * screens it knew about and measured anything else. Andy's capture showed there are
+ * at least four non-composer states rather than one, and which you land on depends
+ * on whether the CWD or the CONFIG is fresh - but the count is not the argument.
+ * The argument is that A DETECTOR THAT ENUMERATES WHAT TO REFUSE FAILS OPEN ON
+ * EVERYTHING IT HAS NOT MET, so the list is always one screen behind the installer.
  *
- * Matched on the CONSENT AFFORDANCE rather than on the word "trust": what makes it a
- * dialog is that it is offering a choice about proceeding, and a prompt box never
- * does. Matching the word alone would also fire on an agent discussing trust.
+ * WHAT THAT COSTS IS NOT A VOID ROW. Andy's driver met the Antigravity consent
+ * screen, where Enter accepts a Terms of Service and a data-collection agreement on
+ * the human's behalf. A blocklist has no entry for a screen nobody has seen, so it
+ * would have measured it - and a measurement here means pressing keys.
+ *
+ * So: refuse by default, and admit only what is recognised. The same asymmetry
+ * `promptLineHasText` already uses, where "don't know" keeps the block rather than
+ * clearing it - a wrong refusal costs a re-run, a wrong admission presses Enter on
+ * a contract.
  */
-function looksLikeTrustDialog(screen: string): boolean {
-  const s = screen.toLowerCase();
-  const consent = [
-    'yes, i trust this folder',
-    '1. yes, continue',
-    'enter to confirm',
-    'trust the files in this folder',
-    'trust this workspace'
-  ];
-  return consent.some((c) => s.includes(c));
+function isMeasurableComposer(screen: string, cursorRow: string): boolean {
+  // A composer offers a place to TYPE: a prompt marker on the row the cursor is on.
+  // A chooser offers a place to PICK, and puts the cursor on a list item.
+  const marker = /[❯>$#▌]/u;
+  if (!marker.test(cursorRow)) return false;
+  // And that row belongs to an input region rather than being prose that happens to
+  // contain a bracket: either boxed, or the marker leads the line.
+  const boxed = /[│┃|]/u.test(cursorRow);
+  const leads = /^\s*[❯>$#▌]/u.test(cursorRow);
+  if (!boxed && !leads) return false;
+  // A composer is a single input affordance. A screen that also presents a numbered
+  // or bracketed choice is asking a question, whatever else is on it.
+  if (/^\s*\d+\.\s+\S/mu.test(screen)) return false;
+  if (/\[\s*(Done|Previous|Next|Continue|Cancel)\s*\]/iu.test(screen)) return false;
+  return true;
 }
 
-function fullScreen(entry: { term: { rows: number; buffer: { active: any } } }): string {
+function screenOf(entry: { term: { rows: number; buffer: { active: any } } }): { full: string; cursorRow: string } {
   const buf = entry.term.buffer.active;
-  const out: string[] = [];
+  const rows: string[] = [];
   for (let y = 0; y < entry.term.rows; y++) {
     const line = buf.getLine(buf.baseY + y);
-    if (line) out.push(line.translateToString(true));
+    if (line) rows.push(line.translateToString(true));
   }
-  return out.join('\n');
+  const cur = buf.getLine(buf.baseY + buf.cursorY);
+  return { full: rows.join('\n'), cursorRow: cur ? cur.translateToString(true) : '' };
 }
 
 window.__harnessRun = async () => {
@@ -103,34 +136,36 @@ window.__harnessRun = async () => {
     const entry = acquireTerminal('tui');
     attachTerminal(entry, root);
 
-    // ── 1. Every installed TUI opens on a dialog, and the harness must refuse ──
-    const trust: Record<string, unknown> = {};
-    for (const [name, frame] of Object.entries(TRUST_SCREENS)) {
+    // ── 1. Every non-composer state must be REFUSED, named or not ─────────────
+    const refusals: Record<string, unknown> = {};
+    for (const [name, frame] of Object.entries(NON_COMPOSER)) {
       await write(entry.term, frame);
-      const screen = fullScreen(entry);
-      trust[name] = {
-        detectedAsDialog: looksLikeTrustDialog(screen),
+      const { full, cursorRow } = screenOf(entry);
+      refusals[name] = {
+        measurable: isMeasurableComposer(full, cursorRow),
         // What a measurement WOULD have reported had it not refused. Recorded so
         // the cost of skipping the precondition is visible rather than argued.
         naiveHasDraft: hasTerminalDraft('tui', Date.now() + 5_000),
-        // AND THE PRODUCTION HAZARD: nothing in the app's automation block knows a
-        // modal owns the screen. `opensInteractiveTerminalUi` matches what the USER
-        // TYPED against a set of slash-commands; a first-run dialog is opened by the
-        // PROGRAM, so no input ever passes through that check and the block cannot
-        // latch. This is the precondition for text being swallowed by the modal.
+        // AND THE PRODUCTION GAP: nothing in the app knows a modal owns the screen.
+        // `opensInteractiveTerminalUi` matches what the USER TYPED against a set of
+        // bare slash-commands; these screens are opened by the PROGRAM, so no input
+        // passes through that check and the picker block cannot latch.
         automationBlock: terminalAutomationBlockFor('tui', Date.now() + 5_000) ?? null
       };
     }
-    result.trustScreens = trust;
+    result.nonComposer = refusals;
 
-    // A real prompt box must NOT trip the detector, or it refuses everything and
-    // the precondition becomes a way of never measuring anything.
-    await write(entry.term, PROMPT_BOX);
-    result.promptBoxIsNotADialog = looksLikeTrustDialog(fullScreen(entry)) === false;
+    // ── And a real composer must still be measurable, empty or full ───────────
+    await write(entry.term, composerFrame(''));
+    const empty = screenOf(entry);
+    await write(entry.term, composerFrame('write the report'));
+    const filled = screenOf(entry);
+    result.composer = {
+      emptyMeasurable: isMeasurableComposer(empty.full, empty.cursorRow),
+      filledMeasurable: isMeasurableComposer(filled.full, filled.cursorRow)
+    };
 
-    // ── 2. The control. A reaction with nothing to compare it against ──────────
-    // A TUI that repaints its frame on ANY key looks like it "reacted" to Ctrl-U.
-    // Codex really does this: the same 16 bytes for Ctrl-U as for an arrow key.
+    // ── 2. The control ────────────────────────────────────────────────────────
     const REPAINT = '\x1b[2;1H\x1b[K│ ❯ │';
     /**
      * EACH REACTION IS MEASURED FROM THE SAME BASELINE, and that is not fussiness.
@@ -141,19 +176,18 @@ window.__harnessRun = async () => {
      * happens to support the conclusion is worse than no control at all.
      */
     const reactionTo = async (key: string) => {
-      await write(entry.term, PROMPT_BOX); // reset to a known screen first
-      const before = fullScreen(entry);
+      await write(entry.term, composerFrame(''));
+      const before = screenOf(entry).full;
       entry.term.input(key);
       await write(entry.term, REPAINT); // what this TUI emits for ANY key
-      return { key, changed: fullScreen(entry) !== before, screen: fullScreen(entry) };
+      const after = screenOf(entry).full;
+      return { changed: after !== before, screen: after };
     };
     const ctrlU = await reactionTo('\x15');
     const arrow = await reactionTo('\x1b[C'); // right arrow: should do nothing
     result.control = {
       ctrlUChanged: ctrlU.changed,
       arrowChanged: arrow.changed,
-      // THE DISCRIMINATOR. Identical reactions mean a repaint was observed, not an
-      // effect. Without the control key, `ctrlUChanged` alone reads as a pass.
       identicalReaction: ctrlU.screen === arrow.screen,
       verdict: ctrlU.screen === arrow.screen ? 'REPAINT_NOT_EFFECT' : 'REAL_EFFECT'
     };
