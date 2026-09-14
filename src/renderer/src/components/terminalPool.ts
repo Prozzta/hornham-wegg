@@ -21,7 +21,7 @@ import { Unicode11Addon } from '@xterm/addon-unicode11';
 import {
   classifyPathToken, isPathToken, pathTokenMatcher, stripPathToken, type PathAction
 } from '@shared/terminalPaths';
-import { attachInputOrigin, classifyOutbound } from './inputOrigin';
+import { attachInputOrigin, classifyOutbound, markHumanOrigin } from './inputOrigin';
 import {
   createTerminalRecoveryState,
   normalizePtyChunk,
@@ -142,7 +142,15 @@ export function acquireTerminal(ptyId: string, theme?: ThemeMap, fontSize = 14):
     // actual background — so it also rescues low-contrast coloured *text* on the
     // cream paper. Untouched for already-high-contrast cells (the dark theme).
     minimumContrastRatio: 4.5,
-    allowProposedApi: true
+    allowProposedApi: true,
+    // L0-FUSION rev 13 row 12, accepted by the human as REMOVAL rather than a gate.
+    // xterm's default is true (typings/xterm.d.ts:43-44): alt+click sends cursor-
+    // movement sequences to the running program as human input, from a mouseup
+    // listener on the DOCUMENT (SelectionService.ts:492-493 -> :711) - outside
+    // term.element and therefore invisible to inputOrigin. A gate would leave a
+    // producer we cannot see and must remember to keep refusing; turning it off
+    // deletes the case. USER-VISIBLE: alt+click no longer moves the prompt cursor.
+    altClickMovesCursor: false
   });
   const fit = new FitAddon();
   term.loadAddon(fit);
@@ -242,11 +250,27 @@ export function acquireTerminal(ptyId: string, theme?: ThemeMap, fontSize = 14):
    *  preload), so this degrades to the previous behaviour rather than to nothing. */
   const pasteClipboard = (): void => {
     if (entry.exited) return;
+    // PROVENANCE, EXPLICITLY, ON BOTH PATHS. `term.paste()` is a public method that
+    // makes xterm emit data with NO DOM paste event (browser/Terminal.ts:890-891 ->
+    // Clipboard.ts:54), so the DOM half of inputOrigin cannot see it. The sync path
+    // happens to run inside the keydown that invoked us, so it would classify HUMAN
+    // by accident; the async fallback runs in a .then() long after that keydown, so
+    // it would classify CONTROL - a user's paste read as not-human, on the exact
+    // compatibility path built to be taken silently on an older preload (L0-FUSION
+    // rev 11 dimension 2; the human's constraint ii). Both are marked here, at code
+    // we own with known provenance, immediately before the call that emits.
     try {
       const text = window.cth.readClipboardSync?.();
-      if (typeof text === 'string') { if (text) term.paste(text); return; }
+      if (typeof text === 'string') {
+        if (text) { markHumanOrigin(ptyId, 'paste-sync'); term.paste(text); }
+        return;
+      }
     } catch { /* fall through to the async path */ }
-    void window.cth.readClipboard().then((t) => { if (t) term.paste(t); });
+    void window.cth.readClipboard().then((t) => {
+      if (!t || entry.exited) return;
+      markHumanOrigin(ptyId, 'paste-async');
+      term.paste(t);
+    });
   };
   term.attachCustomKeyEventHandler((ev) => {
     if (ev.type !== 'keydown') return true;
