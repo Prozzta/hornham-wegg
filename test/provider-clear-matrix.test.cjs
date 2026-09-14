@@ -59,6 +59,24 @@ test('L0-TERMMATRIX: the clear control, measured per provider on a rendered scre
       `${name}: hasTerminalDraft is blind to automatically staged text — if this `
       + 'ever becomes true the predicate has changed and the abort design must be re-read');
 
+    // ── L0-FUSION §9.3 DIMENSION 5, PINNED AS AN ASSERTION ──────────────────
+    // A public-only human-input adapter CANNOT see mouse-origin input: xterm's drag
+    // and release reports (CoreMouseService.ts:284) and alt-click cursor movement
+    // (SelectionService.ts:711) both fire from DOCUMENT-level listeners, outside
+    // term.element. The only safe response is to refuse to arm automatic delivery
+    // while mouse tracking is live — so whether these TUIs enable it decides whether
+    // that refusal is occasional or permanent.
+    // MEASURED HERE FROM XTERM'S OWN `modes`, not from a regex over DECSET bytes.
+    // If a provider ever starts enabling mouse tracking, THIS BREAKS AND SAYS SO,
+    // because the feasibility answer changes rather than merely getting worse.
+    assert.equal(p.modes.atBoot.mouseTrackingMode, 'none',
+      `${name}: mouse tracking is OFF at boot — if this is ever anything but 'none', `
+      + 'a public-only input adapter must refuse to arm on this provider and the '
+      + '§9.3 determination has to be re-read');
+    assert.equal(p.modes.atEnd.mouseTrackingMode, 'none',
+      `${name}: mouse tracking is still off after staging and clearing — one reading `
+      + 'at boot cannot tell "never" from "not yet", so it is read twice');
+
     // ── THE PRECONDITION. The marker must be ON THE PROMPT ROW: the row at
     // baseY + cursorY is the one production reads, and text elsewhere on screen is
     // scrollback, not a draft. This is the arm a trust modal fails — it swallows the

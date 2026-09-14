@@ -49,6 +49,21 @@ const write = (term: { write: (d: string, cb?: () => void) => void }, data: stri
 
 const ECHO_GRACE_MS = 1000;
 
+/** xterm's own view of the modes this design depends on. `mouseTrackingMode` is
+ *  the one that decides L0-FUSION 9.3 dimension 5; `bracketedPasteMode` is
+ *  dimension 6; `sendFocusMode` matters because focus reports reach the SAME
+ *  public onData a keystroke does, and are NOT human text. */
+function readModes(e: { term: { modes: { mouseTrackingMode: string; bracketedPasteMode: boolean; sendFocusMode: boolean } } }): {
+  mouseTrackingMode: string; bracketedPasteMode: boolean; sendFocusMode: boolean;
+} {
+  const m = e.term.modes;
+  return {
+    mouseTrackingMode: m.mouseTrackingMode,
+    bracketedPasteMode: m.bracketedPasteMode,
+    sendFocusMode: m.sendFocusMode
+  };
+}
+
 /** Real per-provider captures. Deltas, in capture order: replaying them in
  *  sequence reconstructs the screen, because a terminal is a state machine. */
 const CAPTURES: Record<string, {
@@ -106,6 +121,12 @@ window.__harnessRun = async () => {
       const a = acquireTerminal('A-' + name);
       attachTerminal(a, root);
       await write(a.term, cap.boot);
+      // L0-FUSION 9.3 dimension 5: can this TUI generate mouse-origin terminal
+      // input at all? Read from xterm's OWN public `modes`, never from a regex of
+      // mine over the DECSET bytes - `modes.mouseTrackingMode` is derived from
+      // `coreMouseService.activeProtocol` (browser/public/Terminal.ts:108-113), so
+      // asking the terminal is asking the thing that actually decides.
+      const modesAtBoot = readModes(a);
       await write(a.term, cap.empty);
       await write(a.term, cap.staged);
       const stagedNow = Date.now() + ECHO_GRACE_MS + 50;
@@ -139,9 +160,13 @@ window.__harnessRun = async () => {
       const noopHasDraft = hasTerminalDraft('B-' + name, noopNow);
       const noopShowsMark = noopScreen.some((l) => l.includes(cap.mark));
       const noopPromptRow = promptRow(b);
+      // Read again at the end: a mode set later would be just as fatal as one set
+      // at boot, and a single reading cannot tell "never" from "not yet".
+      const modesAtEnd = readModes(a);
 
       (result.providers as Record<string, unknown>)[name] = {
         opened: a.opened && b.opened,
+        modes: { atBoot: modesAtBoot, atEnd: modesAtEnd },
         staged: { hasDraft: stagedHasDraft, showsMark: stagedShowsMark, onPromptRow: stagedPromptRow.includes(cap.mark), promptRow: stagedPromptRow, screen: stagedScreen.slice(-6) },
         afterClear: { hasDraft: clearedHasDraft, showsMark: clearedShowsMark, onPromptRow: clearedPromptRow.includes(cap.mark), promptRow: clearedPromptRow, screen: clearedScreen.slice(-6) },
         restaged: { hasDraft: reHasDraft, showsMark: reShowsMark },
