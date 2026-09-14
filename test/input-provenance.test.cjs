@@ -35,6 +35,36 @@ const {
 
 const src = (rel) => fs.readFileSync(path.join(__dirname, '..', rel), 'utf8');
 
+/** Every .ts/.tsx file under a source subtree - so a census cannot be evaded by adding
+ *  a NEW file the test did not name (Dwight 23.4). Returns repo-relative POSIX paths. */
+function walk(rel) {
+  const abs = path.join(__dirname, '..', rel);
+  const out = [];
+  for (const ent of fs.readdirSync(abs, { withFileTypes: true })) {
+    const childRel = rel + '/' + ent.name;
+    if (ent.isDirectory()) out.push(...walk(childRel));
+    else if (/\.(ts|tsx)$/.test(ent.name)) out.push(childRel);
+  }
+  return out;
+}
+
+/** Every `.writePty(` call in `text`, each returned as its balanced-paren argument
+ *  substring - so a MULTILINE call is read whole rather than by its first line. */
+function writePtyCalls(text) {
+  const calls = [];
+  const re = /\.writePty\s*\(/g;
+  let m;
+  while ((m = re.exec(text))) {
+    let depth = 1, i = m.index + m[0].length;
+    for (; i < text.length && depth > 0; i++) {
+      if (text[i] === '(') depth++;
+      else if (text[i] === ')') depth--;
+    }
+    calls.push(text.slice(m.index, i).replace(/\s+/g, ' '));
+  }
+  return calls;
+}
+
 // ─── the wire type ──────────────────────────────────────────────────────────
 
 test('the wire origin is exactly three values and nothing else passes', () => {
@@ -160,42 +190,59 @@ test('the generation is per-session and dies with the session', () => {
 
 // ─── the call graph, read from the source ───────────────────────────────────
 
-test('EVERY renderer writePty call declares an origin - none can omit it', () => {
-  const files = [
-    'src/renderer/src/components/terminalPool.ts',
-    'src/renderer/src/components/PtyTerminalView.tsx',
-    'src/renderer/src/hooks/useHive.ts'
-  ];
-  // Per LINE, not per regex-captured argument list: two of the CONTROL writes carry a
-  // template literal with a ';' inside it, which a lazy [^;] capture cuts short. The
-  // first version of this test did exactly that and counted six of eight - right to be
-  // strict about the count, wrong about how it read the source.
+test('SOURCE CENSUS: every writePty call in the WHOLE renderer tree declares an origin', () => {
+  // Exhaustive over src/renderer, not three named files, and balanced-paren so a
+  // multiline call is read whole. This is a census of the CURRENT tree's call sites
+  // (Dwight 23.4) - it proves no present renderer writePty omits an origin, not future
+  // call-graph closure. A new caller anywhere under src/renderer is included the moment
+  // it exists; a wrapper that hides `.writePty(` behind another name is the residual
+  // this census does not chase, and the claim is bounded to that.
   const calls = [];
-  for (const f of files) {
-    for (const raw of src(f).split('\n')) {
-      const line = raw.trim();
-      if (line.includes('window.cth.writePty(') && !line.startsWith('//') && !line.startsWith('*')) {
-        calls.push({ f, line });
-      }
-    }
+  for (const f of walk('src/renderer')) for (const c of writePtyCalls(src(f))) calls.push({ f, c });
+  assert.ok(calls.length >= 8, `expected at least the eight known calls, found ${calls.length}`);
+  for (const { f, c } of calls) {
+    assert.match(c, /, ?'(HUMAN|CONTROL|PROGRAMMATIC)'\)$|, ?classifyOutbound\([^)]*\)\)$/,
+      `${f}: ${c} does not end in a declared origin`);
   }
-  assert.equal(calls.length, 8, `found ${calls.length} writePty calls; the design has exactly eight:\n`
-    + calls.map((c) => c.f + ': ' + c.line).join('\n'));
-  for (const c of calls) {
-    // Either a literal origin or the classifier - never two bare arguments.
-    assert.match(c.line, /'(HUMAN|CONTROL|PROGRAMMATIC)'\)|classifyOutbound\(/,
-      `${c.f}: ${c.line} does not declare an origin`);
+  // And no renderer file reaches the raw IPC channel directly, bypassing the typed wrapper.
+  for (const f of walk('src/renderer')) {
+    assert.doesNotMatch(src(f), /ipcRenderer[\s\S]{0,40}pty:write/, `${f} must not invoke pty:write directly`);
   }
 });
 
-test('PROGRAMMATIC has exactly the callers the design allows: the two automatic owners', () => {
-  const renderer = src('src/renderer/src/hooks/useHive.ts');
-  const main = src('src/main/index.ts');
-  const others = ['src/renderer/src/components/terminalPool.ts', 'src/renderer/src/components/PtyTerminalView.tsx']
-    .map(src).join('\n');
-  assert.equal((renderer.match(/'PROGRAMMATIC'/g) || []).length, 2, 'useHive: payload and Enter');
-  assert.equal((main.match(/'PROGRAMMATIC'/g) || []).length, 2, 'main: nudge text and Enter');
-  assert.equal((others.match(/'PROGRAMMATIC'/g) || []).length, 0, 'nowhere else in the renderer');
+test('SOURCE CENSUS: the PROGRAMMATIC literal appears ONLY in the two allowed owners, tree-wide', () => {
+  // Enumerate every src/*.ts(x) file containing the literal and assert the SET is exactly
+  // the two automatic owners - so a new main/renderer file using it is caught, not just a
+  // wrong count in pre-named files (Dwight 23.4). The shared type definition names the
+  // union member and is allowed; call sites are not.
+  const owners = { 'src/renderer/src/hooks/useHive.ts': 2, 'src/main/index.ts': 2 };
+  const allowedDefs = new Set(['src/shared/inputOrigin.ts']);
+  const found = {};
+  for (const f of [...walk('src/renderer'), ...walk('src/main'), ...walk('src/shared')]) {
+    const n = (src(f).match(/'PROGRAMMATIC'/g) || []).length;
+    if (n) found[f] = n;
+  }
+  for (const f of Object.keys(found)) {
+    assert.ok(f in owners || allowedDefs.has(f), `${f} uses 'PROGRAMMATIC' but is neither an allowed owner nor the type def`);
+  }
+  for (const [f, n] of Object.entries(owners)) {
+    assert.equal(found[f], n, `${f} should hold exactly ${n} PROGRAMMATIC call sites, found ${found[f] ?? 0}`);
+  }
+});
+
+test('the held-window discriminator and the self-test matchers are exact', () => {
+  const { isTerminalReply, SELFTEST_ARROW_RIGHT, SELFTEST_CPR } = loadTs('src/renderer/src/components/inputOrigin.ts');
+  // A protocol reply begins with ESC; composition output never does (its only C0 is DEL).
+  for (const reply of ['\x1b[0n', '\x1b[6;12R', '\x1b[?1;2c', '\x1b]11;rgb:0/0/0\x1b\\'])
+    assert.equal(isTerminalReply(reply), true, JSON.stringify(reply));
+  for (const human of ['あ', 'abc', '\x7f', 'x', ' '])
+    assert.equal(isTerminalReply(human), false, JSON.stringify(human));
+  // The self-test consumes ONLY its exact expected byte, so an unrelated reply cannot
+  // satisfy it (Dwight 23.1).
+  for (const yes of ['\x1b[C', '\x1bOC']) assert.match(yes, SELFTEST_ARROW_RIGHT);
+  for (const no of ['\x1b[D', '\x1b[6;1R', 'x', '\x1b[C ']) assert.doesNotMatch(no, SELFTEST_ARROW_RIGHT);
+  assert.match('\x1b[6;12R', SELFTEST_CPR);
+  for (const no of ['\x1b[C', '\x1b[0n', '\x1b[R', 'R']) assert.doesNotMatch(no, SELFTEST_CPR);
 });
 
 test('the IPC boundary consults the validators, and refuses rather than defaults', () => {

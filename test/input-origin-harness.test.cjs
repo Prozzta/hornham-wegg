@@ -47,11 +47,12 @@ test('INPUT ORIGIN on a rendered terminal: regimes, exclusions, programmatic pas
   assert.equal(r.replyInHeld, 'CONTROL', 'a DSR/CPR reply inside the held drain is CONTROL, never HUMAN');
   assert.equal(r.humanAfterReplyInHeld, 'HUMAN', 'and the reply did not destroy the held window for real input');
 
-  // Held regime: composition data on a LATER tick is still HUMAN, to the last byte...
-  assert.equal(r.compositionNextTick, 'HUMAN', 'constraint (iii): composition data on the next tick is HUMAN');
-  assert.equal(r.compositionSecondByte, 'HUMAN', 'and so is the second byte of the burst');
-  // ...and the drain does close.
-  assert.equal(r.afterDrain.origin, 'CONTROL', `after ${r.afterDrain.drainMs}ms of quiet the held window is shut`);
+  // Held regime, driven by a REAL IME through CompositionHelper (Dwight 23.2).
+  assert.match(r.realImeData, /あ/, 'xterm really emitted the composed text through the DOM pipeline');
+  assert.equal(r.realImeOrigin, 'HUMAN', 'constraint (iii): the real IME emission classifies HUMAN');
+  // Both sides of the 50 ms boundary, pinned with literals independent of the constant.
+  assert.equal(r.heldAt25, true, 'at ~25 ms (< 50) the held window is still open');
+  assert.equal(r.heldAt145, false, 'at ~145 ms (> 50) the held window has drained');
 
   // The mirror follows the TUI both ways, from xterm's own modes.
   assert.equal(r.mirror.afterOn, 'vt200', 'DECSET 1000 -> xterm says vt200 -> main is told');

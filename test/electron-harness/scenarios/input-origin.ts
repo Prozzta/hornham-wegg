@@ -15,7 +15,7 @@ import {
   acquireTerminal, attachTerminal, disposeTerminal, resetTerminal
 } from '../../../src/renderer/src/components/terminalPool';
 import {
-  HELD_DRAIN_MS, inspectInputOrigin, markHumanOrigin
+  inspectInputOrigin, markHumanOrigin
 } from '../../../src/renderer/src/components/inputOrigin';
 
 declare global {
@@ -113,19 +113,34 @@ window.__harnessRun = async () => {
     term.input('x', false);
     result.humanAfterReplyInHeld = lastOrigin();
 
-    // ARM 6 - the HELD regime spans a tick. Kills: "one closing regime (microtask only)".
-    sent.length = 0;
+    // ARM 6 - a REAL IME through xterm's CompositionHelper (Dwight 23.2: the old arm
+    // used manual term.input()). compositionstart opens our held window; xterm emits the
+    // composed text on a setTimeout(0); the emitted byte must classify HUMAN. This drives
+    // the actual DOM pipeline - compositionstart/update/end - not an injected byte.
+    ta.focus();
+    ta.value = '';
     ta.dispatchEvent(new CompositionEvent('compositionstart', { bubbles: true }));
-    await tick();                       // xterm finalises composition in a setTimeout(0)
-    term.input('あ', false);        // the burst arrives on the later tick
-    result.compositionNextTick = lastOrigin();
-    term.input('い', false);        // and a second byte of the same burst
-    result.compositionSecondByte = lastOrigin();
+    ta.value = 'あ';
+    ta.dispatchEvent(new CompositionEvent('compositionupdate', { data: 'あ', bubbles: true }));
+    await tick();                       // xterm schedules compositionPosition.end (setTimeout 0)
+    sent.length = 0;
+    ta.dispatchEvent(new CompositionEvent('compositionend', { data: 'あ', bubbles: true }));
+    for (let i = 0; i < 20 && sent.length === 0; i++) await sleep(5);   // _finalizeComposition emits on setTimeout(0)
+    result.realImeData = sent.map((x) => x.data).join('');
+    result.realImeOrigin = lastOrigin();
+    const imeEmittedAt = Date.now();
 
-    // ARM 7 - the drain CLOSES. Kills: "held forever / drain never expires".
-    await sleep(HELD_DRAIN_MS + 30);
-    sent.length = 0; term.input('after', false);
-    result.afterDrain = { origin: lastOrigin(), drainMs: HELD_DRAIN_MS };
+    // ARM 7 - BOTH sides of the 50 ms boundary, with LITERALS, not the imported constant
+    // (Dwight 23.2: importing HELD_DRAIN_MS made the test's own wait move with the boundary,
+    // so it proved eventual expiry, not that 50 is what holds). The held window was just
+    // rearmed by the IME emission. The bracket [25, 145] ms is deliberately loose against
+    // timer jitter while pinning both directions independent of the constant: raise it past
+    // 145 and the upper read fails; drop it below 25 and the lower read does. inspect() is a
+    // pure read and does not itself rearm the drain.
+    await sleep(Math.max(0, 25 - (Date.now() - imeEmittedAt)));
+    result.heldAt25 = inspectInputOrigin('io')?.held;      // < 50 -> still held
+    await sleep(120);
+    result.heldAt145 = inspectInputOrigin('io')?.held;     // > 50 -> drained
 
     // ARM 8 - the mouse-mode MIRROR follows the TUI and comes back. Kills: "one-shot at
     // arm time". Read from xterm's own modes, forwarded to (the stub of) main.
