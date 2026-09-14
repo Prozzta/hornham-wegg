@@ -24,6 +24,7 @@ import {
 import { listDir, readFileText, readFileBinary, writeFileText, statAbs, expandTilde } from './fs';
 import { normalizeWeekly, weeklyDelayMs } from '../shared/weeklySchedule';
 import { isInputOrigin } from '../shared/inputOrigin';
+import { automaticDeliveryEligibility, isTerminalInputState } from '../shared/inputProvenance';
 import {
   getBranch, getStatus, getLog, getBranches, getAheadBehind, isRepo, getDiff, mainRepoRoot,
   addWorktree, removeWorktree, worktreeHasUnintegratedWork, worktreeIsGcSafe,
@@ -3051,6 +3052,19 @@ ipcMain.handle('pty:write', (_evt, id: string, data: string, origin: unknown) =>
   // missing fact is UNKNOWN — never CONTROL, and never quietly HUMAN.
   if (!isInputOrigin(origin)) return { ok: false, error: 'invalid origin' };
   return ptyManager.write(id, data, origin);
+});
+// L0-FUSION stage 3. The mirror is validated at the boundary and stored on the live
+// session; a malformed report is refused rather than stored as something it is not.
+ipcMain.handle('pty:inputState', (_evt, id: string, state: unknown) => {
+  if (typeof id !== 'string') return { ok: false, error: 'invalid args' };
+  if (!isTerminalInputState(state)) return { ok: false, error: 'invalid input state' };
+  return ptyManager.setInputState(id, state);
+});
+// Evaluated FRESH from the stored mirror on every ask - re-entrant by construction.
+// No caller may cache the answer across a guard; a TUI can change its mind in between.
+ipcMain.handle('pty:automaticDeliveryEligibility', (_evt, id: string) => {
+  if (typeof id !== 'string') return { eligible: false, reason: 'NO_STATE', detail: 'invalid args' };
+  return automaticDeliveryEligibility(ptyManager.inputState(id));
 });
 ipcMain.handle('pty:resize', (_evt, id: string, cols: number, rows: number) => {
   if (typeof id !== 'string' || typeof cols !== 'number' || typeof rows !== 'number') return { ok: false, error: 'invalid args' };

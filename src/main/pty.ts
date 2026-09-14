@@ -1,5 +1,6 @@
 import * as pty from 'node-pty';
 import type { InputOrigin } from '../shared/inputOrigin';
+import type { TerminalInputState } from '../shared/inputProvenance';
 import type { WebContents } from 'electron';
 import { existsSync, readFileSync, statSync } from 'node:fs';
 import { delimiter, join, win32 } from 'node:path';
@@ -56,6 +57,10 @@ interface PtySession {
    *  and discarded with it — a respawn must not inherit a judgement about a
    *  terminal that no longer exists. Never derived from terminal output. */
   humanInputGeneration: number;
+  /** L0-FUSION stage 3: the renderer's mirror of xterm's provenance facts for this
+   *  terminal. Absent until the renderer has attached and reported - and ABSENT MEANS
+   *  UNKNOWN, which the eligibility predicate refuses. Dies with the session. */
+  inputState?: TerminalInputState;
 }
 
 export interface SpawnOptions {
@@ -728,6 +733,19 @@ export class PtyManager {
    *  the number itself carries no meaning and must not be persisted. */
   humanInputGeneration(id: string): number | undefined {
     return this.sessions.get(id)?.humanInputGeneration;
+  }
+
+  /** Store the renderer's provenance mirror for a LIVE pty. */
+  setInputState(id: string, state: TerminalInputState): { ok: boolean; error?: string } {
+    const s = this.sessions.get(id);
+    if (!s) return { ok: false, error: `no pty: ${id}` };
+    s.inputState = state;
+    return { ok: true };
+  }
+
+  /** The mirror as last reported, or undefined (= UNKNOWN) if never reported or dead. */
+  inputState(id: string): TerminalInputState | undefined {
+    return this.sessions.get(id)?.inputState;
   }
 
   resize(id: string, cols: number, rows: number): { ok: boolean; error?: string } {

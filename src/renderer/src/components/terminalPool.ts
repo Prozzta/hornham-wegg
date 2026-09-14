@@ -21,7 +21,9 @@ import { Unicode11Addon } from '@xterm/addon-unicode11';
 import {
   classifyPathToken, isPathToken, pathTokenMatcher, stripPathToken, type PathAction
 } from '@shared/terminalPaths';
-import { attachInputOrigin, classifyOutbound, markHumanOrigin } from './inputOrigin';
+import { attachInputOrigin, classifyOutbound, markHumanOrigin, runInputOriginSelfTest } from './inputOrigin';
+import type { InputOrigin } from '@shared/inputOrigin';
+import { sameInputState, type TerminalInputState } from '@shared/inputProvenance';
 import {
   createTerminalRecoveryState,
   normalizePtyChunk,
@@ -76,6 +78,14 @@ export interface TerminalEntry {
    * prompt (Ctrl-U, a respawn reset) has to clear both or the next keystroke
    * resurrects the deleted text as a phantom draft. */
   lineBuf: string;
+  /** L0-FUSION stage 3. While set, the NEXT byte xterm emits is handed here instead of
+   *  written to the pty - the self-test's swallow. One-shot; cleared by the onData
+   *  handler the moment it fires. */
+  inputOriginProbe?: (origin: InputOrigin) => void;
+  /** Last provenance state reported to main, so we report only on change. */
+  inputStateReported?: TerminalInputState;
+  /** Self-test outcome for this incarnation; 'unknown' until it has run. */
+  inputSelfTest: 'unknown' | 'pass' | 'fail';
   /** Bumped every time this pty is respawned under the same id. Late events from
    * the OLD process carry the generation they were registered under, so they can
    * be recognised and dropped instead of corrupting the replacement. */
@@ -181,6 +191,7 @@ export function acquireTerminal(ptyId: string, theme?: ThemeMap, fontSize = 14):
     inputDirtyAt: 0,
     automationSettleUntil: 0,
     lineBuf: '',
+    inputSelfTest: 'unknown',
     generation: 0
   };
 
@@ -327,6 +338,12 @@ export function acquireTerminal(ptyId: string, theme?: ThemeMap, fontSize = 14):
   // its panels from that answer keeps them until something tells it to repaint,
   // which is why flipping the app theme left OpenCode's boxes in the old colours.
   // Return false so xterm still applies the mode itself; we are only listening.
+  // Any DEC private mode set/reset MAY have changed mouse tracking. We do not decode
+  // which - xterm does, and `term.modes` is its answer - we only schedule a re-read
+  // after xterm has applied the mode (the handler returns false so it does). This is
+  // the runtime, re-entrant half of the human's rule: the mirror follows the TUI.
+  term.parser.registerCsiHandler({ prefix: '?', final: 'h' }, () => { scheduleInputStateReport(entry); return false; });
+  term.parser.registerCsiHandler({ prefix: '?', final: 'l' }, () => { scheduleInputStateReport(entry); return false; });
   term.parser.registerCsiHandler({ prefix: '?', final: 'h' }, (params) => {
     if (params.includes(2031)) {
       entry.themeNotify = true;
@@ -353,6 +370,13 @@ export function acquireTerminal(ptyId: string, theme?: ThemeMap, fontSize = 14):
   // path resets it too.
   term.onData((data) => {
     if (entry.exited) return;
+    // Self-test swallow: this byte is evidence, not input. It never reaches the pty.
+    if (entry.inputOriginProbe) {
+      const probe = entry.inputOriginProbe;
+      entry.inputOriginProbe = undefined;
+      probe(classifyOutbound(ptyId));
+      return;
+    }
     // THE ONE CLASSIFICATION POINT (L0-FUSION rev 13 section 13.2). Everything xterm
     // emits — keystrokes, pastes, IME, AND the terminal's own protocol replies —
     // arrives here on one callback with no origin attached. `classifyOutbound`
@@ -633,6 +657,35 @@ function releaseWebglRenderer(entry: TerminalEntry): void {
   entry.needsRendererRepaint = true;
 }
 
+/** The provenance facts main needs, read from xterm's OWN public `modes` - never from a
+ *  regex over the bytes. `attached` is true only after open(); before that the DOM half
+ *  has nothing to attach to and every byte would read CONTROL. */
+function currentInputState(entry: TerminalEntry): TerminalInputState {
+  return {
+    mouseTrackingMode: entry.term.modes.mouseTrackingMode,
+    inputOriginAttached: entry.opened,
+    selfTest: entry.inputSelfTest
+  };
+}
+
+/** Mirror to main, on change only. Optional-chained: the Electron test harness stubs
+ *  `window.cth` without this method, and a missing bridge must not throw inside xterm's
+ *  parser. Under a missing bridge main simply never receives a mirror and the terminal
+ *  stays NO_STATE - which is the fail-closed answer, not a silent pass. */
+function reportInputState(entry: TerminalEntry): void {
+  if (entry.exited) return;
+  const state = currentInputState(entry);
+  if (sameInputState(entry.inputStateReported, state)) return;
+  entry.inputStateReported = state;
+  void window.cth.reportTerminalInputState?.(entry.ptyId, state);
+}
+
+/** Read `term.modes` AFTER xterm has applied the DEC mode the parser just saw. A CSI
+ *  handler runs before xterm's own, so reading inside it would see the previous mode. */
+function scheduleInputStateReport(entry: TerminalEntry): void {
+  queueMicrotask(() => reportInputState(entry));
+}
+
 /** Re-parent a pty's terminal into `container`, opening xterm on first attach. */
 export function attachTerminal(entry: TerminalEntry, container: HTMLElement): void {
   container.appendChild(entry.host);
@@ -649,6 +702,15 @@ export function attachTerminal(entry: TerminalEntry, container: HTMLElement): vo
     // being seen. If this guard is ever relaxed, `attachInputOrigin` must move
     // with it. (L0-FUSION rev 11 dimension 7.)
     entry.unsub.push(attachInputOrigin(entry.ptyId, entry.term));
+    // Report the attached-but-unproven state at once (main must not sit on NO_STATE
+    // for a terminal that exists), then prove the reconstruction and report again.
+    reportInputState(entry);
+    void runInputOriginSelfTest(
+      entry.ptyId, entry.term,
+      (cb) => { entry.inputOriginProbe = cb; },
+      () => { entry.inputOriginProbe = undefined; }
+    ).then((r) => { entry.inputSelfTest = r; reportInputState(entry); })
+      .catch(() => { entry.inputSelfTest = 'fail'; reportInputState(entry); });
   }
   leaseWebglRenderer(entry);
   // PTY startup output can arrive before this pooled terminal subscribes.

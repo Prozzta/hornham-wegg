@@ -178,6 +178,63 @@ export function classifyOutbound(ptyId: string): InputOrigin {
   return w.sameTick ? 'HUMAN' : 'CONTROL';
 }
 
+/**
+ * THE STARTUP SELF-TEST (rev 13 step 7). Proves, on THIS terminal on THIS build, the two
+ * things the reconstruction rests on and cannot get from any public contract:
+ *   1. a keyboard event dispatched into the terminal produces a byte that classifies
+ *      HUMAN - i.e. our capture listener runs before xterm's handler in the same
+ *      dispatch, and xterm emits synchronously inside it;
+ *   2. a terminal protocol reply (DSR, `ESC[6n`) produces a byte that classifies
+ *      CONTROL - i.e. write() processing never lands inside a human window.
+ *
+ * NOT ONE BYTE REACHES THE PTY. The caller supplies `armProbe`, which makes the very
+ * next `onData` hand its byte HERE instead of to `writePty`. Without that swallow the
+ * keyboard half would type into the real program, which is worse than not testing.
+ * The key is ArrowRight (keyCode 39) rather than a printable: xterm's printable path
+ * needs `keyCode >= 48` (common/input/Keyboard.ts:381) which a synthetic event only has
+ * if we say so, and an arrow is harmless even in the impossible case of a leak.
+ *
+ * 'fail' is a REFUSAL, not a warning: the predicate in shared/inputProvenance.ts makes
+ * a failed self-test ineligible. Proving a property at arm time is not a contract, but
+ * it converts a silent failure into a refusal - stated as a mitigation, not a fix.
+ */
+export async function runInputOriginSelfTest(
+  ptyId: string,
+  term: Terminal,
+  armProbe: (cb: (origin: InputOrigin) => void) => void,
+  disarmProbe: () => void
+): Promise<'pass' | 'fail'> {
+  const ta = term.textarea;
+  if (!ta || !isInputOriginAttached(ptyId)) return 'fail';
+
+  // Half 1: keyboard -> HUMAN, synchronously.
+  // Holder object, not a `let`: TS narrows a `let` to `null` across the closure
+  // assignment, and a future compiler may reject the comparison below as no-overlap.
+  const key: { got: InputOrigin | null } = { got: null };
+  armProbe((o) => { key.got = o; });
+  ta.dispatchEvent(new KeyboardEvent('keydown', {
+    key: 'ArrowRight', code: 'ArrowRight', keyCode: 39, which: 39, bubbles: true, cancelable: true
+  } as KeyboardEventInit));
+  // The probe must already have fired: same dispatch, no tick between.
+  const keyOk = key.got === 'HUMAN';
+  disarmProbe();
+  if (!keyOk) return 'fail';
+
+  // Let the same-tick window close before the control half, or a fast reply could
+  // be classified by the keyboard's window and the test would pass for the wrong reason.
+  await new Promise<void>((r) => { queueMicrotask(r); });
+
+  // Half 2: DSR reply -> CONTROL. `write(data, cb)` resolves after parsing, and the
+  // reply is emitted synchronously inside that parse, so by `cb` the probe has fired.
+  const ctlResult = await new Promise<InputOrigin | null>((resolve) => {
+    const ctl: { got: InputOrigin | null } = { got: null };
+    armProbe((o) => { ctl.got = o; });
+    term.write('\x1b[6n', () => resolve(ctl.got));
+  });
+  disarmProbe();
+  return ctlResult === 'CONTROL' ? 'pass' : 'fail';
+}
+
 /** Test seam: the window state, read-only. Not for production decisions. */
 export function inspectInputOrigin(ptyId: string): { sameTick: boolean; held: boolean; lastReason: HumanOriginReason | null; attached: boolean } | null {
   const w = windows.get(ptyId);

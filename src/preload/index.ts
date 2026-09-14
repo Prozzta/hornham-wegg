@@ -1,6 +1,7 @@
 import { contextBridge, ipcRenderer, webUtils, type IpcRendererEvent } from 'electron';
 import type { AgentProvider } from '../shared/agentProvider';
 import type { InputOrigin } from '../shared/inputOrigin';
+import type { Eligibility, TerminalInputState } from '../shared/inputProvenance';
 import type { HireManifest } from '../shared/hire';
 export type { HireManifest } from '../shared/hire';
 import type { IntegrationRecord, IntegrationTemplate } from '../shared/integrations';
@@ -592,6 +593,14 @@ const api = {
     ipcRenderer.invoke('pty:write', id, data, origin),
   resizePty: (id: string, cols: number, rows: number): Promise<{ ok: boolean; error?: string }> =>
     ipcRenderer.invoke('pty:resize', id, cols, rows),
+  /** L0-FUSION stage 3: the renderer mirrors xterm's own provenance facts for one
+   *  terminal (mouse tracking mode, DOM attachment, self-test) to main, on change. */
+  reportTerminalInputState: (id: string, state: TerminalInputState): Promise<{ ok: boolean; error?: string }> =>
+    ipcRenderer.invoke('pty:inputState', id, state),
+  /** May automatic delivery arm on this terminal RIGHT NOW? Evaluated fresh in main on
+   *  every call from the mirrored state; never cached. */
+  automaticDeliveryEligibility: (id: string): Promise<Eligibility> =>
+    ipcRenderer.invoke('pty:automaticDeliveryEligibility', id),
   redrawPty: (id: string): Promise<{ ok: boolean; error?: string }> =>
     ipcRenderer.invoke('pty:redraw', id),
   killPty: (id: string): Promise<{ ok: boolean; error?: string }> =>
