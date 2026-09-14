@@ -151,6 +151,20 @@ export function attachInputOrigin(ptyId: string, term: Terminal): () => void {
   return detach;
 }
 
+/** Reset the transient window state for a same-id process relaunch. The DOM
+ *  listeners persist (xterm keeps the same `element`/`textarea` across `reset()`),
+ *  so `detach` is KEPT and only the in-flight sameTick/held flags and drain timer
+ *  are cleared - a held window left open from the dead process must not carry into
+ *  the new one. */
+export function resetInputWindow(ptyId: string): void {
+  const w = windows.get(ptyId);
+  if (!w) return;
+  w.sameTick = false;
+  w.held = false;
+  if (w.holdTimer) { clearTimeout(w.holdTimer); w.holdTimer = null; }
+  w.lastReason = null;
+}
+
 /** Is the DOM half attached for this terminal? The arming gate (stage 3) refuses to
  *  arm automatic delivery when this is false: unattached means every byte reads
  *  CONTROL, which is exactly the silent failure `attachInputOrigin` throws to avoid. */

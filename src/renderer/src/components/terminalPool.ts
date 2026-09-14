@@ -22,7 +22,8 @@ import {
   classifyPathToken, isPathToken, pathTokenMatcher, stripPathToken, type PathAction
 } from '@shared/terminalPaths';
 import {
-  attachInputOrigin, classifyOutbound, markHumanOrigin, runInputOriginSelfTest, type ProbeConsumer
+  attachInputOrigin, classifyOutbound, markHumanOrigin, resetInputWindow,
+  runInputOriginSelfTest, type ProbeConsumer
 } from './inputOrigin';
 import type { InputOrigin } from '@shared/inputOrigin';
 import { sameInputState, type TerminalInputState } from '@shared/inputProvenance';
@@ -229,6 +230,11 @@ export function acquireTerminal(ptyId: string, theme?: ThemeMap, fontSize = 14):
   entry.unsub.push(window.cth.onPtyRelaunch(ptyId, () => {
     entry.exited = false;
     try { term.reset(); } catch { /* not yet open */ }
+    // Same-id respawn: main has a fresh session at NO_STATE and the old window may be
+    // mid-drain. Clear the transient window and re-run state + self-test for the new
+    // incarnation, or eligibility stays NO_STATE forever (Dwight 23.3).
+    resetInputWindow(ptyId);
+    establishInputProvenance(entry);
   }));
 
   // ── Copy / paste ──────────────────────────────────────────────────────────
@@ -670,16 +676,53 @@ function currentInputState(entry: TerminalEntry): TerminalInputState {
   };
 }
 
-/** Mirror to main, on change only. Optional-chained: the Electron test harness stubs
- *  `window.cth` without this method, and a missing bridge must not throw inside xterm's
- *  parser. Under a missing bridge main simply never receives a mirror and the terminal
- *  stays NO_STATE - which is the fail-closed answer, not a silent pass. */
-function reportInputState(entry: TerminalEntry): void {
+/** Retry backoff for a mirror report that main did not accept - e.g. the renderer
+ *  attached and reported BEFORE main had created the session (`no pty`). Bounded: if
+ *  the bridge is permanently down the terminal stays NO_STATE, which is fail-closed. */
+const INPUT_STATE_RETRY_MS = [100, 250, 500, 1000, 2000];
+
+/** Mirror to main. The local cache is set only AFTER main ACKS the exact state, never
+ *  before: Dwight 23.3 - caching on send meant a report lost to a transient failure or
+ *  a pre-session race was recorded as delivered and never retried, leaving main at
+ *  NO_STATE forever while the renderer believed it had reported. A rejected or thrown
+ *  report is retried on a bounded backoff; a newer state supersedes it (the dedupe
+ *  below re-sends whenever the live state differs from the last ACKED one).
+ *  Optional-chained: the Electron harness stubs `window.cth` without this method, and a
+ *  missing bridge must not throw inside xterm's parser - it simply leaves main NO_STATE,
+ *  the fail-closed answer, not a silent pass. */
+function reportInputState(entry: TerminalEntry, attempt = 0): void {
   if (entry.exited) return;
   const state = currentInputState(entry);
-  if (sameInputState(entry.inputStateReported, state)) return;
-  entry.inputStateReported = state;
-  void window.cth.reportTerminalInputState?.(entry.ptyId, state);
+  if (sameInputState(entry.inputStateReported, state)) return;   // already ACKED this exact state
+  const p = window.cth.reportTerminalInputState?.(entry.ptyId, state);
+  if (!p) return;   // no bridge (harness): nothing to ACK, nothing to retry
+  void p.then((r) => {
+    if (r && r.ok) { entry.inputStateReported = state; return; }   // cache ONLY on ACK
+    scheduleReportRetry(entry, attempt);
+  }).catch(() => scheduleReportRetry(entry, attempt));
+}
+
+function scheduleReportRetry(entry: TerminalEntry, attempt: number): void {
+  if (entry.exited || attempt >= INPUT_STATE_RETRY_MS.length) return;   // give up -> stays NO_STATE
+  setTimeout(() => reportInputState(entry, attempt + 1), INPUT_STATE_RETRY_MS[attempt]);
+}
+
+/** Establish input provenance for THIS live incarnation: report the attached-but-
+ *  unproven state at once (so main is not left at NO_STATE for a terminal that exists),
+ *  then run the self-test and report the proven result. Called at first open AND after
+ *  every same-id respawn - Dwight 23.3: a reused entry that never re-ran this left the
+ *  new main session UNKNOWN forever. */
+function establishInputProvenance(entry: TerminalEntry): void {
+  if (!entry.opened) return;
+  entry.inputSelfTest = 'unknown';
+  entry.inputStateReported = undefined;   // the new session has no prior state; force a fresh report
+  reportInputState(entry);
+  void runInputOriginSelfTest(
+    entry.ptyId, entry.term,
+    (consumer) => { entry.inputOriginProbe = consumer; },
+    () => { entry.inputOriginProbe = undefined; }
+  ).then((r) => { entry.inputSelfTest = r; reportInputState(entry); })
+    .catch(() => { entry.inputSelfTest = 'fail'; reportInputState(entry); });
 }
 
 /** Read `term.modes` AFTER xterm has applied the DEC mode the parser just saw. A CSI
@@ -704,15 +747,7 @@ export function attachTerminal(entry: TerminalEntry, container: HTMLElement): vo
     // being seen. If this guard is ever relaxed, `attachInputOrigin` must move
     // with it. (L0-FUSION rev 11 dimension 7.)
     entry.unsub.push(attachInputOrigin(entry.ptyId, entry.term));
-    // Report the attached-but-unproven state at once (main must not sit on NO_STATE
-    // for a terminal that exists), then prove the reconstruction and report again.
-    reportInputState(entry);
-    void runInputOriginSelfTest(
-      entry.ptyId, entry.term,
-      (consumer) => { entry.inputOriginProbe = consumer; },
-      () => { entry.inputOriginProbe = undefined; }
-    ).then((r) => { entry.inputSelfTest = r; reportInputState(entry); })
-      .catch(() => { entry.inputSelfTest = 'fail'; reportInputState(entry); });
+    establishInputProvenance(entry);
   }
   leaseWebglRenderer(entry);
   // PTY startup output can arrive before this pooled terminal subscribes.
@@ -837,6 +872,10 @@ export function resetTerminal(
       entry.term.reset();
     }
   } catch { /* not yet open */ }
+  // A reset is a new process on the same entry - re-establish provenance for it, the
+  // same as the relaunch path, or the new session stays NO_STATE (Dwight 23.3).
+  resetInputWindow(ptyId);
+  establishInputProvenance(entry);
 }
 
 /** Tear down a pty's terminal (call when the agent/pty is gone for good). */

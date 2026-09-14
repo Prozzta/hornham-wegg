@@ -58,4 +58,11 @@ test('INPUT ORIGIN on a rendered terminal: regimes, exclusions, programmatic pas
   assert.equal(r.mirror.afterOff, 'none', 'DECRST 1000 -> none -> main is told again (re-entrant)');
   assert.equal(r.mirror.xtermNow, 'none');
   assert.ok(r.mirror.reports >= 2, 'at least one report per change');
+
+  // BLOCKER 4 (Dwight 23.3): same-id respawn re-establishes provenance; a rejected report retries.
+  assert.equal(r.selfTestResetImmediate, 'unknown', 'a reset returns the entry to unproven at once');
+  assert.equal(r.selfTestAfterReset, 'pass', 'and the self-test re-runs to pass for the new incarnation');
+  assert.ok(r.reportsAfterReset >= 1, 'a fresh state is reported after the reset, not the stale cache');
+  assert.equal(r.lastReportSelfTest, 'pass', 'and the last post-reset report carries the proven state');
+  assert.equal(r.retryLanded, true, 'a report main rejected once was retried on backoff and accepted');
 });

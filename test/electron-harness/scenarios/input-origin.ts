@@ -12,7 +12,7 @@
  * on the cases it was written from is the shape of every weak test this floor has found.
  */
 import {
-  acquireTerminal, attachTerminal, disposeTerminal
+  acquireTerminal, attachTerminal, disposeTerminal, resetTerminal
 } from '../../../src/renderer/src/components/terminalPool';
 import {
   HELD_DRAIN_MS, inspectInputOrigin, markHumanOrigin
@@ -138,6 +138,35 @@ window.__harnessRun = async () => {
       afterOn: onReport?.mouseTrackingMode, afterOff: offReport?.mouseTrackingMode,
       xtermNow: term.modes.mouseTrackingMode, reports: reported.length
     };
+
+    // ARM 9 - BLOCKER 4 (Dwight 23.3): a same-id respawn re-establishes provenance.
+    // resetTerminal mirrors the relaunch path. After it the entry must reset to 'unknown'
+    // and re-run the self-test back to 'pass', and send a FRESH report - not sit on the
+    // old cached state while main's new session is NO_STATE.
+    const reportsBefore = reported.length;
+    resetTerminal('io');
+    result.selfTestResetImmediate = entry.inputSelfTest;          // synchronously back to 'unknown'
+    for (let i = 0; i < 40 && entry.inputSelfTest === 'unknown'; i++) await tick();
+    result.selfTestAfterReset = entry.inputSelfTest;              // proven again
+    const afterReset = reported.slice(reportsBefore);
+    result.reportsAfterReset = afterReset.length;
+    result.lastReportSelfTest = (afterReset[afterReset.length - 1] as { selfTest?: string } | undefined)?.selfTest;
+
+    // ARM 10 - BLOCKER 4 retry half: a report main REJECTS is retried on backoff and the
+    // cache is set only on ACK. Reject the next report once, then change state; the retry
+    // (100ms) must land the state that the first, rejected attempt carried.
+    let failsLeft = 1;
+    const realReport = window.cth.reportTerminalInputState as (id: string, st: unknown) => Promise<{ ok: boolean }>;
+    const recordedOk: unknown[] = [];
+    window.cth.reportTerminalInputState = (id: string, st: unknown) => {
+      if (failsLeft > 0) { failsLeft--; return Promise.resolve({ ok: false, error: 'no pty (simulated)' }); }
+      recordedOk.push(st); return realReport(id, st);
+    };
+    await write(term, '[?1000h');   // mouse mode -> new state -> first report REJECTED
+    await sleep(400);                    // the 100ms retry fires and is accepted
+    window.cth.reportTerminalInputState = realReport;
+    result.retryLanded = recordedOk.some((st) => (st as { mouseTrackingMode?: string }).mouseTrackingMode === 'vt200');
+    await write(term, '[?1000l');
 
     disposeTerminal('io');
     window.harness.report({ ok: true, ...result });
