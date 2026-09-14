@@ -158,9 +158,11 @@ function submitToPty(
     // moving the gate below the payload write reads as a fix and restores the defect.
     await typeAndSubmit(ptyId, {
       maySubmit,
-      writePayload: () => window.cth.writePty(ptyId, payload),
+      // PROGRAMMATIC: the automatic owner's own bytes. Never HUMAN, never CONTROL —
+      // kept distinct so a call-graph check can prove this is the only producer.
+      writePayload: () => window.cth.writePty(ptyId, payload, 'PROGRAMMATIC'),
       pause: () => new Promise((r) => setTimeout(r, 140)),
-      writeSubmit: () => window.cth.writePty(ptyId, '\r')
+      writeSubmit: () => window.cth.writePty(ptyId, '\r', 'PROGRAMMATIC')
     });
     await new Promise((r) => setTimeout(r, settleMs));
   });

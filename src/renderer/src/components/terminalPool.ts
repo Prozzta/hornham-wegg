@@ -21,6 +21,7 @@ import { Unicode11Addon } from '@xterm/addon-unicode11';
 import {
   classifyPathToken, isPathToken, pathTokenMatcher, stripPathToken, type PathAction
 } from '@shared/terminalPaths';
+import { attachInputOrigin, classifyOutbound } from './inputOrigin';
 import {
   createTerminalRecoveryState,
   normalizePtyChunk,
@@ -109,7 +110,7 @@ export function notifyThemeChangeAll(theme: 'light' | 'dark'): void {
 function notifyThemeChange(ptyId: string, theme: 'light' | 'dark'): void {
   const entry = pool.get(ptyId);
   if (!entry || entry.exited || !entry.themeNotify) return;
-  window.cth.writePty(ptyId, `\x1b[?997;${theme === 'dark' ? 1 : 2}n`);
+  window.cth.writePty(ptyId, `\x1b[?997;${theme === 'dark' ? 1 : 2}n`, 'CONTROL');
 }
 
 /** Get (or lazily create) the persistent terminal for a pty. Theme/font are
@@ -291,7 +292,7 @@ export function acquireTerminal(ptyId: string, theme?: ThemeMap, fontSize = 14):
     const hex = index === 11 ? map?.background : map?.foreground;
     const rgb = hex && parseHexColor(hex);
     if (!rgb) return false;                  // unknown colour: stay silent rather than lie
-    window.cth.writePty(ptyId, `\x1b]${index};${oscColorBody(rgb)}\x1b\\`);
+    window.cth.writePty(ptyId, `\x1b]${index};${oscColorBody(rgb)}\x1b\\`, 'CONTROL');
     return true;
   };
   term.parser.registerOscHandler(10, oscColorReply(10));
@@ -328,7 +329,12 @@ export function acquireTerminal(ptyId: string, theme?: ThemeMap, fontSize = 14):
   // path resets it too.
   term.onData((data) => {
     if (entry.exited) return;
-    window.cth.writePty(ptyId, data);
+    // THE ONE CLASSIFICATION POINT (L0-FUSION rev 13 section 13.2). Everything xterm
+    // emits — keystrokes, pastes, IME, AND the terminal's own protocol replies —
+    // arrives here on one callback with no origin attached. `classifyOutbound`
+    // answers from the human window that `inputOrigin.ts` owns; nothing here
+    // guesses from the bytes.
+    window.cth.writePty(ptyId, data, classifyOutbound(ptyId));
     // A lone Escape or Ctrl-C closes interactive pickers. Arrow-key escape
     // sequences must NOT clear the block while the user navigates a picker.
     if (data === '\x1b' || data === '\x03') {
@@ -503,7 +509,9 @@ export function clearTerminalDraft(ptyId: string): string {
   // again. Ctrl-U is not undoable in a TUI, so silently discarding it was data
   // loss every time an abandoned-looking draft turned out to be a real one.
   const discarded = entry.lineBuf;
-  void window.cth.writePty(ptyId, '\x15');
+  // HUMAN: this runs only because the user pressed the composer's own button —
+  // explicit provenance at a site we own, not inferred from the byte.
+  void window.cth.writePty(ptyId, '\x15', 'HUMAN');
   entry.inputDirty = false;
   entry.inputDirtyAt = 0;
   // Reset our model of the line too. Leaving it set made the very next keystroke
@@ -529,7 +537,8 @@ export function clearTerminalDraft(ptyId: string): string {
 export function dismissTerminalPicker(ptyId: string): void {
   const entry = pool.get(ptyId);
   if (!entry || entry.exited) return;
-  void window.cth.writePty(ptyId, '\x1b');
+  // HUMAN for the same reason as clearTerminalDraft: user-initiated, site we own.
+  void window.cth.writePty(ptyId, '\x1b', 'HUMAN');
   releasePickerBlock(entry);
 }
 
@@ -608,6 +617,14 @@ export function attachTerminal(entry: TerminalEntry, container: HTMLElement): vo
     // terminal, and xterm needs its host in the document to measure the cell.
     entry.term.open(entry.host);
     entry.opened = true;
+    // THIS GUARD IS LOAD-BEARING FOR INPUT PROVENANCE, not only for WebGL.
+    // xterm creates `term.element` and `term.textarea` INSIDE open() (browser/
+    // Terminal.ts:444), so the provenance listeners below can only be attached
+    // now, and only once: a second open() would recreate the element and orphan
+    // them with no error and no symptom except that human input silently stops
+    // being seen. If this guard is ever relaxed, `attachInputOrigin` must move
+    // with it. (L0-FUSION rev 11 dimension 7.)
+    entry.unsub.push(attachInputOrigin(entry.ptyId, entry.term));
   }
   leaseWebglRenderer(entry);
   // PTY startup output can arrive before this pooled terminal subscribes.

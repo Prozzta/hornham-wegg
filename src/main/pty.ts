@@ -1,4 +1,5 @@
 import * as pty from 'node-pty';
+import type { InputOrigin } from '../shared/inputOrigin';
 import type { WebContents } from 'electron';
 import { existsSync, readFileSync, statSync } from 'node:fs';
 import { delimiter, join, win32 } from 'node:path';
@@ -49,6 +50,12 @@ interface PtySession {
   /** True after the child has emitted at least one frame. Automation waits for
    *  this before typing, so startup prompts cannot outrun the TUI subscription. */
   hasOutput: boolean;
+  /** L0-FUSION section 4: advanced ONLY by a write whose declared origin is HUMAN,
+   *  in the same synchronous operation as the write, and only when node-pty
+   *  accepted the bytes. Opaque, equality-tested, scoped to THIS live incarnation
+   *  and discarded with it — a respawn must not inherit a judgement about a
+   *  terminal that no longer exists. Never derived from terminal output. */
+  humanInputGeneration: number;
 }
 
 export interface SpawnOptions {
@@ -667,7 +674,8 @@ export class PtyManager {
         command: resolved,
         lastOutputAt: Date.now(),
         hasOutput: false,
-        owner
+        owner,
+        humanInputGeneration: 0
       };
       this.sessions.set(opts.id, session);
 
@@ -697,15 +705,29 @@ export class PtyManager {
     }
   }
 
-  write(id: string, data: string): { ok: boolean; error?: string } {
+  /** Every writer declares `origin` (`shared/inputOrigin.ts`). The human-input
+   *  generation advances HERE, inside the same synchronous call that hands the
+   *  bytes to node-pty, and only when that hand-off did not throw. Not before the
+   *  write (a refused write must not count) and not in a separate notification
+   *  (two operations can be separated, dropped or reordered — Oscar's review).
+   *  "Accepted" means node-pty took the bytes, not that the child read them. */
+  write(id: string, data: string, origin: InputOrigin): { ok: boolean; error?: string } {
     const s = this.sessions.get(id);
     if (!s) return { ok: false, error: `no pty: ${id}` };
     try {
       s.proc.write(data);
+      if (origin === 'HUMAN') s.humanInputGeneration++;
       return { ok: true };
     } catch (e) {
       return { ok: false, error: e instanceof Error ? e.message : String(e) };
     }
+  }
+
+  /** The current human-input generation for a LIVE pty, or undefined if there is
+   *  none. Callers compare for EQUALITY against a value they captured earlier;
+   *  the number itself carries no meaning and must not be persisted. */
+  humanInputGeneration(id: string): number | undefined {
+    return this.sessions.get(id)?.humanInputGeneration;
   }
 
   resize(id: string, cols: number, rows: number): { ok: boolean; error?: string } {

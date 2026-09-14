@@ -1,5 +1,6 @@
 import { contextBridge, ipcRenderer, webUtils, type IpcRendererEvent } from 'electron';
 import type { AgentProvider } from '../shared/agentProvider';
+import type { InputOrigin } from '../shared/inputOrigin';
 import type { HireManifest } from '../shared/hire';
 export type { HireManifest } from '../shared/hire';
 import type { IntegrationRecord, IntegrationTemplate } from '../shared/integrations';
@@ -584,8 +585,11 @@ const api = {
    *  into — the renderer stores that, not the raw `~/…` the user typed. */
   spawnPty: (opts: SpawnPtyOptions): Promise<{ ok: boolean; error?: string; cwd?: string; worktreePath?: string; resumeNotFound?: boolean; resumed?: boolean; seedPrompt?: string }> =>
     ipcRenderer.invoke('pty:spawn', opts),
-  writePty: (id: string, data: string): Promise<{ ok: boolean; error?: string }> =>
-    ipcRenderer.invoke('pty:write', id, data),
+  /** `origin` is REQUIRED: every writer declares who is behind the bytes
+   *  (`shared/inputOrigin.ts`). Main advances the PTY's human-input generation
+   *  only for HUMAN, and refuses a write whose origin it does not recognise. */
+  writePty: (id: string, data: string, origin: InputOrigin): Promise<{ ok: boolean; error?: string }> =>
+    ipcRenderer.invoke('pty:write', id, data, origin),
   resizePty: (id: string, cols: number, rows: number): Promise<{ ok: boolean; error?: string }> =>
     ipcRenderer.invoke('pty:resize', id, cols, rows),
   redrawPty: (id: string): Promise<{ ok: boolean; error?: string }> =>

@@ -23,6 +23,7 @@ import {
 } from './config';
 import { listDir, readFileText, readFileBinary, writeFileText, statAbs, expandTilde } from './fs';
 import { normalizeWeekly, weeklyDelayMs } from '../shared/weeklySchedule';
+import { isInputOrigin } from '../shared/inputOrigin';
 import {
   getBranch, getStatus, getLog, getBranches, getAheadBehind, isRepo, getDiff, mainRepoRoot,
   addWorktree, removeWorktree, worktreeHasUnintegratedWork, worktreeIsGcSafe,
@@ -3043,9 +3044,13 @@ async function spawnAgentCore(opts: AgentSpawnOptions, owner: Electron.WebConten
   // record matches what the registry and the PTY actually used.
   return { ...res, cwd: opts.cwd, ...(worktreePath ? { worktreePath } : {}), ...(resumeNotFound ? { resumeNotFound: true } : {}), ...(didResume ? { resumed: true } : {}), ...(seedPrompt ? { seedPrompt } : {}) };
 }
-ipcMain.handle('pty:write', (_evt, id: string, data: string) => {
+ipcMain.handle('pty:write', (_evt, id: string, data: string, origin: unknown) => {
   if (typeof id !== 'string' || typeof data !== 'string') return { ok: false, error: 'invalid args' };
-  return ptyManager.write(id, data);
+  // An unrecognised or missing origin is REFUSED, not defaulted. A write that
+  // cannot say who is behind it is a missing fact, and the fail-closed rule says a
+  // missing fact is UNKNOWN — never CONTROL, and never quietly HUMAN.
+  if (!isInputOrigin(origin)) return { ok: false, error: 'invalid origin' };
+  return ptyManager.write(id, data, origin);
 });
 ipcMain.handle('pty:resize', (_evt, id: string, cols: number, rows: number) => {
   if (typeof id !== 'string' || typeof cols !== 'number' || typeof rows !== 'number') return { ok: false, error: 'invalid args' };
@@ -5151,9 +5156,9 @@ function nudgeWorker(
   // the renderer's lives in queueDelivery.ts: it is the invariant, not the plumbing.
   submitWorkerNudge({
     maySubmit,
-    writeText: () => ptyManager.write(ptyId, inboxNudgeText(ids)),
+    writeText: () => ptyManager.write(ptyId, inboxNudgeText(ids), 'PROGRAMMATIC'),
     delaySubmit: (fn) => { setTimeout(fn, 140); },
-    writeSubmit: () => ptyManager.write(ptyId, '\r'),
+    writeSubmit: () => ptyManager.write(ptyId, '\r', 'PROGRAMMATIC'),
     onSubmitted,
     warn: (message) => console.warn(`[worker-wake] ${ptyId}: ${message}`)
   });
