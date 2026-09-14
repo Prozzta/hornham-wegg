@@ -21,7 +21,9 @@ import { Unicode11Addon } from '@xterm/addon-unicode11';
 import {
   classifyPathToken, isPathToken, pathTokenMatcher, stripPathToken, type PathAction
 } from '@shared/terminalPaths';
-import { attachInputOrigin, classifyOutbound, markHumanOrigin, runInputOriginSelfTest } from './inputOrigin';
+import {
+  attachInputOrigin, classifyOutbound, markHumanOrigin, runInputOriginSelfTest, type ProbeConsumer
+} from './inputOrigin';
 import type { InputOrigin } from '@shared/inputOrigin';
 import { sameInputState, type TerminalInputState } from '@shared/inputProvenance';
 import {
@@ -81,7 +83,7 @@ export interface TerminalEntry {
   /** L0-FUSION stage 3. While set, the NEXT byte xterm emits is handed here instead of
    *  written to the pty - the self-test's swallow. One-shot; cleared by the onData
    *  handler the moment it fires. */
-  inputOriginProbe?: (origin: InputOrigin) => void;
+  inputOriginProbe?: ProbeConsumer;
   /** Last provenance state reported to main, so we report only on change. */
   inputStateReported?: TerminalInputState;
   /** Self-test outcome for this incarnation; 'unknown' until it has run. */
@@ -370,11 +372,11 @@ export function acquireTerminal(ptyId: string, theme?: ThemeMap, fontSize = 14):
   // path resets it too.
   term.onData((data) => {
     if (entry.exited) return;
-    // Self-test swallow: this byte is evidence, not input. It never reaches the pty.
-    if (entry.inputOriginProbe) {
-      const probe = entry.inputOriginProbe;
-      entry.inputOriginProbe = undefined;
-      probe(classifyOutbound(ptyId));
+    // Self-test swallow, CORRELATED: the probe is offered this byte's origin and data
+    // and returns true only if it is the byte it awaits, in which case it is consumed
+    // and never reaches the pty. An unrelated byte (return false) falls through to be
+    // classified and written normally, so the probe cannot eat real input.
+    if (entry.inputOriginProbe && entry.inputOriginProbe(classifyOutbound(ptyId, data), data)) {
       return;
     }
     // THE ONE CLASSIFICATION POINT (L0-FUSION rev 13 section 13.2). Everything xterm
@@ -382,7 +384,7 @@ export function acquireTerminal(ptyId: string, theme?: ThemeMap, fontSize = 14):
     // arrives here on one callback with no origin attached. `classifyOutbound`
     // answers from the human window that `inputOrigin.ts` owns; nothing here
     // guesses from the bytes.
-    window.cth.writePty(ptyId, data, classifyOutbound(ptyId));
+    window.cth.writePty(ptyId, data, classifyOutbound(ptyId, data));
     // A lone Escape or Ctrl-C closes interactive pickers. Arrow-key escape
     // sequences must NOT clear the block while the user navigates a picker.
     if (data === '\x1b' || data === '\x03') {
@@ -707,7 +709,7 @@ export function attachTerminal(entry: TerminalEntry, container: HTMLElement): vo
     reportInputState(entry);
     void runInputOriginSelfTest(
       entry.ptyId, entry.term,
-      (cb) => { entry.inputOriginProbe = cb; },
+      (consumer) => { entry.inputOriginProbe = consumer; },
       () => { entry.inputOriginProbe = undefined; }
     ).then((r) => { entry.inputSelfTest = r; reportInputState(entry); })
       .catch(() => { entry.inputSelfTest = 'fail'; reportInputState(entry); });

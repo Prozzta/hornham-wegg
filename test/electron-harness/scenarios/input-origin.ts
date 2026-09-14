@@ -98,6 +98,21 @@ window.__harnessRun = async () => {
     ta.dispatchEvent(new FocusEvent('focus'));
     result.focusReport = lastOrigin();
 
+    // ARM 5b - BLOCKER 1: a protocol reply INSIDE a held window is CONTROL and does NOT
+    // extend the drain. Open held with a composition event, then write a DSR; xterm's CPR
+    // reply lands while held is open. Before the fix classifyOutbound returned HUMAN for
+    // every held byte and rearmHold reset the timer, so a cursor-polling TUI held the
+    // window open forever. Now: ESC-prefixed reply -> CONTROL, no rearm.
+    sent.length = 0;
+    ta.dispatchEvent(new CompositionEvent('compositionstart', { bubbles: true }));
+    result.heldOpenBeforeReply = inspectInputOrigin('io')?.held === true;
+    await write(term, '[6n');
+    result.replyInHeld = lastOrigin();                 // must be CONTROL, not HUMAN
+    // A printable composition byte right after must still be HUMAN: the reply neither
+    // stole the window nor, by not rearming, is the only thing keeping it open.
+    term.input('x', false);
+    result.humanAfterReplyInHeld = lastOrigin();
+
     // ARM 6 - the HELD regime spans a tick. Kills: "one closing regime (microtask only)".
     sent.length = 0;
     ta.dispatchEvent(new CompositionEvent('compositionstart', { bubbles: true }));

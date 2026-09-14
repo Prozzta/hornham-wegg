@@ -183,7 +183,7 @@ test('EVERY renderer writePty call declares an origin - none can omit it', () =>
     + calls.map((c) => c.f + ': ' + c.line).join('\n'));
   for (const c of calls) {
     // Either a literal origin or the classifier - never two bare arguments.
-    assert.match(c.line, /'(HUMAN|CONTROL|PROGRAMMATIC)'\)|classifyOutbound\(ptyId\)\)/,
+    assert.match(c.line, /'(HUMAN|CONTROL|PROGRAMMATIC)'\)|classifyOutbound\(/,
       `${c.f}: ${c.line} does not declare an origin`);
   }
 });

@@ -41,6 +41,12 @@ test('INPUT ORIGIN on a rendered terminal: regimes, exclusions, programmatic pas
   // Focus is excluded by name - measured necessity, claude has focus reporting on.
   assert.equal(r.focusReport, 'CONTROL', 'a focus report emitted inside a focus dispatch is CONTROL');
 
+  // BLOCKER 1 (Dwight 23.2): a protocol reply INSIDE a held IME window is CONTROL, not
+  // HUMAN, and does not consume or extend the window - a human byte after it is still HUMAN.
+  assert.equal(r.heldOpenBeforeReply, true, 'the composition event really opened a held window');
+  assert.equal(r.replyInHeld, 'CONTROL', 'a DSR/CPR reply inside the held drain is CONTROL, never HUMAN');
+  assert.equal(r.humanAfterReplyInHeld, 'HUMAN', 'and the reply did not destroy the held window for real input');
+
   // Held regime: composition data on a LATER tick is still HUMAN, to the last byte...
   assert.equal(r.compositionNextTick, 'HUMAN', 'constraint (iii): composition data on the next tick is HUMAN');
   assert.equal(r.compositionSecondByte, 'HUMAN', 'and so is the second byte of the burst');

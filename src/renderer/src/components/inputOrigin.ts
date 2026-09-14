@@ -56,6 +56,22 @@ import type { HumanOriginReason, InputOrigin } from '@shared/inputOrigin';
  *  `input` event cannot make the next automatic reply look human for long. */
 export const HELD_DRAIN_MS = 50;
 
+/** A self-test probe: offered each classified byte, it returns TRUE to CONSUME the
+ *  byte (swallow it - it is evidence, not input, and must not reach the pty) or
+ *  FALSE to let it flow on normally. A CORRELATED probe consumes ONLY the specific
+ *  byte it is waiting for, so an unrelated reply neither satisfies it nor is lost. */
+export type ProbeConsumer = (origin: InputOrigin, data: string) => boolean;
+
+/** ArrowRight, as xterm emits it for a synthetic keydown: `ESC[C` (normal cursor
+ *  keys) or `ESC O C` (application cursor keys). The self-test's keyboard half
+ *  consumes exactly this and nothing else. */
+export const SELFTEST_ARROW_RIGHT = /^\x1b(\[|O)C$/;
+/** A Cursor-Position Report, the reply to the self-test's `ESC[6n`: `ESC[<r>;<c>R`.
+ *  The control half consumes exactly this shape and nothing else. */
+export const SELFTEST_CPR = /^\x1b\[\d+;\d+R$/;
+/** How long a self-test half waits for its correlated byte before failing closed. */
+export const SELFTEST_TIMEOUT_MS = 1000;
+
 /** DOM events whose data reaches `onData` synchronously inside the same dispatch. */
 export const SAME_TICK_EVENTS = ['keydown', 'keypress', 'paste', 'wheel', 'mousedown', 'touchstart'] as const;
 /** DOM events whose data is emitted by xterm on a LATER tick (see header). */
@@ -166,16 +182,38 @@ export function markHumanOrigin(ptyId: string, reason: Exclude<HumanOriginReason
  *   - An UNATTACHED terminal classifies CONTROL for everything. That is not safe on its
  *     own; it is made safe by the arming gate consulting `isInputOriginAttached`.
  */
-export function classifyOutbound(ptyId: string): InputOrigin {
+export function classifyOutbound(ptyId: string, data: string): InputOrigin {
   const w = windows.get(ptyId);
   if (!w) return 'CONTROL';
+  // The same-tick window covers a synchronous DOM dispatch (a keystroke, a paste),
+  // where an ESC-prefixed byte is a legitimate human arrow/escape key. So it does
+  // NOT discriminate by shape - the whole byte is the human's.
+  if (w.sameTick) return 'HUMAN';
   if (w.held) {
-    // Every byte during a held window re-arms the drain, so a composition that
-    // emits diff + DEL + newValue across ticks stays HUMAN to the last byte.
+    // The held window exists ONLY for the IME/`input` drain, whose only legitimate
+    // human bytes are the printable composition output (diff / DEL / newValue) - none
+    // of which begins with ESC. A terminal PROTOCOL REPLY (DA/DSR/CPR/DECRQM/colour)
+    // DOES begin with ESC, and one can land inside the 50 ms drain if the program
+    // polls its cursor. It is CONTROL, and - critically - it must NOT rearm the
+    // drain, or a TUI emitting periodic cursor reports would hold the window open
+    // forever and turn every automatic delivery into a spurious INTERFERED. That
+    // wholesale-HUMAN gap is exactly what Dwight's audit (section 23.2) caught: a
+    // named focus/blur exclusion made the category feel handled while the general
+    // case underneath it was not.
+    if (isTerminalReply(data)) return 'CONTROL';
     rearmHold(w, null);
     return 'HUMAN';
   }
-  return w.sameTick ? 'HUMAN' : 'CONTROL';
+  return 'CONTROL';
+}
+
+/** A terminal-generated protocol reply, recognised by the one property that
+ *  separates it from IME composition output inside the held window: it is an
+ *  escape sequence (begins with ESC, 0x1b). Composition output is printable text
+ *  and its only C0 byte is DEL (0x7f), never ESC. This is a discriminator for the
+ *  HELD window only; a same-tick ESC byte is a human arrow key and stays HUMAN. */
+export function isTerminalReply(data: string): boolean {
+  return data.charCodeAt(0) === 0x1b;
 }
 
 /**
@@ -201,38 +239,43 @@ export function classifyOutbound(ptyId: string): InputOrigin {
 export async function runInputOriginSelfTest(
   ptyId: string,
   term: Terminal,
-  armProbe: (cb: (origin: InputOrigin) => void) => void,
-  disarmProbe: () => void
+  setProbe: (consumer: ProbeConsumer) => void,
+  clearProbe: () => void
 ): Promise<'pass' | 'fail'> {
   const ta = term.textarea;
   if (!ta || !isInputOriginAttached(ptyId)) return 'fail';
 
-  // Half 1: keyboard -> HUMAN, synchronously.
-  // Holder object, not a `let`: TS narrows a `let` to `null` across the closure
-  // assignment, and a future compiler may reject the comparison below as no-overlap.
-  const key: { got: InputOrigin | null } = { got: null };
-  armProbe((o) => { key.got = o; });
+  // Each half installs a CORRELATED probe: it consumes ONLY the byte whose shape it
+  // is waiting for (returns true) and lets anything else flow on untouched (returns
+  // false, staying armed). Dwight 23.1: an uncorrelated one-shot could be satisfied
+  // by an unrelated reply and then let the INTENDED byte reach the pty. Correlation
+  // is what makes 'not one byte reaches the pty' true for the bytes we generate,
+  // rather than true only in a quiescent scenario. A half that never sees its byte
+  // TIMES OUT to 'fail' - fail-closed, never a hang.
+  const await1 = (match: RegExp): Promise<InputOrigin | 'timeout'> =>
+    new Promise((resolve) => {
+      const timer = setTimeout(() => { clearProbe(); resolve('timeout'); }, SELFTEST_TIMEOUT_MS);
+      setProbe((origin, data) => {
+        if (!match.test(data)) return false;   // not our byte: let it flow, stay armed
+        clearTimeout(timer); clearProbe(); resolve(origin);
+        return true;                            // our byte: consume it, never sent
+      });
+    });
+
+  // Half 1: a synthetic ArrowRight keydown must emit `ESC[C`/`ESC O C` and classify HUMAN.
+  const keyResult = await1(SELFTEST_ARROW_RIGHT);
   ta.dispatchEvent(new KeyboardEvent('keydown', {
     key: 'ArrowRight', code: 'ArrowRight', keyCode: 39, which: 39, bubbles: true, cancelable: true
   } as KeyboardEventInit));
-  // The probe must already have fired: same dispatch, no tick between.
-  const keyOk = key.got === 'HUMAN';
-  disarmProbe();
-  if (!keyOk) return 'fail';
+  if ((await keyResult) !== 'HUMAN') return 'fail';
 
-  // Let the same-tick window close before the control half, or a fast reply could
-  // be classified by the keyboard's window and the test would pass for the wrong reason.
+  // Close the same-tick window before the control half so its byte cannot ride it.
   await new Promise<void>((r) => { queueMicrotask(r); });
 
-  // Half 2: DSR reply -> CONTROL. `write(data, cb)` resolves after parsing, and the
-  // reply is emitted synchronously inside that parse, so by `cb` the probe has fired.
-  const ctlResult = await new Promise<InputOrigin | null>((resolve) => {
-    const ctl: { got: InputOrigin | null } = { got: null };
-    armProbe((o) => { ctl.got = o; });
-    term.write('\x1b[6n', () => resolve(ctl.got));
-  });
-  disarmProbe();
-  return ctlResult === 'CONTROL' ? 'pass' : 'fail';
+  // Half 2: the CPR reply to `ESC[6n` must be `ESC[<r>;<c>R` and classify CONTROL.
+  const ctlResult = await1(SELFTEST_CPR);
+  term.write('\x1b[6n');
+  return (await ctlResult) === 'CONTROL' ? 'pass' : 'fail';
 }
 
 /** Test seam: the window state, read-only. Not for production decisions. */
