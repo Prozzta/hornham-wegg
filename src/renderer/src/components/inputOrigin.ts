@@ -66,22 +66,19 @@ export type ProbeConsumer = (origin: InputOrigin, data: string) => boolean;
  *  keys) or `ESC O C` (application cursor keys). The self-test's keyboard half
  *  consumes exactly this and nothing else. */
 export const SELFTEST_ARROW_RIGHT = /^\x1b(\[|O)C$/;
-/** A Cursor-Position Report, the reply to the self-test's `ESC[6n`: `ESC[<r>;<c>R`.
- *  Shape alone does NOT correlate a CPR to OUR request - see SELFTEST_CONTROL_QUERY. */
-export const SELFTEST_CPR = /^\x1b\[\d+;\d+R$/;
-/** The DEC private mode the CPR half queries as a CORRELATION MARKER. 1016 (SGR-pixel
- *  mouse) is recognised by xterm 5.5.0 - so `ESC[?1016$p` returns a deterministic
- *  `ESC[?1016;<v>$y` (browser/InputHandler requestMode) - and is essentially never
- *  queried by an application, so a foreign reply of THIS exact shape landing inside the
- *  self-test's millisecond window is the stated residual, far narrower than a bare
- *  same-shape CPR. VERSION-PINNED: the reply format is xterm 5.5.0's, not a contract. */
-export const SELFTEST_CPR_MODE = 1016;
-/** The reply to `ESC[?1016$p`: `ESC[?1016;<value>$y`. Matched EXACTLY, so only our own
- *  marker - not an arbitrary DECRPM reply - opens the one-byte CPR-capture window. */
-export const SELFTEST_DECRQM_MARK = /^\x1b\[\?1016;\d+\$y$/;
-/** ONE write: the marker query THEN the DSR, in a single chunk so xterm emits their
- *  replies ADJACENTLY in one synchronous parse - that adjacency is the correlation. */
-export const SELFTEST_CONTROL_QUERY = '\x1b[?1016$p\x1b[6n';
+/** The control half's request correlation (god fix-round-3 amendment; Phyllis Rank 1).
+ *  DECRQM echoes the queried mode number VERBATIM: for an unrecognised ANSI mode `ESC[<n>$p`,
+ *  xterm 5.5.0 replies `ESC[<n>;0$y` (InputHandler.requestMode; the ANSI branch recognises
+ *  only modes 2/4/12/20, everything else -> value 0). We query a fresh RANDOM nonce per
+ *  self-test, so the reply carries a token only we generated - provably ours WITHOUT relying
+ *  on same-parse adjacency or xterm's non-coalescing behaviour, and uncollidable with ordinary
+ *  program output. VERSION-PINNED: the echo behaviour is xterm 5.5.0's (recorded in the design
+ *  note); the EXACT-match on the reply fails closed if a future xterm fragments or coalesces
+ *  it (Phyllis Rank 3), a live check rather than a comment. */
+export const selftestQuery = (nonce: number): string => '\x1b[' + nonce + '$p';
+export const selftestReply = (nonce: number): string => '\x1b[' + nonce + ';0$y';
+/** A fresh nonce in [100000, 999999] - 900k values, collision probability ~0. */
+export const makeNonce = (): number => 100000 + Math.floor(Math.random() * 900000);
 /** How long a self-test half waits for its correlated byte before failing closed. */
 export const SELFTEST_TIMEOUT_MS = 1000;
 
@@ -244,26 +241,19 @@ export function isTerminalReply(data: string): boolean {
 }
 
 /**
- * The CPR half's CORRELATED probe, as a pure factory so its adjacency rule can be
- * driven byte-by-byte in a unit test (Dwight 24.2 asked the committed test to preload
- * the collision and prove OUR CPR, not merely some CPR, is the one consumed). The rule:
- * ignore every byte until OUR marker reply (consume that), then the IMMEDIATELY next
- * byte is our CPR - proven adjacent because xterm emits the marker reply and the CPR as
- * two back-to-back triggerDataEvent calls in one synchronous parse of SELFTEST_CONTROL_
- * QUERY, with nothing interleaved. A foreign or pre-marker CPR fails the marker test and
- * flows on untouched; a shape-only probe would instead swallow it and leak ours.
+ * The control half's probe as a pure factory, so its correlation can be driven byte-by-byte
+ * in a unit test AND installed directly by a REAL-xterm adversarial arm (the human's fix-
+ * round-3 requirement: demonstrate that a FOREIGN reply FAILS token correlation, not merely
+ * that the parser works). It consumes ONLY the byte that EXACTLY equals our expected nonce
+ * reply; a foreign reply - a CPR, a colour report, or a DECRQM reply for a DIFFERENT nonce -
+ * fails the equality and flows on untouched. A shape-only probe would swallow the first
+ * CPR-shaped byte and leak ours. No same-parse adjacency is assumed.
  */
-export function makeCorrelatedCprProbe(onResult: (origin: InputOrigin | null) => void): ProbeConsumer {
-  let sawMarker = false;
+export function makeNonceCorrelatedProbe(expected: string, onResult: (origin: InputOrigin) => void): ProbeConsumer {
   return (origin, data) => {
-    if (!sawMarker) {
-      if (!SELFTEST_DECRQM_MARK.test(data)) return false;   // incl. a foreign/pre-marker CPR: flow on, stay armed
-      sawMarker = true;                                     // our marker reply: consume it, never sent
-      return true;
-    }
-    const isCpr = SELFTEST_CPR.test(data);                  // the byte adjacent to our marker is our CPR
-    onResult(isCpr ? origin : null);                        // null -> invariant broken -> the caller fails closed
-    return isCpr;                                           // consume our CPR; leave anything else on the wire
+    if (data !== expected) return false;   // not our nonce reply (incl. ANY foreign reply): flow on, stay armed
+    onResult(origin);                      // our reply: its origin (must be CONTROL) decides pass
+    return true;                           // consume it, never sent
   };
 }
 
@@ -323,26 +313,26 @@ export async function runInputOriginSelfTest(
   // Close the same-tick window before the control half so its byte cannot ride it.
   await new Promise<void>((r) => { queueMicrotask(r); });
 
-  // Half 2, CORRELATED BY A MARKER (Dwight 24.2). A bare SELFTEST_CPR match is only
-  // SHAPE-correlated: `term.write` is async through xterm's WriteBuffer, and PTY output
-  // (a program's own DSR) can already be queued when the probe arms, so a prequeued
-  // foreign CPR would satisfy the probe while OUR later CPR escaped to the pty. We make
-  // the reply provably ours WITHOUT reading any xterm internal: emit, as ONE write, a
-  // DECRQM query for a fixed mode THEN the DSR (SELFTEST_CONTROL_QUERY). xterm parses
-  // the chunk in order and fires the mode reply and then the CPR as two back-to-back
-  // triggerDataEvent calls in the SAME synchronous parse (CoreService does not buffer or
-  // concatenate them - the version-pinned fact in Dwight 24.1 Q2), so no byte from any
-  // other chunk lands between them. makeCorrelatedCprProbe consumes only the CPR adjacent
-  // to OUR marker; a foreign CPR from another chunk flows through untouched. Only
-  // `terminal.write(data)` is used - public, documented (R1).
+  // Half 2, NONCE-CORRELATED DECRQM (god fix-round-3 amendment; Phyllis Rank 1). A CPR is only
+  // SHAPE-correlated, and my earlier fixed-mode marker rested on SAME-PARSE ADJACENCY; a nonce
+  // removes both as load-bearing. We (a) BARRIER: await an empty write, which the WriteBuffer
+  // queues in FIFO order, so all prequeued PTY output is parsed and flushed BEFORE we arm;
+  // then (b) query ANSI DECRQM for a fresh RANDOM nonce - `ESC[<nonce>$p` - which xterm 5.5.0
+  // echoes VERBATIM as `ESC[<nonce>;0$y` for an unrecognised mode. The reply carries a token
+  // only we generated, so it is provably ours without adjacency or non-coalescing; a foreign
+  // or previous reply cannot satisfy it. We match it EXACTLY (Phyllis Rank 3), so a fragmented
+  // or coalesced chunk fails closed. The reply begins with ESC, so the held-window discriminator
+  // still reads it CONTROL. Public API only: `terminal.write(data[, callback])` is in xterm.d.ts (R1).
+  await new Promise<void>((r) => { term.write('', () => r()); });
+  const nonce = makeNonce();
+  const expected = selftestReply(nonce);
   const ctlResult = new Promise<InputOrigin | 'timeout'>((resolve) => {
     const timer = setTimeout(() => { clearProbe(); resolve('timeout'); }, SELFTEST_TIMEOUT_MS);
-    setProbe(makeCorrelatedCprProbe((origin) => {
-      clearTimeout(timer); clearProbe();
-      resolve(origin ?? 'timeout');   // a non-CPR after our marker breaks the invariant -> fail closed
+    setProbe(makeNonceCorrelatedProbe(expected, (origin) => {
+      clearTimeout(timer); clearProbe(); resolve(origin);
     }));
   });
-  term.write(SELFTEST_CONTROL_QUERY);
+  term.write(selftestQuery(nonce));
   return (await ctlResult) === 'CONTROL' ? 'pass' : 'fail';
 }
 

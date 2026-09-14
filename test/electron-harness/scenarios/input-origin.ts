@@ -15,7 +15,7 @@ import {
   acquireTerminal, attachTerminal, disposeTerminal, resetTerminal
 } from '../../../src/renderer/src/components/terminalPool';
 import {
-  inspectInputOrigin, markHumanOrigin
+  inspectInputOrigin, markHumanOrigin, makeNonceCorrelatedProbe, selftestQuery, selftestReply
 } from '../../../src/renderer/src/components/inputOrigin';
 
 declare global {
@@ -253,6 +253,27 @@ window.__harnessRun = async () => {
     await sleep(350);                                           // the 100ms + 250ms retries would fire under the mutant
     result.disposed_retryCallsAfterDispose = io2Calls.length - io2CallsAtDispose;   // MUST be 0
     window.cth.reportTerminalInputState = baseReport;          // restore the recording stub
+
+    // ARM 15 - BLOCKER 1 real-xterm adversarial (god fix-round-3; human requirement): a FOREIGN
+    // reply must FAIL token correlation against REAL xterm, not merely in a byte-by-byte pure
+    // test. Install the PRODUCTION nonce probe with a known nonce, then drive REAL xterm to emit
+    // foreign replies - a genuine CPR (from a foreign DSR) and a DECRQM reply for a DIFFERENT
+    // nonce - and then OUR own nonce query. Only OUR reply carries the token, so only it is
+    // consumed; the foreign replies fail the exact-match and reach the pty. No same-parse
+    // adjacency is used. KILLS THE SHAPE-ONLY MUTANT: a probe matching any CPR/$y would swallow
+    // the foreign CPR or the foreign $y, so they would NOT reach the pty.
+    const advNonce = 424242;
+    const advExpected = selftestReply(advNonce);
+    let advProbeOrigin: string | undefined;
+    entry.inputOriginProbe = makeNonceCorrelatedProbe(advExpected, (o) => { advProbeOrigin = o; });
+    sent.length = 0;
+    await write(term, '[6n');                    // foreign DSR -> REAL CPR -> fails token -> flows
+    await write(term, selftestQuery(222222));         // foreign DECRQM (different nonce) -> ESC[222222;0$y -> fails token -> flows
+    await write(term, selftestQuery(advNonce));        // OUR query -> xterm echoes ESC[424242;0$y -> matches -> consumed
+    result.adv_foreignCprReachedPty = sent.some((x) => /^\[\d+;\d+R$/.test(x.data) && x.origin === 'CONTROL');
+    result.adv_foreignYReachedPty = sent.some((x) => x.data === '[222222;0$y' && x.origin === 'CONTROL');
+    result.adv_ourReplyConsumed = advProbeOrigin === 'CONTROL' && !sent.some((x) => x.data === advExpected);
+    entry.inputOriginProbe = undefined;
 
     disposeTerminal('io');
     window.harness.report({ ok: true, ...result });

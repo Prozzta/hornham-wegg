@@ -89,4 +89,10 @@ test('INPUT ORIGIN on a rendered terminal: regimes, exclusions, programmatic pas
   // report retry must never fire, or a reused ptyId inherits its stale eligible evidence.
   assert.equal(r.disposed_hadPendingReport, true, 'a rejected report really scheduled a retry before dispose');
   assert.equal(r.disposed_retryCallsAfterDispose, 0, 'a disposed terminal fires NO further report - a reused id cannot inherit its state');
+
+  // BLOCKER 1 real-xterm adversarial (god fix-round-3; human requirement): a FOREIGN reply
+  // fails token correlation against REAL xterm - kills a shape-only probe that would swallow it.
+  assert.equal(r.adv_foreignCprReachedPty, true, 'a real foreign CPR failed the token match and reached the pty');
+  assert.equal(r.adv_foreignYReachedPty, true, 'a DECRQM reply for a DIFFERENT nonce failed the token match and reached the pty');
+  assert.equal(r.adv_ourReplyConsumed, true, 'and only OUR own nonce reply was consumed, never leaked');
 });

@@ -231,59 +231,49 @@ test('SOURCE CENSUS: the PROGRAMMATIC literal appears ONLY in the two allowed ow
 });
 
 test('the held-window discriminator and the self-test matchers are exact', () => {
-  const { isTerminalReply, SELFTEST_ARROW_RIGHT, SELFTEST_CPR } = loadTs('src/renderer/src/components/inputOrigin.ts');
+  const { isTerminalReply, SELFTEST_ARROW_RIGHT } = loadTs('src/renderer/src/components/inputOrigin.ts');
   // A protocol reply begins with ESC; composition output never does (its only C0 is DEL).
   for (const reply of ['\x1b[0n', '\x1b[6;12R', '\x1b[?1;2c', '\x1b]11;rgb:0/0/0\x1b\\'])
     assert.equal(isTerminalReply(reply), true, JSON.stringify(reply));
   for (const human of ['あ', 'abc', '\x7f', 'x', ' '])
     assert.equal(isTerminalReply(human), false, JSON.stringify(human));
-  // The self-test consumes ONLY its exact expected byte, so an unrelated reply cannot
+  // The keyboard half consumes ONLY its exact expected byte, so an unrelated reply cannot
   // satisfy it (Dwight 23.1).
   for (const yes of ['\x1b[C', '\x1bOC']) assert.match(yes, SELFTEST_ARROW_RIGHT);
   for (const no of ['\x1b[D', '\x1b[6;1R', 'x', '\x1b[C ']) assert.doesNotMatch(no, SELFTEST_ARROW_RIGHT);
-  assert.match('\x1b[6;12R', SELFTEST_CPR);
-  for (const no of ['\x1b[C', '\x1b[0n', '\x1b[R', 'R']) assert.doesNotMatch(no, SELFTEST_CPR);
-  // The CPR half is CORRELATED by a marker, not shape alone (Dwight 24.2): one write
-  // carries a DECRQM query for a fixed mode THEN the DSR, and only OUR marker reply
-  // opens the one-byte CPR-capture window.
-  const { SELFTEST_CPR_MODE, SELFTEST_DECRQM_MARK, SELFTEST_CONTROL_QUERY } =
-    loadTs('src/renderer/src/components/inputOrigin.ts');
-  assert.equal(SELFTEST_CONTROL_QUERY, '\x1b[?' + SELFTEST_CPR_MODE + '$p\x1b[6n',
-    'the query is the mode DECRQM THEN the DSR, in ONE chunk so their replies are adjacent');
-  assert.ok(SELFTEST_CONTROL_QUERY.indexOf('$p') < SELFTEST_CONTROL_QUERY.indexOf('[6n'),
-    'the marker query precedes the DSR, so the marker reply arrives before our CPR');
-  assert.match('\x1b[?' + SELFTEST_CPR_MODE + ';1$y', SELFTEST_DECRQM_MARK);
-  for (const no of ['\x1b[?2004;1$y', '\x1b[6;1R', '\x1b[?1016;1x', '\x1b[1016;1$y'])
-    assert.doesNotMatch(no, SELFTEST_DECRQM_MARK);
 });
 
-test('the CPR self-test consumes ONLY the CPR adjacent to its own marker (Dwight 24.2)', () => {
-  const { makeCorrelatedCprProbe } = loadTs('src/renderer/src/components/inputOrigin.ts');
-  // Preload the collision: a FOREIGN CPR (a program's own, at a different position) arrives
-  // BEFORE our marker. A shape-only probe would swallow it and then leak our own CPR; the
-  // correlated probe must let it flow and consume only the CPR that FOLLOWS our marker.
-  const seen = [];
-  let result;
-  const probe = makeCorrelatedCprProbe((origin) => { result = origin; });
-  // 1) foreign CPR before any marker -> NOT consumed (flows to the pty), no result yet.
-  assert.equal(probe('CONTROL', '\x1b[3;3R'), false, 'a pre-marker foreign CPR flows through');
-  assert.equal(result, undefined, 'and does not resolve the self-test');
-  // 2) an unrelated byte -> flows, still armed.
-  assert.equal(probe('HUMAN', 'x'), false);
-  // 3) OUR marker reply -> consumed (never sent), opens the one-byte window.
-  assert.equal(probe('CONTROL', '\x1b[?1016;2$y'), true, 'our marker reply is consumed');
-  // 4) the CPR ADJACENT to our marker is OURS -> consumed, and its origin is the result.
-  assert.equal(probe('CONTROL', '\x1b[9;9R'), true, 'the CPR after our marker is consumed');
-  assert.equal(result, 'CONTROL', 'and its origin (CONTROL) is what decides pass');
-  void seen;
+test('the CPR half is a NONCE-correlated DECRQM query, matched exactly (god fix-round-3 / Phyllis Rank 1)', () => {
+  const { makeNonce, selftestQuery, selftestReply } = loadTs('src/renderer/src/components/inputOrigin.ts');
+  // The query is ANSI DECRQM for a nonce (no `?` prefix), and the reply xterm 5.5.0 echoes for
+  // an unrecognised mode is `ESC[<nonce>;0$y` - the nonce verbatim, so the reply is provably ours.
+  for (let i = 0; i < 200; i++) {
+    const n = makeNonce();
+    assert.ok(Number.isInteger(n) && n >= 100000 && n <= 999999, 'nonce is a 6-digit integer: ' + n);
+    assert.equal(selftestQuery(n), '\x1b[' + n + '$p', 'ANSI DECRQM, no DEC-private ? prefix');
+    assert.equal(selftestReply(n), '\x1b[' + n + ';0$y', 'the exact echoed reply we match');
+  }
+  // Distinct nonces across calls (probabilistic - a fixed nonce would be a real defect).
+  const seen = new Set();
+  for (let i = 0; i < 50; i++) seen.add(makeNonce());
+  assert.ok(seen.size > 1, 'makeNonce is not constant');
+});
 
-  // A marker NOT followed by a CPR breaks the invariant -> the probe resolves null (the
-  // caller fails closed) and does NOT consume the stray byte.
-  let r2;
-  const p2 = makeCorrelatedCprProbe((origin) => { r2 = origin; });
-  assert.equal(p2('CONTROL', '\x1b[?1016;1$y'), true);
-  assert.equal(p2('HUMAN', 'z'), false, 'a non-CPR after the marker is left on the wire');
-  assert.equal(r2, null, 'and the self-test fails closed');
+test('the CPR self-test consumes ONLY its own exact nonce reply (Dwight 24.2, nonce form)', () => {
+  const { makeNonceCorrelatedProbe, selftestReply } = loadTs('src/renderer/src/components/inputOrigin.ts');
+  const expected = selftestReply(424242);
+  let result;
+  const probe = makeNonceCorrelatedProbe(expected, (origin) => { result = origin; });
+  // Preload the collision: foreign replies of every shape arrive, INCLUDING a DECRQM reply for
+  // a DIFFERENT nonce. None equals our expected reply, so all flow to the pty and none resolves.
+  for (const foreign of ['\x1b[3;3R', '\x1b[?1;2c', '\x1b[999999;0$y', '\x1b[0n', 'x'])
+    assert.equal(probe('CONTROL', foreign), false, 'a foreign reply flows through: ' + JSON.stringify(foreign));
+  assert.equal(result, undefined, 'and none of them resolves the self-test');
+  // OUR exact nonce reply -> consumed (never sent), and its origin decides pass.
+  assert.equal(probe('CONTROL', expected), true, 'our own nonce reply is consumed');
+  assert.equal(result, 'CONTROL', 'and its origin (CONTROL) is what decides pass');
+  // A shape-only probe (match any CPR / any $y) would have swallowed the foreign bytes above
+  // and resolved on one of them - this test is red against it.
 });
 
 test('the IPC boundary consults the validators, and refuses rather than defaults', () => {
