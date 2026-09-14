@@ -183,6 +183,77 @@ window.__harnessRun = async () => {
     result.retryLanded = recordedOk.some((st) => (st as { mouseTrackingMode?: string }).mouseTrackingMode === 'vt200');
     await write(term, '[?1000l');
 
+    // ── The five mutant-killing arms this replacement adds (Dwight 24.1 / 24.3) ──────
+    // Each NAMES the defective variant it kills and is written so it FAILS against that
+    // variant; a green arm here is only meaningful because its mutant is red.
+
+    // ARM 11 - GAP A (Dwight 24.1): held AND same-tick open at once. A real human arrow
+    // dispatched while a held (IME) window is open must classify HUMAN. classifyOutbound
+    // checks sameTick BEFORE held, so the ESC-prefixed arrow is the human's key, not a
+    // reply. KILLS THE BRANCH-SWAP MUTANT: swap the two branches and held is consulted
+    // first, where isTerminalReply sees the leading ESC and returns CONTROL - this fails.
+    await sleep(60);                                             // let any prior held drain first
+    ta.dispatchEvent(new Event('input', { bubbles: true }));    // opens the held window (no xterm composition)
+    result.gapA_heldOpen = inspectInputOrigin('io')?.held === true;
+    sent.length = 0;
+    key(ta, 'ArrowRight', 39);                                  // opens same-tick; xterm emits ESC[C
+    result.gapA_arrowData = sent[sent.length - 1]?.data;
+    result.gapA_arrowOrigin = lastOrigin();                     // HUMAN (only if sameTick is checked first)
+    result.gapA_heldStillOpen = inspectInputOrigin('io')?.held === true;   // both were open at emit
+
+    // ARM 12 - GAP B (Dwight 24.1): a protocol reply inside held returns CONTROL and MUST
+    // NOT rearm the drain. Open held at T; at ~T+30 inject a CPR reply; then poll PAST the
+    // ORIGINAL 50ms drain but before a reply-rearm drain (~T+80) would elapse. The window
+    // must already be closed. KILLS THE REARM MUTANT: a variant that rearms after returning
+    // CONTROL keeps the window open at the poll, so gapB_heldAfterOriginalDrain reads true.
+    await sleep(60);                                            // ensure the Gap-A held window has drained
+    ta.dispatchEvent(new Event('input', { bubbles: true }));   // open held at T
+    const heldOpenedAt = Date.now();
+    await sleep(30);
+    sent.length = 0;
+    term.input('\x1b[6;5R', false);                            // a CPR reply INSIDE held, ~T+30
+    result.gapB_replyOrigin = lastOrigin();                    // CONTROL
+    result.gapB_heldRightAfterReply = inspectInputOrigin('io')?.held === true;   // still true: original drain not yet
+    await sleep(Math.max(0, 66 - (Date.now() - heldOpenedAt))); // poll at ~T+66 (> 50, < 80)
+    result.gapB_heldAfterOriginalDrain = inspectInputOrigin('io')?.held;         // MUST be false (no rearm)
+
+    // ARM 13 - BLOCKER 2 overlap (Dwight 24.3), CONVERGENCE SANITY (not a standalone
+    // mutant-killer - the reused-id arm below is): fire two resets back-to-back so the first
+    // incarnation is superseded mid-flight, and confirm the entry still converges to the
+    // LATEST incarnation's pass rather than wedging. It cannot by itself catch a late stale
+    // publish, which lands ~SELFTEST_TIMEOUT_MS later; ARM 14 is the deterministic proof that
+    // a superseded/disposed run cannot report.
+    resetTerminal('io');
+    const genAfterFirstReset = entry.generation;
+    resetTerminal('io');                                       // supersede the first run immediately
+    result.overlap_genBumped = entry.generation > genAfterFirstReset;
+    result.overlap_immediate = entry.inputSelfTest;           // 'unknown': the latest run just started
+    for (let i = 0; i < 80 && entry.inputSelfTest === 'unknown'; i++) await tick();
+    result.overlap_converged = entry.inputSelfTest;           // 'pass' from the latest run
+
+    // ARM 14 - BLOCKER 2 reused-id fail-open (Dwight 24.3): a disposed terminal's OUTSTANDING
+    // report retry must never fire - or a reused ptyId inherits its stale 'eligible' evidence.
+    // Acquire a second id, force a report REJECT so a retry is scheduled, dispose before the
+    // 100ms backoff, and assert the retry never calls the bridge again for that id. KILLS THE
+    // MUTANT where disposeTerminal leaves the entry un-exited and the generation unbumped.
+    const entry2 = acquireTerminal('io2');
+    attachTerminal(entry2, root);
+    for (let i = 0; i < 60 && entry2.inputSelfTest === 'unknown'; i++) await tick();
+    const baseReport = window.cth.reportTerminalInputState as (id: string, st: unknown) => Promise<{ ok: boolean }>;
+    const io2Calls: string[] = [];
+    window.cth.reportTerminalInputState = (id: string, _st: unknown) => {
+      io2Calls.push(id);
+      return Promise.resolve({ ok: false, error: 'reject-always (simulated)' });   // force a retry to be scheduled
+    };
+    await write(entry2.term, '\x1b[?1000h');                   // new state -> report -> rejected -> retry scheduled
+    await tick();
+    result.disposed_hadPendingReport = io2Calls.length > 0;    // sanity: a report really went out first
+    disposeTerminal('io2');                                     // ends the incarnation: exited + generation bump
+    const io2CallsAtDispose = io2Calls.length;
+    await sleep(350);                                           // the 100ms + 250ms retries would fire under the mutant
+    result.disposed_retryCallsAfterDispose = io2Calls.length - io2CallsAtDispose;   // MUST be 0
+    window.cth.reportTerminalInputState = baseReport;          // restore the recording stub
+
     disposeTerminal('io');
     window.harness.report({ ok: true, ...result });
   } catch (e) {

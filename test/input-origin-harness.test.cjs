@@ -66,4 +66,27 @@ test('INPUT ORIGIN on a rendered terminal: regimes, exclusions, programmatic pas
   assert.ok(r.reportsAfterReset >= 1, 'a fresh state is reported after the reset, not the stale cache');
   assert.equal(r.lastReportSelfTest, 'pass', 'and the last post-reset report carries the proven state');
   assert.equal(r.retryLanded, true, 'a report main rejected once was retried on backoff and accepted');
+
+  // GAP A (Dwight 24.1): a real arrow inside a held window is HUMAN - kills the
+  // branch-swap mutant (held-first would call the ESC-prefixed arrow a CONTROL reply).
+  assert.equal(r.gapA_heldOpen, true, 'the input event really opened a held window');
+  assert.match(r.gapA_arrowData, /^\x1b(\[|O)C$/, 'xterm emitted the arrow as an ESC-prefixed sequence');
+  assert.equal(r.gapA_arrowOrigin, 'HUMAN', 'held + same-tick: the human arrow classifies HUMAN, not CONTROL');
+  assert.equal(r.gapA_heldStillOpen, true, 'and the held window was genuinely still open at the emit');
+
+  // GAP B (Dwight 24.1): a reply inside held is CONTROL and does NOT rearm - kills the
+  // mutant that rearms after returning CONTROL (which would hold the window open).
+  assert.equal(r.gapB_replyOrigin, 'CONTROL', 'a CPR inside the held window is CONTROL');
+  assert.equal(r.gapB_heldRightAfterReply, true, 'the reply did not destroy the held window');
+  assert.equal(r.gapB_heldAfterOriginalDrain, false, 'and past the ORIGINAL drain the window is closed: the reply never rearmed it');
+
+  // BLOCKER 2 (Dwight 24.3): async provenance work is incarnation-owned.
+  // Convergence sanity - a double reset does not wedge the self-test (see the scenario note):
+  assert.equal(r.overlap_genBumped, true, 'a second reset bumped the incarnation token');
+  assert.equal(r.overlap_immediate, 'unknown', 'the superseding reset restarts the self-test');
+  assert.equal(r.overlap_converged, 'pass', 'and it converges to the LATEST run');
+  // The deterministic incarnation-ownership mutant-killer: a disposed terminal's outstanding
+  // report retry must never fire, or a reused ptyId inherits its stale eligible evidence.
+  assert.equal(r.disposed_hadPendingReport, true, 'a rejected report really scheduled a retry before dispose');
+  assert.equal(r.disposed_retryCallsAfterDispose, 0, 'a disposed terminal fires NO further report - a reused id cannot inherit its state');
 });

@@ -89,9 +89,12 @@ export interface TerminalEntry {
   inputStateReported?: TerminalInputState;
   /** Self-test outcome for this incarnation; 'unknown' until it has run. */
   inputSelfTest: 'unknown' | 'pass' | 'fail';
-  /** Bumped every time this pty is respawned under the same id. Late events from
-   * the OLD process carry the generation they were registered under, so they can
-   * be recognised and dropped instead of corrupting the replacement. */
+  /** The INCARNATION TOKEN. Bumped on every establish (open/reset/relaunch) and on
+   * dispose, so a live pty session under this id owns exactly one value. Every async
+   * bit of input provenance - self-test probes, its timeout, its completion, and each
+   * report retry - captures the generation it began under and drops the instant that
+   * value moves on (Dwight 24.3), so a late callback can neither clear a newer probe,
+   * mutate a newer entry, nor report stale state under a REUSED ptyId (a fail-open). */
   generation: number;
   webgl?: WebglAddon;
 }
@@ -690,21 +693,24 @@ const INPUT_STATE_RETRY_MS = [100, 250, 500, 1000, 2000];
  *  Optional-chained: the Electron harness stubs `window.cth` without this method, and a
  *  missing bridge must not throw inside xterm's parser - it simply leaves main NO_STATE,
  *  the fail-closed answer, not a silent pass. */
-function reportInputState(entry: TerminalEntry, attempt = 0): void {
-  if (entry.exited) return;
+function reportInputState(entry: TerminalEntry, gen: number, attempt = 0): void {
+  if (entry.exited || entry.generation !== gen) return;   // disposed or superseded incarnation: drop
   const state = currentInputState(entry);
   if (sameInputState(entry.inputStateReported, state)) return;   // already ACKED this exact state
   const p = window.cth.reportTerminalInputState?.(entry.ptyId, state);
   if (!p) return;   // no bridge (harness): nothing to ACK, nothing to retry
   void p.then((r) => {
+    if (entry.exited || entry.generation !== gen) return;   // incarnation ended while we waited: publish nothing
     if (r && r.ok) { entry.inputStateReported = state; return; }   // cache ONLY on ACK
-    scheduleReportRetry(entry, attempt);
-  }).catch(() => scheduleReportRetry(entry, attempt));
+    scheduleReportRetry(entry, gen, attempt);
+  }).catch(() => scheduleReportRetry(entry, gen, attempt));
 }
 
-function scheduleReportRetry(entry: TerminalEntry, attempt: number): void {
-  if (entry.exited || attempt >= INPUT_STATE_RETRY_MS.length) return;   // give up -> stays NO_STATE
-  setTimeout(() => reportInputState(entry, attempt + 1), INPUT_STATE_RETRY_MS[attempt]);
+function scheduleReportRetry(entry: TerminalEntry, gen: number, attempt: number): void {
+  // Superseded (a newer establish bumped generation) or disposed (exited) -> stop; a
+  // permanently-down bridge exhausts the backoff and the terminal stays NO_STATE.
+  if (entry.exited || entry.generation !== gen || attempt >= INPUT_STATE_RETRY_MS.length) return;
+  setTimeout(() => reportInputState(entry, gen, attempt + 1), INPUT_STATE_RETRY_MS[attempt]);
 }
 
 /** Establish input provenance for THIS live incarnation: report the attached-but-
@@ -713,22 +719,35 @@ function scheduleReportRetry(entry: TerminalEntry, attempt: number): void {
  *  every same-id respawn - Dwight 23.3: a reused entry that never re-ran this left the
  *  new main session UNKNOWN forever. */
 function establishInputProvenance(entry: TerminalEntry): void {
-  if (!entry.opened) return;
+  if (!entry.opened || entry.exited) return;
+  // Bumping the generation cancels any in-flight prior run: its gen-guarded setProbe/
+  // clearProbe become no-ops (a late timeout cannot clear THIS run's probe) and its
+  // result-publish is dropped (a late completion cannot publish as this incarnation).
+  const gen = ++entry.generation;
   entry.inputSelfTest = 'unknown';
   entry.inputStateReported = undefined;   // the new session has no prior state; force a fresh report
-  reportInputState(entry);
+  entry.inputOriginProbe = undefined;     // drop any probe a superseded run left installed
+  reportInputState(entry, gen);
   void runInputOriginSelfTest(
     entry.ptyId, entry.term,
-    (consumer) => { entry.inputOriginProbe = consumer; },
-    () => { entry.inputOriginProbe = undefined; }
-  ).then((r) => { entry.inputSelfTest = r; reportInputState(entry); })
-    .catch(() => { entry.inputSelfTest = 'fail'; reportInputState(entry); });
+    (consumer) => { if (entry.generation === gen) entry.inputOriginProbe = consumer; },
+    () => { if (entry.generation === gen) entry.inputOriginProbe = undefined; }
+  ).then((r) => {
+    if (entry.exited || entry.generation !== gen) return;   // a newer incarnation (or dispose) owns the entry now
+    entry.inputSelfTest = r; reportInputState(entry, gen);
+  }).catch(() => {
+    if (entry.exited || entry.generation !== gen) return;
+    entry.inputSelfTest = 'fail'; reportInputState(entry, gen);
+  });
 }
 
 /** Read `term.modes` AFTER xterm has applied the DEC mode the parser just saw. A CSI
  *  handler runs before xterm's own, so reading inside it would see the previous mode. */
 function scheduleInputStateReport(entry: TerminalEntry): void {
-  queueMicrotask(() => reportInputState(entry));
+  // The live mouse-mode mirror: report under the CURRENT generation, read at fire
+  // time, so it is never dropped as stale yet is still incarnation-guarded if the
+  // terminal was disposed between the mode change and this microtask.
+  queueMicrotask(() => reportInputState(entry, entry.generation));
 }
 
 /** Re-parent a pty's terminal into `container`, opening xterm on first attach. */
@@ -882,6 +901,12 @@ export function resetTerminal(
 export function disposeTerminal(ptyId: string): void {
   const entry = pool.get(ptyId);
   if (!entry) return;
+  // A dispose ENDS the incarnation (Dwight 24.3). Marking exited and bumping the
+  // generation makes every outstanding self-test completion and report retry a no-op
+  // the instant it fires, so none can report stale state under a later REUSED ptyId.
+  entry.exited = true;
+  entry.generation++;
+  entry.inputOriginProbe = undefined;
   entry.unsub.forEach((u) => { try { u(); } catch { /* noop */ } });
   try { entry.webgl?.dispose(); } catch { /* noop */ }
   try { entry.term.dispose(); } catch { /* noop */ }

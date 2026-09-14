@@ -67,8 +67,21 @@ export type ProbeConsumer = (origin: InputOrigin, data: string) => boolean;
  *  consumes exactly this and nothing else. */
 export const SELFTEST_ARROW_RIGHT = /^\x1b(\[|O)C$/;
 /** A Cursor-Position Report, the reply to the self-test's `ESC[6n`: `ESC[<r>;<c>R`.
- *  The control half consumes exactly this shape and nothing else. */
+ *  Shape alone does NOT correlate a CPR to OUR request - see SELFTEST_CONTROL_QUERY. */
 export const SELFTEST_CPR = /^\x1b\[\d+;\d+R$/;
+/** The DEC private mode the CPR half queries as a CORRELATION MARKER. 1016 (SGR-pixel
+ *  mouse) is recognised by xterm 5.5.0 - so `ESC[?1016$p` returns a deterministic
+ *  `ESC[?1016;<v>$y` (browser/InputHandler requestMode) - and is essentially never
+ *  queried by an application, so a foreign reply of THIS exact shape landing inside the
+ *  self-test's millisecond window is the stated residual, far narrower than a bare
+ *  same-shape CPR. VERSION-PINNED: the reply format is xterm 5.5.0's, not a contract. */
+export const SELFTEST_CPR_MODE = 1016;
+/** The reply to `ESC[?1016$p`: `ESC[?1016;<value>$y`. Matched EXACTLY, so only our own
+ *  marker - not an arbitrary DECRPM reply - opens the one-byte CPR-capture window. */
+export const SELFTEST_DECRQM_MARK = /^\x1b\[\?1016;\d+\$y$/;
+/** ONE write: the marker query THEN the DSR, in a single chunk so xterm emits their
+ *  replies ADJACENTLY in one synchronous parse - that adjacency is the correlation. */
+export const SELFTEST_CONTROL_QUERY = '\x1b[?1016$p\x1b[6n';
 /** How long a self-test half waits for its correlated byte before failing closed. */
 export const SELFTEST_TIMEOUT_MS = 1000;
 
@@ -231,6 +244,30 @@ export function isTerminalReply(data: string): boolean {
 }
 
 /**
+ * The CPR half's CORRELATED probe, as a pure factory so its adjacency rule can be
+ * driven byte-by-byte in a unit test (Dwight 24.2 asked the committed test to preload
+ * the collision and prove OUR CPR, not merely some CPR, is the one consumed). The rule:
+ * ignore every byte until OUR marker reply (consume that), then the IMMEDIATELY next
+ * byte is our CPR - proven adjacent because xterm emits the marker reply and the CPR as
+ * two back-to-back triggerDataEvent calls in one synchronous parse of SELFTEST_CONTROL_
+ * QUERY, with nothing interleaved. A foreign or pre-marker CPR fails the marker test and
+ * flows on untouched; a shape-only probe would instead swallow it and leak ours.
+ */
+export function makeCorrelatedCprProbe(onResult: (origin: InputOrigin | null) => void): ProbeConsumer {
+  let sawMarker = false;
+  return (origin, data) => {
+    if (!sawMarker) {
+      if (!SELFTEST_DECRQM_MARK.test(data)) return false;   // incl. a foreign/pre-marker CPR: flow on, stay armed
+      sawMarker = true;                                     // our marker reply: consume it, never sent
+      return true;
+    }
+    const isCpr = SELFTEST_CPR.test(data);                  // the byte adjacent to our marker is our CPR
+    onResult(isCpr ? origin : null);                        // null -> invariant broken -> the caller fails closed
+    return isCpr;                                           // consume our CPR; leave anything else on the wire
+  };
+}
+
+/**
  * THE STARTUP SELF-TEST (rev 13 step 7). Proves, on THIS terminal on THIS build, the two
  * things the reconstruction rests on and cannot get from any public contract:
  *   1. a keyboard event dispatched into the terminal produces a byte that classifies
@@ -286,9 +323,26 @@ export async function runInputOriginSelfTest(
   // Close the same-tick window before the control half so its byte cannot ride it.
   await new Promise<void>((r) => { queueMicrotask(r); });
 
-  // Half 2: the CPR reply to `ESC[6n` must be `ESC[<r>;<c>R` and classify CONTROL.
-  const ctlResult = await1(SELFTEST_CPR);
-  term.write('\x1b[6n');
+  // Half 2, CORRELATED BY A MARKER (Dwight 24.2). A bare SELFTEST_CPR match is only
+  // SHAPE-correlated: `term.write` is async through xterm's WriteBuffer, and PTY output
+  // (a program's own DSR) can already be queued when the probe arms, so a prequeued
+  // foreign CPR would satisfy the probe while OUR later CPR escaped to the pty. We make
+  // the reply provably ours WITHOUT reading any xterm internal: emit, as ONE write, a
+  // DECRQM query for a fixed mode THEN the DSR (SELFTEST_CONTROL_QUERY). xterm parses
+  // the chunk in order and fires the mode reply and then the CPR as two back-to-back
+  // triggerDataEvent calls in the SAME synchronous parse (CoreService does not buffer or
+  // concatenate them - the version-pinned fact in Dwight 24.1 Q2), so no byte from any
+  // other chunk lands between them. makeCorrelatedCprProbe consumes only the CPR adjacent
+  // to OUR marker; a foreign CPR from another chunk flows through untouched. Only
+  // `terminal.write(data)` is used - public, documented (R1).
+  const ctlResult = new Promise<InputOrigin | 'timeout'>((resolve) => {
+    const timer = setTimeout(() => { clearProbe(); resolve('timeout'); }, SELFTEST_TIMEOUT_MS);
+    setProbe(makeCorrelatedCprProbe((origin) => {
+      clearTimeout(timer); clearProbe();
+      resolve(origin ?? 'timeout');   // a non-CPR after our marker breaks the invariant -> fail closed
+    }));
+  });
+  term.write(SELFTEST_CONTROL_QUERY);
   return (await ctlResult) === 'CONTROL' ? 'pass' : 'fail';
 }
 
