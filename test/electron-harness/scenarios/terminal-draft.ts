@@ -93,6 +93,7 @@ window.__harnessRun = async () => {
     const past = Date.now() + ECHO_GRACE_MS + 50;
     result.unopened = {
       opened: detached.opened,
+      everAttached: detached.everAttached,
       // No rendered screen, so the screen cannot clear anything and the predicate
       // falls back to the keystroke model. This is the reading that cannot
       // distinguish an empty box from a full one.

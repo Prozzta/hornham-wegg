@@ -50,7 +50,12 @@ test('HARNESS: without a rendered screen the same question cannot be answered', 
   // phantom-draft bug, and no assertion made without a renderer can see past it.
   const r = await runScenario(scenario('terminal-draft'), { timeoutMs: 60_000 });
   assert.equal(r.ok, true);
-  assert.equal(r.unopened.opened, false, 'never attached, so never opened');
+  // Since the acquire-time detached attach this terminal IS opened - that is the point of
+  // that stage - but it has still never been rendered, which is what the question needs.
+  // The claim this test exists for is unchanged and is the second assertion: with no screen
+  // to read, the predicate falls back to the keystroke model and keeps the block.
+  assert.equal(r.unopened.opened, true, 'opened at acquire, into a host no view has shown');
+  assert.equal(r.unopened.everAttached, false, 'but never attached, so never rendered');
   assert.equal(r.unopened.hasDraft, true, 'and the answer is the keystroke model, not the screen');
 });
 

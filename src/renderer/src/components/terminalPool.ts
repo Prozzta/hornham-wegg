@@ -51,8 +51,15 @@ export interface TerminalEntry {
   fit: FitAddon;
   /** The element xterm renders into; views re-parent this in/out of the DOM. */
   host: HTMLDivElement;
-  /** xterm is only `open()`ed once its host is first attached to the document. */
+  /** xterm is `open()`ed at ACQUIRE time, into a host that is NOT yet in the document
+   *  (see acquireTerminal). Attaching only re-parents that host into a view. */
   opened: boolean;
+  /** Has this terminal ever been in the document — i.e. has it ever had a RENDERED
+   *  screen? Distinct from `opened` since the acquire-time attach: every pooled
+   *  terminal is opened, so `opened` no longer answers "is the screen evidence of
+   *  anything". Only `promptLineHasText` needs that distinction, and it is the one
+   *  place where getting it wrong hands a user's prompt to automation. */
+  everAttached: boolean;
   exited: boolean;
   /** Stream subscriptions to tear down on dispose. */
   unsub: Array<() => void>;
@@ -177,8 +184,6 @@ export function acquireTerminal(ptyId: string, theme?: ThemeMap, fontSize = 14):
   term.loadAddon(new Unicode11Addon());
   term.unicode.activeVersion = '11';
   registerMarkdownLinkProvider(term, ptyId);
-  // NOTE: don't open() yet — xterm needs its host connected to the document to
-  // measure correctly. We open on first attach (see attachTerminal).
 
   const entry: TerminalEntry = {
     ptyId,
@@ -186,6 +191,7 @@ export function acquireTerminal(ptyId: string, theme?: ThemeMap, fontSize = 14):
     fit,
     host,
     opened: false,
+    everAttached: false,
     exited: false,
     unsub: [],
     recovery: createTerminalRecoveryState(),
@@ -439,6 +445,30 @@ export function acquireTerminal(ptyId: string, theme?: ThemeMap, fontSize = 14):
   });
 
   pool.set(ptyId, entry);
+
+  // ── ACQUIRE-TIME DETACHED ATTACH ─────────────────────────────────────────
+  // Open xterm NOW, into `host` while it is still outside the document, so the input
+  // provenance DOM half is wired for EVERY acquired terminal instead of only the ones a
+  // view has shown. App.tsx pre-warms one terminal per agent (App.tsx: acquireTerminal per
+  // live agent), so before this the unviewed majority reported `inputOriginAttached: false`
+  // and could never become eligible however long they ran. Human ruling: "GO WITH DETACHED".
+  //
+  // THE PRICE, MEASURED ON THIS BUILD, NOT ASSUMED — ONE GRID COLUMN. xterm's Viewport reads
+  // the scrollbar width ONCE, in its constructor, from offsetWidth (Viewport.ts:70). Detached
+  // that is 0, so it keeps the 15px FALLBACK for this terminal's whole life, while a terminal
+  // opened attached measures the platform's real bar (17px on this Windows box). FitAddon
+  // subtracts it, so for the same 640px host a detached-opened terminal proposes 78 columns
+  // where an attached-opened one proposes 77 — and no later fit or reflow re-measures it. The
+  // cost is one column of grid, and one pixel of the last column under the scrollbar, on
+  // platforms whose bar is not 15px, for every terminal opened before its first view.
+  //
+  // The OFFSCREEN variant deletes that cost (a real offsetWidth measures the real bar) and was
+  // DECLINED, because it buys the column back with three behaviour changes: fit() stops being
+  // a no-op before first view, so the relaunch paths here that fit-then-spawn would size the
+  // pty to a phantom box and repaint on first view; the helper textarea becomes reachable by
+  // Tab; and every pooled terminal adds a live "Terminal input" textbox to the accessibility
+  // tree with nothing on screen. Detached keeps fit() inert, which is what those paths rely on.
+  openTerminalOnce(entry);
   return entry;
 }
 
@@ -473,8 +503,8 @@ const ECHO_GRACE_MS = 1000;
  *  arrive" bug. xterm already holds the rendered screen, so read it instead of
  *  trusting the count.
  *
- *  Returns null when the screen is not evidence of anything: the terminal has not
- *  been opened, the row is missing, or the last keystroke is too recent for the
+ *  Returns null when the screen is not evidence of anything: the terminal has never
+ *  been RENDERED, the row is missing, or the last keystroke is too recent for the
  *  echo to have landed. Deliberately only ever used to CLEAR a phantom, never to
  *  invent a draft: "empty" drops the block, while "has text" or "don't know"
  *  falls back to the keystroke model and keeps it. The asymmetry matters because
@@ -482,7 +512,12 @@ const ECHO_GRACE_MS = 1000;
  *  automation and fuses a message onto what the user is writing, where a wrong
  *  "has text" only parks a queued message until the draft expires. */
 function promptLineHasText(entry: TerminalEntry, now = Date.now()): boolean | null {
-  if (!entry.opened || entry.exited) return null;
+  // NOT `!entry.opened`. Since the acquire-time detached attach every pooled terminal is
+  // opened, including ones no view has ever shown, and such a terminal's buffer is EMPTY
+  // while its keystroke model may not be - so reading it would return "empty" and DROP the
+  // block, the one mistake this predicate is built never to make. `everAttached` is the
+  // property `opened` used to stand for here: has this screen ever existed to be read.
+  if (!entry.everAttached || entry.exited) return null;
   // Too soon after the last keystroke for the echo to have landed — the buffer
   // is showing us the past, so it cannot clear anything.
   if (entry.inputDirtyAt && now - entry.inputDirtyAt < ECHO_GRACE_MS) return null;
@@ -750,24 +785,34 @@ function scheduleInputStateReport(entry: TerminalEntry): void {
   queueMicrotask(() => reportInputState(entry, entry.generation));
 }
 
-/** Re-parent a pty's terminal into `container`, opening xterm on first attach. */
+/** Open xterm ONCE for this entry and wire the input-provenance DOM half.
+ *
+ *  Called at ACQUIRE time, against a host that is not in the document yet — that is the
+ *  whole point of the acquire-time attach, and acquireTerminal carries the priced cost.
+ *  attachTerminal calls it again, so an entry whose acquire-time open did not happen (a
+ *  future caller building an entry another way) still opens on first view rather than
+ *  never; for the normal entry it is a no-op because `opened` is already true.
+ *
+ *  THIS GUARD IS LOAD-BEARING FOR INPUT PROVENANCE, not only for WebGL. xterm creates
+ *  `term.element` and `term.textarea` INSIDE open() (browser/Terminal.ts:444), so the
+ *  provenance listeners can only be attached after it, and only once: a second open()
+ *  would recreate the element and orphan them with no error and no symptom except that
+ *  human input silently stops being seen. `attachInputOrigin` lives INSIDE this guard and
+ *  must move with it if it is ever relaxed. (L0-FUSION rev 11 dimension 7.) */
+function openTerminalOnce(entry: TerminalEntry): void {
+  if (entry.opened) return;
+  entry.term.open(entry.host);
+  entry.opened = true;
+  entry.unsub.push(attachInputOrigin(entry.ptyId, entry.term));
+  establishInputProvenance(entry);
+}
+
+/** Re-parent a pty's terminal into `container`. xterm is already open (acquire time,
+ *  detached); the open below is the fallback described in openTerminalOnce. */
 export function attachTerminal(entry: TerminalEntry, container: HTMLElement): void {
   container.appendChild(entry.host);
-  if (!entry.opened) {
-    // open() must come first — the WebGL addon can only load onto an opened
-    // terminal, and xterm needs its host in the document to measure the cell.
-    entry.term.open(entry.host);
-    entry.opened = true;
-    // THIS GUARD IS LOAD-BEARING FOR INPUT PROVENANCE, not only for WebGL.
-    // xterm creates `term.element` and `term.textarea` INSIDE open() (browser/
-    // Terminal.ts:444), so the provenance listeners below can only be attached
-    // now, and only once: a second open() would recreate the element and orphan
-    // them with no error and no symptom except that human input silently stops
-    // being seen. If this guard is ever relaxed, `attachInputOrigin` must move
-    // with it. (L0-FUSION rev 11 dimension 7.)
-    entry.unsub.push(attachInputOrigin(entry.ptyId, entry.term));
-    establishInputProvenance(entry);
-  }
+  entry.everAttached = true;   // from here the rendered screen is evidence (promptLineHasText)
+  openTerminalOnce(entry);
   leaseWebglRenderer(entry);
   // PTY startup output can arrive before this pooled terminal subscribes.
   // Request one same-size redraw after open/subscription even when fit() later

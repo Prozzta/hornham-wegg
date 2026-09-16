@@ -286,15 +286,39 @@ test('the IPC boundary consults the validators, and refuses rather than defaults
 });
 
 test('attachInputOrigin is called INSIDE the open() guard and nowhere else', () => {
+  // The guard moved with the acquire-time detached attach: it is now the once-guard of
+  // openTerminalOnce, called from acquireTerminal (detached) and again from
+  // attachTerminal. What it pins is unchanged and still load-bearing - a second open()
+  // recreates term.element and orphans the provenance listeners silently - so this test
+  // follows the guard rather than the old location.
   const pool = src('src/renderer/src/components/terminalPool.ts');
-  const guardStart = pool.indexOf('if (!entry.opened) {');
-  const guardEnd = pool.indexOf('\n  }\n', guardStart);
-  const inside = pool.slice(guardStart, guardEnd);
+  const fnStart = pool.indexOf('function openTerminalOnce(');
+  assert.ok(fnStart > 0, 'the open-once guard exists');
+  const inside = pool.slice(fnStart, pool.indexOf('\n}\n', fnStart));
+  assert.match(inside, /if \(entry\.opened\) return;/, 'it opens at most once');
   assert.match(inside, /entry\.term\.open\(entry\.host\)/);
   assert.match(inside, /attachInputOrigin\(entry\.ptyId, entry\.term\)/,
     'the attach sits inside the guard, after open()');
+  assert.ok(inside.indexOf('entry.term.open(') < inside.indexOf('attachInputOrigin('),
+    'open() really comes first - xterm builds term.element/textarea inside it');
   assert.equal((pool.match(/attachInputOrigin\(/g) || []).length, 1, 'exactly one attach site');
-  assert.match(inside, /LOAD-BEARING FOR INPUT PROVENANCE/, 'and the guard says why, AT the guard');
+  // The reason must sit AT the guard, not only in a decision record.
+  const doc = pool.slice(Math.max(0, fnStart - 1400), fnStart);
+  assert.match(doc, /LOAD-BEARING FOR INPUT PROVENANCE/, 'and the guard says why, AT the guard');
+});
+
+test('the acquire-time open is at acquire, and its one-column cost is priced AT that site', () => {
+  // The human accepted ONE GRID COLUMN for opening detached, and the instruction that came
+  // with the ruling was that the cost must live at the attach site, not only on a card:
+  // "a priced cost that lives only in a decision record becomes an unexplained bug report
+  // six months later". This pins that it is still there, with the measurement in it.
+  const pool = src('src/renderer/src/components/terminalPool.ts');
+  const acq = pool.slice(pool.indexOf('export function acquireTerminal('), pool.indexOf('export function isTerminalAutomationSafe('));
+  assert.match(acq, /openTerminalOnce\(entry\);/, 'acquire opens the terminal');
+  assert.match(acq, /Viewport\.ts:70/, 'the cost names where xterm measures the scrollbar once');
+  assert.match(acq, /15px/, 'and the fallback it takes when detached');
+  assert.ok(acq.indexOf('ACQUIRE-TIME DETACHED ATTACH') < acq.indexOf('openTerminalOnce(entry);'),
+    'the price is stated AT the call, above it');
 });
 
 test('focus and blur are excluded by name and appear in no listened-to list', () => {
