@@ -7,9 +7,11 @@
  * THE QUESTION, IN god's WORDS: can the harness observe "the input box is empty AND
  * nothing was submitted" for a real provider TUI? Andy's falsifier half works with
  * node-pty alone; the POSITIVE half needs a rendered screen, because
- * `promptLineHasText` returns `null` — "not evidence of anything" — unless
- * `entry.opened` is true, and `entry.opened` only becomes true when `term.open()`
- * has run against a real element.
+ * `promptLineHasText` returns `null` — "not evidence of anything" — unless the
+ * terminal has actually been RENDERED. Since the acquire-time detached attach that
+ * property is `entry.everAttached`, set on first attach, and NOT `entry.opened`:
+ * every pooled terminal is now opened at acquire, into a host no view has shown, so
+ * `opened` no longer distinguishes a screen that exists from one that never has.
  *
  * THESE TESTS LAUNCH A REAL ELECTRON PROCESS. That costs a few seconds and is the
  * whole point: jsdom has no layout engine, so every geometry- or render-dependent

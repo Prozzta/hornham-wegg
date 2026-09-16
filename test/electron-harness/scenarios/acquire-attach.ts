@@ -52,6 +52,21 @@ const write = (term: { write: (d: string, cb?: () => void) => void }, data: stri
 const lastOrigin = () => sent.length ? sent[sent.length - 1].origin : null;
 const key = (ta: HTMLTextAreaElement, k: string, code: number) =>
   ta.dispatchEvent(new KeyboardEvent('keydown', { key: k, code: k, keyCode: code, which: code, bubbles: true, cancelable: true } as KeyboardEventInit));
+/** Dispatch a key on xterm's helper textarea IF it has built one, and say whether it did.
+ *
+ *  THE SCENARIO MUST NOT THROW BEFORE IT HAS REPORTED. Under the lifecycle this scenario
+ *  kills - open() deferred to first attach - there is no element and no textarea at all
+ *  before a view, so dispatching on it raises a TypeError, the whole run comes back as a
+ *  bare `ok:false`, and the test fails at `r.ok` instead of at the named assertion that
+ *  says WHICH property was lost. A mutant has to fail loudly in the right place: "the
+ *  scenario threw" is not a diagnosis. So every fact is recorded first, and the keystroke
+ *  is attempted defensively. (Dwight, follow-up finding 1.) */
+const keyIfPossible = (term: { textarea?: HTMLTextAreaElement }, k: string, code: number): boolean => {
+  const ta = term.textarea;
+  if (!ta) return false;
+  key(ta, k, code);
+  return true;
+};
 const settle = async (pred: () => boolean, turns = 300): Promise<void> => {
   for (let i = 0; i < turns && !pred(); i++) await tick();
 };
@@ -89,7 +104,7 @@ window.__harnessRun = async () => {
 
     // A real keystroke on the detached textarea still classifies HUMAN...
     sent.length = 0;
-    key(entry.term.textarea!, 'ArrowRight', 39);
+    result.detachedKeyDispatched = keyIfPossible(entry.term, 'ArrowRight', 39);
     result.detachedKeyOrigin = lastOrigin();
     result.detachedKeyData = sent.length ? sent[sent.length - 1].data : null;
 
@@ -122,7 +137,7 @@ window.__harnessRun = async () => {
     result.hostConnectedAfterAttach = entry.host.isConnected === true;
 
     sent.length = 0;
-    key(entry.term.textarea!, 'ArrowRight', 39);
+    result.attachedKeyDispatched = keyIfPossible(entry.term, 'ArrowRight', 39);
     result.attachedKeyOrigin = lastOrigin();
     result.attachedKeyEmissions = sent.length;   // exactly 1: no duplicated listener
 

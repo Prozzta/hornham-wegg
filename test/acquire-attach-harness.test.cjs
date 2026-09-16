@@ -39,6 +39,7 @@ test('ACQUIRE-TIME DETACHED ATTACH: an unviewed terminal has full input provenan
   assert.equal(r.reportedSelfTest, 'pass', 'and that its self-test passed');
 
   // ── Classification works detached, in both directions. ──
+  assert.equal(r.detachedKeyDispatched, true, 'a key was really dispatched - xterm had built a textarea to dispatch on');
   assert.equal(r.detachedKeyOrigin, 'HUMAN',
     `a keystroke on the detached textarea is HUMAN (data ${JSON.stringify(r.detachedKeyData)})`);
   assert.equal(r.windowClosedBeforeReply, true,
@@ -50,6 +51,7 @@ test('ACQUIRE-TIME DETACHED ATTACH: an unviewed terminal has full input provenan
   assert.equal(r.generationUnchangedByAttach, true, 'attach did not re-establish provenance');
   assert.equal(r.noExtraListenerOnAttach, true, 'attach added no second input-origin listener');
   assert.equal(r.hostConnectedAfterAttach, true, 'the host really is in the document after attach');
+  assert.equal(r.attachedKeyDispatched, true, 'and a key was really dispatched after attach too');
   assert.equal(r.attachedKeyOrigin, 'HUMAN', 'a keystroke after attach is still HUMAN');
   assert.equal(r.attachedKeyEmissions, 1, 'and is emitted exactly ONCE - no duplicated listener');
 
