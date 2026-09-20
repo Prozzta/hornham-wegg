@@ -33,6 +33,7 @@ export interface OwnerCapacity {
   revalidate(claim: OwnerClaim, target: string | null): { verdict: AdmissionDecision['verdict']; reason: string };
   confirmLaunch(decision: AdmissionDecision): void;
   cancelGrant(decision: AdmissionDecision): void;
+  holdGrant(decision: AdmissionDecision): void;
 }
 
 export interface OwnerWiring {
@@ -96,7 +97,8 @@ export function buildOwnerDeps(w: OwnerWiring): OwnerDeps {
       admit: (agentId, workClass) => w.capacity.admit(agentId, workClass),
       revalidate: (claim) => w.capacity.revalidate(claim, claim.target),
       confirmLaunch: (decision) => w.capacity.confirmLaunch(decision),
-      cancelGrant: (decision) => w.capacity.cancelGrant(decision)
+      cancelGrant: (decision) => w.capacity.cancelGrant(decision),
+      holdGrant: (decision) => w.capacity.holdGrant(decision)
     },
     now: w.now ?? (() => Date.now()),
     // A submission in flight must never be the reason this process stays alive.

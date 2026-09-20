@@ -146,7 +146,8 @@ const owner = new AutomaticSubmitOwner(buildOwnerDeps({
     admit: (_agentId, workClass) => ({ verdict: 'ALLOW', reason: 'AVAILABLE', poolKey: 'pool', state: null, workClass, limitEpochAt: null, grantId: null }) as never,
     revalidate: () => (lateRefuse ? { verdict: 'REFUSE', reason: 'LIMITED' } : { verdict: 'ALLOW', reason: 'AVAILABLE' }) as never,
     confirmLaunch: () => { /* nothing to confirm */ },
-    cancelGrant: () => { /* nothing to cancel */ }
+    cancelGrant: () => { /* nothing to cancel */ },
+    holdGrant: () => { /* nothing to hold */ }
   },
   ptyForAgent: (agentId) => agentId.replace(/^agent-/, ''),
   providerForPty: () => 'claude',
@@ -194,13 +195,16 @@ window.__harnessRun = async () => {
       const again = await submit('int', 'r-int-2', 'a later automatic message');
       const manual = await submit('int', 'r-int-3', 'a later send-now message', 'USER_RELEASED');
       const lineBeforeResolve = pty('int').tui.line;
-      const resolved = owner.resolveInterference('int');
+      // There is no default resolution: a bare "resolved" is refused and the hold stays.
+      const bare = (owner.resolveInterference as (p: string, how?: unknown) => boolean)('int');
+      const stillHeld = owner.inhibition('int') !== null;
+      const resolved = owner.resolveInterference('int', 'SEND_AGAIN');
       const afterResolve = await submit('int', 'r-int-4', 'after the human resolved');
       result.int = {
         ready: t.ready, outcome, writesAtOutcome,
         humanBytes: pty('int').log.filter((e) => e.via === 'BRIDGE' && e.origin === 'HUMAN').map((e) => e.data),
         promptRow: t.rowText(), oracle: readScreenForNeedle('int', 'interfered message two'),
-        submitted: pty('int').tui.submitted, again, manual, resolved,
+        submitted: pty('int').tui.submitted, again, manual, bare, stillHeld, resolved,
         lineBeforeResolve, lineAfterResolve: pty('int').tui.line,
         afterResolve, ownerWritesAtEnd: ownerWrites('int'),
         inhibitedAtEnd: owner.inhibition('int') !== null

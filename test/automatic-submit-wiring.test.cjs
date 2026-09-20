@@ -72,6 +72,11 @@ function rig(over = {}) {
     deliver: () => {}, now: () => r.now, setTimer,
     clearTimer: (h) => { r.timers = r.timers.filter((t) => t.seq !== (h && h.id)); }
   }, r.tracker);
+  if (over.Admission) {
+    // A MUTANT admission seam, wired exactly as CapacityRuntime wires the real one.
+    const real = r.runtime.admission;
+    r.runtime.admission = new over.Admission(real.deps);
+  }
   r.pty = {
     write: (id, data, origin) => {
       assert.equal(origin, 'PROGRAMMATIC', 'the owner only ever declares PROGRAMMATIC');
@@ -186,14 +191,126 @@ test('L0-WAKE via the owner: a failed text write never presses Enter', async () 
   assert.equal(out.reason, 'STAGE_WRITE_FAILED');
 });
 
-test('L0-WAKE via the owner: an Enter that THROWS is not a launch - the recovery turn goes back', async () => {
+test('L0-WAKE via the owner: an Enter that THROWS is not a launch - and the recovery turn is HELD FOR A HUMAN, not handed back', async () => {
+  // god's ruling on G1b. Our nudge is still on a live prompt where a person can press
+  // Enter on it, so the evidence has run out: the turn is neither spent nor returned.
   const r = rig();
   recovering(r);
   r.writeThrows = (d) => d === '\r';
   const out = await r.settle(wake(r));
   assert.equal(out.kind, 'INTERFERED'); assert.equal(out.reason, 'ENTER_WRITE_FAILED');
-  assert.equal(r.runtime.admit('jim').verdict, 'ALLOW',
-    'the epoch’s single recovery turn was RETURNED, so a real turn can still take it');
+  assert.deepEqual([r.runtime.admit('jim').verdict, r.runtime.admit('jim').reason], ['REFUSE', ADMISSION_REASON.RECOVERING_SPENT],
+    'the epoch’s single turn is IN SUSPENSE: nobody else is handed it while a person may still launch ours');
+  assert.equal(r.owner.resolveInterference('pty-jim', 'SEND_AGAIN'), true);
+  assert.equal(r.runtime.admit('jim').verdict, 'ALLOW', 'a person says it was NOT sent: only then does the turn go back');
+});
+
+// --- The grant in suspense, against the REAL admission seam (stage 5.6) -------------------
+//
+// THE COLLISION god asked to be told about: admission ABANDONS an unconfirmed reservation
+// after RECOVERY_RESERVATION_TTL_MS (60 s). "Do not return the grant at INTERFERED" is
+// therefore not enough by itself - left merely unconfirmed, the turn would be handed to
+// someone else a minute later, while a person is still reading the prompt. So the seam has
+// a third state, `holdGrantForHuman`: not confirmed, not abandoned, no timer.
+
+/** RECOVERING, then a delivery a human interferes with. Returns the rig, mid-hold. */
+async function interferedOnRecovering(Admission) {
+  const r = rig({ Admission });
+  recovering(r);
+  r.onStaged = () => { r.at(40, () => { r.session.gen += 1; r.session.lastHumanAt = r.now; r.prompt += 'x'; }); };
+  const out = await r.settle(wake(r));
+  assert.deepEqual([out.kind, out.reason], ['INTERFERED', 'HUMAN_INPUT_AFTER_STAGE'], 'precondition');
+  return r;
+}
+const TEN_MINUTES = 600_000;
+const KA = {};
+
+KA.aGrantHeldForAHumanOutlivesTheReservationTtl = async (Admission) => {
+  const r = await interferedOnRecovering(Admission);
+  r.now += TEN_MINUTES; r.mono += TEN_MINUTES;
+  assert.equal(r.state(), 'RECOVERING', 'precondition: still the same recovery epoch');
+  assert.deepEqual([r.runtime.admit('jim').verdict, r.runtime.admit('jim').reason], ['REFUSE', ADMISSION_REASON.RECOVERING_SPENT],
+    'TEN MINUTES into an INTERFERED hold the turn is STILL in suspense - the 60 s reservation TTL does not hand it to someone else');
+  // ...and the control: a reservation nobody is holding for a human IS abandoned by then.
+  const plain = rig({ Admission });
+  recovering(plain);
+  const reserved = plain.runtime.admit('jim');
+  assert.ok(reserved.grantId, 'precondition: a plain reservation');
+  plain.now += TEN_MINUTES; plain.mono += TEN_MINUTES;
+  assert.equal(plain.runtime.admit('jim').verdict, 'ALLOW', 'an ordinary abandoned reservation still expires: the hold is an exception, not a new default');
+};
+
+KA.alreadyHandledSpendsTheTurn = async (Admission) => {
+  const r = await interferedOnRecovering(Admission);
+  assert.equal(r.owner.resolveInterference('pty-jim', 'ALREADY_HANDLED'), true);
+  r.now += TEN_MINUTES; r.mono += TEN_MINUTES;
+  assert.equal(r.runtime.admit('jim').verdict, 'REFUSE', '"already handled" CONFIRMS the launch: the epoch’s one turn is spent for good');
+};
+
+KA.sendAgainReturnsTheTurnAndAsksAfresh = async (Admission) => {
+  const r = await interferedOnRecovering(Admission);
+  assert.equal(r.owner.resolveInterference('pty-jim', 'SEND_AGAIN'), true);
+  r.prompt = ''; r.session.promptState = { block: null }; r.onStaged = null;
+  r.now += 5_000; r.mono += 5_000;
+  const writesBefore = r.writes.length;
+  const out = await r.settle(wake(r));
+  assert.equal(out.kind, 'COMMITTED', '"send queued message" returned the turn, and the re-admission took it again through the real seam');
+  assert.deepEqual(r.writes.slice(writesBefore), ['You have new hive inbox message(s)', '\r'], 'exactly one delivery');
+  assert.equal(r.runtime.admit('jim').verdict, 'REFUSE', 'and NOW it is spent - by the launch, not by the hold');
+};
+
+KA.aHeldGrantCanStillBeSettledOnlyOnce = async (Admission) => {
+  const r = await interferedOnRecovering(Admission);
+  const probe = () => r.runtime.admission.probe('jim', 'ORDINARY_TURN').verdict;
+  assert.equal(probe(), 'REFUSE');
+  assert.equal(r.owner.resolveInterference('pty-jim', 'SEND_AGAIN'), true);
+  assert.equal(probe(), 'ALLOW', 'returned');
+  assert.equal(r.owner.resolveInterference('pty-jim', 'ALREADY_HANDLED'), false, 'a second resolution finds nothing to resolve');
+  assert.equal(probe(), 'ALLOW', 'and cannot retroactively spend a turn that was given back');
+};
+
+for (const [name, killer] of Object.entries(KA)) test(`grant in suspense (REAL admission): ${name}`, () => killer(undefined));
+
+const ADMISSION_MUTANTS = [
+  { name: 'a grant held for a human is abandoned at the reservation TTL',
+    edits: [['    return !grant.confirmed && !grant.heldForHuman && this.deps.now()', '    return !grant.confirmed && this.deps.now()']],
+    killer: 'aGrantHeldForAHumanOutlivesTheReservationTtl', dies: /STILL in suspense/ },
+  { name: 'holding for a human makes EVERY reservation immortal',
+    edits: [['    return !grant.confirmed && !grant.heldForHuman && this.deps.now()', '    return false && this.deps.now()']],
+    killer: 'aGrantHeldForAHumanOutlivesTheReservationTtl', dies: /an exception, not a new default/ },
+  { name: 'holding for a human silently confirms the launch',
+    edits: [['    held.heldForHuman = true;', '    held.confirmed = true;']],
+    killer: 'sendAgainReturnsTheTurnAndAsksAfresh', dies: /returned the turn/ }
+];
+
+test('MUTANT CENSUS (capacityAdmission.holdGrantForHuman): every mutant applies exactly once and dies at the named assertion', async (t) => {
+  const source = read('src/main/capacityAdmission.ts');
+  fs.rmSync(RUNTIME_MUTANT_DIR + '-adm', { recursive: true, force: true });
+  fs.mkdirSync(RUNTIME_MUTANT_DIR + '-adm', { recursive: true });
+  try {
+    for (const [i, mutant] of ADMISSION_MUTANTS.entries()) {
+      await t.test(`mutant: ${mutant.name}`, async () => {
+        await KA[mutant.killer](undefined); // passes on the real class...
+        let text = source;
+        for (const [from, to] of mutant.edits) {
+          const hits = text.split(from).length - 1;
+          assert.equal(hits, 1, `mutant "${mutant.name}": edit target must match EXACTLY ONCE, matched ${hits}`);
+          text = text.replace(from, () => to);
+        }
+        text = text.replace(/from '\.\/(\w+)'/g, "from '../../src/main/$1'").replace(/from '\.\.\/shared\//g, "from '../../src/shared/");
+        const file = path.join(RUNTIME_MUTANT_DIR + '-adm', `a${i}.ts`);
+        fs.writeFileSync(file, text, 'utf8');
+        const Mutant = loadTs(path.relative(path.resolve(__dirname, '..'), file)).CapacityAdmission;
+        let died = null;
+        try { await KA[mutant.killer](Mutant); } catch (e) { died = e; }
+        assert.ok(died, `SURVIVED: "${mutant.name}" was not killed by ${mutant.killer}`);
+        assert.ok(died instanceof assert.AssertionError, `"${mutant.name}" must die by ASSERTION, got: ${died && died.stack}`);
+        assert.match(died.message, mutant.dies, `"${mutant.name}" died at the wrong assertion`);
+      });
+    }
+  } finally {
+    fs.rmSync(RUNTIME_MUTANT_DIR + '-adm', { recursive: true, force: true });
+  }
 });
 
 // ─── The join to the REAL capacity runtime ────────────────────────────────────────────

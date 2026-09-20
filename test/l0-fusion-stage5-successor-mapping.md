@@ -36,8 +36,8 @@ Test files: `AS` = `automatic-submit.test.cjs` (killers `K.*`, each with census 
 |---|---|---|---|---|
 | 1 | A15: a death AFTER the submit keystroke does NOT hand out a second recovery turn | once the Enter may have landed the turn stays spent | AS `criticalSectionNeverYields` + `commitsInOrder` (confirmLaunch runs in the same synchronous section as the Enter: there is no "after the Enter, before the confirm" for anything to die in); ASW `a RECOVERING pool: the owner's own reservation…` (asserts the turn IS spent after COMMIT) | HELD |
 | 2 | A15: a death BEFORE the write DOES return the turn | an abandoned, untyped delivery gives the turn back | AS `stageFailureTypesNothingAndReturnsTheGrant`, `lateRefusalAborts`, `preStageHumanIsRefusalNotInterference`, `respawnInGapNeverReceivesTheEnter` (every pre-Enter exit asserts `cancelled.length === 1`) | HELD |
-| 3 | A15: the two deaths reach DIFFERENT outcomes | the recorded fact, not a constant, decides | AS mutant `a failed Enter confirmed as a launch` (kills collapsing confirm/cancel into one) with killer `enterFailureReturnsTheGrantAndHolds` | HELD |
-| 4 | A15: a LIVE report of a failed write beats the inference from silence | a known failure returns the turn | AS `enterFailureReturnsTheGrantAndHolds`; ASW `an Enter that THROWS is not a launch - the recovery turn goes back` | HELD |
+| 3 | A15: the two deaths reach DIFFERENT outcomes | the recorded fact, not a constant, decides | AS mutant `a failed Enter confirmed as a launch` (kills collapsing confirm/cancel into one) with killer `enterFailureHoldsTheGrantForAHuman` | HELD |
+| 4 | A15: a LIVE report of a failed write beats the inference from silence | a known failure returns the turn | AS `enterFailureHoldsTheGrantForAHuman`; ASW `an Enter that THROWS is not a launch - the recovery turn goes back` | HELD |
 | 5 | A15: a mark is not a confirm | asking permission spends nothing | ASW `TOCTOU on revalidate: ownReservationIsNotARefusal` (revalidate is a read: asked, then the grant is still cancellable and then reports `CLAIM_GRANT_LOST`); ASW `FIX4`-equivalent below (#28) | HELD |
 | 6 | A15: a mark for a RECLAIMED ticket cannot reach the reservation that replaced it | a stale claim cannot act on a newer reservation | ASW `KR.ownReservationIsNotARefusal` (a claim whose grant was handed back answers `REFUSE / CLAIM_GRANT_LOST`; mutant `a lost grant still authorises`) | HELD |
 | 7 | A15: stopping the runtime reads the mark too | shutdown with a delivery in flight | there is no ticket for `stop()` to settle: grants live in the admission seam, in main's memory, and die with the process; restored pools come back `restoredUnconfirmed` = UNKNOWN (L0-TAIL tests) | BY CONSTRUCTION |
@@ -60,7 +60,7 @@ Test files: `AS` = `automatic-submit.test.cjs` (killers `K.*`, each with census 
 |---|---|---|---|
 | 20 | TWO agents on one recovering pool cannot both be authorised | the reservation is made by `admit()` itself (unchanged, `provider-capacity-admission.test.cjs`); through the owner: ASW `KR.ownReservationIsNotARefusal` (second asker `REFUSE`) | HELD |
 | 21 | the probe still does NOT spend | `provider-capacity-admission.test.cjs` probe tests (unchanged); the snapshot handler probes: ASW `the control snapshot is computed through the ONE resolver` | HELD |
-| 22 | a CONFIRMED delivery spends the grant; a failed one returns it | AS `commitsInOrder`, `enterFailureReturnsTheGrantAndHolds`; ASW `a RECOVERING pool…` | HELD |
+| 22 | a CONFIRMED delivery spends the grant; a failed one returns it | AS `commitsInOrder`, `enterFailureHoldsTheGrantForAHuman`; ASW `a RECOVERING pool…` | HELD |
 | 23 | an ABANDONED ticket returns its grant on MAIN's own expiry | **see GAP 1** | GAP |
 | 24 | a late settle for an already-expired ticket is a no-op | no settle message exists; the outcome is recorded against the request id: AS `replayAfterCommitWritesNoSecondEnter`, `mismatchedReplayRejects` | BY CONSTRUCTION |
 | 25 | stopping the runtime settles outstanding tickets, no timer armed | as #7; the owner's timers are `unref`'d (`buildOwnerDeps`) | BY CONSTRUCTION |
@@ -76,6 +76,16 @@ Test files: `AS` = `automatic-submit.test.cjs` (killers `K.*`, each with census 
 | 30 | a RESERVE_ONLY pool holds ordinary work but not closure work | ordinary: ASW `KR.reserveOnlyAfterAdmission`. **Closure work: see GAP 2** | GAP (half) |
 
 ## The two gaps
+
+> **UPDATE, stage 5.6 (after this mapping was written).** GAP 1 is CLOSED: AS
+> `everyOutcomeAccountsForItsGrant` enumerates the outcomes and proves each accounts for
+> its grant exactly once. GAP 1b is RULED (god, consistent with A15 and the human's option
+> B): the grant is NOT returned at INTERFERED; it is held as possibly launched
+> (`holdGrantForHuman`, which no timer abandons) until a person resolves - "already handled"
+> confirms it, "send queued message" returns it - or the terminal dies (spent). Rows 2-4
+> and 22 read accordingly: a failed Enter no longer returns the turn, it HOLDS it
+> (AS `enterFailureHoldsTheGrantForAHuman`, ASW `an Enter that THROWS...HELD FOR A HUMAN`).
+> GAP 2 stands. The text below is kept as written.
 
 **GAP 1 — a delivery that never finishes (row 23).** The ticket had a 30 s main-owned
 expiry, so a deliverer that vanished returned its recovery turn. The owner has no such

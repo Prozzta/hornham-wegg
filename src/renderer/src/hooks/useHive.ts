@@ -851,6 +851,16 @@ export function useHive(config: HarnessConfig | null): void {
         // a failure — capacity held it, a human owns the line, the terminal cannot be
         // proven safe — so the item simply stays queued and costs no send attempt.
         if (outcome.kind === 'REFUSED' || outcome.kind === 'ABORTED') return { sent: false };
+        // HUMAN_HANDLED: a person resolved an INTERFERED hold on THIS message with "already
+        // handled - drop". Main recorded that against the id; it is never typed again. The
+        // composer normally removes the row itself - this is the backstop for a copy that
+        // was asked for again before it did. It is not a delivery: no send side-effects.
+        if (outcome.kind === 'HUMAN_HANDLED') {
+          delete sendFailures[next.id];
+          removeQueuedMessage(srcId, next.id);
+          console.warn(`[queue-drain] message ${next.id} for ${target.id} dropped: a person marked it already handled`);
+          return { sent: false };
+        }
         // INTERFERED: a human wrote onto our staged text. Main sent no Enter and cleared
         // nothing, and it now refuses automatic delivery to that terminal until a human
         // resolves it. The item is HELD — never retried into the prompt, never dropped.

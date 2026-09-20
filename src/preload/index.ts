@@ -500,7 +500,13 @@ export type AutoSubmitOutcome =
   | { kind: 'ABORTED'; detail: string }
   | { kind: 'INTERFERED'; reason: string; detail?: string }
   | { kind: 'FAILED'; reason: string }
-  | { kind: 'REJECTED'; reason: string };
+  | { kind: 'REJECTED'; reason: string }
+  /** A person resolved an INTERFERED hold on this message with "already handled". It is
+   *  never typed again; the queue drops it. */
+  | { kind: 'HUMAN_HANDLED' };
+
+/** How a person resolves an INTERFERED hold. No default exists - see main's handler. */
+export type InterferenceResolution = 'SEND_AGAIN' | 'ALREADY_HANDLED';
 
 export interface AgentControlSnapshot {
   /**
@@ -1118,10 +1124,11 @@ const api = {
    * L0-FUSION stage 5.4b - A HUMAN says the prompt that was interfered with is dealt with.
    * The only way an INTERFERED hold ends while its terminal lives. Call it from a person's
    * click and from nowhere else: no timer, no retry loop, no automation may decide that a
-   * human's text no longer matters. Types nothing, clears nothing, sends no Enter.
+   * human's text no longer matters. Types nothing, clears nothing, sends no Enter. The
+   * person says HOW (option B): 'SEND_AGAIN' or 'ALREADY_HANDLED'. There is no default.
    */
-  resolveInterference: (agentId: string): Promise<boolean> =>
-    ipcRenderer.invoke('autoSubmit:resolveInterference', agentId),
+  resolveInterference: (agentId: string, how: InterferenceResolution): Promise<boolean> =>
+    ipcRenderer.invoke('autoSubmit:resolveInterference', agentId, how),
   /** Subscribe to gate/deny events (a tool was blocked); returns unsubscribe fn. */
   onApprovalRequest: (cb: (e: { agentId: string; tool?: string; reason?: string }) => void): (() => void) => {
     const listener = (_e: IpcRendererEvent, payload: { agentId: string; tool?: string; reason?: string }) => cb(payload);

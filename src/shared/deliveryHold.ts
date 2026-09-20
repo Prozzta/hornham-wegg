@@ -19,6 +19,11 @@
  * no Enter and cleared nothing, and main refuses EVERY programmatic delivery to that
  * terminal - "send now" included - until a human says the prompt is dealt with. So its
  * action is RESOLVE, never SEND_NOW, and there is no wording that promises it will pass.
+ *
+ * RESOLVING IS TWO ACTIONS, NEVER ONE (human ruling, option B). A bare "resolved" could not
+ * say whether the person had submitted the staged message themselves, and if they had, the
+ * queue delivered it a second time. The two actions are worded so the DUPLICATE RISK is on
+ * the button's own tooltip, and nothing anywhere guesses from an empty prompt.
  */
 
 export type CapacityEvidenceName =
@@ -65,6 +70,52 @@ export interface DeliveryHoldInput {
 
 export type DeliveryHoldAction = 'RESOLVE_INTERFERENCE' | 'SEND_NOW' | null;
 
+/** One of the two ways a person ends an INTERFERED hold. `how` is what main is told. */
+export interface InterferenceChoice {
+  how: 'SEND_AGAIN' | 'ALREADY_HANDLED';
+  label: string;
+  title: string;
+}
+
+/** Is the held request a queue item (the drain's `queue:<agent>:<id>`)? A worker wake or a
+ *  boot prompt can be held too, and then there is no queued message to send or drop. */
+export function heldIsQueueItem(interfered: InterferedView | null): boolean {
+  return !!interfered && interfered.requestId.startsWith('queue:');
+}
+
+/**
+ * The two resolutions, worded for what is actually held.
+ *
+ * A QUEUE ITEM: "send queued message" keeps it and re-delivers it through every gate;
+ * "already handled - drop" removes THAT item and nothing else, and types nothing.
+ * NOT A QUEUE ITEM (a worker wake, a boot prompt): there is nothing queued to send or drop.
+ * "Let it retry" only releases the hold and gives the capacity turn back - a wake fires
+ * again by its own schedule, a boot prompt is NOT re-sent by anything. "Already handled"
+ * releases the hold and counts the turn as used. Neither types anything.
+ */
+export function interferenceChoices(interfered: InterferedView | null): InterferenceChoice[] {
+  if (!interfered) return [];
+  if (heldIsQueueItem(interfered)) {
+    return [
+      { how: 'SEND_AGAIN', label: 'send queued message',
+        title: 'The queued message has NOT been handled: I dealt with the prompt, deliver the message again. '
+          + 'It goes through every normal check and is typed only onto a clear prompt. '
+          + 'DO NOT use this if you already pressed Enter on it yourself - it would be sent TWICE. Nothing is typed by pressing this.' },
+      { how: 'ALREADY_HANDLED', label: 'already handled — drop',
+        title: 'I handled or submitted this content myself: drop the held message so it is NOT sent again. '
+          + 'Only that one message is removed; nothing is typed, erased or submitted by pressing this.' }
+    ];
+  }
+  return [
+    { how: 'SEND_AGAIN', label: 'let it retry',
+      title: 'An automatic wake-up or start-up message (not one of your queued messages) was interrupted. '
+        + 'Release the hold so automatic delivery can happen again. A wake-up retries on its own schedule; a start-up message is NOT re-sent. Nothing is typed by pressing this.' },
+    { how: 'ALREADY_HANDLED', label: 'already handled',
+      title: 'An automatic wake-up or start-up message (not one of your queued messages) was interrupted and I dealt with it myself. '
+        + 'Release the hold and count it as done. Nothing is typed by pressing this.' }
+  ];
+}
+
 export interface DeliveryHoldView {
   kind: 'INTERFERED' | 'PAUSED' | 'CAPACITY';
   hint: string;
@@ -85,7 +136,7 @@ export function deliveryHoldView(i: DeliveryHoldInput): DeliveryHoldView | null 
       title: `A queued message was typed onto ${i.agentName}'s prompt and a person typed before it was submitted. `
         + 'Nothing was submitted and nothing was erased: the text is still on that prompt, and it is yours. '
         + 'Automatic delivery to this terminal stays off - "send now" included - until you deal with the prompt '
-        + 'and press "resolved". It does not time out.',
+        + 'and then say which happened: the message still needs sending, or you already handled it. It does not time out.',
       action: 'RESOLVE_INTERFERENCE'
     };
   }

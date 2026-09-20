@@ -61,7 +61,8 @@ test('int - the hold: every class refused, no timer, and a human resolution type
   const { int } = await result();
   assert.deepEqual(int.again, { kind: 'REFUSED', reason: 'PTY_INHIBITED' }, 'automatic delivery is refused');
   assert.deepEqual(int.manual, { kind: 'REFUSED', reason: 'PTY_INHIBITED' }, 'and so is "send now" - which is why the composer never offers it while INTERFERED');
-  assert.equal(int.resolved, true);
+  assert.deepEqual([int.bare, int.stillHeld], [false, true], 'a bare "resolved" is NOT a resolution: refused, and the hold stays (option B has no default)');
+  assert.equal(int.resolved, true, '"send queued message" releases it');
   assert.equal(int.lineAfterResolve, int.lineBeforeResolve, 'resolving typed nothing and cleared nothing');
   assert.equal(int.inhibitedAtEnd, false, 'the inhibition ended with the human’s resolution');
   assert.deepEqual(int.afterResolve, { kind: 'REFUSED', reason: 'PROMPT_DRAFT' },

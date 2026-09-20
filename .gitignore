@@ -32,3 +32,4 @@ docs/blog-preview-*/
 test/.mutants/
 test/.mutants-delivery-hold/
 test/.mutants-capacity-runtime/
+test/.mutants-capacity-runtime-adm/

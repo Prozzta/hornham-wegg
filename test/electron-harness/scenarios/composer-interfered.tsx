@@ -52,39 +52,74 @@ window.__harnessRun = async () => {
     const agent = { id: 'a1', name: 'Alice', status: 'idle' } as unknown as Agent;
     useStore.setState({ messageQueues: { a1: [
       { id: 'm1', text: 'the message that was typed over', ts: 1 },
-      { id: 'm2', text: 'a later message', ts: 2 }
+      { id: 'm2', text: 'a later message', ts: 2 },
+      { id: 'm3', text: 'a third message', ts: 3 }
     ] } } as never);
     bridge.snapshot = { autoDeliveryPaused: false, capacityHold: true, capacityEvidence: 'SPENT_RESET_PASSED',
       interfered: { requestId: 'queue:a1:m1', reason: 'HUMAN_INPUT_AFTER_STAGE', at: 1 } };
     createRoot(document.getElementById('root')!).render(<MessageQueueComposer agent={agent} />);
 
-    // ── STEP 1: INTERFERED is on the page. ──────────────────────────────────────────
-    const shown = await until(() => buttons('resolved').length === 1, 4_000);
+    const SEND = 'send queued message'; const DROP = 'already handled — drop';
+    const heldTags = () => (pageText().match(/held — typed over, not submitted/g) ?? []).length;
+    const calls = () => bridge.resolveCalls.map((c) => [c.agentId, c.how]);
+    const hold = (requestId: string) => { bridge.snapshot = { ...bridge.snapshot, interfered: { requestId, reason: 'HUMAN_INPUT_AFTER_STAGE', at: 1 } }; };
+
+    // ── STEP 1: INTERFERED is on the page, as TWO actions. ─────────────────────────────
+    const shown = await until(() => buttons(SEND).length === 1 && buttons(DROP).length === 1, 4_000);
     const ax = await window.harness.axTree();
+    const axNames = Array.isArray(ax) ? ax.filter((n: { role: string; ignored: boolean }) => n.role === 'button' && !n.ignored).map((n: { name: string }) => n.name) : [];
     result.interfered = {
       shown, text: pageText(), title: titleOfHint(),
-      resolvedButtons: buttons('resolved').length, sendNowButtons: buttons('send now').length,
-      heldTags: (pageText().match(/held — typed over, not submitted/g) ?? []).length,
-      axResolved: Array.isArray(ax) ? ax.filter((n: { role: string; name: string; ignored: boolean }) => n.role === 'button' && n.name === 'resolved' && !n.ignored).length : ax
+      sendTitle: buttons(SEND)[0]?.getAttribute('title'), dropTitle: buttons(DROP)[0]?.getAttribute('title'),
+      resolvedButtons: buttons('resolved').length, sendNowButtons: buttons('send now').length, heldTags: heldTags(),
+      axSend: axNames.filter((n: string) => n === SEND).length, axDrop: axNames.filter((n: string) => n === DROP).length
     };
 
     // ── STEP 2: NOTHING BUT A CLICK RESOLVES IT. Two full poll cycles, no click. ────
     await sleep(4_500);
-    result.unattended = { resolveCalls: bridge.resolveCalls.length, snapshotReads: bridge.snapshotReads, stillShown: buttons('resolved').length === 1 };
+    result.unattended = { resolveCalls: bridge.resolveCalls.length, snapshotReads: bridge.snapshotReads, stillShown: buttons(DROP).length === 1 };
 
-    // ── STEP 3: a REAL click on the rendered button. ────────────────────────────────
+    // ── STEP 3a: main REFUSES the resolution -> nothing is dropped. ─────────────────────
+    bridge.refuse = true;
+    await realClick(buttons(DROP)[0]);
+    await sleep(300);
+    result.refused = { rows: rows(), calls: calls(), stillShown: buttons(DROP).length === 1 };
+    bridge.refuse = false; bridge.resolveCalls.length = 0;
+
+    // ── STEP 3b: a REAL click on "already handled - drop": THAT row goes, no other. ─
     trusted = [];
-    const click = await realClick(buttons('resolved')[0]);
-    const gone = await until(() => buttons('resolved').length === 0, 4_000);
-    result.clicked = { click, trusted: trusted.slice(), resolveCalls: bridge.resolveCalls.map((c) => c.agentId), gone, rows: rows() };
+    const dropClick = await realClick(buttons(DROP)[0]);
+    const dropGone = await until(() => buttons(DROP).length === 0, 4_000);
+    result.dropped = { click: dropClick, trusted: trusted.slice(), calls: calls(), gone: dropGone, rows: rows() };
+
+    // ── STEP 3c: the NEXT message is interfered with; "send queued message" keeps it. ─
+    bridge.resolveCalls.length = 0;
+    hold('queue:a1:m2');
+    await until(() => buttons(SEND).length === 1, 4_000);
+    const heldTagsOnM2 = heldTags();
+    trusted = [];
+    const sendClick = await realClick(buttons(SEND)[0]);
+    const sendGone = await until(() => buttons(SEND).length === 0, 4_000);
+    result.sentAgain = { click: sendClick, trusted: trusted.slice(), calls: calls(), gone: sendGone, rows: rows(), heldTagsOnM2 };
+
+    // ── STEP 3d: a held WAKE (not a queue item): other words, and no row is touched. ─
+    bridge.resolveCalls.length = 0;
+    hold('wake:a1:9');
+    await until(() => buttons('let it retry').length === 1, 4_000);
+    result.wake = { labels: ['let it retry', 'already handled', SEND, DROP].map((l) => buttons(l).length), heldTags: heldTags(),
+      retryTitle: buttons('let it retry')[0]?.getAttribute('title') };
+    await realClick(buttons('already handled')[0]);
+    await until(() => buttons('already handled').length === 0, 4_000);
+    result.wakeResolved = { calls: calls(), rows: rows() };
 
     // ── STEP 4: what remains is the ENDLESS capacity hold, and "send now" is the way out. ─
+    bridge.resolveCalls.length = 0;
     const offered = await until(() => buttons('send now').length === 2, 4_000);
     result.capacity = { offered, text: pageText(), title: titleOfHint(), sendNowButtons: buttons('send now').length,
       heldTags: (pageText().match(/held — typed over, not submitted/g) ?? []).length };
     trusted = [];
     const click2 = await realClick(buttons('send now')[1]);
-    await until(() => rows()[0]?.id === 'm2', 2_000);
+    await until(() => rows()[0]?.id === 'm3', 2_000);
     result.released = { click: click2, trusted: trusted.slice(), rows: rows(), resolveCalls: bridge.resolveCalls.length };
 
     // ── STEP 5: no pool. The queue moves, and it is NOT called available. ───────────

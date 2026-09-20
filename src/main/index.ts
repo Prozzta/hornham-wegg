@@ -26,7 +26,7 @@ import { normalizeWeekly, weeklyDelayMs } from '../shared/weeklySchedule';
 import { isInputOrigin } from '../shared/inputOrigin';
 import { automaticDeliveryEligibility, isTerminalInputState } from '../shared/inputProvenance';
 import { isTerminalPromptState } from '../shared/promptState';
-import { AutomaticSubmitOwner, ADMISSION_CLASSES, capacityGateOf, type AdmissionClass } from './automaticSubmit';
+import { AutomaticSubmitOwner, ADMISSION_CLASSES, INTERFERENCE_RESOLUTIONS, capacityGateOf, type AdmissionClass, type InterferenceResolution } from './automaticSubmit';
 import { buildOwnerDeps, ScreenReadingBroker } from './automaticSubmitWiring';
 import {
   getBranch, getStatus, getLog, getBranches, getAheadBehind, isRepo, getDiff, mainRepoRoot,
@@ -4101,16 +4101,20 @@ ipcMain.handle('autoSubmit:submit', (_evt, req: unknown) => {
 /**
  * L0-FUSION stage 5.4b - A HUMAN RESOLVES AN INTERFERED HOLD.
  *
- * The only caller is a person's click in the composer. It types nothing, clears nothing
- * and sends no Enter: it lifts the owner's refusal for that terminal and releases the held
- * request id, and whatever is delivered next goes through the full gate again - which
- * still refuses a prompt that has text on it. There is deliberately no timer, no expiry
- * and no main-side caller: automation does not get to decide a human's text is finished.
+ * The only caller is a person's click in the composer, and the person SAYS HOW (human
+ * ruling, option B): 'SEND_AGAIN' - the message was not handled, re-admit it through the
+ * one owner with every gate - or 'ALREADY_HANDLED' - they dealt with it themselves, never
+ * type it again. There is NO DEFAULT: a call that does not name one of the two is refused
+ * and the hold stays, because the ambiguity of a bare "resolved" is exactly what produced
+ * duplicate deliveries. Nothing here looks at the prompt to guess. It types nothing, clears
+ * nothing and sends no Enter. There is deliberately no timer, no expiry and no main-side
+ * caller: automation does not get to decide a human's text is finished.
  */
-ipcMain.handle('autoSubmit:resolveInterference', (_evt, agentId: unknown) => {
+ipcMain.handle('autoSubmit:resolveInterference', (_evt, agentId: unknown, how: unknown) => {
   if (typeof agentId !== 'string' || !agentId) return false;
+  if (typeof how !== 'string' || !(INTERFERENCE_RESOLUTIONS as readonly string[]).includes(how)) return false;
   const ptyId = ptyForAgent(agentId);
-  return ptyId ? automaticSubmit.resolveInterference(ptyId) : false;
+  return ptyId ? automaticSubmit.resolveInterference(ptyId, how as InterferenceResolution) : false;
 });
 
 // ─── IPC: scheduled missions (recurring auto-dispatch) ──────────────────────

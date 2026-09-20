@@ -9,14 +9,17 @@
  */
 export const bridge = {
   snapshot: {} as Record<string, unknown>,
-  resolveCalls: [] as Array<{ agentId: string; at: number }>,
+  resolveCalls: [] as Array<{ agentId: string; how: unknown; at: number }>,
+  /** When true main REFUSES the resolution (returns false) and the hold stays. */
+  refuse: false,
   snapshotReads: 0
 };
 
 const known: Record<string, unknown> = {
   controlSnapshot: (_agentId: string) => { bridge.snapshotReads += 1; return Promise.resolve({ ...bridge.snapshot }); },
-  resolveInterference: (agentId: string) => {
-    bridge.resolveCalls.push({ agentId, at: Date.now() });
+  resolveInterference: (agentId: string, how: unknown) => {
+    bridge.resolveCalls.push({ agentId, how, at: Date.now() });
+    if (bridge.refuse) return Promise.resolve(false);
     bridge.snapshot = { ...bridge.snapshot, interfered: null };
     return Promise.resolve(true);
   }

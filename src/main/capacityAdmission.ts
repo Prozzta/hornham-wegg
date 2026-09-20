@@ -278,6 +278,26 @@ export class CapacityAdmission {
     this.recoveryGrants.delete(decision.poolKey!);
   }
 
+  /**
+   * The turn MAY have started, and only a person can say (L0-FUSION stage 5.6, god's
+   * ruling on G1b). The submit owner calls this at INTERFERED: our payload is on a live
+   * prompt and a human may press Enter on it at any moment, so the evidence has run out
+   * and - as A15 ruled for the ticket before it - we fail toward ALREADY LAUNCHED.
+   *
+   * It exists as its own state because neither existing one is right. `confirmLaunch`
+   * cannot be undone, and the human may yet say "it was NOT sent - send it again", which
+   * must give the turn back. Leaving the reservation merely unconfirmed is worse: it is
+   * ABANDONED after `RECOVERY_RESERVATION_TTL_MS` (60 s), so the epoch's one turn would be
+   * handed to someone else while a person is still reading the prompt. A grant held for a
+   * human never expires on a timer; it ends by `confirmLaunch` (handled) or `cancelGrant`
+   * (send again), or with its epoch. Idempotent; a no-op for a decision that holds nothing.
+   */
+  holdGrantForHuman(decision: AdmissionDecision): void {
+    const held = decision.poolKey ? this.recoveryGrants.get(decision.poolKey) : undefined;
+    if (!held || !decision.grantId || held.grantId !== decision.grantId || held.confirmed) return;
+    held.heldForHuman = true;
+  }
+
   /** Forget a pool's grant record — used when a pool is removed. */
   forget(poolKey: string): void {
     this.recoveryGrants.delete(poolKey);
@@ -305,7 +325,7 @@ export class CapacityAdmission {
   }
 
   private abandoned(grant: RecoveryGrant): boolean {
-    return !grant.confirmed && this.deps.now() - grant.reservedAt >= this.reservationTtlMs;
+    return !grant.confirmed && !grant.heldForHuman && this.deps.now() - grant.reservedAt >= this.reservationTtlMs;
   }
 }
 
@@ -314,6 +334,8 @@ interface RecoveryGrant {
   grantId: string;
   confirmed: boolean;
   reservedAt: number;
+  /** Set by `holdGrantForHuman`: possibly launched, awaiting a person. No TTL applies. */
+  heldForHuman?: boolean;
 }
 
 function decision(

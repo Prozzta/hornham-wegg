@@ -14,11 +14,15 @@ what IS known, what is not, and what would settle it. Nothing here is a claim of
    our staged payload THEMSELVES and then clicks "resolved", the message is still queued and
    is delivered again; the gate cannot see it because the prompt is empty by then. Measured:
    while text is still on the prompt the gate does refuse (`PROMPT_DRAFT`, harness arm `int`).
-   Options A/B/C are with the human.
+   **RULED at stage 5.6: option B.** Two actions, "send queued message" / "already handled -
+   drop", no default, nothing inferred from an empty prompt. Built and tested; no longer open.
 4. **INTERFERED returns the recovery turn while the payload is still on the prompt**
    (successor mapping, GAP 1b). The ticket design failed toward ALREADY LAUNCHED where
    evidence ran out; the owner fails toward NOT LAUNCHED on every INTERFERED except
    `ENTER_WRITE_FAILED`. Same fact pattern as item 3; should be ruled with it.
+   **RULED at stage 5.6 (god):** the grant is held as possibly launched until a person
+   resolves. Built with a new admission state, because a merely unconfirmed reservation is
+   abandoned after 60 s. No longer open. What it COSTS is now item 13b below.
 
 ## Unmeasured
 
@@ -57,12 +61,16 @@ what IS known, what is not, and what would settle it. Nothing here is a claim of
     unproven: stage 5.4d (`4e1ac8e0`) mounts the production composer and resolves through a
     TRUSTED Chromium click. What remains unproven about it is item 10, not the click.
 12. **Grant return on every non-COMMIT outcome, in one place** (successor mapping, GAP 1).
-    Each exit is individually tested; no single test enumerates the outcomes and proves none
-    returns neither confirm nor cancel. Proposed for the deletion commit.
+    CLOSED at stage 5.6: `everyOutcomeAccountsForItsGrant` enumerates nine outcomes.
 13. **A recovery turn can be held for up to 30 s** by a submission waiting at READY
     (`READY_TIMEOUT_MS`), because ADMIT precedes READY. Tested to be returned on timeout;
     not tested is whether 30 s of a RECOVERING pool's only turn is acceptable. It is the
     same order as the ticket TTL it replaces.
+13b. **An unresolved INTERFERED keeps a RECOVERING pool's only turn in suspense for as long
+    as nobody resolves it** - hours, if the person has walked away - so no other agent on
+    that pool is probed in that epoch. That is the ruling working as ruled (fail toward
+    ALREADY LAUNCHED), not a defect; it ends with a resolution, the terminal's death, or a
+    new epoch. Whether a floor with one shared pool can afford it is not measured.
 14. **The callee census has a stated limit:** a PTY smuggled in under an allowlisted
     non-PTY receiver NAME is invisible to a census of names. The no-alias check, the
     node-pty-importer check and the refusal of `write` taken as a value stand in its way;

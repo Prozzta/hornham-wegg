@@ -183,6 +183,11 @@ export class CapacityRuntime {
     this.admission.confirmLaunch(decision);
   }
 
+  /** The work MAY have started and only a person can say — see `holdGrantForHuman`. */
+  holdGrant(decision: AdmissionDecision): void {
+    this.admission.holdGrantForHuman(decision);
+  }
+
   /** The work did not start after all — return any reservation it held. */
   cancelGrant(decision: AdmissionDecision): void {
     this.admission.cancelGrant(decision);

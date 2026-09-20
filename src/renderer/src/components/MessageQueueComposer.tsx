@@ -5,7 +5,7 @@ import { Icon } from './Icon';
 import { useStore, type Agent, type QueuedMessage } from '@/store/store';
 import { clearTerminalDraft, dismissTerminalPicker, terminalAutomationBlockFor } from './terminalPool';
 import type { TerminalAutomationBlock } from './terminalAutomation';
-import { capacityStateNote, deliveryHoldView, isHeldQueueItem, type CapacityEvidenceName, type InterferedView } from '@shared/deliveryHold';
+import { capacityStateNote, deliveryHoldView, interferenceChoices, isHeldQueueItem, type CapacityEvidenceName, type InterferenceChoice, type InterferedView } from '@shared/deliveryHold';
 import { freeflowRecorder, useFreeflow } from '@/freeflow/recorder';
 import { useTerminalFontSize } from './terminalFontSize';
 
@@ -173,6 +173,19 @@ export function MessageQueueComposer({ agent }: MessageQueueComposerProps) {
   const releasable = !delivery.interfered && (delivery.paused || delivery.capacityHold);
   const capacityNote = capacityStateNote(delivery.capacityEvidence);
 
+  // A PERSON ends an INTERFERED hold, and says HOW (human ruling, option B): the message
+  // still needs sending, or they already handled it. Nothing here - and nothing in main -
+  // guesses which from the prompt. "Already handled" drops THE HELD ITEM AND NO OTHER, and
+  // only once main has confirmed the hold is released; main also records the id as
+  // human-handled, so a copy the drain asks for again is dropped rather than typed.
+  const resolveHeld = (how: InterferenceChoice['how']) => {
+    const heldRow = queue.find((m) => isHeldQueueItem(delivery.interfered, m.id));
+    void window.cth.resolveInterference(agent.id, how).then((released) => {
+      if (released && how === 'ALREADY_HANDLED' && heldRow) removeQueuedMessage(agent.id, heldRow.id);
+      delivery.refresh();
+    });
+  };
+
   // INTERFERED is shown even with nothing queued: a worker wake can be the held request,
   // and the terminal stays refused until a person resolves it.
   const statusHint = hold?.kind === 'INTERFERED'
@@ -241,21 +254,20 @@ export function MessageQueueComposer({ agent }: MessageQueueComposerProps) {
             }}
           >{statusHint}</span>
         )}
-        {hold?.action === 'RESOLVE_INTERFERENCE' && (
+        {hold?.action === 'RESOLVE_INTERFERENCE' && interferenceChoices(delivery.interfered).map((choice) => (
           <button
-            // A PERSON'S CLICK, and nothing else, ends an INTERFERED hold. It types
-            // nothing, clears nothing and sends no Enter; delivery that resumes goes
-            // through main's full gate again, which still refuses a prompt with text on it.
-            onClick={() => { void window.cth.resolveInterference(agent.id).then(delivery.refresh); }}
-            title={"I have dealt with the text on this agent's prompt - let queued messages be delivered again. "
-              + 'Nothing is typed, erased or submitted by pressing this.'}
+            key={choice.how}
+            // A PERSON'S CLICK, and nothing else, ends an INTERFERED hold. Neither action
+            // types, clears or sends anything; the tooltip carries the duplicate-send risk.
+            onClick={() => resolveHeld(choice.how)}
+            title={choice.title}
             style={{
-              border: 'none', background: 'transparent', cursor: 'pointer', padding: 0,
+              border: 'none', background: 'transparent', cursor: 'pointer', padding: 0, whiteSpace: 'nowrap',
               fontFamily: 'var(--cth-font-ui)', fontSize: 12,
               color: 'var(--cth-ink-900)', textDecoration: 'underline'
             }}
-          >resolved</button>
-        )}
+          >{choice.label}</button>
+        ))}
         {(block === 'draft' || block === 'picker') && agent.ptyId && (
           <button
             onClick={() => {
@@ -553,7 +565,7 @@ function QueuedMessageRow(
             )}
             {held && (
               <span
-                title={'This message was typed onto the prompt and someone typed before it was submitted. It was NOT submitted and nothing was erased. Deal with the prompt, then press "resolved" above — or remove this message.'}
+                title={'This message was typed onto the prompt and someone typed before it was submitted. It was NOT submitted and nothing was erased. Deal with the prompt, then choose above: "send queued message" if it still needs sending, or "already handled — drop" if you submitted it yourself.'}
                 style={{ fontSize: 12, lineHeight: '16px', color: 'var(--cth-coral)' }}
               >held — typed over, not submitted</span>
             )}

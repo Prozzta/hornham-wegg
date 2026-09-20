@@ -116,7 +116,47 @@ K.onlyTheHeldQueueRowIsFlagged = async (mod) => {
     'a worker wake held under INTERFERED flags NO queue row');
 };
 
+// --- RESOLVING IS TWO ACTIONS (human ruling, option B) --------------------------------------
+
+K.resolvingIsTwoActionsAndTheDuplicateRiskIsOnTheButton = async (mod) => {
+  const choices = mod.interferenceChoices(INTERFERED);
+  assert.deepEqual(choices.map((c) => [c.label, c.how]), [['send queued message', 'SEND_AGAIN'], ['already handled — drop', 'ALREADY_HANDLED']],
+    'a held QUEUE ITEM offers exactly two actions, and each label tells main what it says');
+  const [send, drop] = choices;
+  assert.match(send.title, /sent TWICE/, 'the DUPLICATE RISK is on the "send queued message" button itself');
+  assert.match(send.title, /already pressed Enter/, 'and it names the situation that causes it');
+  assert.match(send.title, /every normal check/, 'it promises the gates, not a delivery');
+  assert.match(drop.title, /NOT sent again/);
+  assert.match(drop.title, /Only that one message/, '"drop" says it touches that one message and no other');
+  for (const c of choices) assert.match(c.title, /[Nn]othing is typed/, `${c.how}: pressing it types nothing, and says so`);
+  assert.deepEqual(mod.interferenceChoices(null), [], 'no hold, no actions');
+  for (const c of choices) assert.ok(!/\bresolved\b/i.test(c.label), 'the ambiguous word is gone from the buttons');
+};
+
+K.aHeldWakeIsNotWordedAsAQueuedMessage = async (mod) => {
+  for (const requestId of ['wake:alice:7', 'boot:alice:1']) {
+    const choices = mod.interferenceChoices({ ...INTERFERED, requestId });
+    assert.deepEqual(choices.map((c) => [c.label, c.how]), [['let it retry', 'SEND_AGAIN'], ['already handled', 'ALREADY_HANDLED']],
+      `${requestId}: there is no queued message to send or drop, so the buttons do not pretend there is`);
+    assert.match(choices[0].title, /start-up message is NOT re-sent/, 'it says what will NOT happen by itself');
+    assert.match(choices[0].title, /not one of your queued messages/);
+    for (const c of choices) assert.match(c.title, /Nothing is typed/);
+  }
+  assert.equal(mod.heldIsQueueItem(INTERFERED), true);
+  assert.equal(mod.heldIsQueueItem({ ...INTERFERED, requestId: 'wake:alice:7' }), false);
+  assert.equal(mod.heldIsQueueItem(null), false);
+};
+
 const MUTANTS = [
+  { name: 'the duplicate warning taken off the button',
+    edits: [["          + 'DO NOT use this if you already pressed Enter on it yourself - it would be sent TWICE. Nothing is typed by pressing this.' },", "          + 'Nothing is typed by pressing this.' },"]],
+    killer: 'resolvingIsTwoActionsAndTheDuplicateRiskIsOnTheButton', dies: /DUPLICATE RISK is on the/ },
+  { name: 'the two buttons wired to each other\u2019s answer',
+    edits: [["      { how: 'SEND_AGAIN', label: 'send queued message',", "      { how: 'ALREADY_HANDLED', label: 'send queued message',"]],
+    killer: 'resolvingIsTwoActionsAndTheDuplicateRiskIsOnTheButton', dies: /each label tells main what it says/ },
+  { name: 'a held wake offered "send queued message"',
+    edits: [['  if (heldIsQueueItem(interfered)) {', '  if (interfered) {']],
+    killer: 'aHeldWakeIsNotWordedAsAQueuedMessage', dies: /do not pretend there is/ },
   { name: 'no pool worded as available',
     edits: [["  NO_POOL: { state: 'outside capacity gating', endsByItself: true },", "  NO_POOL: { state: 'provider capacity available', endsByItself: true },"]],
     killer: 'noPoolIsOutsideCapacityGating', dies: /NO_POOL is worded "outside capacity gating"/ },
@@ -187,11 +227,13 @@ test('main: the snapshot REPORTS the owner’s inhibition, and only a dedicated 
   assert.match(snapshot, /automaticSubmit\.inhibition\(heldPty\)/, 'read from the ONE owner, not kept anywhere else');
   assert.ok(!/resolveInterference/.test(snapshot), 'a read of the state never resolves it');
   const resolve = handlerBody(index, 'autoSubmit:resolveInterference');
-  assert.match(resolve, /automaticSubmit\.resolveInterference\(ptyId\)/);
+  assert.match(resolve, /automaticSubmit\.resolveInterference\(ptyId, how as InterferenceResolution\)/, 'the person\u2019s answer is passed through');
+  assert.match(resolve, /if \(typeof how !== 'string' \|\| !\(INTERFERENCE_RESOLUTIONS as readonly string\[\]\)\.includes\(how\)\) return false;/,
+    'THERE IS NO DEFAULT: a call that does not name one of the two resolutions is refused before the owner is touched');
   assert.ok(!/write|sendToOwner|submit\(|setTimeout|setInterval/.test(resolve), 'resolving types nothing, submits nothing and schedules nothing');
   assert.equal(index.split('.resolveInterference(').length - 1, 1, 'main has exactly ONE caller of resolveInterference: that handler - no timer, no expiry');
   const owner = codeOnly(readSource('src/main/automaticSubmit.ts'));
-  const at = owner.indexOf('  resolveInterference(ptyId: string): boolean {');
+  const at = owner.indexOf('  resolveInterference(ptyId: string, how: InterferenceResolution): boolean {');
   const body = owner.slice(at, owner.indexOf('\n  }\n', at));
   assert.ok(at >= 0 && !/safeWrite|deps\.write|enqueue|submit\(/.test(body), 'the owner’s resolve writes nothing and delivers nothing');
   assert.ok(!/setTimeout|setInterval/.test(owner.slice(owner.indexOf('  inhibition(ptyId'), at)), 'an inhibition has no timer');
@@ -206,13 +248,22 @@ test('renderer: resolveInterference is called from ONE place, a click', () => {
   assert.deepEqual(callers.map((f) => path.basename(f)), ['MessageQueueComposer.tsx'], 'one file calls it');
   const composer = codeOnly(readSource(callers[0]));
   assert.equal(composer.split('resolveInterference(').length - 1, 1, 'once');
-  assert.match(composer, /onClick=\{\(\) => \{ void window\.cth\.resolveInterference\(agent\.id\)/, 'from an onClick - never an effect, a timer or the drain');
-  assert.match(composer, /hold\?\.action === 'RESOLVE_INTERFERENCE' && \(/, 'offered exactly when the hold view names it');
+  assert.match(composer, /const resolveHeld = \(how: InterferenceChoice\['how'\]\) => \{/, 'inside ONE function...');
+  assert.equal(composer.split('resolveHeld(').length - 1, 1, '...which has exactly ONE caller');
+  assert.match(composer, /onClick=\{\(\) => resolveHeld\(choice\.how\)\}/, 'an onClick - never an effect, a timer or the drain');
+  assert.match(composer, /hold\?\.action === 'RESOLVE_INTERFERENCE' && interferenceChoices\(delivery\.interfered\)\.map\(/, 'the buttons ARE the shared module\u2019s two choices, offered exactly when the hold view names the action');
+  assert.match(composer, /if \(released && how === 'ALREADY_HANDLED' && heldRow\) removeQueuedMessage\(agent\.id, heldRow\.id\);/,
+    '"already handled" drops THE HELD ROW and no other, and only once main confirmed the release');
+  assert.match(composer, /const heldRow = queue\.find\(\(m\) => isHeldQueueItem\(delivery\.interfered, m\.id\)\);/, 'and the held row is the one MAIN names');
+  assert.ok(!/>resolved</.test(composer), 'the single ambiguous "resolved" button is gone');
+  const hive = codeOnly(readSource('src/renderer/src/hooks/useHive.ts'));
+  assert.match(hive, /if \(outcome\.kind === 'HUMAN_HANDLED'\) \{\s*delete sendFailures\[next\.id\];\s*removeQueuedMessage\(srcId, next\.id\);/,
+    'the drain treats HUMAN_HANDLED as "drop this one item" - never as a delivery and never as a retry');
   assert.match(composer, /const releasable = !delivery\.interfered && \(delivery\.paused \|\| delivery\.capacityHold\);/,
     '"send now" is offered for a pause or a capacity hold and NEVER while INTERFERED');
   assert.ok(!/useDeliveryPaused/.test(composer), 'the pause-only poll is replaced, not kept beside the new one');
   const preload = codeOnly(readSource('src/preload/index.ts'));
-  assert.match(preload, /resolveInterference: \(agentId: string\): Promise<boolean> =>\s*ipcRenderer\.invoke\('autoSubmit:resolveInterference', agentId\)/);
+  assert.match(preload, /resolveInterference: \(agentId: string, how: InterferenceResolution\): Promise<boolean> =>\s*ipcRenderer\.invoke\('autoSubmit:resolveInterference', agentId, how\)/);
 });
 
 test('this file reads source only through read-source.cjs', () => {

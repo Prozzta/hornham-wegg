@@ -423,6 +423,9 @@ export interface OwnerDeps {
     revalidate: (claim: OwnerClaim) => { verdict: AdmissionVerdict; reason: string };
     confirmLaunch: (decision: AdmissionDecision) => void;
     cancelGrant: (decision: AdmissionDecision) => void;
+    /** POSSIBLY LAUNCHED, awaiting a person (INTERFERED). Must not expire on a timer;
+     *  ends only by `confirmLaunch` or `cancelGrant`. Idempotent. */
+    holdGrant: (decision: AdmissionDecision) => void;
   };
   unknownPolicy?: UnknownPolicy;
   now: () => number;
@@ -483,7 +486,10 @@ export type SubmitOutcome =
   /** The staged text died with its terminal; nothing of ours remains anywhere. */
   | { kind: 'FAILED'; reason: 'PTY_REPLACED_AFTER_STAGE' | 'PTY_GONE_AFTER_STAGE' }
   /** The id was presented with different arguments than it is bound to. */
-  | { kind: 'REJECTED'; reason: 'ID_BINDING_MISMATCH' };
+  | { kind: 'REJECTED'; reason: 'ID_BINDING_MISMATCH' }
+  /** A PERSON resolved an INTERFERED hold with "already handled - drop": they dealt with
+   *  this content themselves. Recorded against the id, so it is never typed again. */
+  | { kind: 'HUMAN_HANDLED' };
 
 export interface OutcomeRecord {
   requestId: string;
@@ -495,6 +501,32 @@ export interface OutcomeRecord {
 }
 
 export interface Inhibition { requestId: string; reason: InterferenceReason; at: number; incarnation: unknown }
+
+/**
+ * HOW A PERSON RESOLVES AN INTERFERED HOLD (human ruling, option B). There are exactly two
+ * answers and no default, because the single "resolved" they replace could not tell them
+ * apart - and NOTHING HERE INFERS WHICH HAPPENED: an empty prompt is not proof that the
+ * staged message was submitted.
+ *
+ *   SEND_AGAIN       "I dealt with the interference; the message has NOT been handled."
+ *                    The hold is released, the possibly-launched grant is RETURNED, the id
+ *                    is released, and the item is re-admitted through this same owner with
+ *                    every gate. Nothing is typed by resolving.
+ *   ALREADY_HANDLED  "I handled / submitted this content myself."
+ *                    The hold is released, the grant is CONFIRMED as a launch (spent), and
+ *                    the id is recorded HUMAN_HANDLED so it can never be typed again.
+ *                    Nothing is typed, no Enter, no retry.
+ */
+export type InterferenceResolution = 'SEND_AGAIN' | 'ALREADY_HANDLED';
+export const INTERFERENCE_RESOLUTIONS: readonly InterferenceResolution[] = ['SEND_AGAIN', 'ALREADY_HANDLED'];
+
+/** What the owner keeps for a hold: the public facts, plus whose grant is in suspense. */
+interface HeldInterference extends Inhibition {
+  agentId: string;
+  admissionClass: AdmissionClass;
+  binding: Binding;
+  decision: AdmissionDecision | null;
+}
 
 /** The irreducible TUI interval between a paste and its Enter. */
 export const GAP_MS = 140;
@@ -621,7 +653,10 @@ export function commitSection(s: Staged, deps: OwnerDeps): CommitVerdict {
   const entered = safeWrite(deps, s.ptyId, '\r');
   if (s.decision) {
     if (entered.ok) deps.capacity.confirmLaunch(s.decision);
-    else deps.capacity.cancelGrant(s.decision);
+    // The Enter did not go out, but our payload is still on a live prompt where a person
+    // can press it: the evidence has run out, so the grant is HELD as possibly launched
+    // (never returned here) and the INTERFERED hold that follows carries it to a human.
+    else deps.capacity.holdGrant(s.decision);
   }
   return { kind: 'ENTERED', ok: entered.ok, error: entered.error };
 }
@@ -632,7 +667,7 @@ interface Known { binding: Binding; promise: Promise<SubmitOutcome>; settled: { 
 export class AutomaticSubmitOwner {
   private readonly chains = new Map<string, Promise<void>>();
   private readonly known = new Map<string, Known>();
-  private readonly inhibited = new Map<string, Inhibition>();
+  private readonly inhibited = new Map<string, HeldInterference>();
 
   constructor(private readonly deps: OwnerDeps) {}
 
@@ -690,21 +725,46 @@ export class AutomaticSubmitOwner {
     if (!held) return null;
     // Scoped to the incarnation it was raised on: the staged text and the human's text
     // both died with that process, and the replacement has a clean prompt.
-    if (this.deps.incarnation(ptyId) !== held.incarnation) { this.inhibited.delete(ptyId); return null; }
-    return held;
+    if (this.deps.incarnation(ptyId) !== held.incarnation) {
+      this.inhibited.delete(ptyId);
+      // Nobody can now say whether a person pressed Enter on our payload before the
+      // terminal died. Where the evidence runs out we fail toward ALREADY LAUNCHED: the
+      // grant is spent, not handed back. The ID is released - the text died unsent as far
+      // as the queue can tell, and re-delivery goes through every gate on the new process.
+      if (held.decision) this.deps.capacity.confirmLaunch(held.decision);
+      if (this.known.get(held.requestId)?.binding === held.binding) this.known.delete(held.requestId);
+      return null;
+    }
+    return { requestId: held.requestId, reason: held.reason, at: held.at, incarnation: held.incarnation };
   }
 
-  /** A HUMAN says the held prompt is dealt with. The ONLY way an inhibition ends while
-   *  its terminal lives — there is no timer, because a timer is automation deciding that
-   *  a human's text no longer matters. */
-  resolveInterference(ptyId: string): boolean {
-    const held = this.inhibited.get(ptyId);
-    if (!held) return false;
+  /** A HUMAN says the held prompt is dealt with, AND SAYS HOW (`InterferenceResolution`).
+   *  The ONLY way an inhibition ends while its terminal lives — there is no timer, because
+   *  a timer is automation deciding that a human's text no longer matters. There is no
+   *  default resolution: an answer that is not one of the two is refused and the hold
+   *  stays. Writes nothing to any terminal, whichever answer it is. */
+  resolveInterference(ptyId: string, how: InterferenceResolution): boolean {
+    if (!INTERFERENCE_RESOLUTIONS.includes(how)) return false;
+    if (!this.inhibition(ptyId)) return false; // also retires a hold whose terminal died
+    const held = this.inhibited.get(ptyId)!;
     this.inhibited.delete(ptyId);
-    // The held item is the human's to re-release or discard. Its recorded INTERFERED
-    // must not answer for it any more, or re-releasing the same message would replay the
-    // hold it was just released from.
-    this.known.delete(held.requestId);
+    const mine = this.known.get(held.requestId)?.binding === held.binding;
+    if (how === 'SEND_AGAIN') {
+      // Not launched, on a person's word: the turn goes back, and the id is released so
+      // re-admitting the same message does not replay the hold it was just released from.
+      if (held.decision) this.deps.capacity.cancelGrant(held.decision);
+      if (mine) this.known.delete(held.requestId);
+    } else {
+      // Launched by the person: the turn is spent, and the id answers HUMAN_HANDLED from
+      // now on - so a copy of the item that is asked for again is never typed.
+      if (held.decision) this.deps.capacity.confirmLaunch(held.decision);
+      const at = this.deps.now();
+      const outcome: SubmitOutcome = { kind: 'HUMAN_HANDLED' };
+      this.known.set(held.requestId, { binding: held.binding, promise: Promise.resolve(outcome), settled: { at } });
+      try {
+        this.deps.onOutcome?.({ requestId: held.requestId, agentId: held.agentId, ptyId, admissionClass: held.admissionClass, outcome, at });
+      } catch { /* diagnostics never decide */ }
+    }
     return true;
   }
 
@@ -828,22 +888,31 @@ export class AutomaticSubmitOwner {
       case 'ENTERED':
         if (verdict.ok) return { kind: 'COMMITTED' };
         // The Enter did not go out and our text is still on a live prompt: residue we
-        // cannot account for. Held, not retried (the grant was returned in-section).
-        return this.interfere(staged, 'ENTER_WRITE_FAILED', verdict.error, false);
+        // cannot account for. Held, not retried (the grant was HELD in-section).
+        return this.interfere(staged, 'ENTER_WRITE_FAILED', verdict.error);
       case 'FAILED':
         if (decision) deps.capacity.cancelGrant(decision);
         return { kind: 'FAILED', reason: verdict.reason };
       case 'INTERFERED':
-        return this.interfere(staged, verdict.reason, verdict.detail, true);
+        return this.interfere(staged, verdict.reason, verdict.detail);
       case 'LATE_REFUSAL':
         return this.abort(staged, verdict.basis);
     }
   }
 
-  /** INTERFERED: write NOTHING. Hold, flag, inhibit. */
-  private interfere(s: Staged, reason: InterferenceReason, detail: string | undefined, returnGrant: boolean): SubmitOutcome {
-    if (returnGrant && s.decision) this.deps.capacity.cancelGrant(s.decision);
-    this.inhibited.set(s.ptyId, { requestId: s.req.requestId, reason, at: this.deps.now(), incarnation: s.incarnation });
+  /** INTERFERED: write NOTHING. Hold, flag, inhibit - and keep the grant IN SUSPENSE.
+   *  Our payload is on a live prompt where a person may press Enter on it, so the turn is
+   *  possibly launched: it is neither returned nor confirmed here. A human's resolution
+   *  (or the terminal's death) settles it. EVERY INTERFERED comes through here, so there
+   *  is no INTERFERED that returns a grant. */
+  private interfere(s: Staged, reason: InterferenceReason, detail: string | undefined): SubmitOutcome {
+    if (s.decision) this.deps.capacity.holdGrant(s.decision);
+    this.inhibited.set(s.ptyId, {
+      requestId: s.req.requestId, reason, at: this.deps.now(), incarnation: s.incarnation,
+      agentId: s.req.agentId, admissionClass: s.req.admissionClass,
+      binding: this.known.get(s.req.requestId)?.binding ?? { agentId: s.req.agentId, admissionClass: s.req.admissionClass, payload: '' },
+      decision: s.decision
+    });
     return detail === undefined ? { kind: 'INTERFERED', reason } : { kind: 'INTERFERED', reason, detail };
   }
 
@@ -874,27 +943,27 @@ export class AutomaticSubmitOwner {
   private async abort(s: Staged, basis: string): Promise<SubmitOutcome> {
     const deps = this.deps;
     const cap = deps.abortCapability(s.req.agentId);
-    if (cap.kind !== 'VERIFIED') return this.interfere(s, 'ABORT_CAPABILITY_UNVERIFIED', undefined, true);
+    if (cap.kind !== 'VERIFIED') return this.interfere(s, 'ABORT_CAPABILITY_UNVERIFIED', undefined);
     const needle = needleFor(s.req.text);
-    if (!needle) return this.interfere(s, 'STAGED_TEXT_NOT_POSITIVELY_VISIBLE', 'no usable needle', true);
+    if (!needle) return this.interfere(s, 'STAGED_TEXT_NOT_POSITIVELY_VISIBLE', 'no usable needle');
     const before = await this.readScreen(s.ptyId, needle);
     if (!before || !before.onPromptRow || before.screenCount < 1) {
-      return this.interfere(s, 'STAGED_TEXT_NOT_POSITIVELY_VISIBLE', before ? 'not on the prompt row' : 'no screen reading', true);
+      return this.interfere(s, 'STAGED_TEXT_NOT_POSITIVELY_VISIBLE', before ? 'not on the prompt row' : 'no screen reading');
     }
     // FRESH, and adjacent to the destructive write: no yield between this and the clear.
     const blocked = postStageGuard(s, deps);
     if (blocked) {
       if (blocked.kind === 'FAILED') { if (s.decision) deps.capacity.cancelGrant(s.decision); return { kind: 'FAILED', reason: blocked.reason }; }
-      if (blocked.kind === 'INTERFERED') return this.interfere(s, blocked.reason, blocked.detail, true);
+      if (blocked.kind === 'INTERFERED') return this.interfere(s, blocked.reason, blocked.detail);
     }
     const cleared = safeWrite(deps, s.ptyId, cap.clearControl);
-    if (!cleared.ok) return this.interfere(s, 'CLEAR_WRITE_FAILED', cleared.error, true);
+    if (!cleared.ok) return this.interfere(s, 'CLEAR_WRITE_FAILED', cleared.error);
     await this.sleep(cap.settleMs);
     const after = await this.readScreen(s.ptyId, needle);
     // BOTH halves, neither traded for the other: gone from the prompt row AND fewer on
     // the screen than before — so the text neither remains sendable nor merely moved.
     if (!after || after.onPromptRow || after.screenCount >= before.screenCount) {
-      return this.interfere(s, 'ERASE_NOT_VERIFIED', after ? `row=${after.onPromptRow} count=${after.screenCount}/${before.screenCount}` : 'no screen reading', true);
+      return this.interfere(s, 'ERASE_NOT_VERIFIED', after ? `row=${after.onPromptRow} count=${after.screenCount}/${before.screenCount}` : 'no screen reading');
     }
     if (s.decision) deps.capacity.cancelGrant(s.decision);
     return { kind: 'ABORTED', detail: basis };

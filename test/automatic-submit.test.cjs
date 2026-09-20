@@ -72,7 +72,7 @@ function world(over = {}) {
     cap: { kind: 'VERIFIED', clearControl: '\x15', settleMs: 300 },
     ready: ['READY'],
     capacity: 'AVAILABLE',
-    revalidations: 0, admits: 0, readyAsks: 0, confirmed: [], cancelled: [],
+    revalidations: 0, admits: 0, readyAsks: 0, confirmed: [], cancelled: [], held: [],
     prompt: '', scrollback: [], clearBehaviour: 'erases', showsStagedText: true,
     reads: 0, onRead: null, oracle: 'answers',
     outcomes: [],
@@ -123,7 +123,8 @@ function world(over = {}) {
         return answer;
       },
       confirmLaunch: (d) => w.confirmed.push(d),
-      cancelGrant: (d) => w.cancelled.push(d)
+      cancelGrant: (d) => w.cancelled.push(d),
+      holdGrant: (d) => { if (!w.held.includes(d)) w.held.push(d); }
     },
     unknownPolicy: over.unknownPolicy,
     now: () => w.vt,
@@ -252,7 +253,8 @@ K.inhibitionHoldsUntilAHumanResolves = async (mod) => {
     'an INTERFERED PTY refuses automatic delivery — and NO timer ever lifts it');
   const manual = await settle(w, o.submit(req({ requestId: 'r3', admissionClass: 'USER_RELEASED' })));
   assert.deepEqual(manual, { kind: 'REFUSED', reason: 'PTY_INHIBITED' }, 'for every class');
-  assert.equal(o.resolveInterference('pty-alice'), true);
+  assert.equal(o.resolveInterference('pty-alice', 'SEND_AGAIN'), true);
+  w.prompt = '';
   const after = await settle(w, o.submit(req({ requestId: 'r4' })));
   assert.equal(after.kind, 'COMMITTED', 'only an explicit human resolution lifts it');
 };
@@ -779,10 +781,143 @@ K.aResolvedInterferenceReleasesItsId = async (mod) => {
   const replay = await settle(w, o.submit(req({ requestId: 'msg-9' })));
   assert.equal(replay.kind, 'INTERFERED', 'while it is held, the same id answers INTERFERED');
   assert.deepEqual(w.writes, ['read your inbox now'], 'and types nothing more');
-  assert.equal(o.resolveInterference('pty-alice'), true);
+  assert.equal(o.resolveInterference('pty-alice', 'SEND_AGAIN'), true);
   w.prompt = ''; w.vt += 60_000; // the human dealt with the line
   const again = await settle(w, o.submit(req({ requestId: 'msg-9' })));
   assert.equal(again.kind, 'COMMITTED', 'a human-resolved hold RELEASES the id: re-releasing the message delivers it');
+};
+
+// --- INTERFERED RESOLUTION: the human ruling (option B) and god's G1b ruling ---------------
+
+/** INTERFERED with a human's text on the prompt, and the owner it happened on. */
+async function interferedWorld(mod, over = {}) {
+  const w = world(over);
+  w.at(50, () => w.human(' mine'));
+  const o = owner(mod, w);
+  const out = await settle(w, o.submit(req({ requestId: 'msg-held' })));
+  assert.equal(out.kind, 'INTERFERED', 'precondition: the delivery was interfered with');
+  return { w, o };
+}
+
+K.interferedKeepsTheGrantInSuspense = async (mod) => {
+  const { w } = await interferedWorld(mod);
+  assert.deepEqual([w.held.length, w.cancelled.length, w.confirmed.length], [1, 0, 0],
+    'at INTERFERED the grant is neither returned nor confirmed: it is HELD as possibly launched, because a person may press Enter on our payload');
+};
+
+K.alreadyHandledNeverTypesItAgain = async (mod) => {
+  // THE DUPLICATE the single "resolved" produced: the person pressed Enter on our staged
+  // payload THEMSELVES, the prompt is empty, and the message is still in the queue.
+  const { w, o } = await interferedWorld(mod);
+  w.prompt = ''; // they submitted it by hand. The owner must NOT read anything into this.
+  const before = w.writes.slice();
+  assert.equal(o.resolveInterference('pty-alice', 'ALREADY_HANDLED'), true);
+  assert.deepEqual(w.writes, before, '"already handled" performs NO terminal input: no text, no Enter, no clear');
+  assert.deepEqual([w.confirmed.length, w.cancelled.length], [1, 0], 'the turn is SPENT: a person launched it');
+  assert.equal(o.inhibition('pty-alice'), null, 'the hold is released');
+  w.vt += 60_000;
+  const again = await settle(w, o.submit(req({ requestId: 'msg-held' })));
+  assert.deepEqual(again, { kind: 'HUMAN_HANDLED' }, 'manually submitted + "already handled" -> NO DUPLICATE: the same message asked for again is never typed');
+  assert.deepEqual(w.writes, before, 'not one byte more reached the terminal');
+  const other = await settle(w, o.submit(req({ requestId: 'msg-other', text: 'an unrelated queued message' })));
+  assert.equal(other.kind, 'COMMITTED', 'and an UNRELATED queued item is untouched: it delivers normally');
+};
+
+K.sendAgainDeliversExactlyOnce = async (mod) => {
+  const { w, o } = await interferedWorld(mod);
+  const before = w.writes.slice();
+  const admitsBefore = w.admits; const revalidationsBefore = w.revalidations;
+  assert.equal(o.resolveInterference('pty-alice', 'SEND_AGAIN'), true);
+  assert.deepEqual(w.writes, before, 'resolving types nothing - delivery is a separate, gated act');
+  assert.deepEqual([w.cancelled.length, w.confirmed.length], [1, 0], 'NOT launched, on a person\u2019s word: the turn goes back');
+  w.prompt = ''; w.vt += 60_000; // they cleared the line; the message was never submitted
+  const again = await settle(w, o.submit(req({ requestId: 'msg-held' })));
+  assert.equal(again.kind, 'COMMITTED', 'not manually submitted + "send queued message" -> delivered');
+  assert.ok(w.admits > admitsBefore && w.revalidations > revalidationsBefore,
+    '"send queued message" goes through NORMAL ADMISSION AND REVALIDATION again - capacity is asked afresh, not remembered');
+  assert.equal(enters(w), 1, 'EXACTLY ONE delivery');
+  await settle(w, o.submit(req({ requestId: 'msg-held' })));
+  assert.equal(enters(w), 1, 'and asking for it yet again replays the commit: still exactly one Enter');
+};
+
+K.sendAgainStillFacesEveryGate = async (mod) => {
+  const { w, o } = await interferedWorld(mod);
+  assert.equal(o.resolveInterference('pty-alice', 'SEND_AGAIN'), true);
+  const before = w.writes.slice();
+  w.vt += 60_000; w.promptBlock = 'draft'; // the human's text is STILL on the prompt, and the mirror says so
+  const blocked = await settle(w, o.submit(req({ requestId: 'msg-held' })));
+  assert.equal(blocked.kind, 'REFUSED', 'a released hold is not a licence: the prompt gate still refuses a line with a person\u2019s text on it');
+  w.prompt = ''; w.promptBlock = null; w.capacity = 'LIMITED';
+  const held = await settle(w, o.submit(req({ requestId: 'msg-held' })));
+  assert.deepEqual([held.kind, held.reason], ['REFUSED', 'CAPACITY_HOLD'], 'and the capacity gate still holds it');
+  assert.deepEqual(w.writes, before, 'nothing was typed by either refusal');
+};
+
+K.thereIsNoDefaultResolution = async (mod) => {
+  const { w, o } = await interferedWorld(mod);
+  for (const how of [undefined, null, '', 'RESOLVED', 'resolved', true]) {
+    assert.equal(o.resolveInterference('pty-alice', how), false, `a resolution that is not one of the two (${String(how)}) is REFUSED`);
+  }
+  assert.ok(o.inhibition('pty-alice'), 'and the hold STAYS: an ambiguous "resolved" is exactly what produced duplicate deliveries');
+  assert.deepEqual([w.cancelled.length, w.confirmed.length], [0, 0], 'the grant is still in suspense');
+  assert.deepEqual([...mod.INTERFERENCE_RESOLUTIONS].sort(), ['ALREADY_HANDLED', 'SEND_AGAIN'], 'there are exactly two');
+};
+
+K.aWakeOrBootHoldResolvesWithoutAQueue = async (mod) => {
+  // The held request need not be a queue item. Both answers still mean what they say.
+  for (const [how, expected] of [['ALREADY_HANDLED', [1, 0]], ['SEND_AGAIN', [0, 1]]]) {
+    const w = world();
+    w.at(50, () => w.human('x'));
+    const o = owner(mod, w);
+    await settle(w, o.submit(req({ requestId: 'wake:alice:7', admissionClass: 'CAPACITY_GATED' })));
+    const before = w.writes.slice();
+    assert.equal(o.resolveInterference('pty-alice', how), true);
+    assert.deepEqual([w.confirmed.length, w.cancelled.length], expected, `${how} on a held WAKE settles the grant the same way`);
+    assert.deepEqual(w.writes, before, `${how} on a held wake types nothing and re-sends nothing by itself`);
+    assert.equal(o.inhibition('pty-alice'), null);
+  }
+};
+
+K.aDeadTerminalSpendsTheHeldGrant = async (mod) => {
+  const { w, o } = await interferedWorld(mod);
+  w.inc = { n: 2 }; // the terminal died and respawned under the same id
+  assert.equal(o.inhibition('pty-alice'), null, 'the hold does not outlive its incarnation');
+  assert.deepEqual([w.confirmed.length, w.cancelled.length], [1, 0],
+    'nobody can now say whether a person pressed Enter: where the evidence runs out the grant is SPENT, not handed back');
+  assert.equal(o.resolveInterference('pty-alice', 'SEND_AGAIN'), false, 'and there is nothing left to resolve');
+};
+
+K.everyOutcomeAccountsForItsGrant = async (mod) => {
+  // G1: no outcome may leave a grant neither confirmed, nor returned, nor held for a human;
+  // and a held grant is settled exactly once by whatever ends the hold.
+  const scenarios = {
+    COMMITTED: { over: {}, want: 'confirmed' },
+    'REFUSED (human before STAGE)': { over: { ready: ['WAIT', 'READY'] }, prep: (w) => { w.at(50, () => { w.gen += 1; w.prompt += 'hello'; }); }, want: 'cancelled' },
+    'REFUSED (terminal never ready)': { over: { ready: ['WAIT'] }, want: 'cancelled' },
+    'REFUSED (payload write failed)': { over: {}, prep: (w) => { w.writeFails = (d) => d !== '\r'; }, want: 'cancelled' },
+    'FAILED (terminal replaced in the gap)': { over: {}, prep: (w) => { w.at(50, () => { w.inc = { n: 2 }; w.gen = 0; }); }, want: 'cancelled' },
+    'ABORTED (late refusal)': { over: {}, prep: (w) => { w.at(50, () => { w.capacity = 'LIMITED'; }); }, want: 'cancelled' },
+    'INTERFERED (human after STAGE)': { over: {}, prep: (w) => { w.at(50, () => w.human('x')); }, want: 'held' },
+    'INTERFERED (Enter write failed)': { over: {}, prep: (w) => { w.writeFails = (d) => d === '\r'; }, want: 'held' },
+    'INTERFERED (erase not verified)': { over: {}, prep: (w) => { w.at(50, () => { w.capacity = 'LIMITED'; }); w.clearBehaviour = 'ignored'; }, want: 'held' }
+  };
+  for (const [name, sc] of Object.entries(scenarios)) {
+    const w = world(sc.over);
+    if (sc.prep) sc.prep(w);
+    const o = owner(mod, w);
+    const out = await settle(w, o.submit(req()));
+    assert.ok(name.startsWith(out.kind), `${name}: the scenario reached its outcome (got ${out.kind} ${out.reason ?? ''})`);
+    const tally = { confirmed: w.confirmed.length, cancelled: w.cancelled.length, held: w.held.length };
+    const settledNow = tally.confirmed + tally.cancelled;
+    assert.equal(sc.want === 'held' ? tally.held : tally[sc.want], 1, `${name}: the grant is ${sc.want} - ${JSON.stringify(tally)}`);
+    assert.equal(settledNow, sc.want === 'held' ? 0 : 1, `${name}: EVERY OUTCOME ACCOUNTS FOR ITS GRANT exactly once - ${JSON.stringify(tally)}`);
+    if (sc.want === 'held') {
+      assert.equal(o.resolveInterference('pty-alice', 'SEND_AGAIN'), true);
+      assert.equal(w.confirmed.length + w.cancelled.length, 1, `${name}: and the resolution settles the held grant exactly once`);
+      assert.equal(o.resolveInterference('pty-alice', 'ALREADY_HANDLED'), false, `${name}: it cannot be settled a second time`);
+      assert.equal(w.confirmed.length + w.cancelled.length, 1);
+    }
+  }
 };
 
 K.mismatchedReplayRejects = async (mod) => {
@@ -797,13 +932,14 @@ K.mismatchedReplayRejects = async (mod) => {
   }
 };
 
-K.enterFailureReturnsTheGrantAndHolds = async (mod) => {
+K.enterFailureHoldsTheGrantForAHuman = async (mod) => {
   const w = world();
   w.writeFails = (d) => d === '\r';
   const o = owner(mod, w);
   const out = await settle(w, o.submit(req()));
   assert.equal(w.confirmed.length, 0, 'a failed Enter is NOT a launch');
-  assert.equal(w.cancelled.length, 1, 'false/throw => cancelGrant, settled in-section');
+  assert.equal(w.cancelled.length, 0, 'and the grant is HELD, not returned: our payload is still on a live prompt where a person can press Enter');
+  assert.equal(w.held.length, 1, 'held in-section, so the grant is never unaccounted for');
   assert.equal(out.kind, 'INTERFERED', 'our text is still on a live prompt: held, not retried');
   assert.equal(out.reason, 'ENTER_WRITE_FAILED');
 };
@@ -940,7 +1076,7 @@ const MUTANTS = [
     edits: [['    this.inhibited.set(s.ptyId, {', "    safeWrite(this.deps, s.ptyId, '\\r');\n    this.inhibited.set(s.ptyId, {"]],
     killer: 'postStageHumanIsInterfered', dies: /INTERFERED writes NOTHING/ },
   { name: 'INTERFERED that does not inhibit the PTY',
-    edits: [["    this.inhibited.set(s.ptyId, { requestId: s.req.requestId, reason, at: this.deps.now(), incarnation: s.incarnation });\n", '']],
+    edits: [['    this.inhibited.set(s.ptyId, {\n      requestId: s.req.requestId, reason,', '    ({\n      requestId: s.req.requestId, reason,']],
     killer: 'postStageHumanIsInterfered', dies: /further automatic delivery on that PTY is inhibited/ },
   { name: 'an inhibition that expires on a timer',
     edits: [['    if (this.deps.incarnation(ptyId) !== held.incarnation) {', '    if (this.deps.now() - held.at > 60_000 || this.deps.incarnation(ptyId) !== held.incarnation) {']],
@@ -1041,11 +1177,38 @@ const MUTANTS = [
     edits: [["      if (outcome.kind !== 'COMMITTED' && outcome.kind !== 'INTERFERED'\n", "      if (outcome.kind !== 'INTERFERED'\n"]],
     killer: 'oneStableIdPerMessageDeliversAtMostOnce', dies: /AT MOST ONCE/ },
   { name: 'a resolved interference that still answers for its id',
-    edits: [['    this.known.delete(held.requestId);\n', '']],
+    edits: [['      if (mine) this.known.delete(held.requestId);\n', '']],
     killer: 'aResolvedInterferenceReleasesItsId', dies: /RELEASES the id/ },
   { name: 'a failed Enter confirmed as a launch',
-    edits: [['    if (entered.ok) deps.capacity.confirmLaunch(s.decision);\n    else deps.capacity.cancelGrant(s.decision);', '    deps.capacity.confirmLaunch(s.decision);']],
-    killer: 'enterFailureReturnsTheGrantAndHolds', dies: /a failed Enter is NOT a launch/ },
+    edits: [['    else deps.capacity.holdGrant(s.decision);', '    else deps.capacity.confirmLaunch(s.decision);']],
+    killer: 'enterFailureHoldsTheGrantForAHuman', dies: /a failed Enter is NOT a launch/ },
+  { name: 'a failed Enter hands the turn back while our payload is on the prompt',
+    edits: [['    else deps.capacity.holdGrant(s.decision);', '    else deps.capacity.cancelGrant(s.decision);']],
+    killer: 'enterFailureHoldsTheGrantForAHuman', dies: /HELD, not returned/ },
+  { name: 'INTERFERED returns the grant (G1b as it stood before the ruling)',
+    edits: [['    if (s.decision) this.deps.capacity.holdGrant(s.decision);', '    if (s.decision) this.deps.capacity.cancelGrant(s.decision);']],
+    killer: 'interferedKeepsTheGrantInSuspense', dies: /neither returned nor confirmed/ },
+  { name: '"already handled" releases the id, so the queue types it again',
+    edits: [['      this.known.set(held.requestId, { binding: held.binding, promise: Promise.resolve(outcome), settled: { at } });\n', '      if (mine) this.known.delete(held.requestId);\n']],
+    killer: 'alreadyHandledNeverTypesItAgain', dies: /NO DUPLICATE/ },
+  { name: '"already handled" hands the turn back',
+    edits: [['      if (held.decision) this.deps.capacity.confirmLaunch(held.decision);\n      const at = this.deps.now();', '      if (held.decision) this.deps.capacity.cancelGrant(held.decision);\n      const at = this.deps.now();']],
+    killer: 'alreadyHandledNeverTypesItAgain', dies: /the turn is SPENT/ },
+  { name: '"send queued message" spends the turn it is about to ask for again',
+    edits: [['      if (held.decision) this.deps.capacity.cancelGrant(held.decision);\n      if (mine)', '      if (held.decision) this.deps.capacity.confirmLaunch(held.decision);\n      if (mine)']],
+    killer: 'sendAgainDeliversExactlyOnce', dies: /the turn goes back/ },
+  { name: '"send queued message" types the message itself instead of re-admitting it',
+    edits: [["    if (how === 'SEND_AGAIN') {\n", "    if (how === 'SEND_AGAIN') {\n      this.deps.write(ptyId, '\\r');\n"]],
+    killer: 'sendAgainDeliversExactlyOnce', dies: /resolving types nothing/ },
+  { name: 'a bare "resolved" accepted as a resolution',
+    edits: [['    if (!INTERFERENCE_RESOLUTIONS.includes(how)) return false;\n', '']],
+    killer: 'thereIsNoDefaultResolution', dies: /is REFUSED/ },
+  { name: 'a dead terminal hands the held turn back',
+    edits: [['      if (held.decision) this.deps.capacity.confirmLaunch(held.decision);\n      if (this.known', '      if (held.decision) this.deps.capacity.cancelGrant(held.decision);\n      if (this.known']],
+    killer: 'aDeadTerminalSpendsTheHeldGrant', dies: /the grant is SPENT/ },
+  { name: 'an abort that could not verify its erase returns the grant',
+    edits: [["      return this.interfere(s, 'ERASE_NOT_VERIFIED',", "      if (s.decision) deps.capacity.cancelGrant(s.decision);\n      return this.interfere(s, 'ERASE_NOT_VERIFIED',"]],
+    killer: 'everyOutcomeAccountsForItsGrant', dies: /EVERY OUTCOME ACCOUNTS FOR ITS GRANT/ },
   { name: 'the Enter sent in the same chunk as the payload',
     edits: [['    await this.sleep(GAP_MS);', '    await this.sleep(0);']],
     killer: 'gapIsHonoured', dies: /one GAP after the payload/ }
