@@ -341,7 +341,6 @@ test('revalidate keeps the verdict tri-state and names each structural refusal',
     'UNKNOWN reaches the owner’s resolver AS UNKNOWN, with its evidence - not collapsed to a boolean');
   r.runtime.ingest('jim', LIMIT(T0 + 1_000));
   assert.deepEqual(r.runtime.revalidate(claim, 'pty-jim'), { verdict: 'REFUSE', reason: CLAIM_REASON.EPOCH });
-  assert.equal(r.runtime.maySubmitNow(claim, 'pty-jim'), false, 'the legacy boolean agrees while it still exists');
 });
 
 // ─── The owner against the REAL PtyManager (stage 5.5a) ───────────────────────────────
@@ -406,14 +405,15 @@ test('REAL PtyManager: a HUMAN write through the real ingress, in the gap -> INT
 // ─── L0-TOCTOU, MIGRATED ONTO `revalidate` (stage 5.5a; nothing is deleted by this) ────
 //
 // The five L0-TOCTOU tests and the L0-WAKE shared check in
-// provider-capacity-delivery-death.test.cjs ask their question through the TICKET door
+// provider-capacity-delivery-death.test.cjs ASKED their question through the TICKET door
 // (`markAutomaticDeliveryWriting`) and the legacy boolean (`maySubmitNow`), neither of
-// which has a production caller any more. The question itself is alive: it is what the
+// which exists any more. The question itself is alive: it is what the
 // owner asks inside its critical section, through `revalidate`. These are the same five
 // schedules asked through THAT door, with the full answer (verdict AND reason) pinned
-// rather than a boolean - so when the ticket door is removed (its own commit, after a
-// validator signs the successor mapping) nothing the old tests held is left unheld.
-// The old tests stay until then; both sets pass side by side.
+// rather than a boolean - so when the ticket door was removed nothing the old tests held
+// was left unheld. IT HAS NOW BEEN REMOVED (stage 5.5, after Dwight signed the successor
+// mapping at `2a50e62e`): that file, the door and the boolean are gone, and these are the
+// only holders of the question.
 
 /** Killers: each takes the CapacityRuntime CLASS under test, so the census below can hand
  *  it a mutant. They run against the real class as ordinary tests. */
@@ -1421,16 +1421,50 @@ test('the one door: autoSubmit:submit names an AGENT and a CLASS, never a PTY', 
   assert.match(body, /return automaticSubmit\.submit\(\{/);
 });
 
-test('the ticket machinery has NO production caller left (its removal is the stage-5.5 commit)', () => {
-  // Declared transitional state, asserted rather than assumed: CapacityRuntime still
-  // DEFINES begin/mark/settle/maySubmitNow, but nothing outside that file calls them.
-  for (const f of walkSrc('src')) {
-    if (f === 'src/main/capacityRuntime.ts') continue;
-    const text = codeOnly(read(f));
-    for (const dead of ['beginAutomaticDelivery(', 'markAutomaticDeliveryWriting(', 'settleAutomaticDelivery(', '.maySubmitNow(', '.holds(']) {
-      assert.ok(!text.includes(dead), `${f} must not call ${dead}`);
+/** The five retired `CapacityRuntime` members (stage 5.5), and the machinery only they used. */
+const RETIRED_TICKET_DOOR = ['beginAutomaticDelivery', 'markAutomaticDeliveryWriting', 'settleAutomaticDelivery', 'maySubmitNow'];
+const RETIRED_TICKET_PARTS = ['expireAutomaticDelivery', 'AutomaticDeliveryGrant', 'PendingDelivery', 'AUTO_DELIVERY_TTL_MS', 'ticketSeq'];
+
+/** Every retired name found in `files` ({ path: text }), over CODE only. `holds` is an
+ *  ordinary English word and a live FIELD of `capacityGateOf`'s answer, so for it the
+ *  retired thing is what is looked for: a method or a call named `holds`. */
+function retiredTicketNamesIn(files) {
+  const found = [];
+  for (const [f, source] of Object.entries(files)) {
+    const text = codeOnly(source, f);
+    for (const name of [...RETIRED_TICKET_DOOR, ...RETIRED_TICKET_PARTS]) {
+      if (new RegExp(`(^|[^A-Za-z0-9_$])${name}(?![A-Za-z0-9_$])`).test(text)) found.push(`${f}: ${name}`);
     }
+    if (/(^|[^A-Za-z0-9_$])holds\s*\(/.test(text)) found.push(`${f}: holds(`);
   }
+  return found;
+}
+
+test('the ticket machinery is GONE: the five retired names are ABSENT FROM ALL OF src (stage 5.5)', () => {
+  // A condition of Dwight's signature on the successor mapping: not "no production
+  // caller" but ABSENT, from every file under src including capacityRuntime.ts itself,
+  // over the parser-based `codeOnly` - never a regex stripper (the 5.5a blind spot).
+  const files = {};
+  for (const f of walkSrc('src')) files[f] = read(f);
+  assert.ok(Object.keys(files).length > 100 && 'src/main/capacityRuntime.ts' in files, 'the walk covers all of src, the runtime included');
+  assert.deepEqual(retiredTicketNamesIn(files), [], 'a retired ticket name is back in src');
+  // And the class itself, as loaded: no member by any of the five names.
+  for (const name of [...RETIRED_TICKET_DOOR, 'holds']) {
+    assert.ok(!(name in CapacityRuntime.prototype), `CapacityRuntime has no \`${name}\``);
+  }
+});
+
+test('the absence census CAN FAIL: each retired name, put back into code, is found - and in a comment is not', () => {
+  const clean = { 'x.ts': 'export class R { revalidate(): number { return 1; } }\n' };
+  assert.deepEqual(retiredTicketNamesIn(clean), []);
+  for (const name of [...RETIRED_TICKET_DOOR, ...RETIRED_TICKET_PARTS]) {
+    assert.deepEqual(retiredTicketNamesIn({ 'x.ts': `export const probe = { ${name}: 1 };\n` }), [`x.ts: ${name}`], `${name} in code is found`);
+    assert.deepEqual(retiredTicketNamesIn({ 'x.ts': `// ${name} was removed\nexport const probe = 1;\n` }), [], `${name} in a comment is history, not a caller`);
+  }
+  assert.deepEqual(retiredTicketNamesIn({ 'x.ts': 'export class R { holds(a: string): boolean { return !!a; } }\n' }), ['x.ts: holds('], 'a method named holds is found');
+  assert.deepEqual(retiredTicketNamesIn({ 'x.ts': 'declare const r: any;\nexport const v = r.holds("a");\n' }), ['x.ts: holds('], 'a call to holds is found');
+  assert.deepEqual(retiredTicketNamesIn({ 'x.ts': 'export const gate = { holds: true };\nexport const s = gate.holds;\n' }), [], 'the live `holds` FIELD of the gate answer is not the retired method');
+  assert.deepEqual(retiredTicketNamesIn({ 'x.ts': 'export const holdsGrant = 1;\n' }), [], 'a longer identifier is not a match');
 });
 
 // ─── Static: the renderer half ────────────────────────────────────────────────────────

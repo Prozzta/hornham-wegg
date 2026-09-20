@@ -26,8 +26,8 @@ export interface OwnerPty {
   promptState(id: string): TerminalPromptState | undefined;
 }
 
-/** The slice of `CapacityRuntime` the owner is allowed to touch. No `holds`, no
- *  `maySubmitNow`: both are boolean collapses of the verdict (section 3). */
+/** The slice of `CapacityRuntime` the owner is allowed to touch. Nothing here answers
+ *  with a boolean: a boolean collapses the tri-state verdict (section 3). */
 export interface OwnerCapacity {
   admit(agentId: string, workClass: WorkClass): AdmissionDecision;
   revalidate(claim: OwnerClaim, target: string | null): { verdict: AdmissionDecision['verdict']; reason: string };

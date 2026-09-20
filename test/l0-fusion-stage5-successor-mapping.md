@@ -1,8 +1,40 @@
 # L0-FUSION stage 5 — successor mapping for the transitional ticket tests
 
-**Status: SIGNED WITH CONDITIONS by Dwight (2026-09-20); this revision meets the conditions and is what he proves
-and signs. Nothing listed here has been deleted, and nothing is deleted until he has.** Written at stage 5.5a
+**Status: SIGNED by Dwight at `2a50e62e` (all four conditions MET; relayed by Michael 2026-09-20 22:52Z), and THE
+DELETION IS DONE - in the commit that carries this text, the sole child of `2a50e62e`. The 30 tests below and the
+five methods no longer exist; this file is now the record of what each test held and what holds it instead. Everything
+below the "What was deleted" section is kept AS SIGNED, so its present tense ("survive", "still call") describes the
+tree at `2a50e62e`, not this one.**
+
+**Status as signed:** SIGNED WITH CONDITIONS by Dwight (2026-09-20); this revision meets the conditions and is what he
+proves and signs. Written at stage 5.5a
 (`9eb9d38e`); updated at 5.6; **CORRECTED at the pin that carries this text** - see "Correction" below.
+
+## What was deleted (stage 5.5, the deletion half) - DONE
+
+One commit, as the signature required:
+
+- **30 tests:** all 19 of `provider-capacity-delivery-death.test.cjs` (the file is gone - it held nothing else); the 8
+  `PIN3/4` tests of `provider-capacity-pin3.test.cjs` with the multi-timer rig only they used; the 3 `holds()` tests of
+  `provider-capacity-runtime.test.cjs`.
+- **From `src/main/capacityRuntime.ts`:** `beginAutomaticDelivery`, `markAutomaticDeliveryWriting`,
+  `settleAutomaticDelivery`, `maySubmitNow`, `holds`; and what only they used - `expireAutomaticDelivery`, the
+  `PendingDelivery` and `AutomaticDeliveryGrant` types, `AUTO_DELIVERY_TTL_MS`, the `pending` map, `ticketSeq`, and the
+  ticket settlement inside `stop()`. **Deletion only - no behaviour of a path that runs was changed.** The reasoning
+  that `maySubmitNow`'s comment carried about the four structural clauses and the own-reservation carve-out now sits on
+  `revalidate`, which is what it always described.
+- **No IPC or preload surface was left to remove:** the ticket channels went at stage 5.3, and the census below covers
+  `src/preload` and `src/renderer` as well as `src/main`.
+- **Kept:** `DeliveryClaim`, `CLAIM_REASON`, `revalidate`, `holdGrant`, `admit` / `confirmLaunch` / `cancelGrant`.
+- **Added (condition 2):** ASW `the ticket machinery is GONE: the five retired names are ABSENT FROM ALL OF src
+  (stage 5.5)` - every file under `src`, `capacityRuntime.ts` included, over the parser-based `codeOnly`; plus the
+  loaded class has no member by any of the five names. `holds` is an English word and a live FIELD of
+  `capacityGateOf`'s answer, so for that one name the census looks for the retired thing - a method or a call named
+  `holds` - and says so. ASW `the absence census CAN FAIL` proves each name is found in code and ignored in a comment;
+  and against the real tree, putting `maySubmitNow` and then `holds(` back into `capacityRuntime.ts` each failed the
+  census by name before being restored. It replaces `the ticket machinery has NO production caller left`.
+- **Still open, unchanged by this commit:** GAP 2 (row 30's closure half) is BY CONSTRUCTION / no production caller,
+  under commitment 3 below - any future closure-work caller adds its own admission class and `READY_GATE_POLICY` cell.
 
 ## What is transitional, and why
 
@@ -169,7 +201,7 @@ seam's own closure tests are untouched and stay. If closure work is ever automat
 an admission class and a cell in `READY_GATE_POLICY`; until then the old test's second half
 has no successor **because it has no caller**. Recorded, not built.
 
-## What the deletion commit would contain (NOT done)
+## What the deletion commit would contain (DONE - see "What was deleted" at the top)
 
 1. Delete rows 1–19, 20–27 and 28–30 and the five methods, the `PendingDelivery` type,
    `AUTO_DELIVERY_TTL_MS`, `pending`, `ticketSeq` and `expireAutomaticDelivery`.

@@ -123,3 +123,8 @@ what IS known, what is not, and what would settle it. Nothing here is a claim of
     `818e6e82`, `6d01797e`, `f9f155fa`, `2073142c`, `4e1ac8e0` or this pin. L0-FUSION-BUILD
     does not close until they are, and the deletion half of stage 5.5 waits for a signature
     on `l0-fusion-stage5-successor-mapping.md`.
+    **UPDATE (stage 5.5 deletion commit):** the validator came back; every pin through `a5ec055b` is validated
+    without caveat, the mapping was SIGNED at `2a50e62e`, and **the deletion half is DONE** - the 30 transitional
+    tests and the five dead `CapacityRuntime` methods are gone together, and a test holds the five names absent
+    from all of `src`. What stays unproven from that work is exactly one thing: row 30's closure half (GAP 2), held
+    BY CONSTRUCTION because no closure-work caller exists.

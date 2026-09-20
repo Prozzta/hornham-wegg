@@ -9,6 +9,11 @@
  * not decoration: three of the four defects are "a bound that does not bind", and
  * every one of those is satisfied by an implementation that retains nothing, admits
  * nothing, or refuses everything.
+ *
+ * THE FOURTH (12.3 #4, the renderer path that probed and never reserved) IS NO LONGER
+ * HERE. Its eight tests drove the delivery-ticket door, which was deleted together with
+ * them at L0-FUSION stage 5.5; what each one held, and what holds it now, is recorded
+ * row by row in test/l0-fusion-stage5-successor-mapping.md (rows 20-27).
  */
 const test = require('node:test');
 const assert = require('node:assert/strict');
@@ -17,8 +22,6 @@ const loadTs = require('./load-ts.cjs');
 const { ProviderCapacityTracker, L0_SEM_POLICY, RETENTION_CAPS } =
   loadTs('src/main/providerCapacityTracker.ts');
 const { admissionEnvelopeOf } = loadTs('src/main/capacityEnvelope.ts');
-const { CapacityRuntime } = loadTs('src/main/capacityRuntime.ts');
-const { ADMISSION_REASON } = loadTs('src/main/capacityAdmission.ts');
 
 const T0 = 1_800_000_000_000;
 const POOL = 'codex:acct-a:codex';
@@ -232,173 +235,4 @@ test('PIN3/3: every variable-width field pushed at once stays constant-size', ()
   );
   assert.ok(JSON.stringify(e).length < 512, 'there is nowhere for unbounded data to go, measured');
   assert.equal(e.hardLimit, 'TYPED_REACHED');
-});
-
-// ═══════════════════════════════════════════════════════════════════════════
-// 12.3 #4 — the renderer path probed and never reserved
-// ═══════════════════════════════════════════════════════════════════════════
-
-/**
- * A rig that can hold MORE THAN ONE timer, because this is the first test that needs
- * the boundary timer and a delivery-ticket expiry alive at the same moment.
- */
-function rig() {
-  let now = T0;
-  let mono = 0;
-  let seq = 0;
-  const timers = new Map();
-  const t = new ProviderCapacityTracker(L0_SEM_POLICY, () => now, () => mono);
-  const runtime = new CapacityRuntime({
-    deliver: () => {},
-    now: () => now,
-    setTimer: (fn, ms) => { const id = (seq += 1); timers.set(id, { fn, ms }); return { id, unref() { return this; } }; },
-    clearTimer: (h) => { if (h && typeof h === 'object') timers.delete(h.id); }
-  }, t);
-  return {
-    tracker: t, runtime,
-    state: () => t.pool(POOL)?.state,
-    /** Fire the soonest armed timer, advancing both clocks by its own delay. */
-    fire: () => {
-      assert.ok(timers.size, 'expected an armed timer');
-      let pick = null;
-      for (const [id, v] of timers) if (!pick || v.ms < pick.v.ms) pick = { id, v };
-      timers.delete(pick.id);
-      now += pick.v.ms;
-      mono += pick.v.ms;
-      pick.v.fn();
-    },
-    /** How many delivery-ticket expiries are armed right now. */
-    ticketTimers: () => [...timers.values()].filter((v) => v.ms === 30_000).length,
-    /** Fire ONLY the delivery-ticket expiries, without moving the capacity clock. */
-    expireTickets: () => {
-      for (const [id, v] of [...timers]) {
-        if (v.ms === 30_000) { timers.delete(id); v.fn(); }
-      }
-    }
-  };
-}
-
-/** Drive a pool into RECOVERING through the production path. */
-function recovering(r) {
-  r.runtime.ingest('jim', obs());
-  r.runtime.ingest('jim', obs({
-    observedAt: T0 + 1_000, receivedAt: T0 + 1_000,
-    providerReachedType: 'rate_limit_reached',
-    windows: [win('five_hour', 0)]
-  }));
-  assert.equal(r.state(), 'LIMITED');
-  for (let i = 0; i < 12 && r.state() !== 'RECOVERING'; i += 1) r.fire();
-  assert.equal(r.state(), 'RECOVERING', 'the rig reached the state the counterexample needs');
-}
-
-test('PIN3/4: TWO agents on one recovering pool cannot both be authorised', () => {
-  // THE COUNTEREXAMPLE. Both agents map to the same pool; under probe-then-submit
-  // both read "not held" and both launched, because a probe reserves nothing.
-  const r = rig();
-  recovering(r);
-  r.runtime.ingest('dwight', obs({ observedAt: T0 + 2_000, receivedAt: T0 + 2_000 }));
-
-  const first = r.runtime.beginAutomaticDelivery('jim');
-  const second = r.runtime.beginAutomaticDelivery('dwight');
-  assert.equal(first.ok, true, 'the epoch really does grant one turn');
-  assert.equal(second.ok, false, 'and only one');
-  assert.equal(second.reason, ADMISSION_REASON.RECOVERING_SPENT);
-});
-
-test('PIN3/4: the probe still does NOT spend — the earlier repair has not regressed', () => {
-  // `holds()` runs on every control snapshot. If reserving had been moved into it,
-  // the single recovery turn would be spent by the first poll, which is the defect
-  // probe() was introduced to fix. Both properties have to hold at once.
-  const r = rig();
-  recovering(r);
-  for (let i = 0; i < 20; i += 1) assert.equal(r.runtime.holds('jim'), false, `poll ${i}`);
-  assert.equal(r.runtime.beginAutomaticDelivery('jim').ok, true, 'twenty probes spent nothing');
-});
-
-test('PIN3/4: a CONFIRMED delivery spends the grant; a failed one returns it', () => {
-  const r = rig();
-  recovering(r);
-
-  const failed = r.runtime.beginAutomaticDelivery('jim');
-  assert.equal(failed.ok, true);
-  r.runtime.settleAutomaticDelivery(failed.ticket, false);
-  const retry = r.runtime.beginAutomaticDelivery('jim');
-  assert.equal(retry.ok, true, 'a delivery that never started must not cost the turn');
-
-  r.runtime.settleAutomaticDelivery(retry.ticket, true);
-  const after = r.runtime.beginAutomaticDelivery('jim');
-  assert.equal(after.ok, false, 'a delivery that DID start costs it');
-  assert.equal(after.reason, ADMISSION_REASON.RECOVERING_SPENT);
-});
-
-test('PIN3/4: an ABANDONED ticket returns its grant on MAIN\'s own expiry', () => {
-  // The renderer cannot be trusted to release a reservation: it can be reloaded,
-  // throttled or closed between the two calls. Nothing here settles the ticket.
-  const r = rig();
-  recovering(r);
-  const orphan = r.runtime.beginAutomaticDelivery('jim');
-  assert.equal(orphan.ok, true);
-  assert.equal(r.runtime.beginAutomaticDelivery('jim').ok, false, 'held while it is outstanding');
-
-  r.expireTickets();
-  assert.equal(r.runtime.beginAutomaticDelivery('jim').ok, true, 'and returned when it is abandoned');
-});
-
-test('PIN3/4: a late settle for an already-expired ticket is a no-op, not a double spend', () => {
-  const r = rig();
-  recovering(r);
-  const orphan = r.runtime.beginAutomaticDelivery('jim');
-  r.expireTickets();
-  const fresh = r.runtime.beginAutomaticDelivery('jim');
-  assert.equal(fresh.ok, true);
-
-  // The renderer answers at last, about a ticket main already reclaimed. If this
-  // were honoured it would confirm a launch against SOMEONE ELSE'S reservation.
-  r.runtime.settleAutomaticDelivery(orphan.ticket, true);
-  r.runtime.settleAutomaticDelivery(orphan.ticket, false);
-  r.runtime.settleAutomaticDelivery(fresh.ticket, true);
-  assert.equal(r.runtime.beginAutomaticDelivery('jim').ok, false, 'exactly one turn was spent, by its owner');
-});
-
-test('PIN3/4: stopping the runtime settles outstanding tickets and leaves no timer armed', () => {
-  const r = rig();
-  recovering(r);
-  const held = r.runtime.beginAutomaticDelivery('jim');
-  assert.equal(held.ok, true);
-  assert.equal(r.ticketTimers(), 1, 'the ticket armed its own expiry');
-
-  r.runtime.stop();
-  assert.equal(r.ticketTimers(), 0, 'and stopping disarmed it rather than leaving it to fire later');
-  // Settled, so the grant went back rather than being swallowed with the runtime.
-  assert.equal(r.runtime.beginAutomaticDelivery('jim').ok, true);
-  // A settle arriving after the stop is about a ticket that is already closed.
-  r.runtime.settleAutomaticDelivery(held.ticket, true);
-  assert.equal(r.ticketTimers(), 1, 'the later grant is still the only one outstanding');
-});
-
-test('PIN3/4: an AVAILABLE pool is authorised every time — this is a gate, not a throttle', () => {
-  // The pair for every refusal above. A reservation scheme that refuses the second
-  // delivery on a healthy pool would pass all of them and break the floor.
-  const r = rig();
-  r.runtime.ingest('jim', obs());
-  assert.equal(r.state(), 'AVAILABLE');
-  for (let i = 0; i < 5; i += 1) {
-    const g = r.runtime.beginAutomaticDelivery('jim');
-    assert.equal(g.ok, true, `delivery ${i}`);
-    r.runtime.settleAutomaticDelivery(g.ticket, true);
-  }
-});
-
-test('PIN3/4: a LIMITED pool is refused and no ticket is minted to leak', () => {
-  const r = rig();
-  r.runtime.ingest('jim', obs());
-  r.runtime.ingest('jim', obs({
-    observedAt: T0 + 1_000, receivedAt: T0 + 1_000,
-    providerReachedType: 'rate_limit_reached',
-    windows: [win('five_hour', 0)]
-  }));
-  assert.equal(r.state(), 'LIMITED');
-  const g = r.runtime.beginAutomaticDelivery('jim');
-  assert.equal(g.ok, false);
-  assert.equal(g.ticket, undefined, 'nothing to settle, so nothing can be forgotten');
 });
