@@ -1,5 +1,10 @@
 # L0-FUSION stage 5+ — what ships UNPROVEN, UNMEASURED or UNDECIDED
 
+**READ WITH `l0-fusion-stage5-successor-mapping.md` (corrected).** Wherever an older line below says a grant or a
+turn is "returned" at INTERFERED or after a failed Enter, that is HISTORY: since stage 5.6 (the human's option B and
+Michael's G1b ruling, both 2026-09-20) such a grant is HELD as possibly launched until a person resolves it or the
+terminal dies. The mapping's "Correction" section is the current statement.
+
 One place, so that nothing on it is mistaken for done. Written at stage 5.5a. Each item says
 what IS known, what is not, and what would settle it. Nothing here is a claim of safety.
 

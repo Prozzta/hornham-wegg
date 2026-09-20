@@ -1,7 +1,8 @@
 # L0-FUSION stage 5 — successor mapping for the transitional ticket tests
 
-**Status: PROPOSAL FOR A VALIDATOR'S SIGN-OFF. Nothing listed here has been deleted, and
-nothing is deleted until a validator signs this file.** Written at stage 5.5a.
+**Status: SIGNED WITH CONDITIONS by Dwight (2026-09-20); this revision meets the conditions and is what he proves
+and signs. Nothing listed here has been deleted, and nothing is deleted until he has.** Written at stage 5.5a
+(`9eb9d38e`); updated at 5.6; **CORRECTED at the pin that carries this text** - see "Correction" below.
 
 ## What is transitional, and why
 
@@ -23,8 +24,11 @@ Three answers are possible for each test, and the difference matters:
 - **BY CONSTRUCTION** — the hazard needed an out-of-process deliverer holding half a
   transaction. That party no longer exists. There is nothing left to test, and the row says
   what removed it (and which test pins *that*).
-- **GAP** — the old test held something the new path does not visibly hold. **Two rows.**
-  They are reported, not papered over.
+- **GAP** — the old test held something the new path does not visibly hold. **Two rows**
+  when this was written; after stage 5.6 and the correction below, ONE: the closure half of row 30 (GAP 2). They are
+  reported, not papered over.
+- **SUPERSEDED BY RULING** - the old test held a property that a later ruling deliberately CHANGED. The row says what
+  the new behaviour is and what proves THAT; it does not pretend the old property is still held. **Rows 3, 4, 22.**
 
 Test files: `AS` = `automatic-submit.test.cjs` (killers `K.*`, each with census mutants),
 `ASW` = `automatic-submit-wiring.test.cjs` (real `CapacityRuntime` + tracker; `KR.*` are the
@@ -36,8 +40,8 @@ Test files: `AS` = `automatic-submit.test.cjs` (killers `K.*`, each with census 
 |---|---|---|---|---|
 | 1 | A15: a death AFTER the submit keystroke does NOT hand out a second recovery turn | once the Enter may have landed the turn stays spent | AS `criticalSectionNeverYields` + `commitsInOrder` (confirmLaunch runs in the same synchronous section as the Enter: there is no "after the Enter, before the confirm" for anything to die in); ASW `a RECOVERING pool: the owner's own reservation…` (asserts the turn IS spent after COMMIT) | HELD |
 | 2 | A15: a death BEFORE the write DOES return the turn | an abandoned, untyped delivery gives the turn back | AS `stageFailureTypesNothingAndReturnsTheGrant`, `lateRefusalAborts`, `preStageHumanIsRefusalNotInterference`, `respawnInGapNeverReceivesTheEnter` (every pre-Enter exit asserts `cancelled.length === 1`) | HELD |
-| 3 | A15: the two deaths reach DIFFERENT outcomes | the recorded fact, not a constant, decides | AS mutant `a failed Enter confirmed as a launch` (kills collapsing confirm/cancel into one) with killer `enterFailureHoldsTheGrantForAHuman` | HELD |
-| 4 | A15: a LIVE report of a failed write beats the inference from silence | a known failure returns the turn | AS `enterFailureHoldsTheGrantForAHuman`; ASW `an Enter that THROWS is not a launch - the recovery turn goes back` | HELD |
+| 3 | A15: the two deaths reach DIFFERENT outcomes | the recorded fact, not a constant, decides | **SUPERSEDED BY RULING - not a same-property successor.** The old pair was "write began -> turn SPENT" against "write not begun -> turn RETURNED". After the G1b ruling the owner has THREE outcomes and a failed Enter is none of the old two: it is INTERFERED and its grant is HELD. What survives, and is proven, is only that the outcomes stay DISTINCT and are decided by what happened: AS `everyOutcomeAccountsForItsGrant` (confirmed / returned / held, each exactly once) and the mutants `a failed Enter confirmed as a launch` and `a failed Enter hands the turn back while our payload is on the prompt`, killer `enterFailureHoldsTheGrantForAHuman` | SUPERSEDED BY RULING |
+| 4 | A15: a LIVE report of a failed write beats the inference from silence | ~~a known failure returns the turn~~ -> a known failed Enter is NOT a launch, and the turn is HELD for a person | **SUPERSEDED BY RULING.** The old guarantee - a reported failed write RETURNS the turn - **no longer holds and is not claimed**: our payload is still on a live prompt where a person can press Enter, so the grant is held as possibly launched until a human resolves it or the terminal dies. AS `enterFailureHoldsTheGrantForAHuman`; ASW `an Enter that THROWS is not a launch - and the recovery turn is HELD FOR A HUMAN, not handed back`. These prove the NEW behaviour; they are NOT evidence that a failed Enter returns the turn | SUPERSEDED BY RULING |
 | 5 | A15: a mark is not a confirm | asking permission spends nothing | ASW `TOCTOU on revalidate: ownReservationIsNotARefusal` (revalidate is a read: asked, then the grant is still cancellable and then reports `CLAIM_GRANT_LOST`); ASW `FIX4`-equivalent below (#28) | HELD |
 | 6 | A15: a mark for a RECLAIMED ticket cannot reach the reservation that replaced it | a stale claim cannot act on a newer reservation | ASW `KR.ownReservationIsNotARefusal` (a claim whose grant was handed back answers `REFUSE / CLAIM_GRANT_LOST`; mutant `a lost grant still authorises`) | HELD |
 | 7 | A15: stopping the runtime reads the mark too | shutdown with a delivery in flight | there is no ticket for `stop()` to settle: grants live in the admission seam, in main's memory, and die with the process; restored pools come back `restoredUnconfirmed` = UNKNOWN (L0-TAIL tests) | BY CONSTRUCTION |
@@ -60,8 +64,8 @@ Test files: `AS` = `automatic-submit.test.cjs` (killers `K.*`, each with census 
 |---|---|---|---|
 | 20 | TWO agents on one recovering pool cannot both be authorised | the reservation is made by `admit()` itself (unchanged, `provider-capacity-admission.test.cjs`); through the owner: ASW `KR.ownReservationIsNotARefusal` (second asker `REFUSE`) | HELD |
 | 21 | the probe still does NOT spend | `provider-capacity-admission.test.cjs` probe tests (unchanged); the snapshot handler probes: ASW `the control snapshot is computed through the ONE resolver` | HELD |
-| 22 | a CONFIRMED delivery spends the grant; a failed one returns it | AS `commitsInOrder`, `enterFailureHoldsTheGrantForAHuman`; ASW `a RECOVERING pool…` | HELD |
-| 23 | an ABANDONED ticket returns its grant on MAIN's own expiry | **see GAP 1** | GAP |
+| 22 | a CONFIRMED delivery spends the grant; ~~a failed one returns it~~ -> a failed one is HELD | **SUPERSEDED BY RULING (second half).** Confirmed spends: AS `commitsInOrder`; ASW `a RECOVERING pool: the owner’s own reservation is not a refusal of the owner`. A delivery whose Enter FAILED does **not** return the grant: it is HELD until a human resolves it ("already handled" confirms, "send queued message" returns) or the terminal dies (spent) - AS `enterFailureHoldsTheGrantForAHuman`, `interferedKeepsTheGrantInSuspense`, `alreadyHandledNeverTypesItAgain`, `sendAgainDeliversExactlyOnce`, `aDeadTerminalSpendsTheHeldGrant`; against the real admission seam ASW `grant in suspense (REAL admission): *`. Deliveries that never reached the Enter still return it (row 2) | HELD (first half) / SUPERSEDED BY RULING (second half) |
+| 23 | an ABANDONED ticket returns its grant on MAIN's own expiry | **CLOSED at `4352578e`** (was GAP 1). There is no ticket and no out-of-process deliverer to abandon one; what the expiry protected - a grant that is never accounted for - is held by AS `everyOutcomeAccountsForItsGrant`: COMMITTED, three REFUSED, FAILED, ABORTED and three INTERFERED paths, each confirmed / returned / held exactly once, a held grant settled exactly once by its resolution; census mutants `INTERFERED returns the grant (G1b as it stood before the ruling)` and `an abort that could not verify its erase returns the grant`. The readiness timeout returns the grant: AS `noPtyAndNotReady`. (The seam's own 60 s abandonment of an UNHELD reservation is unchanged and still tested: ASW `aGrantHeldForAHumanOutlivesTheReservationTtl`, control arm) | HELD |
 | 24 | a late settle for an already-expired ticket is a no-op | no settle message exists; the outcome is recorded against the request id: AS `replayAfterCommitWritesNoSecondEnter`, `mismatchedReplayRejects` | BY CONSTRUCTION |
 | 25 | stopping the runtime settles outstanding tickets, no timer armed | as #7; the owner's timers are `unref`'d (`buildOwnerDeps`) | BY CONSTRUCTION |
 | 26 | an AVAILABLE pool is authorised every time | as #8 | HELD |
@@ -74,6 +78,53 @@ Test files: `AS` = `automatic-submit.test.cjs` (killers `K.*`, each with census 
 | 28 | holds() reports a refusal WITHOUT spending the recovery turn | the snapshot uses `admission.probe` + `capacityGateOf`: ASW `the control snapshot is computed through the ONE resolver, and carries the evidence` | HELD |
 | 29 | holds() is true exactly when an ordinary automatic start is refused | superseded on purpose: `holds` was `verdict === 'REFUSE'`, one of the four inequalities under which UNKNOWN proceeded unchosen. The successor is the ratified table: AS `unknownPolicyIsOneNamedValue`, `unknown mapping *`, `anOutlookNamesAHoldAndLiftsNothing` | HELD (stricter) |
 | 30 | a RESERVE_ONLY pool holds ordinary work but not closure work | ordinary: ASW `KR.reserveOnlyAfterAdmission`. **Closure work: see GAP 2** | GAP (half) |
+
+## Correction (rows 3, 4, 22, 23) - required by Dwight before he would sign
+
+Dwight's audit of the 30 rows: rows 1, 5-21 and 24-29 CONFIRMED subject to their named successors / the absence
+census; row 2 CONFIRMED (pre-Enter only); rows 7, 24, 25 BY CONSTRUCTION confirmed; row 30's ordinary half
+confirmed, its closure half = the declared GAP 2; GAP 1 genuinely CLOSED. **He could not sign four rows as written:**
+they described the OLD "the turn is returned" behaviour as though a successor still proved it, contradicting this
+document's own 5.6 update. Those are properties CHANGED BY RULING, not same-property successors, and the table now
+says so. The superseding authority, with dates:
+
+- **The human, 2026-09-20 (card `L0-S5-RESOLVED-UX`, option B):** "Replace the single ambiguous "resolved" action
+  with two explicit outcomes ... Do not attempt to infer which happened from the terminal prompt being empty. Prompt
+  emptiness is not proof that the queued message was submitted. ... Keep the current INTERFERED protections: no timer;
+  no automatic Enter; no automatic clear; no overwrite; no retry until human resolution".
+- **Michael (god), 2026-09-20, ruling G1b:** "while INTERFERED our payload is on the prompt and a human may press
+  Enter at any moment, so the evidence HAS run out: the grant is NOT returned at INTERFERED; it stays accounted as
+  possibly-launched until the human resolves. 'Already handled - drop' CONFIRMS the launch (spent). 'Send queued
+  message' returns that grant and the re-admission asks capacity afresh." Confirmed the same day for
+  `ENTER_WRITE_FAILED` ("held rather than returned, every INTERFERED through one function - ACCEPTED; no exception
+  wanted") and for a hold that outlives its terminal ("SPENT (fail toward launched) ... consistent with A15").
+
+**The rows as they read BEFORE this correction, kept so the history is honest:**
+
+> row 3, before:
+> | 3 | A15: the two deaths reach DIFFERENT outcomes | the recorded fact, not a constant, decides | AS mutant `a failed Enter confirmed as a launch` (kills collapsing confirm/cancel into one) with killer `enterFailureHoldsTheGrantForAHuman` | HELD |
+
+> row 4, before:
+> | 4 | A15: a LIVE report of a failed write beats the inference from silence | a known failure returns the turn | AS `enterFailureHoldsTheGrantForAHuman`; ASW `an Enter that THROWS is not a launch - the recovery turn goes back` | HELD |
+
+> row 22, before:
+> | 22 | a CONFIRMED delivery spends the grant; a failed one returns it | AS `commitsInOrder`, `enterFailureHoldsTheGrantForAHuman`; ASW `a RECOVERING pool…` | HELD |
+
+> row 23, before:
+> | 23 | an ABANDONED ticket returns its grant on MAIN's own expiry | **see GAP 1** | GAP |
+
+
+## Commitments of the deletion commit (conditions of the signature)
+
+1. The five dead `CapacityRuntime` methods - `beginAutomaticDelivery`, `markAutomaticDeliveryWriting`,
+   `settleAutomaticDelivery`, `maySubmitNow`, `holds` - and the 30 transitional tests are deleted **TOGETHER, in one
+   commit**. GAP 2 is acceptable as BY CONSTRUCTION / no production caller **only on that condition**.
+2. That commit adds a test asserting the five names are **ABSENT FROM ALL OF `src`** - not merely "no production
+   caller" - over the parser-based `codeOnly` (`test/read-source.cjs`), never a regex stripper.
+3. **Any future closure-work caller must add an explicit admission class and a cell in `READY_GATE_POLICY`.** Closure
+   work may not reach the owner by borrowing `ORDINARY_TURN` or any existing class.
+4. The suite counts are reported with their arithmetic (what left, what stayed), verified in a fresh CRLF checkout under
+   BOTH provider environments.
 
 ## The two gaps
 
@@ -123,7 +174,7 @@ has no successor **because it has no caller**. Recorded, not built.
 1. Delete rows 1–19, 20–27 and 28–30 and the five methods, the `PendingDelivery` type,
    `AUTO_DELIVERY_TTL_MS`, `pending`, `ticketSeq` and `expireAutomaticDelivery`.
 2. Keep `DeliveryClaim`, `CLAIM_REASON` and `revalidate`.
-3. Add the GAP 1 killer first, in the same commit, so the suite never has a moment where
-   grant-return is unpinned.
+3. ~~Add the GAP 1 killer first, in the same commit~~ - DONE EARLIER, at `4352578e`
+   (`everyOutcomeAccountsForItsGrant`), so grant accounting is already pinned before anything is deleted.
 4. Turn `the ticket machinery has NO production caller left` into "is gone": the five names
-   appear nowhere in `src`.
+   appear nowhere in `src` (see "Commitments of the deletion commit" above - it is a condition of the signature).
