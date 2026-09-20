@@ -3,7 +3,7 @@ import { spawn } from 'node:child_process';
 import {
   rmSync, existsSync, readFileSync, readdirSync, statSync, cpSync, writeFileSync,
   unlinkSync, mkdirSync, renameSync, createWriteStream, copyFileSync, lstatSync,
-  readlinkSync, symlinkSync
+  readlinkSync, symlinkSync, appendFileSync
 } from 'node:fs';
 import { randomBytes, createHash, timingSafeEqual } from 'node:crypto';
 import { join, resolve, sep, basename, dirname, isAbsolute } from 'node:path';
@@ -21,6 +21,10 @@ import {
   readConfig, writeConfig, setAgentTokenCap, resetConfig, ensureHarnessHome, ensureClaudePermissionsAccepted,
   modelForRole, OPS_STANDUP_MISSION, HEARTBEAT_MISSION, COMPACT_MAINTENANCE_MISSION, type HarnessConfig, type ScheduledMission
 } from './config';
+import {
+  decideStandup, projectTasks, skipRecord,
+  type FloorState, type StandupDecision
+} from './standupDelta';
 import { listDir, readFileText, readFileBinary, writeFileText, statAbs, expandTilde } from './fs';
 import { normalizeWeekly, weeklyDelayMs } from '../shared/weeklySchedule';
 import { isInputOrigin } from '../shared/inputOrigin';
@@ -768,6 +772,73 @@ function clearMissionTimers(): void {
   missionTimers.clear();
 }
 
+/** Read the floor state the TE0 delta gate hashes.
+ *
+ *  Everything here is a local file read or an in-memory map — no model, no
+ *  network, and nothing the standup itself writes. See standupDelta.ts for why
+ *  board.md and the task prose are absent: they are god's OUTPUT, and hashing
+ *  them would make the gate see a delta after every standup and suppress nothing.
+ *
+ *  Never throws: a partially-readable floor must not take the scheduler down, and
+ *  an unreadable one is handled by the caller as "cannot prove unchanged" — which
+ *  dispatches. */
+function collectFloorState(): FloorState {
+  const reg = hive.registry();
+  const agents: FloorState['agents'] = [];
+  for (const [id, a] of Object.entries(reg.agents)) {
+    if (a.archived) continue;
+    let actionableInbox = 0;
+    try {
+      // The SAME exclusion the heartbeat already uses. Counting the scheduler's
+      // own beats as floor activity would be the "hash your own exhaust" mistake.
+      actionableInbox = hive.inbox(id).filter((msg) => !SYSTEM_SENDERS.has(msg.from)).length;
+    } catch { /* unreadable inbox reads as zero; a real change elsewhere still fires */ }
+    agents.push({
+      id,
+      onHold: !!a.onHold,
+      breaker: breaker.levelFor(id),
+      hasLivePty: !!ptyForAgent(id),
+      actionableInbox,
+      lastCoordinationAtMs: lastCoordinationAt(id)
+    });
+  }
+  const countDir = (p: string): number => {
+    try { return readdirSync(p).length; } catch { return 0; }
+  };
+  const root = hive.root();
+  return {
+    agents,
+    tasks: projectTasks(hive.tasks()),
+    spawnRequests: root ? countDir(join(root, 'spawn-requests')) : 0,
+    crashes: root ? countDir(join(root, 'crashes')) : 0
+  };
+}
+
+/** Append the durable record of a SUPPRESSED standup.
+ *
+ *  Its own file, deliberately NOT log.jsonl: that file's mtime is an input to
+ *  isFloorQuiet(), so writing a skip there would keep the floor reading "busy"
+ *  forever and silently disable the heartbeat's re-engage. The heartbeat ships
+ *  disabled, which is exactly how that would have gone unnoticed. */
+function recordStandupSkip(
+  missionId: string,
+  decision: StandupDecision,
+  now: number,
+  lastDispatchAt?: number
+): void {
+  const root = hive.root();
+  if (!root) return;
+  try {
+    appendFileSync(
+      join(root, 'standup-skips.jsonl'),
+      JSON.stringify(skipRecord(missionId, decision, now, lastDispatchAt)) + '\n',
+      'utf8'
+    );
+  } catch (e) {
+    console.error('[scheduler] skip record', missionId, e);
+  }
+}
+
 /** Rebuild the scheduler from persisted config: clear every existing timer,
  *  then arm each enabled mission honoring its lastFiredAt — a setTimeout for the
  *  time remaining until its next due fire, which then settles into a steady
@@ -788,15 +859,37 @@ function syncMissions(): void {
     // with an adaptive cadence. Registered into the same missionTimers map so
     // clearMissionTimers() tears it down identically on quit/reset.
     if (m.kind === 'heartbeat') { armHeartbeat(m); continue; }
-    const fire = (): void => {
+    const fire = (forced = false): void => {
       try {
+        // TE0's gate state must be read FRESH, not taken from `m`. `m` is the
+        // snapshot syncMissions armed the timer with; nothing re-arms on a fire,
+        // so the closure's copy of lastDeltaFingerprint/lastDispatchAt would stay
+        // frozen at app-boot values for the life of the process and the gate would
+        // compare every tick against a fingerprint from hours ago. lastFiredAt has
+        // always been re-read for the same reason, a few lines down.
+        const live = (readConfig().missions ?? []).find((x) => x.id === m.id) ?? m;
+        let gate: StandupDecision | null = null;
         // A 'compact' maintenance mission (maint-1) is compaction-ONLY: it carries
         // no dispatch body/target, so skip the hive.send and just fire auto-compact.
         // Gate on `kind!=='compact'` ALONE — that already excludes the compact mission;
         // we deliberately do NOT add `&& m.body`, so other (dispatch) missions keep
         // their prior behaviour, including the historical empty-body send (Pam N1).
         if (m.kind !== 'compact' && hive.enabled()) {
-          hive.send({ to: m.to, act: 'request', subject: m.label, body: m.body }, 'scheduler');
+          // TE0. Without a deltaGate on the mission this decides 'gate-off' and
+          // dispatches, so every mission that has not opted in is untouched.
+          gate = decideStandup({
+            state: collectFloorState(),
+            gate: live.deltaGate,
+            lastFingerprint: live.lastDeltaFingerprint,
+            lastDispatchAt: live.lastDispatchAt,
+            now: Date.now(),
+            forced
+          });
+          if (gate.dispatch) {
+            hive.send({ to: m.to, act: 'request', subject: m.label, body: m.body }, 'scheduler');
+          } else {
+            recordStandupSkip(m.id, gate, Date.now(), live.lastDispatchAt);
+          }
         }
         // Auto-compact: do NOT jam /compact into busy terminals. Hand it to the
         // renderer, which queues a /compact per agent (deduped — never two at
@@ -811,9 +904,26 @@ function syncMissions(): void {
         if (m.autoCompact || m.kind === 'compact') {
           emitContextTrigger('compact', contextRule('compact'));
         }
+        // lastFiredAt is stamped on EVERY tick, suppressed ones included. It is the
+        // timer's clock, not a record of dispatches: syncMissions arms from
+        // `intervalMs - (now - lastFiredAt)`, so leaving it unstamped after a skip
+        // would compute a zero delay on the next re-arm and spin the mission.
+        // The gate's own clock is lastDispatchAt, advanced only below.
+        const firedAt = Date.now();
         const current = readConfig().missions ?? [];
         const next = current.map((x) =>
-          x.id === m.id ? { ...x, lastFiredAt: Date.now() } : x
+          x.id === m.id
+            ? {
+                ...x,
+                lastFiredAt: firedAt,
+                // Only a REAL dispatch moves the comparison baseline and the
+                // max-age clock. Advancing either on a skip would make the floor
+                // look freshly reviewed when no one has reviewed it.
+                ...(gate?.dispatch
+                  ? { lastDeltaFingerprint: gate.fingerprint, lastDispatchAt: firedAt }
+                  : {})
+              }
+            : x
         );
         writeConfig({ missions: next });
         // Let the SCHEDULES panel refresh its "last fired" without a reload (#2.3).
@@ -1022,6 +1132,25 @@ function ensureDefaultMissions(): void {
     writeConfig({
       missions: has ? missions : [...missions, { ...HEARTBEAT_MISSION, lastFiredAt: Date.now() }],
       heartbeatSeeded: true
+    });
+  }
+
+  // TE0 MIGRATION: attach the delta gate to an ops standup that already exists.
+  // The seeding branch above is guarded by `opsStandupSeeded`, which is already
+  // true on every install that has ever launched — so without this, the gate
+  // would ship to new installs only and the machines actually paying for
+  // no-change standups would never get it. Runs at most once, and only fills a
+  // gate that is absent: an operator who later turns it off stays off.
+  const cfgGate = readConfig();
+  if (!cfgGate.standupDeltaGateSeeded) {
+    const missions = cfgGate.missions ?? [];
+    writeConfig({
+      missions: missions.map((m) =>
+        m.id === OPS_STANDUP_MISSION.id && !m.deltaGate
+          ? { ...m, deltaGate: OPS_STANDUP_MISSION.deltaGate }
+          : m
+      ),
+      standupDeltaGateSeeded: true
     });
   }
 
@@ -4129,9 +4258,21 @@ ipcMain.handle('missions:save', (_evt, missions) => {
     (readConfig().missions ?? []).map((m) => [m.id, m] as const)
   );
   const merged = incoming.map((m) => {
-    const prevLastFired = persistedById.get(m.id)?.lastFiredAt ?? 0;
+    const prev = persistedById.get(m.id);
+    const prevLastFired = prev?.lastFiredAt ?? 0;
     const lastFiredAt = Math.max(m.lastFiredAt ?? 0, prevLastFired) || undefined;
-    return { ...m, lastFiredAt };
+    // TE0's two fields are scheduler-owned for exactly the same reason, and the
+    // renderer never sets them at all — so they are taken from the persisted
+    // record outright rather than max()'d. Without this, any save from the
+    // Schedules panel would drop the delta baseline and the next tick would
+    // dispatch on 'no-baseline': not dangerous (the gate fails open by design),
+    // but it would quietly undo the saving every time the user edits a schedule.
+    return {
+      ...m,
+      lastFiredAt,
+      lastDeltaFingerprint: prev?.lastDeltaFingerprint,
+      lastDispatchAt: prev?.lastDispatchAt
+    };
   });
   writeConfig({ missions: merged });
   syncMissions();

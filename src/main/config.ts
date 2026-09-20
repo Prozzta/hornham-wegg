@@ -11,6 +11,7 @@ import {
   type AgentProvider
 } from '../shared/agentProvider';
 import { defaultMcpDefaults } from '../shared/mcpCatalog';
+import { DEFAULT_MAX_AGE_MS } from './standupDelta';
 import { MAX_AGENT_TOKEN_CAP } from '../shared/tokenCaps';
 import { expandTilde, normalizeHiveHome } from './fs';
 import type { IntegrationRecord } from '../shared/integrations';
@@ -58,6 +59,17 @@ export interface ScheduledMission {
    *  inbox/outbox mtimes, any PTY output) has moved in this many ms. Default
    *  ~5 min. NOT derived from registry.status (which never transitions in main). */
   quietThresholdMs?: number;
+  /** TE0: suppress this mission's dispatch while the floor is provably unchanged.
+   *  ABSENT ⇒ OFF ⇒ the pre-TE0 unconditional dispatch, so every mission that does
+   *  not opt in keeps its exact prior behaviour. See main/standupDelta.ts for what
+   *  "unchanged" hashes, and for the two rules that make the answer trustworthy. */
+  deltaGate?: { enabled: boolean; maxAgeMs?: number };
+  /** Scheduler-owned, like `lastFiredAt`: the floor fingerprint as of the last
+   *  DISPATCHED run, and when that was. `lastFiredAt` cannot stand in for the
+   *  latter — it advances on suppressed ticks too (it has to, or the timer
+   *  re-arms with zero delay), so the max-age safeguard needs its own clock. */
+  lastDeltaFingerprint?: string;
+  lastDispatchAt?: number;
 }
 
 /** The built-in hourly ops standup: god reviews who's doing what + whether tasks
@@ -77,7 +89,12 @@ export const OPS_STANDUP_MISSION: ScheduledMission = {
     'next step, then compact and resume from the same point — so terminal ' +
     'contexts stay bounded without losing work. The compaction is queued and ' +
     'runs when an agent is idle, so it never interrupts work mid-step.)',
-  enabled: true
+  enabled: true,
+  // TE0. A standup whose only finding is "nothing changed" still costs a full
+  // model turn over god's whole session prefix, because the dispatch wakes him.
+  // The gate answers that question locally instead; the max-age expiry means a
+  // frozen floor still gets a real review once a day.
+  deltaGate: { enabled: true, maxAgeMs: DEFAULT_MAX_AGE_MS }
   // NO autoCompact. Compaction belongs to contextTrigger.compact and nothing else.
   // This flag used to live here as well, which meant a default install asked for
   // compaction on TWO cadences — hourly from this standup and 2-hourly from the
@@ -228,6 +245,12 @@ export interface HarnessConfig {
   /** One-time guard for the built-in heartbeat mission (mirrors opsStandupSeeded
    *  so a user who deletes the heartbeat doesn't get it re-added every boot). */
   heartbeatSeeded?: boolean;
+  /** TE0 one-time guard: has the delta gate been attached to an ALREADY-SEEDED
+   *  ops standup? Without this migration the gate would reach new installs only —
+   *  `opsStandupSeeded` is already true on every existing install, so the seeding
+   *  branch never runs again and the mission would keep its pre-TE0 shape forever.
+   *  Set once; a user who then turns the gate off keeps it off. */
+  standupDeltaGateSeeded?: boolean;
   /** maint-1 guard for the dedicated auto-compact maintenance mission. UNLIKE the
    *  two above, this does NOT suppress re-add forever: once seeded (flag set), a
    *  later delete makes the mission reappear DISABLED on next boot (compaction is
