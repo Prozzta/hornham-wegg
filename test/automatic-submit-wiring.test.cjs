@@ -18,9 +18,8 @@
  */
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const fs = require('node:fs');
-const path = require('node:path');
 const loadTs = require('./load-ts.cjs');
+const { readSource: read } = require('./read-source.cjs');
 
 const { AutomaticSubmitOwner, GAP_MS } = loadTs('src/main/automaticSubmit.ts');
 const { buildOwnerDeps, ScreenReadingBroker, isScreenReading } = loadTs('src/main/automaticSubmitWiring.ts');
@@ -31,9 +30,6 @@ const { L0_SEM_POLICY } = loadTs('src/shared/providerCapacity.ts');
 const { automaticAbortCapability } = loadTs('src/shared/providerAutomation.ts');
 const { isTerminalPromptState } = loadTs('src/shared/promptState.ts');
 const { WorkerWakeWatchdog, WORKER_WAKE_IDLE_MS, WORKER_WAKE_COOLDOWN_MS } = loadTs('src/main/workerWake.ts');
-
-const ROOT = path.resolve(__dirname, '..');
-const read = (rel) => fs.readFileSync(path.join(ROOT, rel), 'utf8').replace(/\r\n/g, '\n');
 
 const T0 = 1_800_000_000_000;
 // The observation shape is the one provider-capacity-delivery-death.test.cjs already

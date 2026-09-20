@@ -15,12 +15,29 @@
  * not apply would otherwise "survive" as a green test of the original — a check that
  * cannot fail. The proofs must kill the wrong implementations, not demonstrate the
  * right one (design of record, section 9.2).
+ *
+ * WHAT THE STATIC READ OF THE CRITICAL SECTION DOES NOT PROVE (Dwight, validating stage
+ * 5.1, accepted in full). That test inspects `commitSection`'s SOURCE TEXT: strings, and
+ * their order. It does not follow a call into a helper or into an injected dependency, so
+ * it could be satisfied while something `commitSection` CALLS yields - a helper that
+ * awaits, a dependency that defers. It is a tripwire for the obvious edit and nothing
+ * more. THE GUARANTEE THAT ACTUALLY CARRIES "no yield between the final check and the
+ * Enter" IS BEHAVIOURAL: the pin-6 schedule in `criticalSectionNeverYields`, which lands
+ * an AVAILABLE->LIMITED observation in the first yield after the check and requires the
+ * record never to read `enter:LIMITED`, whatever the source looks like.
+ *
+ * LINE ENDINGS. This repo is `core.autocrlf=true` with no `.gitattributes`: a file is LF
+ * in the tree it was authored in and CRLF in a fresh checkout. Every read of source text
+ * here goes through `./read-source.cjs`, the static test runs against BOTH renderings,
+ * and a registered test forbids this file from reading source any other way.
  */
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
+const os = require('node:os');
 const loadTs = require('./load-ts.cjs');
+const { readSource, bothEolRenderings } = require('./read-source.cjs');
 
 const SRC = path.resolve(__dirname, '..', 'src/main/automaticSubmit.ts');
 const REAL = loadTs('src/main/automaticSubmit.ts');
@@ -654,7 +671,11 @@ for (const [name, killer] of Object.entries(K)) test(`owner: ${name}`, () => kil
 
 // ─── The critical section, read as SOURCE ─────────────────────────────────────────────
 
+/** `source` MUST already be LF - i.e. it came from `readSource`. Asserted rather than
+ *  assumed: handed CRLF text, the `'\n}\n'` search below finds nothing and the old
+ *  version of this function failed for a reason that had nothing to do with the section. */
 function commitSectionSource(source) {
+  assert.ok(!source.includes('\r'), 'commitSectionSource needs LF text: read it with readSource()');
   const start = source.indexOf('export function commitSection(');
   const asyncStart = source.indexOf('export async function commitSection(');
   assert.ok(start >= 0 && asyncStart < 0, 'commitSection is a plain synchronous function');
@@ -663,8 +684,7 @@ function commitSectionSource(source) {
   return source.slice(start, end);
 }
 
-test('the COMMIT critical section contains no yielding construct (section 2 prohibition list)', () => {
-  const body = commitSectionSource(fs.readFileSync(SRC, 'utf8'));
+function assertCriticalSectionIsClean(body) {
   for (const banned of ['await', '.then', 'setTimeout', 'setImmediate', 'queueMicrotask', 'async', 'import(', 'Promise', 'setTimer', 'readScreen']) {
     assert.ok(!body.includes(banned), `commitSection must not contain \`${banned}\``);
   }
@@ -672,6 +692,48 @@ test('the COMMIT critical section contains no yielding construct (section 2 proh
   const enter = body.indexOf("'\\r'");
   const settleAt = body.indexOf('confirmLaunch(');
   assert.ok(check > 0 && enter > check && settleAt > enter, 'check -> Enter -> settle, in that order, in one function');
+}
+
+test('the COMMIT critical section contains no yielding construct (section 2 prohibition list)', () => {
+  assertCriticalSectionIsClean(commitSectionSource(readSource(SRC)));
+});
+
+test('LINE-ENDING INDEPENDENCE: the same source as an LF checkout AND as a CRLF checkout', () => {
+  // Dwight's rejection of stage 5.1, made permanent. The file is written to disk in BOTH
+  // renderings and each is read back the way every test here reads source. If a reader
+  // ever stops normalising, the CRLF arm fails HERE, in the author's own LF tree, instead
+  // of only in somebody else's fresh checkout.
+  const { lf, crlf } = bothEolRenderings(readSource(SRC));
+  assert.ok(crlf.includes('\r\n') && !lf.includes('\r'), 'the two renderings really differ on disk');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'l0-eol-'));
+  try {
+    const bodies = {};
+    for (const [name, text] of Object.entries({ lf, crlf })) {
+      const file = path.join(dir, `${name}.ts`);
+      fs.writeFileSync(file, text, 'utf8');
+      assert.equal(fs.readFileSync(file, 'utf8'), text, `${name}: written byte-for-byte`);
+      const source = readSource(file);
+      assert.equal(source, lf, `${name}: reads back as the one LF text`);
+      bodies[name] = commitSectionSource(source);
+      assertCriticalSectionIsClean(bodies[name]);
+    }
+    assert.ok(bodies.lf.length > 400, 'and the section that was inspected is the real one, not an empty slice');
+    assert.equal(bodies.crlf, bodies.lf, 'both checkouts inspect the identical critical section');
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('no L0-FUSION stage-5 test reads source text except through read-source.cjs', () => {
+  // The needle is assembled so this file does not contain it.
+  const direct = 'readFile' + 'Sync(';
+  for (const file of ['test/automatic-submit.test.cjs', 'test/automatic-submit-wiring.test.cjs']) {
+    const text = readSource(file);
+    const hits = text.split(direct).length - 1;
+    // The one permitted use is the byte-for-byte write check in the EOL test above.
+    assert.equal(hits, file.endsWith('automatic-submit.test.cjs') ? 1 : 0,
+      `${file}: source is read through readSource(), which normalises line endings`);
+  }
 });
 
 // ─── THE MUTANT CENSUS ────────────────────────────────────────────────────────────────
@@ -842,7 +904,7 @@ function buildMutant(index, mutant, source) {
 }
 
 test('MUTANT CENSUS: every mutant applies, and dies at the assertion that names its guarantee', async (t) => {
-  const source = fs.readFileSync(SRC, 'utf8').replace(/\r\n/g, '\n');
+  const source = readSource(SRC);
   fs.rmSync(MUTANT_DIR, { recursive: true, force: true });
   fs.mkdirSync(MUTANT_DIR, { recursive: true });
   try {
