@@ -756,6 +756,11 @@ function syncKeepAwake(): void {
 interface MissionTimer {
   timeout?: NodeJS.Timeout;
   interval?: NodeJS.Timeout;
+  /** TE0: this mission's dispatch, kept so `missions:runNow` can force a run past
+   *  the delta gate. The gate can only ever SUPPRESS, so without a force path an
+   *  operator who wants a standup right now has no way to ask for one. Absent for
+   *  a heartbeat, which self-schedules a beat rather than arming a fire. */
+  fire?: (forced?: boolean) => void;
 }
 
 /** Active scheduler timers keyed by mission id. */
@@ -933,6 +938,9 @@ function syncMissions(): void {
       }
     };
     const entry: MissionTimer = {};
+    // Registered before either arming branch: a weekly mission returns early
+    // below, and it needs a run-now just as much as an interval one does.
+    entry.fire = fire;
     if (weekly) {
       // Weekly self-reschedules: there is no steady interval to settle into,
       // because the gap between two slots varies (Fri to Mon is not Mon to Wed,
@@ -4275,6 +4283,26 @@ ipcMain.handle('missions:save', (_evt, missions) => {
     };
   });
   writeConfig({ missions: merged });
+  syncMissions();
+  return { ok: true };
+});
+/** TE0's force path: run a mission NOW, past the delta gate.
+ *
+ *  The gate only ever suppresses, so this is the other half of it — an operator
+ *  who wants a standup on a floor that has not moved needs a way to say so, and
+ *  before TE0 there was no run-now control at all.
+ *
+ *  Re-syncs afterwards because `fire()` stamps lastFiredAt, which is what the
+ *  Schedules row derives "next" from; without it the panel would advertise a next
+ *  run the timer was never going to honour. syncMissions re-arms every mission
+ *  from its own lastFiredAt, so nothing else's partially-elapsed interval moves. */
+ipcMain.handle('missions:runNow', (_evt, missionId: unknown) => {
+  const id = typeof missionId === 'string' ? missionId : '';
+  const entry = missionTimers.get(id);
+  // No entry means disabled or unknown; no `fire` means a heartbeat, which beats
+  // on its own adaptive cadence and has no dispatch to force.
+  if (!entry?.fire) return { ok: false, error: 'mission is not armed for dispatch' };
+  entry.fire(true);
   syncMissions();
   return { ok: true };
 });

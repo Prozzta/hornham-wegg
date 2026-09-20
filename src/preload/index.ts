@@ -1153,6 +1153,9 @@ const api = {
   listMissions: (): Promise<ScheduledMission[]> => ipcRenderer.invoke('missions:list'),
   saveMissions: (missions: ScheduledMission[]): Promise<{ ok: boolean }> =>
     ipcRenderer.invoke('missions:save', missions),
+  /** TE0: dispatch this mission NOW, past its delta gate. */
+  runMissionNow: (missionId: string): Promise<{ ok: boolean; error?: string }> =>
+    ipcRenderer.invoke('missions:runNow', missionId),
   /** Fires when the scheduler stamps a mission's lastFiredAt (a beat/dispatch),
    *  so the SCHEDULES panel can refresh "last fired" without a reload. */
   onMissionsUpdated: (cb: () => void): (() => void) => {

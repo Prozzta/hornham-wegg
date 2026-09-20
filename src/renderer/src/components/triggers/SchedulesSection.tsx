@@ -188,6 +188,9 @@ function MissionRow({ mission, targetName, agents, onPatch, onDelete }: {
   const [weekly, setWeekly] = useState<WeeklyDraft | null>(weeklyDraft(mission.weekly));
   const [body, setBody] = useState(mission.body);
   const [saved, setSaved] = useState(false);
+  // TE0: 'sent' after a manual run, 'blocked' when main had nothing armed to fire
+  // (a disabled mission, or the heartbeat, which beats instead of dispatching).
+  const [ran, setRan] = useState<'' | 'sent' | 'blocked'>('');
 
   // Seed the draft when the row opens — never on every render, or the scheduler
   // stamping `lastFiredAt` mid-edit would wipe what you are typing.
@@ -298,6 +301,20 @@ function MissionRow({ mission, targetName, agents, onPatch, onDelete }: {
             <PixelButton variant="primary" size="sm" onClick={save} disabled={!dirty || !label.trim() || !whenIsUsable}>
               {saved && !dirty ? 'saved' : 'save'}
             </PixelButton>
+            {/* TE0. A gated mission only ever fires LESS often than its schedule
+                says, so this is the way to ask for one now — and it is useful on
+                an ungated mission too, where "run it and see" previously meant
+                waiting out the interval. */}
+            <MiniButton
+              onClick={() => {
+                void window.cth.runMissionNow(mission.id).then((r) => {
+                  setRan(r?.ok ? 'sent' : 'blocked');
+                  setTimeout(() => setRan(''), 1600);
+                }).catch(() => { /* noop */ });
+              }}
+            >
+              {ran === 'sent' ? 'sent' : ran === 'blocked' ? 'not armed' : 'run now'}
+            </MiniButton>
             <span style={{ flex: 1 }} />
             <MiniButton tone="danger" onClick={onDelete}>delete</MiniButton>
           </div>
