@@ -65,7 +65,7 @@ const { ADMISSION_REASON } = loadTs('src/main/capacityAdmission.ts');
 // including this one). The figure carried here first said "ten", which was read off a
 // `grep | head -10` -- a pipe capped at ten cannot be evidence of ten. Re-derive it by
 // search against a named revision, never by memory and never off a truncated pipe.
-const { typeAndSubmit } = loadTs('src/renderer/src/hooks/queueDelivery.ts');
+// (L0-FUSION stage 5.3: `typeAndSubmit` is REMOVED - see the L0-STAGED note below.)
 
 const T0 = 1_800_000_000_000;
 const POOL = 'codex:acct-a:codex';
@@ -346,78 +346,23 @@ test('L0-FIX9: the ANSWER and the RECORD are the same act — a granted ticket i
 // L0-STAGED — a refusal must leave nothing sendable behind
 // ═══════════════════════════════════════════════════════════════════════════
 
-/** Records what was typed, in order, so the ORDER can be asserted and not just the set. */
-function typist(over = {}) {
-  const log = [];
-  const io = {
-    maySubmit: over.maySubmit ?? (async () => { log.push('ask'); return true; }),
-    writePayload: async () => { log.push('payload'); return over.payload ?? { ok: true }; },
-    pause: async () => { log.push('pause'); },
-    writeSubmit: async () => { log.push('submit'); return over.submit ?? { ok: true }; }
-  };
-  if (over.noGate) delete io.maySubmit;
-  return { log, io };
-}
-
-test('L0-STAGED: a REFUSED submission types nothing at all — not even the payload', async () => {
-  // THE DISCRIMINATOR. Against the shipped-then-fixed version that wrote the payload
-  // first and withheld only the Enter, this arm fails: `payload` is in the log, the
-  // message is staged in the box, and a human pressing Enter sends what capacity just
-  // refused. A refusal that leaves sendable text did not refuse.
-  const t = typist({ maySubmit: async () => { return false; } });
-  await assert.rejects(
-    () => typeAndSubmit('pty-1', t.io),
-    /capacity refused the submit keystroke/,
-    'a refusal is an error, not a silent no-op'
-  );
-  assert.deepEqual(t.log, [], 'NOTHING was written: no payload staged, so there is nothing to send');
-});
-
-test('L0-STAGED: a GRANTED submission types, in order — the gate is not a blanket refusal', async () => {
-  // The pair, and it is load-bearing: "types nothing when refused" is satisfied just as
-  // well by a function that never types anything, which would stop the floor entirely.
-  const t = typist();
-  await typeAndSubmit('pty-1', t.io);
-  assert.deepEqual(t.log, ['ask', 'payload', 'pause', 'submit'],
-    'asked FIRST, then staged, then the TUI pause, then the keystroke');
-});
-
-test('L0-STAGED: a gate that REJECTS types nothing either — a failure is not a yes', async () => {
-  // The named wrong fix, in its other form: treating a transport failure as permission.
-  // Nothing may be staged on an answer that never arrived.
-  const boom = new Error('ipc went away');
-  const t = typist({ maySubmit: async () => { throw boom; } });
-  await assert.rejects(() => typeAndSubmit('pty-1', t.io), /ipc went away/);
-  assert.deepEqual(t.log, [], 'a rejection stages nothing, exactly as a false does');
-});
-
-test('L0-STAGED: repeated refusals leave nothing for a retry to append to', async () => {
-  // Dwight\u2019s second route: a retry that appends to text the previous attempt staged,
-  // building one oversized line out of several messages. With nothing staged there is
-  // nothing to append to, and that is a property of the order rather than of a cleanup.
-  const t = typist({ maySubmit: async () => false });
-  for (let i = 0; i < 4; i += 1) {
-    await assert.rejects(() => typeAndSubmit('pty-1', t.io), /capacity refused/);
-  }
-  assert.deepEqual(t.log, [], 'four refused attempts, zero characters staged');
-});
-
-test('L0-STAGED: a submission with NO ticket still types — a manual send is not gated', async () => {
-  // Both-sides again, on the other axis. `manual` sends hold no reservation and must be
-  // unaffected; a fix that gated them would silently stop the human escape hatch.
-  const t = typist({ noGate: true });
-  await typeAndSubmit('pty-1', t.io);
-  assert.deepEqual(t.log, ['payload', 'pause', 'submit'], 'no gate asked, and it typed');
-});
-
-test('L0-STAGED: a failed payload write does not press Enter on text that is not there', async () => {
-  // Pre-existing behaviour, re-asserted because the refactor could have lost it: the
-  // submit keystroke must never follow a stage that did not land, or the Enter answers
-  // whatever prompt the terminal happens to be showing.
-  const t = typist({ payload: { ok: false, error: 'no pty: pty-1' } });
-  await assert.rejects(() => typeAndSubmit('pty-1', t.io), /no pty: pty-1/);
-  assert.deepEqual(t.log, ['ask', 'payload'], 'it stopped at the failed stage');
-});
+// L0-FUSION stage 5.3: THE SIX `typeAndSubmit` TESTS THAT LIVED HERE WENT WITH THE FUNCTION.
+// `typeAndSubmit` was the RENDERER'S ask -> payload -> pause -> Enter order. The renderer no
+// longer types programmatically at all - main's `pty:write` REFUSES a renderer write that
+// declares PROGRAMMATIC - so there is no renderer order left to pin. Each guarantee is held
+// by the one main-owned submit transaction, and proven against it:
+//   a REFUSED submission types nothing, not even the payload  -> automatic-submit: every
+//       REFUSE cell of the policy table, `unknown mapping *`, `abortCapabilityFailsClosedAtReady`
+//   a GRANTED submission types, in order                       -> `commitsInOrder`, `gapIsHonoured`
+//   a gate that REJECTS types nothing - a failure is not a yes -> there is no awaited IPC gate
+//       to reject any more: the check and the Enter are one synchronous section
+//       (`criticalSectionNeverYields`)
+//   repeated refusals leave nothing for a retry to append to   -> `holdIsARealHoldAndOnlyAnObservationReleasesIt`,
+//       `oneStableIdPerMessageDeliversAtMostOnce`
+//   a manual send is not gated                                 -> `bypassIsDeclaredNotInherited`
+//   a failed payload write does not press Enter                -> `stageFailureTypesNothingAndReturnsTheGrant`
+// and what `typeAndSubmit` could NOT give - a refusal arriving AFTER the payload was staged
+// un-types it - is `lateRefusalAborts` plus the differential erase arms.
 
 // ═══════════════════════════════════════════════════════════════════════════
 // L0-TOCTOU — revalidate at the keystroke, against the projection of the moment

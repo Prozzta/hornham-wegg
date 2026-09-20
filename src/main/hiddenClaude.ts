@@ -186,7 +186,12 @@ export function runHiddenClaude(prompt: string, opts: HiddenClaudeOptions): Prom
       if (settled || promptSent) return;
       promptSent = true;
       if (bootTimer) { clearTimeout(bootTimer); bootTimer = null; }
-      // Bracketed paste + enter — same mechanism as submitToPty in useHive.ts.
+      // Bracketed paste, then Enter a tick later (a single chunk would land the "\r"
+      // inside the input box). NOT routed through the main-owned submit transaction, and
+      // deliberately: this is a PRIVATE, hidden, single-use PTY this module spawned for
+      // itself. It is not an agent terminal, it is not in `ptyManager`, no xterm is
+      // attached to it and no human can type into it - so there is no prompt to share and
+      // nothing for the owner's human-interference machinery to protect.
       ptyProc.write(`\x1b[200~${prompt}\x1b[201~`);
       setTimeout(() => { if (!settled) ptyProc.write('\r'); }, 140);
     };

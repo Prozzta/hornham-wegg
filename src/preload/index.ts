@@ -486,12 +486,21 @@ export interface ClosingTimeEvent {
 
 /** Per-agent operator-control state (#7C.1–7C.3). */
 /**
- * The answer to a capacity reservation request. A refusal carries no ticket, so
- * there is nothing to settle and nothing for a caller to forget to release.
+ * L0-FUSION stage 5.3 - what the main-owned submit transaction reports. `COMMITTED` is
+ * the ONLY outcome a queue item may be acknowledged on. `REFUSED`, `ABORTED` and `FAILED`
+ * left nothing of ours on any live prompt: keep the item and ask again (the same id is
+ * fine). `INTERFERED` means a human wrote onto our staged text: the item is HELD, nothing
+ * was cleared or sent, and automatic delivery to that terminal is inhibited until a human
+ * resolves it. The renderer decides nothing here - it is told.
  */
-export type CapacityDeliveryGrant =
-  | { ok: true; ticket: string }
-  | { ok: false; reason: string; poolKey: string | null };
+export type AutoSubmitClass = 'CAPACITY_GATED' | 'USER_RELEASED' | 'BOOT_SEQUENCE';
+export type AutoSubmitOutcome =
+  | { kind: 'COMMITTED' }
+  | { kind: 'REFUSED'; reason: string; detail?: string }
+  | { kind: 'ABORTED'; detail: string }
+  | { kind: 'INTERFERED'; reason: string; detail?: string }
+  | { kind: 'FAILED'; reason: string }
+  | { kind: 'REJECTED'; reason: string };
 
 export interface AgentControlSnapshot {
   /**
@@ -1088,31 +1097,15 @@ const api = {
   controlSnapshot: (agentId: string): Promise<AgentControlSnapshot | null> =>
     ipcRenderer.invoke('control:snapshot', agentId),
   /**
-   * Reserve provider capacity for ONE automatic delivery, atomically.
-   *
-   * The `capacityHold` flag on a control snapshot answers "would this be refused?"
-   * without reserving anything, which is what makes it safe to read on every queue
-   * tick - and useless as the thing that authorises the send. This takes the
-   * reservation. Main owns the decision, the grant and its expiry; what comes back
-   * is an opaque ticket carrying no capacity state at all.
+   * L0-FUSION stage 5.3 - ask MAIN to type a message into an agent's terminal and submit
+   * it. The one door for programmatic text+Enter: the renderer names the agent and the
+   * admission class, and main owns everything else - the PTY, capacity, readiness, the
+   * order, the final check next to the Enter, and the settle. `requestId` is the message's
+   * own stable id: it is delivered AT MOST ONCE however many times it is asked. Resolves
+   * with what happened; never rejects for a delivery reason.
    */
-  capacityBeginAutoDelivery: (agentId: string, ptyId?: string): Promise<CapacityDeliveryGrant> =>
-    ipcRenderer.invoke('capacity:beginAutoDelivery', agentId, ptyId ?? null),
-  /**
-   * ASK whether this authorised delivery may type its submit keystroke.
-   *
-   * AWAIT IT AND WRITE ONLY ON `true`. It is not an announcement: resolving is what
-   * makes main's record of the keystroke happen BEFORE the keystroke, rather than
-   * relying on two invokes arriving in the order they were sent — which Electron does
-   * not guarantee for any pair of channels. `false` means main has already reclaimed
-   * the ticket, so nothing authorises the send; a rejection means the same thing and
-   * must never be treated as a yes.
-   */
-  capacityMarkAutoDeliveryWriting: (ticket: string, ptyId?: string): Promise<boolean> =>
-    ipcRenderer.invoke('capacity:markAutoDeliveryWriting', ticket, ptyId ?? null),
-  /** Report whether the authorised delivery actually started. Always call it. */
-  capacitySettleAutoDelivery: (ticket: string, launched: boolean): Promise<void> =>
-    ipcRenderer.invoke('capacity:settleAutoDelivery', ticket, launched),
+  autoSubmit: (req: { requestId: string; agentId: string; admissionClass: AutoSubmitClass; text: string; settleMs?: number }): Promise<AutoSubmitOutcome> =>
+    ipcRenderer.invoke('autoSubmit:submit', req),
   /** Subscribe to gate/deny events (a tool was blocked); returns unsubscribe fn. */
   onApprovalRequest: (cb: (e: { agentId: string; tool?: string; reason?: string }) => void): (() => void) => {
     const listener = (_e: IpcRendererEvent, payload: { agentId: string; tool?: string; reason?: string }) => cb(payload);

@@ -199,10 +199,15 @@ test('SOURCE CENSUS: every writePty call in the WHOLE renderer tree declares an 
   // this census does not chase, and the claim is bounded to that.
   const calls = [];
   for (const f of walk('src/renderer')) for (const c of writePtyCalls(src(f))) calls.push({ f, c });
-  assert.ok(calls.length >= 8, `expected at least the eight known calls, found ${calls.length}`);
+  // L0-FUSION stage 5.3: EIGHT BECAME SIX, and the floor became an exact count. The two
+  // that left were the renderer's PROGRAMMATIC payload and Enter in useHive.ts - the
+  // renderer no longer types programmatically at all. So a renderer call may now only
+  // declare HUMAN or CONTROL (or ask the one classification point): PROGRAMMATIC is no
+  // longer an acceptable ending here, and main's pty:write refuses it regardless.
+  assert.equal(calls.length, 6, `expected exactly the six known calls, found ${calls.length}: ${calls.map((x) => x.f).join(', ')}`);
   for (const { f, c } of calls) {
-    assert.match(c, /, ?'(HUMAN|CONTROL|PROGRAMMATIC)'\)$|, ?classifyOutbound\([^)]*\)\)$/,
-      `${f}: ${c} does not end in a declared origin`);
+    assert.match(c, /, ?'(HUMAN|CONTROL)'\)$|, ?classifyOutbound\([^)]*\)\)$/,
+      `${f}: ${c} does not end in a declared HUMAN/CONTROL origin`);
   }
   // And no renderer file reaches the raw IPC channel directly, bypassing the typed wrapper.
   for (const f of walk('src/renderer')) {
@@ -220,10 +225,18 @@ test('SOURCE CENSUS: the PROGRAMMATIC literal appears ONLY in the two allowed ow
   // writes to a PTY at all - it submits to the one main-owned submit transaction - and that
   // owner's single write is declared in automaticSubmitWiring.ts (once in the `OwnerPty`
   // slice that types it, once at the call). index.ts holding ZERO is asserted below, not
-  // merely tolerated. The renderer's two go the same way at the stage 5.3 cutover.
-  const owners = { 'src/renderer/src/hooks/useHive.ts': 2, 'src/main/automaticSubmitWiring.ts': 2 };
-  assert.equal((src('src/main/index.ts').match(/'PROGRAMMATIC'/g) || []).length, 0,
-    'index.ts no longer types anything programmatically itself');
+  // merely tolerated.
+  //
+  // L0-FUSION stage 5.3: THE RENDERER'S TWO ARE GONE. useHive.ts no longer types
+  // programmatically at all, so the literal has exactly ONE producer in the whole tree -
+  // the submit owner's wiring. index.ts names it once, and that one is the REFUSAL: the
+  // `pty:write` handler turning away a renderer that declares it.
+  const owners = { 'src/main/automaticSubmitWiring.ts': 2, 'src/main/index.ts': 1 };
+  assert.equal((src('src/renderer/src/hooks/useHive.ts').match(/'PROGRAMMATIC'/g) || []).length, 0,
+    'the renderer no longer declares PROGRAMMATIC anywhere');
+  assert.match(src('src/main/index.ts'),
+    /if \(origin === 'PROGRAMMATIC'\) return \{ ok: false, error: 'origin not permitted on this channel' \}/,
+    "and index.ts's one mention is the pty:write REFUSAL, not a write");
   const allowedDefs = new Set(['src/shared/inputOrigin.ts']);
   const found = {};
   for (const f of [...walk('src/renderer'), ...walk('src/main'), ...walk('src/shared')]) {

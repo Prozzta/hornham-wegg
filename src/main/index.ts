@@ -26,7 +26,7 @@ import { normalizeWeekly, weeklyDelayMs } from '../shared/weeklySchedule';
 import { isInputOrigin } from '../shared/inputOrigin';
 import { automaticDeliveryEligibility, isTerminalInputState } from '../shared/inputProvenance';
 import { isTerminalPromptState } from '../shared/promptState';
-import { AutomaticSubmitOwner, capacityGateOf } from './automaticSubmit';
+import { AutomaticSubmitOwner, ADMISSION_CLASSES, capacityGateOf, type AdmissionClass } from './automaticSubmit';
 import { buildOwnerDeps, ScreenReadingBroker } from './automaticSubmitWiring';
 import {
   getBranch, getStatus, getLog, getBranches, getAheadBehind, isRepo, getDiff, mainRepoRoot,
@@ -3078,6 +3078,13 @@ ipcMain.handle('pty:write', (_evt, id: string, data: string, origin: unknown) =>
   // cannot say who is behind it is a missing fact, and the fail-closed rule says a
   // missing fact is UNKNOWN — never CONTROL, and never quietly HUMAN.
   if (!isInputOrigin(origin)) return { ok: false, error: 'invalid origin' };
+  // L0-FUSION stage 5.3. PROGRAMMATIC belongs to the ONE submit owner, and the owner lives
+  // in THIS process: it writes through ptyManager directly and never crosses this channel.
+  // So a renderer that declares it is asking for a capability it no longer has. Refused
+  // HERE, structurally - not by the renderer promising not to: after this no automatic
+  // module holds a raw text+Enter capability at all (design section 10). HUMAN and
+  // CONTROL are what this channel is for.
+  if (origin === 'PROGRAMMATIC') return { ok: false, error: 'origin not permitted on this channel' };
   return ptyManager.write(id, data, origin);
 });
 // L0-FUSION stage 3. The mirror is validated at the boundary and stored on the live
@@ -4053,35 +4060,32 @@ ipcMain.handle('control:snapshot', (_evt, agentId: unknown) => {
 });
 
 /**
- * L0-SEAM, the half the probe could not do. `capacityHold` above answers a question
- * and reserves nothing - correct for a per-tick snapshot read, and not an admission.
- * The automatic delivery itself goes through THIS pair, so the dispatch the gate
- * waved through is the thing that actually spends the epoch's single recovery turn.
- * Without it two agents on one RECOVERING pool both read "not held" and both send.
+ * L0-FUSION stage 5.3 - THE ONE DOOR for programmatic text+Enter from a renderer.
  *
- * Main owns the decision, the reservation and its expiry; the renderer holds only an
- * opaque ticket, so a window that is reloaded or closed mid-delivery costs one
- * delivery window rather than a permanently swallowed grant.
+ * The renderer chooses WHICH message and WHEN to ask, and acknowledges a queue item on a
+ * reported COMMIT. That is all it does. It names an AGENT, never a PTY - main resolves the
+ * terminal, so a request can no longer spend one agent's grant on another's prompt. It
+ * holds no ticket, no capacity state, no ordering, no readiness polling and no settlement:
+ * the renderer's write chain, its `typeAndSubmit` order and the capacity ticket IPC
+ * (`capacity:beginAutoDelivery` / `markAutoDeliveryWriting` / `settleAutoDelivery`) are
+ * REMOVED, not wrapped. A window that is reloaded or closed mid-delivery now costs
+ * nothing: every step and the settle happen here, and the outcome is recorded against
+ * the request id for a caller that comes back and asks again.
+ *
+ * Resolves with what HAPPENED; it never rejects for a delivery reason.
  */
-ipcMain.handle('capacity:beginAutoDelivery', (_evt, agentId: unknown, ptyId: unknown) => {
-  if (typeof agentId !== 'string') return { ok: false, reason: 'BAD_REQUEST', poolKey: null };
-  return providerCapacity.beginAutomaticDelivery(agentId, 'ORDINARY_TURN',
-    typeof ptyId === 'string' ? ptyId : null);
-});
-// A15/L0-FIX9: the renderer ASKING whether it may type. Without the record, the expiry
-// cannot tell a window that died mid-send from one that never sent and returns the
-// recovery turn for both - authorising a second send of an instruction that already
-// landed. Without the ANSWER, the record was merely announced and the keystroke could
-// overtake it. Answering false for anything main does not hold is what makes the
-// refusal meaningful: a reclaimed ticket authorises nothing.
-ipcMain.handle('capacity:markAutoDeliveryWriting', (_evt, ticket: unknown, ptyId: unknown) => {
-  if (typeof ticket !== 'string') return false;
-  return providerCapacity.markAutomaticDeliveryWriting(ticket,
-    typeof ptyId === 'string' ? ptyId : null);
-});
-ipcMain.handle('capacity:settleAutoDelivery', (_evt, ticket: unknown, launched: unknown) => {
-  if (typeof ticket !== 'string') return;
-  providerCapacity.settleAutomaticDelivery(ticket, launched === true);
+ipcMain.handle('autoSubmit:submit', (_evt, req: unknown) => {
+  const r = (req && typeof req === 'object' ? req : {}) as Record<string, unknown>;
+  if (typeof r.requestId !== 'string' || !r.requestId || typeof r.agentId !== 'string' || !r.agentId
+    || typeof r.text !== 'string' || !r.text
+    || typeof r.admissionClass !== 'string' || !(ADMISSION_CLASSES as readonly string[]).includes(r.admissionClass)) {
+    return { kind: 'REJECTED', reason: 'BAD_REQUEST' };
+  }
+  const settleMs = typeof r.settleMs === 'number' && r.settleMs >= 0 && r.settleMs <= 10_000 ? r.settleMs : undefined;
+  return automaticSubmit.submit({
+    requestId: r.requestId, agentId: r.agentId, admissionClass: r.admissionClass as AdmissionClass,
+    text: r.text, settleMs
+  });
 });
 
 // ─── IPC: scheduled missions (recurring auto-dispatch) ──────────────────────

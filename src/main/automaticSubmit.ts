@@ -564,6 +564,14 @@ export class AutomaticSubmitOwner {
    * same outcome — in flight or settled — and types nothing twice: a replay after COMMIT
    * writes no second Enter. The same id with ANY different argument is REJECTED; it does
    * not get the prior success for a different request.
+   *
+   * WHAT IS REMEMBERED, AND WHAT IS NOT. COMMITTED and INTERFERED are FACTS ABOUT THE
+   * PROMPT: the message went out, or it is sitting there held. Those are recorded, so a
+   * caller that lost the reply or was reloaded learns what happened instead of typing it
+   * again. REFUSED, ABORTED and FAILED left NOTHING of ours on any live prompt; they are
+   * "not delivered, ask again", so the id is released the moment they settle and the SAME
+   * id may be retried. That is what lets a caller use one stable id per message — a
+   * message is delivered AT MOST ONCE, however many times it is asked.
    */
   submit(req: SubmitRequest): Promise<SubmitOutcome> {
     this.sweep();
@@ -581,6 +589,10 @@ export class AutomaticSubmitOwner {
     const settled = { at: null as number | null };
     const promise = this.enqueue(req, ptyId).then((outcome) => {
       settled.at = this.deps.now();
+      if (outcome.kind !== 'COMMITTED' && outcome.kind !== 'INTERFERED'
+        && this.known.get(req.requestId)?.promise === promise) {
+        this.known.delete(req.requestId);
+      }
       try {
         this.deps.onOutcome?.({
           requestId: req.requestId, agentId: req.agentId, ptyId,
@@ -607,7 +619,14 @@ export class AutomaticSubmitOwner {
    *  its terminal lives — there is no timer, because a timer is automation deciding that
    *  a human's text no longer matters. */
   resolveInterference(ptyId: string): boolean {
-    return this.inhibited.delete(ptyId);
+    const held = this.inhibited.get(ptyId);
+    if (!held) return false;
+    this.inhibited.delete(ptyId);
+    // The held item is the human's to re-release or discard. Its recorded INTERFERED
+    // must not answer for it any more, or re-releasing the same message would replay the
+    // hold it was just released from.
+    this.known.delete(held.requestId);
+    return true;
   }
 
   private sweep(): void {

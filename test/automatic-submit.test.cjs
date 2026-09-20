@@ -691,6 +691,34 @@ K.replayInFlightSharesOneTransaction = async (mod) => {
   assert.equal(enters(w), 1, 'a replay while in flight joins the one transaction');
 };
 
+K.oneStableIdPerMessageDeliversAtMostOnce = async (mod) => {
+  // A caller uses ONE id per message (the queue item's own id) for as long as it lives.
+  // A refusal left nothing on the prompt, so it is "ask again" and the id is free; a
+  // COMMIT is a fact, so every later ask with that id learns it and types nothing.
+  const w = world({ capacity: 'LIMITED' });
+  const o = owner(mod, w);
+  assert.equal((await settle(w, o.submit(req({ requestId: 'msg-7' })))).kind, 'REFUSED');
+  w.capacity = 'AVAILABLE';
+  const retried = await settle(w, o.submit(req({ requestId: 'msg-7' })));
+  assert.equal(retried.kind, 'COMMITTED', 'a REFUSAL is not remembered as the answer: the SAME id is retried and delivered');
+  assert.equal((await settle(w, o.submit(req({ requestId: 'msg-7' })))).kind, 'COMMITTED');
+  assert.equal(enters(w), 1, 'and once COMMITTED the same id never types again: AT MOST ONCE');
+};
+
+K.aResolvedInterferenceReleasesItsId = async (mod) => {
+  const w = world();
+  w.at(50, () => w.human(' mine'));
+  const o = owner(mod, w);
+  assert.equal((await settle(w, o.submit(req({ requestId: 'msg-9' })))).kind, 'INTERFERED');
+  const replay = await settle(w, o.submit(req({ requestId: 'msg-9' })));
+  assert.equal(replay.kind, 'INTERFERED', 'while it is held, the same id answers INTERFERED');
+  assert.deepEqual(w.writes, ['read your inbox now'], 'and types nothing more');
+  assert.equal(o.resolveInterference('pty-alice'), true);
+  w.prompt = ''; w.vt += 60_000; // the human dealt with the line
+  const again = await settle(w, o.submit(req({ requestId: 'msg-9' })));
+  assert.equal(again.kind, 'COMMITTED', 'a human-resolved hold RELEASES the id: re-releasing the message delivers it');
+};
+
 K.mismatchedReplayRejects = async (mod) => {
   for (const change of [{ text: 'a different payload' }, { agentId: 'bob' }, { admissionClass: 'USER_RELEASED' }]) {
     const w = world();
@@ -940,6 +968,15 @@ const MUTANTS = [
   { name: 'a mismatched replay handed the prior success',
     edits: [["      return same ? prior.promise : Promise.resolve({ kind: 'REJECTED', reason: 'ID_BINDING_MISMATCH' });", '      return prior.promise;']],
     killer: 'mismatchedReplayRejects', dies: /BINDS IMMUTABLY/ },
+  { name: 'a refusal remembered as the answer for that id',
+    edits: [["      if (outcome.kind !== 'COMMITTED' && outcome.kind !== 'INTERFERED'\n        && this.known.get(req.requestId)?.promise === promise) {\n        this.known.delete(req.requestId);\n      }\n", '']],
+    killer: 'oneStableIdPerMessageDeliversAtMostOnce', dies: /REFUSAL is not remembered as the answer/ },
+  { name: 'a COMMIT forgotten, so the same id types again',
+    edits: [["      if (outcome.kind !== 'COMMITTED' && outcome.kind !== 'INTERFERED'\n", "      if (outcome.kind !== 'INTERFERED'\n"]],
+    killer: 'oneStableIdPerMessageDeliversAtMostOnce', dies: /AT MOST ONCE/ },
+  { name: 'a resolved interference that still answers for its id',
+    edits: [['    this.known.delete(held.requestId);\n', '']],
+    killer: 'aResolvedInterferenceReleasesItsId', dies: /RELEASES the id/ },
   { name: 'a failed Enter confirmed as a launch',
     edits: [['    if (entered.ok) deps.capacity.confirmLaunch(s.decision);\n    else deps.capacity.cancelGrant(s.decision);', '    deps.capacity.confirmLaunch(s.decision);']],
     killer: 'enterFailureReturnsTheGrantAndHolds', dies: /a failed Enter is NOT a launch/ },

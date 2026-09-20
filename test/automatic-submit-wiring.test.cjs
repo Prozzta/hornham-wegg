@@ -453,6 +453,109 @@ test('the prompt mirror is validated at the boundary', () => {
   }
 });
 
+// ─── Stage 5.3: the renderer holds NO programmatic submit capability ──────────────────
+
+const nodeFs = require('node:fs');
+const nodePath = require('node:path');
+/** Source with its comments removed. An ABSENCE check must look at code: the files that
+ *  removed a thing are exactly the files whose comments explain that it was removed. */
+const codeOnly = (text) => text.replace(/\/\*[\s\S]*?\*\//g, '').replace(/(^|[^:'"`])\/\/.*$/gm, '$1');
+
+/** Every .ts/.tsx under a subtree, so a census cannot be dodged by adding a new file. */
+function walkSrc(rel) {
+  const out = [];
+  for (const ent of nodeFs.readdirSync(nodePath.join(__dirname, '..', rel), { withFileTypes: true })) {
+    const child = `${rel}/${ent.name}`;
+    if (ent.isDirectory()) out.push(...walkSrc(child));
+    else if (/\.(ts|tsx)$/.test(ent.name)) out.push(child);
+  }
+  return out;
+}
+
+test('EXHAUSTIVE CENSUS: a bare Enter is WRITTEN in exactly two places, and one is a declared private PTY', () => {
+  // The design's closing claim (section 10): "no current automatic caller uses raw Enter,
+  // by exhaustive call-graph". Every source file, not a named list. A line that WRITES a
+  // lone carriage return is a programmatic submit; comparisons against '\r' are not.
+  const writers = [];
+  for (const f of walkSrc('src')) {
+    read(f).split('\n').forEach((line, i) => {
+      if (/(write|writePty|safeWrite)\w*\([^)]*['"`]\\r['"`]\s*\)/.test(line)) writers.push(`${f}:${i + 1}`);
+    });
+  }
+  const files = writers.map((w) => w.split(':')[0]).sort();
+  assert.deepEqual(files, ['src/main/automaticSubmit.ts', 'src/main/hiddenClaude.ts'],
+    `a bare Enter is written ONLY by the submit owner and by hiddenClaude's private PTY; found ${writers.join(', ')}`);
+  // The owner's one Enter is inside the critical section, nowhere else.
+  const owner = read('src/main/automaticSubmit.ts');
+  const section = owner.slice(owner.indexOf('export function commitSection('));
+  assert.ok(section.slice(0, section.indexOf('\n}\n')).includes("safeWrite(deps, s.ptyId, '\\r')"), 'and the owner writes it inside commitSection');
+  // The exclusion is DECLARED where it lives, not merely tolerated here.
+  const hidden = read('src/main/hiddenClaude.ts');
+  assert.match(hidden, /NOT routed through the main-owned submit transaction, and\s+\/\/ deliberately: this is a PRIVATE, hidden, single-use PTY/);
+  assert.ok(!/ptyManager/.test(codeOnly(hidden)), 'hiddenClaude never touches an AGENT terminal: its code has no reference to ptyManager at all');
+});
+
+test('the renderer cannot type programmatically: no chain, no order, no ticket, no raw submit', () => {
+  const hive = read('src/renderer/src/hooks/useHive.ts');
+  for (const gone of ['writeChains', 'waitForTerminalReady', 'readyPids', 'typeAndSubmit(', 'capacityBeginAutoDelivery',
+    'capacityMarkAutoDeliveryWriting', 'capacitySettleAutoDelivery', 'function submitToPty', '.writePty(']) {
+    assert.ok(!codeOnly(hive).includes(gone), `useHive.ts code no longer contains \`${gone}\``);
+  }
+  assert.equal(hive.split('window.cth.autoSubmit(').length - 1, 2,
+    'exactly two asks of main: the boot-prompt helper and the queue drain');
+  assert.match(hive, /admissionClass: next\.manual \? 'USER_RELEASED' : 'CAPACITY_GATED'/, 'send-now is a DECLARED class, not a fall-through');
+  assert.match(hive, /admissionClass: 'BOOT_SEQUENCE'/);
+  assert.match(hive, /requestId: `queue:\$\{srcId\}:\$\{next\.id\}`/, 'a queue item is asked under its OWN stable id: at most once');
+  // The acknowledgement is reachable only from a COMMIT.
+  assert.match(hive, /if \(outcome\.kind !== 'COMMITTED'\) throw new Error\(outcome\.kind\);/);
+  // INTERFERED is held: it must not fall into the attempt counter that DROPS a message.
+  const held = hive.indexOf("if (outcome.kind === 'INTERFERED') {");
+  const counter = hive.indexOf('const attempts = (sendFailures[next.id] ?? 0) + 1;');
+  assert.ok(held > 0 && counter > held, 'INTERFERED returns before the drop-after-N-failures counter');
+  assert.ok(hive.slice(held, counter).includes('return { sent: false };'));
+
+  const queue = read('src/renderer/src/hooks/queueDelivery.ts');
+  assert.ok(!/typeAndSubmit|SubmitSteps|writeSubmit/.test(codeOnly(queue)), 'the renderer submit order is removed, not wrapped');
+  const preload = read('src/preload/index.ts');
+  for (const gone of ['capacity:beginAutoDelivery', 'capacity:markAutoDeliveryWriting', 'capacity:settleAutoDelivery', 'CapacityDeliveryGrant']) {
+    assert.ok(!codeOnly(preload).includes(gone), `preload no longer exposes \`${gone}\``);
+  }
+  assert.match(preload, /ipcRenderer\.invoke\('autoSubmit:submit', req\)/);
+});
+
+test("main's pty:write REFUSES renderer-origin PROGRAMMATIC, before anything is written", () => {
+  const index = read('src/main/index.ts');
+  const handler = index.slice(index.indexOf("ipcMain.handle('pty:write'"));
+  const body = handler.slice(0, handler.indexOf('\n});'));
+  const refuse = body.indexOf("if (origin === 'PROGRAMMATIC') return { ok: false, error: 'origin not permitted on this channel' };");
+  const write = body.indexOf('ptyManager.write(');
+  assert.ok(refuse > 0 && write > refuse, 'the refusal sits BEFORE the only write in the handler');
+  for (const gone of ["'capacity:beginAutoDelivery'", "'capacity:markAutoDeliveryWriting'", "'capacity:settleAutoDelivery'"]) {
+    assert.ok(!index.includes(`ipcMain.handle(${gone}`), `${gone} is no longer handled`);
+  }
+});
+
+test('the one door: autoSubmit:submit names an AGENT and a CLASS, never a PTY', () => {
+  const index = read('src/main/index.ts');
+  const handler = index.slice(index.indexOf("ipcMain.handle('autoSubmit:submit'"));
+  const body = handler.slice(0, handler.indexOf('\n});'));
+  assert.ok(!/ptyId/.test(body), 'a renderer cannot name the terminal: main resolves it (design section 7)');
+  assert.match(body, /\(ADMISSION_CLASSES as readonly string\[\]\)\.includes\(r\.admissionClass\)/, 'an unknown class is rejected, not defaulted');
+  assert.match(body, /return automaticSubmit\.submit\(\{/);
+});
+
+test('the ticket machinery has NO production caller left (its removal is the stage-5.5 commit)', () => {
+  // Declared transitional state, asserted rather than assumed: CapacityRuntime still
+  // DEFINES begin/mark/settle/maySubmitNow, but nothing outside that file calls them.
+  for (const f of walkSrc('src')) {
+    if (f === 'src/main/capacityRuntime.ts') continue;
+    const text = codeOnly(read(f));
+    for (const dead of ['beginAutomaticDelivery(', 'markAutomaticDeliveryWriting(', 'settleAutomaticDelivery(', '.maySubmitNow(', '.holds(']) {
+      assert.ok(!text.includes(dead), `${f} must not call ${dead}`);
+    }
+  }
+});
+
 // ─── Static: the renderer half ────────────────────────────────────────────────────────
 
 test('the erase oracle reads the SCREEN and never the keystroke model (design 5.1 prohibition)', () => {

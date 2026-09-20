@@ -11,8 +11,7 @@ import {
 import {
   clearCommandForProvider,
   compactionCommandForProvider,
-  remoteControlCommandForProvider,
-  terminalReadyToReceive
+  remoteControlCommandForProvider
 } from '../../../shared/providerAutomation';
 import { DEFAULT_CONTEXT_TRIGGER, type ContextRule } from '../../../shared/triggers';
 import type { AgentProvider } from '../../../shared/agentProvider';
@@ -20,7 +19,8 @@ import { bridgeOf, providerPreset } from '../../../shared/agentProvider';
 import { isDurableRole, preferredAgentRole, roleForHiveSpawn } from '../../../shared/agentRole';
 import { inboxNudgeText } from '../../../shared/hiveNudge';
 import { acquireTerminal, resetTerminal, isTerminalAutomationSafe } from '@/components/terminalPool';
-import { canDeliverToAgent, deliverWithAcknowledgement, checkPrecondition, typeAndSubmit } from './queueDelivery';
+import { canDeliverToAgent, deliverWithAcknowledgement, checkPrecondition } from './queueDelivery';
+import type { AutoSubmitOutcome } from '../../../preload';
 import { OFFICE_CAST, DEFAULT_CHARACTER } from '@/scene/office/cast';
 
 const GOD_ID = 'god';
@@ -46,7 +46,7 @@ const QUIESCE_POLL_MS = 4000;
 const BOOT_GRACE_MS = 35_000;
 // Delay before typing a one-time TUI protocol seed into a fresh worker (3b) —
 // long enough for the TUI to finish painting and surface any permission prompt.
-// submitToPty additionally waits for the terminal's readiness handshake.
+// Main's submit owner additionally waits for the terminal's readiness handshake.
 const SEED_BOOT_MS = 12_000;
 
 /** Hive-aware / hooks-bridge engines get standing goals via HookServer
@@ -80,94 +80,51 @@ const INITIAL_GOD_PROMPT = [
   'Then begin orchestrating: triage requests, delegate work to the team, and keep everyone unblocked. You are fully autonomous — there is no approval queue, so handle tool-permission prompts in this session yourself (the human can approve them remotely from their phone).'
 ].join('\n');
 
-// Per-pty submission chain. Every submitToPty for a given pty is appended here so
-// two callers (e.g. the boot sequence's /remote-control and the inbox-wake nudge)
-// can NEVER interleave their text + Enter — which jammed them onto one line and
-// produced "Unknown command: /remote-control<next prompt>".
-const writeChains = new Map<string, Promise<void>>();
-const readyPids = new Map<string, number>();
+// L0-FUSION stage 5.3 — THE RENDERER NO LONGER TYPES PROGRAMMATICALLY AT ALL.
+//
+// This file used to own a whole submit path: a per-pty promise chain (`writeChains`) that
+// ordered text+Enter, a readiness poll, the `typeAndSubmit` order, and a capacity ticket
+// it asked main to mint, mark and settle. Every one of those is REMOVED, not wrapped. The
+// one main-owned submit transaction (`src/main/automaticSubmit.ts`) now resolves the PTY,
+// asks capacity, waits for readiness, stages, holds the TUI gap, re-checks everything next
+// to the Enter, and settles — for every class of programmatic message — and it serializes
+// them per terminal, so two callers can still never jam their text and Enter together.
+//
+// What stays HERE is exactly the renderer's one job: choosing WHICH message to deliver
+// and WHEN to ask, and acknowledging a queue item on a reported COMMIT. And main's
+// `pty:write` now REFUSES a renderer write that declares origin PROGRAMMATIC, so this is
+// not a convention this file keeps — it is a capability it no longer has.
 
-async function waitForTerminalReady(
-  ptyId: string,
-  provider: AgentProvider,
-  timeoutMs = 30_000
-): Promise<void> {
-  const started = Date.now();
-  while (Date.now() - started < timeoutMs) {
-    const live = await window.cth.listPtys();
-    const pty = live.find((entry) => entry.id === ptyId);
-    if (!pty) throw new Error(`PTY exited before becoming ready: ${ptyId}`);
-    if (readyPids.get(ptyId) === pty.pid) return;
-    if (terminalReadyToReceive(pty.hasOutput, Date.now() - started, provider)) {
-      readyPids.set(ptyId, pty.pid);
-      return;
-    }
-    await new Promise((resolve) => setTimeout(resolve, 100));
-  }
-  throw new Error(`PTY did not become ready within ${timeoutMs}ms: ${ptyId}`);
+let autoSubmitSeq = 0;
+/** A one-off request id, for a message that has no stable id of its own (boot prompts). */
+function oneOffRequestId(kind: string, agentId: string): string {
+  return `${kind}:${agentId}:${Date.now()}:${(autoSubmitSeq += 1)}`;
 }
 
+const BOOT_PROMPT_RETRY_MS = 1500;
+const BOOT_PROMPT_MAX_ATTEMPTS = 40;
+
 /**
- * Type a line into an agent's Claude Code TUI and actually submit it.
+ * Hand a BOOT-SEQUENCE prompt (remote-control, seed, orientation) to main, and keep
+ * asking while main says "not now".
  *
- * Writing the text and the carriage return in a single chunk makes the TUI
- * treat the whole thing as a paste, so the "\r" lands as a newline inside the
- * input box instead of submitting — the command just sits there as text. We
- * send the text first, then the Enter as a separate keystroke a tick later so
- * the prompt is registered and executed. Idle autonomous agents thus act on a
- * dispatched instruction on their own.
- *
- * Submissions to the same pty are serialized (and each settles for `settleMs`
- * after Enter) so concurrent callers can't jam their input together.
- *
- * The text is wrapped in bracketed-paste markers (ESC[200~ … ESC[201~) so the
- * TUI treats it as ONE paste: embedded newlines land as literal newlines in the
- * input box. Without them, every "\n" in a multi-line message acted as Enter —
- * the message submitted line-by-line in fragments (the agent saw only the last
- * chunk). The closing Enter, sent a tick later, submits the whole block. (#24) */
-function submitToPty(
-  ptyId: string,
-  text: string,
-  provider: AgentProvider,
-  settleMs = 250,
-  /**
-   * Asked immediately before the submit keystroke and AWAITED. Resolving `false` (or
-   * rejecting) aborts the submission without typing anything. See the call site.
-   */
-  maySubmit?: () => Promise<boolean>
-): Promise<void> {
-  const prev = writeChains.get(ptyId) ?? Promise.resolve();
-  const next = prev.catch(() => { /* a failed prior write must not stall the chain */ }).then(async () => {
-    await waitForTerminalReady(ptyId, provider);
-    // Bracketed paste (ESC[200~ … ESC[201~) only matters for MULTI-LINE text, so a
-    // stray "\n" doesn't submit early (#24). Single-line text (nudges, slash
-    // commands) is sent raw — some TUIs (Antigravity's agy) treat the paste
-    // markers as literal input and never submit, so skipping them is more robust.
-    const payload = text.includes('\n') ? `\x1b[200~${text}\x1b[201~` : text;
-    // A15/L0-FIX9/L0-STAGED: ASK main first, AWAIT the answer, and type NOTHING unless
-    // it says yes. The gate used to sit after the payload write, so a refusal left the
-    // message staged in the input box for a retry to append to or a human to send.
-    //
-    // writePty NEVER rejects for a dead pty — it resolves { ok:false, error:
-    // 'no pty: …' } — so an unchecked await made every failed delivery look successful
-    // (the queue-drain then destroyed the message it had already popped, #36). Every
-    // step below surfaces its failure as a rejection; the chain itself is immune (the
-    // prev.catch above absorbs it for the next writer).
-    //
-    // The ORDER is the invariant and it lives in typeAndSubmit, where it is testable:
-    // moving the gate below the payload write reads as a fix and restores the defect.
-    await typeAndSubmit(ptyId, {
-      maySubmit,
-      // PROGRAMMATIC: the automatic owner's own bytes. Never HUMAN, never CONTROL —
-      // kept distinct so a call-graph check can prove this is the only producer.
-      writePayload: () => window.cth.writePty(ptyId, payload, 'PROGRAMMATIC'),
-      pause: () => new Promise((r) => setTimeout(r, 140)),
-      writeSubmit: () => window.cth.writePty(ptyId, '\r', 'PROGRAMMATIC')
-    });
-    await new Promise((r) => setTimeout(r, settleMs));
-  });
-  writeChains.set(ptyId, next);
-  return next;
+ * A REFUSED or ABORTED outcome left NOTHING on the prompt — the terminal was not ready, a
+ * human was typing, a picker was open — so asking again is free and is the right thing:
+ * a spawn needs its orientation. The SAME request id is reused, so however the retries
+ * interleave the prompt is delivered at most once. Anything else (INTERFERED, FAILED,
+ * REJECTED) is final and throws, exactly as a dead PTY used to.
+ */
+async function submitBootPrompt(agentId: string, text: string, settleMs?: number): Promise<void> {
+  const requestId = oneOffRequestId('boot', agentId);
+  for (let attempt = 0; attempt < BOOT_PROMPT_MAX_ATTEMPTS; attempt += 1) {
+    const outcome = await window.cth.autoSubmit({ requestId, agentId, admissionClass: 'BOOT_SEQUENCE', text, settleMs });
+    if (outcome.kind === 'COMMITTED') return;
+    if (outcome.kind !== 'REFUSED' && outcome.kind !== 'ABORTED') {
+      throw new Error(`boot prompt for ${agentId} not delivered: ${outcome.kind}`);
+    }
+    await new Promise((r) => setTimeout(r, BOOT_PROMPT_RETRY_MS));
+  }
+  throw new Error(`boot prompt for ${agentId} not delivered: still refused after ${BOOT_PROMPT_MAX_ATTEMPTS} attempts`);
 }
 
 /** Wrap a user message as an enrich task for the assistant. The assistant's
@@ -456,14 +413,14 @@ export function useHive(config: HarnessConfig | null): void {
           if (remoteCommand) {
             // settleMs pauses the chain ~1.5s after /remote-control before the
             // orientation prompt (fresh spawns only) is submitted next.
-            await submitToPty(GOD_PTY, remoteCommand, godProvider, REMOTE_CONTROL_SETTLE_MS);
+            await submitBootPrompt(GOD_ID, remoteCommand, REMOTE_CONTROL_SETTLE_MS);
           }
           if (!cancelled && !resumedGod) {
             // A type-into-tui god (Crush) can't ride its hive protocol on argv, so the
             // main process hands it back as seedPrompt — type it FIRST (identity), then
-            // the orientation kick. Serialized via writeChains so they can't jam. (ondev-b)
-            if (res.seedPrompt) await submitToPty(GOD_PTY, res.seedPrompt, godProvider);
-            await submitToPty(GOD_PTY, INITIAL_GOD_PROMPT, godProvider);
+            // the orientation kick. Serialized by main's submit owner so they can't jam. (ondev-b)
+            if (res.seedPrompt) await submitBootPrompt(GOD_ID, res.seedPrompt);
+            await submitBootPrompt(GOD_ID, INITIAL_GOD_PROMPT);
           }
         } catch { /* PTY may have died during startup */ }
         finally { bootGraceUntil.current[GOD_ID] = 0; }
@@ -761,11 +718,7 @@ export function useHive(config: HarnessConfig | null): void {
             useStore.getState().updateAgent(a.id, { seedPrompt: seed });
             return;
           }
-          submitToPty(
-            ptyId,
-            withStandingGoal(live, seed),
-            inferAgentProvider(live.command, live.provider)
-          )
+          submitBootPrompt(live.id, withStandingGoal(live, seed))
             .catch(() => { /* pty may have died */ });
         }, SEED_BOOT_MS);
       }
@@ -850,39 +803,31 @@ export function useHive(config: HarnessConfig | null): void {
       if (inFlight.has(flightKey)) return { sent: false };
       inFlight.add(flightKey);
       lastFlush.current[target.id] = now;
-      // The gate above only ASKED. This RESERVES, and it is main that reserves: the
-      // snapshot flag is read on every queue tick and must not spend anything, so on
-      // its own it lets two agents on one recovering pool both pass and both send.
-      // `manual` skips it for the same reason it skips the gate — a person pressing
-      // "send now" is not an automatic start. The ticket is opaque; no capacity
-      // state is derived on this side.
-      // The PTY is named at MINT time so main can bind the grant to it: a keystroke
-      // that later names a different terminal must not spend this agent's turn there.
-      const grant = next.manual
-        ? null
-        : await window.cth.capacityBeginAutoDelivery(target.id, target.ptyId ?? undefined);
-      if (grant && !grant.ok) { inFlight.delete(flightKey); return { sent: false }; }
-      let launched = false;
       try {
+        // MAIN DELIVERS; this only asks. `manual` ("send now") is USER_RELEASED: a person
+        // asked for it, so main does not ask capacity — it still serializes, still
+        // revalidates immediately before Enter, and still stops on human interference.
+        // Everything else is CAPACITY_GATED and gets main's full fail-closed gate.
+        //
+        // The request id is the queue item's OWN id, stable for as long as the item lives.
+        // Main delivers an id AT MOST ONCE: a refusal frees it for the next ask, a COMMIT
+        // is remembered — so a reload between main's Enter and this acknowledgement can
+        // no longer type the message twice.
+        let outcome: AutoSubmitOutcome;
+        try {
+          outcome = await window.cth.autoSubmit({
+            requestId: `queue:${srcId}:${next.id}`,
+            agentId: target.id,
+            admissionClass: next.manual ? 'USER_RELEASED' : 'CAPACITY_GATED',
+            // `instruction` (when present) is the authoritative text to type into
+            // the PTY; UI/card surfaces continue to show the readable `text`.
+            text: withStandingGoal(target, wrap ? wrap(next) : (next.instruction ?? next.text))
+          });
+        } catch (e) {
+          outcome = { kind: 'FAILED', reason: `ipc: ${String(e)}` };
+        }
         const sent = await deliverWithAcknowledgement(
-          // `instruction` (when present) is the authoritative text to type into
-          // the PTY; UI/card surfaces continue to show the readable `text`.
-          () => submitToPty(
-            target.ptyId!,
-            withStandingGoal(
-              target,
-              wrap ? wrap(next) : (next.instruction ?? next.text)
-            ),
-            inferAgentProvider(target.command, target.provider),
-            undefined,
-            // The one thing main cannot observe for itself: which side of the Enter this
-            // window was on when it died. ASKED AND AWAITED, not announced - the ticket
-            // is still opaque and no capacity state crosses back, only a yes or a no.
-            // A manual send holds no ticket, so it is not gated and types as before.
-            grant?.ok
-              ? () => window.cth.capacityMarkAutoDeliveryWriting(grant.ticket, target.ptyId ?? undefined)
-              : undefined
-          ),
+          async () => { if (outcome.kind !== 'COMMITTED') throw new Error(outcome.kind); },
           () => {
             removeQueuedMessage(srcId, next.id);
             // Zero the gauge on a DELIVERED /clear — the new session's context
@@ -897,30 +842,38 @@ export function useHive(config: HarnessConfig | null): void {
             }
           }
         );
-        launched = sent;
         if (sent) {
           delete sendFailures[next.id];
           return { sent: true, message: next };
         }
-        // Failed write (dead/crashed pty the store still thinks is idle): retry
-        // on the next cooldown-spaced flush, but only MAX_SEND_ATTEMPTS times —
-        // then drop LOUDLY so the loss is diagnosable. (#113/#36)
+        // NOT DELIVERED, AND NOTHING OF OURS IS ON THE PROMPT (REFUSED / ABORTED): main
+        // declined before typing, or typed and verifiably erased. That is "not now", not
+        // a failure — capacity held it, a human owns the line, the terminal cannot be
+        // proven safe — so the item simply stays queued and costs no send attempt.
+        if (outcome.kind === 'REFUSED' || outcome.kind === 'ABORTED') return { sent: false };
+        // INTERFERED: a human wrote onto our staged text. Main sent no Enter and cleared
+        // nothing, and it now refuses automatic delivery to that terminal until a human
+        // resolves it. The item is HELD — never retried into the prompt, never dropped.
+        if (outcome.kind === 'INTERFERED') {
+          console.warn(`[queue-drain] message ${next.id} for ${target.id} is HELD: a human typed after it was staged (${outcome.reason})`);
+          return { sent: false };
+        }
+        // FAILED / REJECTED: the terminal died under the message, or the request was
+        // malformed. Retry on the next cooldown-spaced flush, but only MAX_SEND_ATTEMPTS
+        // times — then drop LOUDLY so the loss is diagnosable. (#113/#36)
         const attempts = (sendFailures[next.id] ?? 0) + 1;
         sendFailures[next.id] = attempts;
         if (attempts >= MAX_SEND_ATTEMPTS) {
           delete sendFailures[next.id];
           removeQueuedMessage(srcId, next.id);
           console.warn(
-            `[queue-drain] dropping message ${next.id} for ${target.id} after ${attempts} failed pty writes ` +
+            `[queue-drain] dropping message ${next.id} for ${target.id} after ${attempts} failed deliveries ` +
             `("${next.text.slice(0, 80)}${next.text.length > 80 ? '…' : ''}")`
           );
         }
         return { sent: false };
       } finally {
         inFlight.delete(flightKey);
-        // Always settled, on every exit including a throw: an unreported ticket
-        // holds a recovery turn until main's own expiry returns it.
-        if (grant?.ok) void window.cth.capacitySettleAutoDelivery(grant.ticket, launched);
       }
     };
 
