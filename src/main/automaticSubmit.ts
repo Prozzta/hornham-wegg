@@ -170,19 +170,28 @@ function promptCondition(block: PromptBlock | undefined): PromptCondition | null
 // ─── UNKNOWN is one decision, made by name (section 3) ────────────────────────────────
 
 /**
- * The three EVIDENCE conditions behind an UNKNOWN verdict (Dwight section 19: different
+ * The EVIDENCE conditions behind an UNKNOWN verdict (Dwight section 19: different
  * evidence, whatever action each is given).
  *
- *   NO_POOL        the agent maps to no capacity pool at all. There is no capacity-control
- *                  surface for it. This is OUTSIDE CAPACITY GATING - it is NOT "available",
- *                  and nothing may label or present it as such.
- *   NO_STATE       a pool is known for the agent and nothing has been observed for it.
- *   INDETERMINATE  a pool is known and observed, and its state cannot be resolved: the
- *                  reading went stale, two readings conflict, a retention cap was breached,
- *                  it was restored across a restart and not yet confirmed, or a window's
- *                  applicability is unknown. (`ADMISSION_REASON.UNKNOWN`.)
+ *   NO_POOL                the agent maps to no capacity pool at all. There is no
+ *                          capacity-control surface for it. This is OUTSIDE CAPACITY GATING
+ *                          - it is NOT "available", and nothing may label it as such.
+ *   NO_STATE               a pool is known for the agent and nothing has been observed.
+ *   STALE_AFTER_HEALTHY    the pool's reading went stale, and that reading was an
+ *                          all-clear. "Stale, last known healthy" - NOT available.
+ *   STALE_AFTER_UNHEALTHY  the pool's reading went stale, and that reading was NOT an
+ *                          all-clear: a window at zero, a missing number, an unidentified
+ *                          window.
+ *   INDETERMINATE          observed and unresolvable for a reason that is NOT staleness:
+ *                          two readings conflict, a retention cap was breached, the pool
+ *                          was restored across a restart and not yet confirmed.
+ *
+ * WHAT IS NOT HERE, because the tracker never calls it unknown: a pool that went quiet
+ * after a provider REFUSAL. A limit epoch outranks staleness, so that pool stays LIMITED
+ * (verdict REFUSE) until its known reset boundary passes, and then becomes RECOVERING.
  */
-export type UnknownEvidence = 'NO_POOL' | 'NO_STATE' | 'INDETERMINATE';
+export type UnknownEvidence =
+  | 'NO_POOL' | 'NO_STATE' | 'STALE_AFTER_HEALTHY' | 'STALE_AFTER_UNHEALTHY' | 'INDETERMINATE';
 export type AdmissionAction = 'PROCEED' | 'HOLD';
 export type UnknownPolicy = Readonly<Record<UnknownEvidence, AdmissionAction>>;
 
@@ -190,21 +199,47 @@ export type UnknownPolicy = Readonly<Record<UnknownEvidence, AdmissionAction>>;
  * THE UNKNOWN MAPPING, RATIFIED. One named value; every guard reads it through
  * `resolveAdmission`, so changing an answer is a one-line edit here.
  *
- * HUMAN RULING, 2026-09-20 (card L0-UNKNOWN, OPTION B), verbatim: "Automatic delivery
- * mapping: (1) NO POOL CONFIGURED -> PROCEED; (2) POOL CONFIGURED, NO OBSERVATION YET ->
- * HOLD; (3) INDETERMINATE / UNKNOWN OBSERVATION -> HOLD. Reason: 'No pool configured' means
- * Hornham does not currently have a capacity-control surface for that provider. Preserve
- * existing delivery behaviour there. But once a capacity pool IS configured, absence of
- * usable evidence must not silently collapse to AVAILABLE. UNKNOWN != AVAILABLE. [...] The
- * final revalidation remains required regardless. Do not label the no-pool case AVAILABLE.
- * It is simply outside capacity gating until a pool is configured."
+ * HUMAN RULING, 2026-09-20 (card L0-UNKNOWN, REVISED AFTER MEASUREMENT - OPTION (ii)),
+ * verbatim: "The measured evidence shows that the previous Option B would create an
+ * idle-floor self-deadlock, so revise the stale mapping. POLICY
+ * 1. NO POOL CONFIGURED -> PROCEED. State remains 'outside capacity gating'. Never label
+ *    this AVAILABLE.
+ * 2. FRESH HEALTHY OBSERVATION -> PROCEED.
+ * 3. STALE, LAST KNOWN HEALTHY -> PROCEED. Important: do NOT relabel it AVAILABLE; preserve
+ *    the state explicitly as 'stale, last known healthy'; final revalidation before Enter
+ *    remains mandatory. Rationale: silence after a healthy reading is weak evidence of
+ *    exhaustion because provider activity both consumes allowance and produces the next
+ *    observation.
+ * 4. FRESH NON-HEALTHY OBSERVATION -> HOLD according to the existing capacity policy.
+ * 5. STALE, LAST KNOWN NON-HEALTHY -> HOLD while the previously known restriction/reset
+ *    remains applicable.
+ * 6. KNOWN RESET TIME PASSES -> do NOT mark AVAILABLE. Transition to RECOVERING (or
+ *    equivalent explicit post-reset state). Automatic delivery may then PROCEED as the
+ *    activity that re-establishes fresh capacity evidence, subject to the normal final
+ *    revalidation and all human-interference gates. This is not an inference that capacity
+ *    is healthy. It is a controlled post-reset re-probe.
+ * STATE INVARIANT: Reset passage must never manufacture AVAILABLE. [...] Do not build a
+ * poll as part of this ruling. Do not change the freshness window merely to mask the
+ * problem."
  *
- * It replaces the proceed-for-all-three that four scattered `!== 'REFUSE'` inequalities
- * used to produce by accident, which stage 5.1 had named and kept only provisionally.
+ * It supersedes the first L0-UNKNOWN ruling (option B, pinned at 297091d6), which held
+ * every stale pool and which measurement showed would self-deadlock an idle floor.
+ *
+ * WHICH RULES ARE THIS TABLE, AND WHICH ARE NOT. Rules 1 and 3 are cells below. Rules 2, 4,
+ * 5 and 6 are NOT unknowns and never reach this table: a fresh healthy pool is verdict
+ * ALLOW; a fresh or stale LIMITED / RESERVE_ONLY pool is verdict REFUSE (a limit epoch
+ * outranks staleness in the tracker, so "stale, last known limited" is still LIMITED);
+ * and a passed reset boundary is the tracker's existing RECOVERING, which admission
+ * answers with its existing SINGLE-TURN grant - one delivery, as the re-probe, never
+ * AVAILABLE. Nothing here re-implements any of that; the tests prove it end to end.
+ *
+ * CELLS THE REVISED RULING DOES NOT NAME keep the PREVIOUS ruling's answer, HOLD, and are
+ * reported rather than decided here: NO_STATE, INDETERMINATE, and STALE_AFTER_UNHEALTHY
+ * (the ruling's rule 5 names it; what it does not name is an exit for it - see the stage
+ * report).
  *
  * HOLD IS A HOLD, NOT A DROP AND NOT AN INTERFERENCE. Nothing is typed, the item stays
- * queued, nothing is inhibited, and the caller simply asks again. THERE IS NO TIMEOUT: a
- * hold that lapsed into proceeding would be the silent collapse the ruling forbids. It
+ * queued, nothing is inhibited, and the caller simply asks again. THERE IS NO TIMEOUT. It
  * ends when an accepted observation gives the pool a resolvable state.
  *
  * THIS IS CAPACITY-STATE UNKNOWN ONLY. Provider abort-capability UNKNOWN and provenance
@@ -215,12 +250,16 @@ export type UnknownPolicy = Readonly<Record<UnknownEvidence, AdmissionAction>>;
 export const UNKNOWN_POLICY: UnknownPolicy = {
   NO_POOL: 'PROCEED',
   NO_STATE: 'HOLD',
+  STALE_AFTER_HEALTHY: 'PROCEED',
+  STALE_AFTER_UNHEALTHY: 'HOLD',
   INDETERMINATE: 'HOLD'
 };
 
 function unknownEvidenceOf(reason: string): UnknownEvidence | null {
   if (reason === ADMISSION_REASON.NO_POOL) return 'NO_POOL';
   if (reason === ADMISSION_REASON.NO_STATE) return 'NO_STATE';
+  if (reason === ADMISSION_REASON.STALE_AFTER_HEALTHY) return 'STALE_AFTER_HEALTHY';
+  if (reason === ADMISSION_REASON.STALE_AFTER_UNHEALTHY) return 'STALE_AFTER_UNHEALTHY';
   if (reason === ADMISSION_REASON.UNKNOWN) return 'INDETERMINATE';
   return null;
 }
@@ -257,11 +296,24 @@ export function resolveAdmission(
 
 /**
  * What capacity says about an agent, KEPT DISTINCT for anything that displays or reports
- * it. The ruling: "UI/state should preserve that distinction rather than presenting all
- * three cases as the same kind of healthy capacity." So this is never a boolean, and
- * NO_POOL is its own value - outside capacity gating - not a flavour of ALLOWED.
+ * it. The ruling's STATE INVARIANT: "The UI/state must preserve distinctions such as:
+ * outside capacity gating; healthy/fresh; stale, last known healthy; stale, last known
+ * limited; recovering after reset; indeterminate." So this is never a boolean, NO_POOL is
+ * never a flavour of healthy, and neither a stale all-clear nor a passed reset is ever
+ * reported as FRESH_HEALTHY.
+ *
+ *   NO_POOL                outside capacity gating
+ *   FRESH_HEALTHY          healthy / fresh
+ *   STALE_AFTER_HEALTHY    stale, last known healthy          (proceeds; NOT healthy)
+ *   FRESH_NOT_HEALTHY      a fresh limit or spent window      (held)
+ *   STALE_AFTER_LIMITED    stale, last known limited          (held: the epoch outranks staleness)
+ *   STALE_AFTER_UNHEALTHY  stale, last known not an all-clear (held)
+ *   RECOVERING             recovering after reset             (one re-probe; NOT healthy)
+ *   NO_STATE / INDETERMINATE / UNCLASSIFIED                   (held)
  */
-export type CapacityEvidence = 'ALLOWED' | 'REFUSED' | UnknownEvidence | 'UNCLASSIFIED';
+export type CapacityEvidence =
+  | 'NO_POOL' | 'FRESH_HEALTHY' | 'STALE_AFTER_HEALTHY' | 'FRESH_NOT_HEALTHY' | 'STALE_AFTER_LIMITED'
+  | 'STALE_AFTER_UNHEALTHY' | 'RECOVERING' | 'NO_STATE' | 'INDETERMINATE' | 'UNCLASSIFIED';
 
 export interface CapacityGate {
   evidence: CapacityEvidence;
@@ -270,16 +322,25 @@ export interface CapacityGate {
   basis: string;
 }
 
-/** The gate for a probe of the admission seam, through the same resolver and the same
- *  policy every guard uses - so what a snapshot SAYS and what the owner DOES cannot drift. */
+/**
+ * The gate for a probe of the admission seam, through the same resolver and the same
+ * policy every guard uses - so what a snapshot SAYS and what the owner DOES cannot drift.
+ * `freshness` is the pool's own published freshness (null when there is no pool); it only
+ * ever chooses BETWEEN labels and never changes `holds`.
+ */
 export function capacityGateOf(
   decision: { verdict: AdmissionVerdict; reason: string },
+  freshness: 'FRESH' | 'STALE' | null = null,
   policy: UnknownPolicy = UNKNOWN_POLICY
 ): CapacityGate {
   const resolved = resolveAdmission(decision, policy);
-  const evidence: CapacityEvidence = decision.verdict === 'ALLOW' ? 'ALLOWED'
-    : decision.verdict === 'REFUSE' ? 'REFUSED'
-      : unknownEvidenceOf(decision.reason) ?? 'UNCLASSIFIED';
+  const recovering = decision.reason === ADMISSION_REASON.RECOVERING_GRANT
+    || decision.reason === ADMISSION_REASON.RECOVERING_SPENT;
+  let evidence: CapacityEvidence;
+  if (recovering) evidence = 'RECOVERING';
+  else if (decision.verdict === 'ALLOW') evidence = 'FRESH_HEALTHY';
+  else if (decision.verdict === 'REFUSE') evidence = freshness === 'STALE' ? 'STALE_AFTER_LIMITED' : 'FRESH_NOT_HEALTHY';
+  else evidence = unknownEvidenceOf(decision.reason) ?? 'UNCLASSIFIED';
   return { evidence, holds: resolved.action === 'HOLD', basis: resolved.basis };
 }
 

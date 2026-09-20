@@ -1257,7 +1257,7 @@ function suggestsImprovement(obs: CapacityObservation, epoch: LimitEpoch): boole
 
 /** Windows that actually constrain this pool. Known-inapplicable ones are excluded
  *  and are not treated as missing data (L0-SEM 121). */
-const applicableWindows = (obs: CapacityObservation): CapacityWindow[] =>
+const applicableWindows = (obs: { windows: CapacityWindow[] }): CapacityWindow[] =>
   obs.windows.filter((w) => applicabilityOf(w) === 'APPLICABLE');
 
 /** Fresh exact zero on an APPLICABLE window. An OBSERVATION; it never implies the
@@ -1269,11 +1269,43 @@ function numericallyExhausted(obs: CapacityObservation): string[] {
 /** K3's "every known-applicable window valid and above zero". A window of unknown
  *  applicability disqualifies the snapshot rather than being skipped: it cannot be
  *  an AUTHORITATIVE all-clear while something in it is unidentified. */
-function allWindowsPositive(obs: CapacityObservation): boolean {
+function allWindowsPositive(obs: { windows: CapacityWindow[] }): boolean {
   if (obs.windows.some((w) => applicabilityOf(w) === 'UNKNOWN')) return false;
   const applicable = applicableWindows(obs);
   return applicable.length > 0
     && applicable.every((w) => w.remainingPercent !== null && w.remainingPercent > 0);
+}
+
+/**
+ * L0-UNKNOWN (human ruling, option ii) - WHAT A STALE POOL WAS, THE LAST TIME IT WAS KNOWN.
+ *
+ * Answers for ONE case only: a pool whose state is UNKNOWN *because its reading went
+ * stale* (`REASON.STALE`). Returns null for every other pool, including every other kind
+ * of UNKNOWN - so a conflict, a breached cap, a restored-unconfirmed pool or an
+ * unidentifiable window can never be mistaken for "merely quiet".
+ *
+ * NOTHING IS INFERRED AND NOTHING NEW IS STORED. `deriveState` reaches the STALE branch
+ * only AFTER the restored gate, the limit epoch, the conflict and the cap breach have all
+ * declined - so reason STALE already means: no open limit epoch, no conflict, no breach,
+ * live evidence. What is left to ask is what the reading's own numbers said, and that is
+ * asked with the predicate this module ALREADY uses to call a snapshot an all-clear
+ * (`allWindowsPositive`, K3) rather than a second copy of it: every window identified,
+ * every applicable window present and above zero. The published projection keeps the
+ * reading's windows while stale, so this reads the tracker's own published facts.
+ *
+ *   'HEALTHY'      quiet after an all-clear. Silence after a healthy reading is weak
+ *                  evidence of exhaustion: provider activity both consumes allowance and
+ *                  produces the next observation.
+ *   'NOT_HEALTHY'  quiet after a reading that was NOT an all-clear - a window at zero, a
+ *                  missing number, an unidentified window.
+ *
+ * A pool that went quiet after a provider REFUSAL never reaches here at all: its limit
+ * epoch outranks staleness, so it stays LIMITED until its reset boundary passes and then
+ * becomes RECOVERING. That is the tracker's existing behaviour and is not changed.
+ */
+export function staleLastKnown(pool: PoolCapacitySnapshot): 'HEALTHY' | 'NOT_HEALTHY' | null {
+  if (pool.state !== 'UNKNOWN' || pool.stateReason !== REASON.STALE) return null;
+  return allWindowsPositive(pool) ? 'HEALTHY' : 'NOT_HEALTHY';
 }
 
 /** Has the reset boundary relevant to the refusal passed? A passed boundary is a

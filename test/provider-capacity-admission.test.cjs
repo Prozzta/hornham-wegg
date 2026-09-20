@@ -85,6 +85,11 @@ test('UNKNOWN is neither permission nor refusal - the seam declines to infer saf
   r.tracker.evaluate();
   const d = r.seam.admit('dwight');
   assert.equal(d.verdict, 'UNKNOWN_NOT_INFERRED_SAFE');
+  // L0-UNKNOWN (human ruling, option ii). THE VERDICT ABOVE IS THE POINT OF THIS TEST AND IS
+  // UNCHANGED: a stale pool is still neither permission nor refusal. What changed is the
+  // EVIDENCE the seam reports for it. This rig builds a bare seam with no `staleLastKnown`
+  // dependency, and ABSENT MEANS NO SPLIT - so the reason is still plain UNKNOWN here, which
+  // is itself the fail-closed default worth pinning.
   assert.equal(d.reason, ADMISSION_REASON.UNKNOWN);
 });
 

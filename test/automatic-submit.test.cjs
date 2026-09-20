@@ -50,7 +50,13 @@ const CAPACITY = {
   LIMITED: { verdict: 'REFUSE', reason: ADMISSION_REASON.LIMITED },
   NO_POOL: { verdict: 'UNKNOWN_NOT_INFERRED_SAFE', reason: ADMISSION_REASON.NO_POOL },
   NO_STATE: { verdict: 'UNKNOWN_NOT_INFERRED_SAFE', reason: ADMISSION_REASON.NO_STATE },
+  // Observed and unresolvable for a reason that is NOT staleness (conflict, cap breach,
+  // restored-unconfirmed, unidentified window). Historically named STALE in this file.
   STALE: { verdict: 'UNKNOWN_NOT_INFERRED_SAFE', reason: ADMISSION_REASON.UNKNOWN },
+  STALE_HEALTHY: { verdict: 'UNKNOWN_NOT_INFERRED_SAFE', reason: ADMISSION_REASON.STALE_AFTER_HEALTHY },
+  STALE_UNHEALTHY: { verdict: 'UNKNOWN_NOT_INFERRED_SAFE', reason: ADMISSION_REASON.STALE_AFTER_UNHEALTHY },
+  RECOVERING: { verdict: 'ALLOW', reason: ADMISSION_REASON.RECOVERING_GRANT },
+  RECOVERING_SPENT: { verdict: 'REFUSE', reason: ADMISSION_REASON.RECOVERING_SPENT },
   NOVEL_UNKNOWN: { verdict: 'UNKNOWN_NOT_INFERRED_SAFE', reason: 'SOME_FUTURE_UNKNOWN' }
 };
 
@@ -503,14 +509,22 @@ K.respawnInGapNeverReceivesTheEnter = async (mod) => {
 
 // ─── L0-UNKNOWN: the ratified mapping, a test per mapping, at all three sites ─────────
 //
-// HUMAN RULING 2026-09-20 (L0-UNKNOWN, OPTION B): "(1) NO POOL CONFIGURED -> PROCEED;
-// (2) POOL CONFIGURED, NO OBSERVATION YET -> HOLD; (3) INDETERMINATE / UNKNOWN OBSERVATION
-// -> HOLD ... UNKNOWN != AVAILABLE ... Add explicit tests for all three mappings."
+// HUMAN RULING 2026-09-20 (L0-UNKNOWN, REVISED AFTER MEASUREMENT - OPTION (ii)): "1. NO POOL
+// CONFIGURED -> PROCEED ... 3. STALE, LAST KNOWN HEALTHY -> PROCEED. Important: do NOT
+// relabel it AVAILABLE ... 5. STALE, LAST KNOWN NON-HEALTHY -> HOLD ..." It supersedes the
+// first ruling (option B, 297091d6), which held every stale pool and which measurement
+// showed would self-deadlock an idle floor. The cells the revised ruling does NOT name -
+// NO_STATE and INDETERMINATE - keep option B's HOLD and are reported, not decided here.
 //
 // WRITTEN OUT HERE, NOT READ FROM THE MODULE, for the same reason the gate table is.
-const RULED_UNKNOWN = { NO_POOL: 'PROCEED', NO_STATE: 'HOLD', INDETERMINATE: 'HOLD' };
+const RULED_UNKNOWN = {
+  NO_POOL: 'PROCEED', NO_STATE: 'HOLD', STALE_AFTER_HEALTHY: 'PROCEED', STALE_AFTER_UNHEALTHY: 'HOLD', INDETERMINATE: 'HOLD'
+};
 /** evidence -> the world state that produces it */
-const UNKNOWN_WORLD = { NO_POOL: 'NO_POOL', NO_STATE: 'NO_STATE', INDETERMINATE: 'STALE' };
+const UNKNOWN_WORLD = {
+  NO_POOL: 'NO_POOL', NO_STATE: 'NO_STATE', STALE_AFTER_HEALTHY: 'STALE_HEALTHY',
+  STALE_AFTER_UNHEALTHY: 'STALE_UNHEALTHY', INDETERMINATE: 'STALE'
+};
 const unknownName = (evidence) => `unknown mapping ${evidence}`;
 
 for (const evidence of Object.keys(RULED_UNKNOWN)) {
@@ -599,19 +613,48 @@ K.holdIsARealHoldAndOnlyAnObservationReleasesIt = async (mod) => {
   assert.equal(released.kind, 'COMMITTED', 'the next ask after the observation is admitted');
 };
 
+K.staleAfterHealthyProceedsAndIsNeverRelabelledHealthy = async (mod) => {
+  // Rule 3, both halves. It PROCEEDS - and the final revalidation is still asked, and
+  // still answers through the same mapping. And it is NOT called healthy anywhere.
+  const w = world({ capacity: 'STALE_HEALTHY' });
+  const out = await settle(w, owner(mod, w).submit(req()));
+  assert.equal(out.kind, 'COMMITTED', 'STALE, LAST KNOWN HEALTHY -> PROCEED');
+  assert.ok(w.revalidations >= 2, 'and final revalidation before Enter remained mandatory');
+  const gate = mod.capacityGateOf(CAPACITY.STALE_HEALTHY, 'STALE');
+  assert.deepEqual(gate, { evidence: 'STALE_AFTER_HEALTHY', holds: false, basis: 'UNKNOWN:STALE_AFTER_HEALTHY' },
+    'stale, last known healthy is reported UNDER ITS OWN NAME and proceeds');
+  assert.notEqual(gate.evidence, mod.capacityGateOf(CAPACITY.AVAILABLE, 'FRESH').evidence,
+    'a stale all-clear is NOT relabelled healthy: "stale, last known healthy" stays its own state');
+};
+
+K.resetPassageIsRecoveringNeverHealthy = async (mod) => {
+  // STATE INVARIANT: "Reset passage must never manufacture AVAILABLE."
+  for (const state of ['RECOVERING', 'RECOVERING_SPENT']) {
+    assert.equal(mod.capacityGateOf(CAPACITY[state], 'STALE').evidence, 'RECOVERING',
+      `${state}: reset passage is reported as RECOVERING, never as healthy`);
+  }
+  assert.equal(mod.capacityGateOf(CAPACITY.RECOVERING, 'STALE').holds, false, 'the one re-probe may proceed');
+  assert.equal(mod.capacityGateOf(CAPACITY.RECOVERING_SPENT, 'STALE').holds, true, 'and once it is out, the rest hold');
+  assert.equal(mod.capacityGateOf(CAPACITY.LIMITED, 'STALE').evidence, 'STALE_AFTER_LIMITED', 'stale, last known limited');
+  assert.equal(mod.capacityGateOf(CAPACITY.LIMITED, 'FRESH').evidence, 'FRESH_NOT_HEALTHY');
+};
+
 K.noPoolIsNeverCalledAvailable = async (mod) => {
   const gate = mod.capacityGateOf(CAPACITY.NO_POOL);
   assert.deepEqual({ evidence: gate.evidence, holds: gate.holds }, { evidence: 'NO_POOL', holds: false },
     'NO_POOL is its own value - outside capacity gating - and is NEVER reported as ALLOWED/AVAILABLE');
-  assert.notEqual(gate.evidence, mod.capacityGateOf(CAPACITY.AVAILABLE).evidence, 'it is distinguishable from a healthy pool');
+  assert.notEqual(gate.evidence, mod.capacityGateOf(CAPACITY.AVAILABLE, 'FRESH').evidence, 'it is distinguishable from a healthy pool');
   assert.deepEqual(mod.capacityGateOf(CAPACITY.NO_STATE), { evidence: 'NO_STATE', holds: true, basis: 'UNKNOWN:NO_STATE' },
     'a configured pool with no observation is HELD through the resolver, not waved through by an inequality');
   assert.deepEqual(mod.capacityGateOf(CAPACITY.STALE), { evidence: 'INDETERMINATE', holds: true, basis: 'UNKNOWN:INDETERMINATE' },
     'an indeterminate observation is HELD through the resolver');
-  assert.equal(mod.capacityGateOf(CAPACITY.LIMITED).evidence, 'REFUSED');
+  assert.equal(mod.capacityGateOf(CAPACITY.AVAILABLE, 'FRESH').evidence, 'FRESH_HEALTHY');
+  assert.equal(mod.capacityGateOf(CAPACITY.LIMITED, 'FRESH').evidence, 'FRESH_NOT_HEALTHY');
   assert.equal(mod.capacityGateOf(CAPACITY.NOVEL_UNKNOWN).holds, true, 'an unclassified unknown holds');
-  assert.equal(new Set(['NO_POOL', 'NO_STATE', 'STALE', 'AVAILABLE', 'LIMITED'].map((s) => mod.capacityGateOf(CAPACITY[s]).evidence)).size, 5,
-    'five situations, five different values: the UI is never handed one "healthy" bucket');
+  const situations = [['NO_POOL', null], ['AVAILABLE', 'FRESH'], ['STALE_HEALTHY', 'STALE'], ['LIMITED', 'STALE'],
+    ['RECOVERING', 'STALE'], ['STALE', 'FRESH']];
+  assert.equal(new Set(situations.map(([s, f]) => mod.capacityGateOf(CAPACITY[s], f).evidence)).size, 6,
+    'the ruling\u2019s six distinctions are six different values: the UI is never handed one "healthy" bucket');
 };
 
 K.unclassifiedUnknownHolds = async (mod) => {
@@ -988,7 +1031,7 @@ const MUTANTS = [
 // ONE MUTANT PER CELL OF THE RATIFIED UNKNOWN MAPPING (L0-UNKNOWN, option B), each killed
 // by that mapping's own test - at the behaviour, not at a read of the table.
 {
-  const block = (m) => `  NO_POOL: '${m.NO_POOL}',\n  NO_STATE: '${m.NO_STATE}',\n  INDETERMINATE: '${m.INDETERMINATE}'\n};`;
+  const block = (m) => `  NO_POOL: '${m.NO_POOL}',\n  NO_STATE: '${m.NO_STATE}',\n  STALE_AFTER_HEALTHY: '${m.STALE_AFTER_HEALTHY}',\n  STALE_AFTER_UNHEALTHY: '${m.STALE_AFTER_UNHEALTHY}',\n  INDETERMINATE: '${m.INDETERMINATE}'\n};`;
   for (const evidence of Object.keys(RULED_UNKNOWN)) {
     const flipped = RULED_UNKNOWN[evidence] === 'PROCEED' ? 'HOLD' : 'PROCEED';
     MUTANTS.push({
@@ -1006,9 +1049,25 @@ const MUTANTS = [
   });
   MUTANTS.push({
     name: 'NO_POOL reported as ALLOWED',
-    edits: [["      : unknownEvidenceOf(decision.reason) ?? 'UNCLASSIFIED';",
-      "      : (unknownEvidenceOf(decision.reason) === 'NO_POOL' ? 'ALLOWED' : unknownEvidenceOf(decision.reason) ?? 'UNCLASSIFIED');"]],
+    edits: [["  else evidence = unknownEvidenceOf(decision.reason) ?? 'UNCLASSIFIED';",
+      "  else evidence = unknownEvidenceOf(decision.reason) === 'NO_POOL' ? 'FRESH_HEALTHY' : (unknownEvidenceOf(decision.reason) ?? 'UNCLASSIFIED');"]],
     killer: 'noPoolIsNeverCalledAvailable', dies: /NEVER reported as ALLOWED/
+  });
+  MUTANTS.push({
+    name: 'a stale all-clear relabelled healthy',
+    edits: [["  else evidence = unknownEvidenceOf(decision.reason) ?? 'UNCLASSIFIED';",
+      "  else evidence = unknownEvidenceOf(decision.reason) === 'STALE_AFTER_HEALTHY' ? 'FRESH_HEALTHY' : (unknownEvidenceOf(decision.reason) ?? 'UNCLASSIFIED');"]],
+    killer: 'staleAfterHealthyProceedsAndIsNeverRelabelledHealthy', dies: /UNDER ITS OWN NAME|NOT relabelled healthy/
+  });
+  MUTANTS.push({
+    name: 'reset passage manufacturing a healthy state',
+    edits: [["  if (recovering) evidence = 'RECOVERING';\n  else if (decision.verdict === 'ALLOW')", "  if (decision.verdict === 'ALLOW')"]],
+    killer: 'resetPassageIsRecoveringNeverHealthy', dies: /reported as RECOVERING, never as healthy/
+  });
+  MUTANTS.push({
+    name: 'stale-after-healthy folded back into plain UNKNOWN',
+    edits: [["  if (reason === ADMISSION_REASON.STALE_AFTER_HEALTHY) return 'STALE_AFTER_HEALTHY';\n", '']],
+    killer: unknownName('STALE_AFTER_HEALTHY'), dies: /PROCEEDS at ADMIT/
   });
   MUTANTS.push({
     name: 'the snapshot gate computed by the old inequality',

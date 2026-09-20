@@ -228,7 +228,6 @@ test('revalidate keeps the verdict tri-state and names each structural refusal',
 // ─── L0-UNKNOWN (human ruling, option B) against the REAL tracker ─────────────────────
 
 const { capacityGateOf, UNKNOWN_POLICY } = loadTs('src/main/automaticSubmit.ts');
-const gateFor = (r, agentId) => capacityGateOf(r.runtime.admission.probe(agentId, 'ORDINARY_TURN'));
 
 /** Let wall and monotonic time pass and let the tracker's own boundary timers run, the
  *  way production does: nothing here calls `evaluate()` by hand. */
@@ -243,55 +242,201 @@ function elapse(r, ms) {
   const dt = until - r.now; r.now += dt; r.mono += dt;
 }
 
-test('L0-UNKNOWN (1) NO POOL: delivery proceeds, and the state says OUTSIDE GATING - never "available"', async () => {
+/** The gate exactly as the control snapshot computes it: probe + the pool's own freshness. */
+const gateFor = (r, agentId) => {
+  const probed = r.runtime.admission.probe(agentId, 'ORDINARY_TURN');
+  return capacityGateOf(probed, probed.poolKey ? r.tracker.pool(probed.poolKey)?.freshness ?? null : null);
+};
+const RESET_AT = T0 + 3_600_000; // the five-hour window's reset in `win()`
+const healthy = (r, seq) => obs({ observedAt: r.now, receivedAt: r.now, sourceSequence: seq });
+const limited = (r, seq, over = {}) => obs({
+  observedAt: r.now, receivedAt: r.now, sourceSequence: seq,
+  providerReachedType: 'rate_limit_reached', windows: [win(0)], ...over
+});
+
+test('L0-UNKNOWN rule 1 - NO POOL: delivery proceeds, and the state says OUTSIDE GATING, never "available"', async () => {
   // An agent none of whose readings has ever been accepted maps to no pool. That is every
   // agent at startup: membership is learned only from the agent's own accepted reading.
   const r = rig();
   assert.deepEqual({ ...gateFor(r, 'jim') }, { evidence: 'NO_POOL', holds: false, basis: 'UNKNOWN:NO_POOL' });
-  const out = await r.settle(wake(r));
-  assert.equal(out.kind, 'COMMITTED', 'NO POOL CONFIGURED -> PROCEED: existing delivery behaviour is preserved');
-  r.runtime.ingest('jim', obs({ observedAt: r.now, receivedAt: r.now }));
-  assert.equal(gateFor(r, 'jim').evidence, 'ALLOWED');
-  assert.notEqual('NO_POOL', 'ALLOWED', 'and the two are different values all the way to the snapshot');
+  assert.equal((await r.settle(wake(r))).kind, 'COMMITTED', 'NO POOL CONFIGURED -> PROCEED');
+  r.runtime.ingest('jim', healthy(r, 2));
+  assert.equal(gateFor(r, 'jim').evidence, 'FRESH_HEALTHY', 'and a healthy fresh pool is a DIFFERENT value (rule 2)');
 });
 
-test('L0-UNKNOWN (3) INDETERMINATE: a reading that went STALE holds delivery - for as long as nothing renews it', async () => {
-  // THE MEASURED CONSEQUENCE, EXECUTED ON THE PRODUCTION TRACKER. liveTtlMs is 120 s. A
-  // pool nobody renews for 120 s is STALE, STALE is UNKNOWN, and the ruling holds UNKNOWN.
-  // No poll exists to renew it ("NO POLLING, HERE OR ANYWHERE"): a renewal comes only
-  // from a provider turn by some agent on the pool.
-  assert.equal(L0_SEM_POLICY.liveTtlMs, 120_000, 'the TTL this arm is about');
-  assert.equal(UNKNOWN_POLICY.INDETERMINATE, 'HOLD');
+// ─── THE SEVEN TESTS THE REVISED RULING NAMES, on the production tracker ──────────────
+
+test('L0-UNKNOWN: STALE-AFTER-HEALTHY PROCEEDS - and is never relabelled AVAILABLE', async () => {
+  // Rule 3. The measured deadlock of option B, gone: 121 s of silence after an all-clear no
+  // longer holds the delivery that would have woken the agent.
+  assert.equal(L0_SEM_POLICY.liveTtlMs, 120_000, 'the freshness window is NOT changed to mask the problem');
+  assert.equal(UNKNOWN_POLICY.STALE_AFTER_HEALTHY, 'PROCEED');
   const r = rig();
   r.runtime.ingest('jim', obs());
-  assert.equal(gateFor(r, 'jim').evidence, 'ALLOWED');
-
   elapse(r, L0_SEM_POLICY.liveTtlMs + 1_000);
-  assert.equal(r.state(), 'UNKNOWN', 'two minutes without a renewal: the pool is UNKNOWN');
-  assert.deepEqual({ ...gateFor(r, 'jim') }, { evidence: 'INDETERMINATE', holds: true, basis: 'UNKNOWN:INDETERMINATE' });
-  const held = await r.settle(wake(r, 'w-stale'));
-  assert.deepEqual(r.writes, [], 'HOLD: nothing is typed');
-  assert.deepEqual(held, { kind: 'REFUSED', reason: 'CAPACITY_HOLD', detail: 'UNKNOWN:INDETERMINATE' });
-  assert.equal(r.owner.inhibition('pty-jim'), null, 'a HOLD inhibits nothing');
-
-  // NOTHING IN THE SYSTEM ENDS THIS ON ITS OWN. Twelve hours of idle floor later:
+  assert.equal(r.state(), 'UNKNOWN', 'THE TRACKER STILL SAYS UNKNOWN: staleness did not manufacture AVAILABLE');
+  assert.deepEqual({ ...gateFor(r, 'jim') },
+    { evidence: 'STALE_AFTER_HEALTHY', holds: false, basis: 'UNKNOWN:STALE_AFTER_HEALTHY' },
+    'the state is preserved explicitly as "stale, last known healthy"');
+  assert.equal((await r.settle(wake(r, 'w-stale'))).kind, 'COMMITTED', 'STALE, LAST KNOWN HEALTHY -> PROCEED');
   elapse(r, 12 * 60 * 60 * 1000);
-  assert.equal(r.state(), 'UNKNOWN');
-  assert.equal((await r.settle(wake(r, 'w-stale-12h'))).kind, 'REFUSED', 'still held: there is no timeout, and no producer');
-  assert.deepEqual(r.writes, []);
+  assert.equal((await r.settle(wake(r, 'w-stale-12h'))).kind, 'COMMITTED', 'an idle night no longer deadlocks the floor');
+});
 
-  // WHAT RELEASES IT: an accepted observation. The NEXT ask is admitted - release is not
-  // pushed by the observation, it is found by the next drain pass / wake beat.
-  r.runtime.ingest('jim', obs({ observedAt: r.now, receivedAt: r.now, sourceSequence: 2 }));
-  assert.equal(gateFor(r, 'jim').evidence, 'ALLOWED');
-  assert.equal((await r.settle(wake(r, 'w-released'))).kind, 'COMMITTED');
+test('L0-UNKNOWN: STALE-AFTER-LIMITED HOLDS - the limit epoch outranks staleness', async () => {
+  // Rule 5. This was never an UNKNOWN: a provider refusal opens a limit epoch, and the
+  // tracker settles the epoch BEFORE freshness, so going quiet cannot clear it.
+  const r = rig();
+  r.runtime.ingest('jim', obs());
+  r.runtime.ingest('jim', limited(r, 2));
+  elapse(r, L0_SEM_POLICY.liveTtlMs + 1_000);
+  assert.equal(r.tracker.pool(POOL).freshness, 'STALE');
+  assert.equal(r.state(), 'LIMITED', 'stale, and STILL LIMITED');
+  assert.equal(gateFor(r, 'jim').evidence, 'STALE_AFTER_LIMITED', 'reported as "stale, last known limited"');
+  const out = await r.settle(wake(r));
+  assert.deepEqual(r.writes, [], 'STALE, LAST KNOWN NON-HEALTHY -> HOLD: nothing typed');
+  assert.deepEqual(out, { kind: 'REFUSED', reason: 'CAPACITY_HOLD', detail: ADMISSION_REASON.LIMITED });
+});
+
+test('L0-UNKNOWN: KNOWN RESET PASSAGE EXITS THE HOLD - and produces RECOVERING, NEVER AVAILABLE', async () => {
+  // Rule 6 and the STATE INVARIANT. It is the tracker's EXISTING RECOVERING - a passed reset
+  // boundary is a hint, never a confirmation - and admission's EXISTING single-turn grant is
+  // exactly "a controlled post-reset re-probe": ONE delivery, as the activity that
+  // re-establishes evidence.
+  const r = rig();
+  r.runtime.ingest('jim', obs());
+  r.runtime.ingest('jim', limited(r, 2));
+  elapse(r, RESET_AT - r.now - 1_000);
+  assert.equal(r.state(), 'LIMITED', 'one second before the known reset: still held');
+  assert.equal((await r.settle(wake(r, 'w-before'))).kind, 'REFUSED');
+  elapse(r, 2_000 + (RESET_AT - r.now > 0 ? RESET_AT - r.now : 0));
+  assert.equal(r.state(), 'RECOVERING', 'RESET PASSAGE PRODUCES RECOVERING');
+  assert.notEqual(r.state(), 'AVAILABLE', 'reset passage must NEVER manufacture AVAILABLE');
+  assert.equal(r.tracker.pool(POOL).recoveryPending, true);
+  assert.equal(gateFor(r, 'jim').evidence, 'RECOVERING', 'and the snapshot says "recovering after reset", not healthy');
+  assert.equal((await r.settle(wake(r, 'w-probe'))).kind, 'COMMITTED', 'KNOWN RESET PASSAGE EXITS THE HOLD: the re-probe is delivered');
+  assert.equal((await r.settle(wake(r, 'w-second'))).kind, 'REFUSED', 'and it is CONTROLLED: one re-probe per epoch, not an open door');
+  assert.equal(r.state(), 'RECOVERING', 'delivering the probe did not manufacture AVAILABLE either');
+});
+
+test('L0-UNKNOWN: POST-RESET DELIVERY STILL UNDERGOES FINAL REVALIDATION', async () => {
+  // The re-probe is staged, and the provider refuses AGAIN inside the gap. The final check
+  // next to the Enter sees it: no Enter, and the staged text is verifiably erased.
+  const r = rig();
+  r.runtime.ingest('jim', obs());
+  r.runtime.ingest('jim', limited(r, 2));
+  elapse(r, RESET_AT - r.now + 1_000);
+  assert.equal(r.state(), 'RECOVERING');
+  r.onStaged = () => r.at(GAP_MS / 2, () => r.runtime.ingest('jim', limited(r, 3,
+    { windows: [{ ...win(0), resetsAt: r.now + 3_600_000 }] })));
+  const out = await r.settle(wake(r));
+  assert.deepEqual(r.record, ['abort:LIMITED'], 'the post-reset delivery was revalidated next to the Enter, and stopped');
+  assert.equal(out.kind, 'ABORTED');
+});
+
+test('L0-UNKNOWN: A NEW LIMITED OBSERVATION IMMEDIATELY RESTORES THE HOLD', async () => {
+  for (const from of ['stale-after-healthy', 'recovering']) {
+    const r = rig();
+    r.runtime.ingest('jim', obs());
+    if (from === 'recovering') { r.runtime.ingest('jim', limited(r, 2)); elapse(r, RESET_AT - r.now + 1_000); }
+    else elapse(r, L0_SEM_POLICY.liveTtlMs + 1_000);
+    assert.equal(gateFor(r, 'jim').holds, false, `${from}: delivery may proceed`);
+    r.runtime.ingest('jim', limited(r, 9, { windows: [{ ...win(0), resetsAt: r.now + 3_600_000 }] }));
+    assert.equal(r.state(), 'LIMITED');
+    assert.equal(gateFor(r, 'jim').evidence, 'FRESH_NOT_HEALTHY');
+    const out = await r.settle(wake(r, `w-${from}`));
+    assert.deepEqual(r.writes, [], `${from}: a new limited observation IMMEDIATELY restores the hold`);
+    assert.equal(out.reason, 'CAPACITY_HOLD');
+  }
+});
+
+test('L0-UNKNOWN: A NEW HEALTHY OBSERVATION RESTORES NORMAL FRESH-HEALTH BEHAVIOUR', async () => {
+  const r = rig();
+  r.runtime.ingest('jim', obs());
+  elapse(r, L0_SEM_POLICY.liveTtlMs + 1_000);
+  assert.equal(gateFor(r, 'jim').evidence, 'STALE_AFTER_HEALTHY');
+  r.runtime.ingest('jim', healthy(r, 2));
+  assert.equal(r.state(), 'AVAILABLE');
+  assert.deepEqual({ ...gateFor(r, 'jim') }, { evidence: 'FRESH_HEALTHY', holds: false, basis: ADMISSION_REASON.AVAILABLE });
+  assert.equal((await r.settle(wake(r))).kind, 'COMMITTED');
+});
+
+// ─── CASES THE REVISED RULING DOES NOT NAME: pinned AS THEY ARE, reported, not decided ─
+
+test('UNNAMED CASE (b): an INDETERMINATE pool that is NOT stale still HOLDS (previous ruling kept)', async () => {
+  // A window nobody can identify makes the FRESH reading UNKNOWN. That is not staleness, so
+  // `staleLastKnown` answers null and the evidence stays INDETERMINATE.
+  const r = rig();
+  r.runtime.ingest('jim', obs({ windows: [win(80), { ...win(50), windowId: 'mystery', kind: 'OTHER', windowMinutes: null }] }));
+  assert.equal(r.state(), 'UNKNOWN');
+  assert.equal(r.tracker.pool(POOL).freshness, 'FRESH');
+  assert.deepEqual({ ...gateFor(r, 'jim') }, { evidence: 'INDETERMINATE', holds: true, basis: 'UNKNOWN:INDETERMINATE' });
+  const out = await r.settle(wake(r));
+  assert.deepEqual(r.writes, []);
+  assert.equal(out.detail, 'UNKNOWN:INDETERMINATE');
+  // ...and once THAT reading goes stale it is "stale, last known NOT healthy" - still held.
+  elapse(r, L0_SEM_POLICY.liveTtlMs + 1_000);
+  assert.equal(gateFor(r, 'jim').evidence, 'STALE_AFTER_UNHEALTHY');
+  assert.equal((await r.settle(wake(r, 'w2'))).kind, 'REFUSED');
+});
+
+test('UNNAMED CASE (c): stale after a NUMERICALLY SPENT window holds - and nothing ends it, even after its known reset', async () => {
+  // REPORTED, NOT DECIDED. A window at exactly zero WITHOUT a provider refusal is
+  // RESERVE_ONLY: no limit epoch is opened, so there is no RECOVERING hint to fire when the
+  // window's known reset passes. Once stale it is STALE_AFTER_UNHEALTHY and rule 5 holds
+  // it; the ruling names no exit for it, and none is invented here.
+  const r = rig();
+  r.runtime.ingest('jim', obs({ windows: [win(0)] }));
+  assert.equal(r.state(), 'RESERVE_ONLY');
+  assert.equal(r.tracker.pool(POOL).limitEpochAt, null, 'no refusal, so no epoch');
+  elapse(r, L0_SEM_POLICY.liveTtlMs + 1_000);
+  assert.equal(gateFor(r, 'jim').evidence, 'STALE_AFTER_UNHEALTHY');
+  assert.equal((await r.settle(wake(r, 'w1'))).kind, 'REFUSED');
+  elapse(r, RESET_AT - r.now + 60_000);
+  assert.equal(r.state(), 'UNKNOWN', 'the known reset has PASSED and the tracker still says UNKNOWN - there is no epoch to hint');
+  assert.equal(gateFor(r, 'jim').evidence, 'STALE_AFTER_UNHEALTHY');
+  assert.equal((await r.settle(wake(r, 'w2'))).kind, 'REFUSED', 'STILL HELD: this is the deadlock class, and it is the human\u2019s to rule on');
+});
+
+test('UNNAMED CASE (c): stale after a refusal with NO known reset time holds with no exit', async () => {
+  const r = rig();
+  r.runtime.ingest('jim', obs());
+  r.runtime.ingest('jim', limited(r, 2, { windows: [{ ...win(0), resetsAt: null }] }));
+  assert.equal(r.state(), 'LIMITED');
+  elapse(r, 7 * 24 * 60 * 60 * 1000);
+  assert.equal(r.state(), 'LIMITED', 'a week on: no reset boundary was ever known, so no RECOVERING hint can fire');
+  assert.equal((await r.settle(wake(r))).kind, 'REFUSED');
+});
+
+test('UNNAMED CASE (d): a reset already in the PAST when the refusal is first seen is not news about it', async () => {
+  // The tracker's existing rule (L0-SEM 11.1): the provider refused KNOWING that boundary,
+  // so it cannot be the recovery hint for this refusal.
+  const r = rig();
+  r.runtime.ingest('jim', obs());
+  r.runtime.ingest('jim', limited(r, 2, { windows: [{ ...win(0), resetsAt: r.now - 60_000 }] }));
+  elapse(r, 10 * 60_000);
+  assert.equal(r.state(), 'LIMITED', 'not RECOVERING: a boundary already passed at the refusal is excluded');
+});
+
+test('UNNAMED CASE (e): with several windows, the ATTRIBUTED window governs, then the spent ones, then the earliest', async () => {
+  const weekly = { windowId: 'weekly', kind: 'WEEKLY', label: '7d', windowMinutes: 10_080, usedPercent: 100, remainingPercent: 0, resetsAt: T0 + 5 * 24 * 3_600_000 };
+  const r = rig();
+  r.runtime.ingest('jim', obs());
+  // Both windows spent; the provider ATTRIBUTES the refusal to the weekly one.
+  r.runtime.ingest('jim', limited(r, 2, { windows: [win(0), weekly], providerAttributedLimitingWindowId: 'weekly' }));
+  elapse(r, RESET_AT - r.now + 60_000);
+  assert.equal(r.state(), 'LIMITED', 'the five-hour reset passed, but the WEEKLY window is the one that refused');
+  elapse(r, weekly.resetsAt - r.now + 60_000);
+  assert.equal(r.state(), 'RECOVERING', 'the attributed window\u2019s reset is the one that governs');
 });
 
 test('L0-UNKNOWN: the control snapshot is computed through the ONE resolver, and carries the evidence', () => {
   const index = read('src/main/index.ts');
   const handler = index.slice(index.indexOf("ipcMain.handle('control:snapshot'"));
   const body = handler.slice(0, handler.indexOf('\n});'));
-  assert.match(body, /capacityGateOf\(providerCapacity\.admission\.probe\(agentId, 'ORDINARY_TURN'\)\)/);
+  assert.match(body, /const probed = providerCapacity\.admission\.probe\(agentId, 'ORDINARY_TURN'\);/);
+  assert.match(body, /capacityGateOf\(probed, probed\.poolKey \? providerCapacity\.tracker\.pool\(probed\.poolKey\)\?\.freshness \?\? null : null\)/,
+    'the pool\u2019s own published freshness chooses between labels; it never changes `holds`');
   assert.match(body, /capacityHold: gate\.holds, capacityEvidence: gate\.evidence/);
   assert.ok(!/providerCapacity\.holds\(/.test(index), 'index.ts no longer reads the boolean collapse at all');
 });

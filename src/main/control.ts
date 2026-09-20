@@ -40,11 +40,12 @@ export interface AgentControlSnapshot {
    */
   capacityHold?: boolean;
   /**
-   * WHY capacity answers as it does, kept distinct (L0-UNKNOWN ruling): 'NO_POOL' is
-   * OUTSIDE capacity gating and must never be shown as available; 'NO_STATE' and
-   * 'INDETERMINATE' are held for want of usable evidence; 'REFUSED' is a provider limit.
+   * WHY capacity answers as it does, kept distinct (L0-UNKNOWN ruling, state invariant):
+   * 'NO_POOL' is OUTSIDE capacity gating and never "available"; 'STALE_AFTER_HEALTHY'
+   * proceeds but is NOT healthy; 'RECOVERING' is a post-reset re-probe and is NOT healthy;
+   * the rest are held. See `CapacityEvidence` in automaticSubmit.ts.
    */
-  capacityEvidence?: 'ALLOWED' | 'REFUSED' | 'NO_POOL' | 'NO_STATE' | 'INDETERMINATE' | 'UNCLASSIFIED';
+  capacityEvidence?: 'NO_POOL' | 'FRESH_HEALTHY' | 'STALE_AFTER_HEALTHY' | 'FRESH_NOT_HEALTHY' | 'STALE_AFTER_LIMITED' | 'STALE_AFTER_UNHEALTHY' | 'RECOVERING' | 'NO_STATE' | 'INDETERMINATE' | 'UNCLASSIFIED';
   paused: boolean;
   halted: boolean;
   autoDeliveryPaused: boolean;

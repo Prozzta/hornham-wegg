@@ -30,7 +30,7 @@
  */
 import { CapacityAdmission, ADMISSION_REASON, type AdmissionDecision, type WorkClass } from './capacityAdmission';
 import { CapacityNotifier, type CapacityNotifyIntent } from './capacityNotify';
-import { ProviderCapacityTracker } from './providerCapacityTracker';
+import { ProviderCapacityTracker, staleLastKnown } from './providerCapacityTracker';
 import type { CapacityCollectionSnapshot, CapacityObservation } from '../shared/providerCapacity';
 
 /**
@@ -136,6 +136,7 @@ export class CapacityRuntime {
       poolKeyForAgent: (agentId) => this.poolForAgent.get(agentId) ?? null,
       poolState: (poolKey) => this.tracker.pool(poolKey),
       collectionAdmission: () => this.tracker.collectionAdmission(),
+      staleLastKnown,
       now: this.now
     });
   }

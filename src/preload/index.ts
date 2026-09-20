@@ -511,10 +511,11 @@ export interface AgentControlSnapshot {
    * shown anywhere.
    */
   capacityHold?: boolean;
-  /** Why (L0-UNKNOWN ruling): 'NO_POOL' = outside capacity gating, NEVER "available";
-   *  'NO_STATE' / 'INDETERMINATE' = held for want of usable evidence; 'REFUSED' = a
-   *  provider limit. Computed in main through the one resolver; never derived here. */
-  capacityEvidence?: 'ALLOWED' | 'REFUSED' | 'NO_POOL' | 'NO_STATE' | 'INDETERMINATE' | 'UNCLASSIFIED';
+  /** Why (L0-UNKNOWN ruling, state invariant): 'NO_POOL' = outside capacity gating, NEVER
+   *  "available"; 'STALE_AFTER_HEALTHY' proceeds but is NOT healthy; 'RECOVERING' is a
+   *  post-reset re-probe and is NOT healthy; the rest are held. Computed in main through
+   *  the one resolver; never derived here. */
+  capacityEvidence?: 'NO_POOL' | 'FRESH_HEALTHY' | 'STALE_AFTER_HEALTHY' | 'FRESH_NOT_HEALTHY' | 'STALE_AFTER_LIMITED' | 'STALE_AFTER_UNHEALTHY' | 'RECOVERING' | 'NO_STATE' | 'INDETERMINATE' | 'UNCLASSIFIED';
   paused: boolean;
   halted: boolean;
   autoDeliveryPaused: boolean;

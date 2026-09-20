@@ -82,6 +82,12 @@ export const ADMISSION_REASON = {
   RECOVERING_GRANT: 'RECOVERING_SINGLE_TURN_GRANTED',
   RECOVERING_SPENT: 'RECOVERING_SINGLE_TURN_ALREADY_GRANTED',
   UNKNOWN: 'CAPACITY_UNKNOWN',
+  /** L0-UNKNOWN option (ii): UNKNOWN because the reading went stale, and the reading was
+   *  an all-clear. Still UNKNOWN - the seam does not infer safety - but DIFFERENT EVIDENCE
+   *  from every other unknown, and the caller's one named mapping treats it differently. */
+  STALE_AFTER_HEALTHY: 'CAPACITY_STALE_LAST_KNOWN_HEALTHY',
+  /** ...and the reading was NOT an all-clear (a window at zero, a gap, an unidentified window). */
+  STALE_AFTER_UNHEALTHY: 'CAPACITY_STALE_LAST_KNOWN_NOT_HEALTHY',
   AVAILABLE: 'POOL_AVAILABLE',
   APPROACHING: 'POOL_APPROACHING_PROVIDER_ADVISORY'
 } as const;
@@ -118,6 +124,14 @@ export interface AdmissionDeps {
    * an unresolved binding stays UNKNOWN, exactly as before.
    */
   collectionAdmission?: () => 'LIMITED' | null;
+  /**
+   * What a STALE pool was when last known, as the TRACKER answers it
+   * (`staleLastKnown`): 'HEALTHY', 'NOT_HEALTHY', or null when the pool is not UNKNOWN
+   * for staleness at all. Injected for the reason everything here is: this module may
+   * not grow a second state table, so the predicate stays the tracker's. Optional, and
+   * ABSENT MEANS NO SPLIT - every unknown stays plain UNKNOWN, which holds.
+   */
+  staleLastKnown?: (pool: PoolCapacitySnapshot) => 'HEALTHY' | 'NOT_HEALTHY' | null;
   /**
    * Wall-clock milliseconds, for the reservation TTL below and nothing else.
    *
@@ -222,8 +236,15 @@ export class CapacityAdmission {
           ? at('ALLOW', ADMISSION_REASON.RESERVE_CLOSURE)
           : at('REFUSE', ADMISSION_REASON.RESERVE_ORDINARY);
 
-      case 'UNKNOWN':
+      case 'UNKNOWN': {
+        // STILL "NOT A REFUSAL AND NOT PERMISSION" in every branch: the verdict does not
+        // change, only the evidence it carries. Which unknowns may proceed is the
+        // caller's ONE named mapping (L0-UNKNOWN), never decided here.
+        const was = this.deps.staleLastKnown?.(pool) ?? null;
+        if (was === 'HEALTHY') return at('UNKNOWN_NOT_INFERRED_SAFE', ADMISSION_REASON.STALE_AFTER_HEALTHY);
+        if (was === 'NOT_HEALTHY') return at('UNKNOWN_NOT_INFERRED_SAFE', ADMISSION_REASON.STALE_AFTER_UNHEALTHY);
         return at('UNKNOWN_NOT_INFERRED_SAFE', ADMISSION_REASON.UNKNOWN);
+      }
 
       case 'APPROACHING':
         // Caution, not suppression: the state exists only behind a provider-native
