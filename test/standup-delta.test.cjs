@@ -28,12 +28,17 @@ const loadTs = require('./load-ts.cjs');
 
 const {
   decideStandup, runStandupTick, fingerprintFloor, projectTasks, canonicalize,
-  skipRecord, DEFAULT_MAX_AGE_MS
+  skipRecord
 } = loadTs('src/main/standupDelta.ts');
+
+/** The module's own source, for the two structural arms at the bottom. The gate's
+ *  central guarantee after the owner's revision is an ABSENCE — no clock reaches
+ *  the decision — and an absence cannot be proved by calling the function. */
+const DELTA_TS = fs.readFileSync(path.join(__dirname, '..', 'src', 'main', 'standupDelta.ts'), 'utf8');
 
 const INDEX_TS = fs.readFileSync(path.join(__dirname, '..', 'src', 'main', 'index.ts'), 'utf8');
 
-const GATE = { enabled: true, maxAgeMs: DEFAULT_MAX_AGE_MS };
+const GATE = { enabled: true };
 
 /** A floor with one working agent and one card. */
 const floor = (over = {}) => ({
@@ -107,7 +112,10 @@ function driver(hive, mission = { deltaGate: GATE }) {
   return {
     log, state,
     tick: (forced = false) => runStandupTick('ops-standup', deps, forced),
-    at: () => clock
+    at: () => clock,
+    /** Advance the wall clock without ticking. Only the no-fallback arms use it,
+     *  and that is the point: time passing must not be able to cause anything. */
+    jump: (ms) => { clock += ms; }
   };
 }
 
@@ -176,7 +184,7 @@ test('a suppressed tick stamps lastFiredAt and NOTHING else', () => {
   assert.ok(d.state.lastFiredAt > afterDispatch.lastFiredAt, 'but the timer clock advanced');
 });
 
-test('a dispatching tick advances the baseline AND the max-age clock', () => {
+test('a dispatching tick advances the baseline AND the dispatch clock', () => {
   const d = driver(fakeHive());
   const r = d.tick();
   const stamp = d.log.stamps[0];
@@ -184,20 +192,12 @@ test('a dispatching tick advances the baseline AND the max-age clock', () => {
   assert.equal(stamp.lastDispatchAt, stamp.lastFiredAt);
 });
 
-test('force, max-age and an unreadable floor each produce EXACTLY ONE send', () => {
+test('force and an unreadable floor each produce EXACTLY ONE send', () => {
   // forced
   let hive = fakeHive(); let d = driver(hive);
   d.tick(); hive.applyStandupEffects(d.at());
   assert.equal(d.tick(true).reason, 'forced');
   assert.equal(d.log.sends, 2, 'forced: one more send, not two');
-
-  // max-age
-  hive = fakeHive(); d = driver(hive, { deltaGate: { enabled: true, maxAgeMs: 1 } });
-  d.tick(); hive.applyStandupEffects(d.at());
-  const r = d.tick();
-  assert.equal(r.reason, 'max-age');
-  assert.equal(d.log.sends, 2);
-  assert.equal(d.log.skips.length, 0);
 
   // read error
   hive = fakeHive(); d = driver(hive);
@@ -206,6 +206,39 @@ test('force, max-age and an unreadable floor each produce EXACTLY ONE send', () 
   const u = d.tick();
   assert.equal(u.reason, 'state-unknown', 'an unobserved floor is never a quiet floor');
   assert.equal(d.log.sends, 2);
+});
+
+test('NO PERIODIC FALLBACK: an unchanged floor stays silent for 30 days', () => {
+  // The owner's revised ruling, as an executable assertion: "A provably unchanged
+  // floor may therefore go indefinitely without a Michael standup. Do not add a
+  // periodic 12h or 24h fallback."
+  //
+  // This arm is the former max-age test turned inside out. It used to prove that
+  // a frozen floor was woken once a day; it now proves that it is never woken at
+  // all. It is also the behavioural half of the mutant kill: reintroduce ANY
+  // age-based dispatch with a period under a month and the send count moves off 1.
+  const hive = fakeHive();
+  const d = driver(hive);
+
+  assert.equal(d.tick().reason, 'no-baseline', 'the first run always dispatches');
+  hive.applyStandupEffects(d.at());
+  assert.equal(d.log.sends, 1);
+
+  const DAY = 86_400_000;
+  for (let day = 1; day <= 30; day += 1) {
+    d.jump(DAY);                       // a whole day passes between ticks
+    const r = d.tick();
+    assert.equal(r.reason, 'no-delta', `day ${day} must still read as unchanged`);
+    assert.equal(r.dispatch, false, `day ${day} must not dispatch`);
+  }
+
+  assert.equal(d.log.sends, 1, 'thirty days, and still exactly the one first send');
+  assert.equal(d.log.skips.length, 30, 'every suppressed tick is still recorded');
+  // And the diagnostic that replaces the ceiling: the skip record says how long
+  // the silence has run, which is now the only thing that reports it.
+  const last = d.log.skips[d.log.skips.length - 1];
+  assert.ok(last.sinceLastDispatchMs >= 30 * DAY,
+    'the last skip reports a month of quiet, so the span is visible to an operator');
 });
 
 test('a PERSISTENTLY unreadable floor keeps dispatching instead of settling', () => {
@@ -285,16 +318,19 @@ test('any real floor movement opens the gate', () => {
     ['a crash', floor({ crashes: 1 })]
   ];
   for (const [what, state] of moved) {
-    const d = decideStandup({ state, gate: GATE, lastFingerprint: fp, lastDispatchAt: 1_000, now: 2_000 });
+    const d = decideStandup({ state, gate: GATE, lastFingerprint: fp });
     assert.equal(d.dispatch, true, `${what} must dispatch`);
     assert.equal(d.reason, 'delta', `${what} must read as a delta`);
   }
 });
 
 test('the gate FAILS OPEN: no gate, and no baseline, both dispatch', () => {
-  assert.equal(decideStandup({ state: floor(), now: 1 }).reason, 'gate-off');
-  assert.equal(decideStandup({ state: floor(), gate: GATE, now: 1 }).reason, 'no-baseline');
-  assert.equal(decideStandup({ state: floor(), gate: { enabled: false }, now: 1 }).dispatch, true);
+  // Unchanged by the revision, and deliberately re-stated: removing the periodic
+  // fallback removes a reason to dispatch, never a reason to suppress. A first
+  // run still fails OPEN.
+  assert.equal(decideStandup({ state: floor() }).reason, 'gate-off');
+  assert.equal(decideStandup({ state: floor(), gate: GATE }).reason, 'no-baseline');
+  assert.equal(decideStandup({ state: floor(), gate: { enabled: false } }).dispatch, true);
 });
 
 test('the fingerprint is order-independent, so readdir order is not a delta', () => {
@@ -309,8 +345,7 @@ test('the fingerprint is order-independent, so readdir order is not a delta', ()
 
 test('a skip record names the mission, the reason and the age', () => {
   const d = decideStandup({
-    state: floor(), gate: GATE, lastFingerprint: fingerprintFloor(floor()),
-    lastDispatchAt: 1_000, now: 5_000
+    state: floor(), gate: GATE, lastFingerprint: fingerprintFloor(floor())
   });
   const rec = skipRecord('ops-standup', d, 5_000, 1_000);
   assert.equal(rec.kind, 'standup-skipped');
@@ -318,6 +353,38 @@ test('a skip record names the mission, the reason and the age', () => {
   assert.equal(rec.reason, 'no-delta');
   assert.equal(rec.sinceLastDispatchMs, 4_000);
   assert.equal(rec.fingerprint, d.fingerprint);
+});
+
+// ─── The absence that has to stay absent ─────────────────────────────────────
+
+test('MUTANT GUARD: the decision function cannot observe time at all', () => {
+  // A behavioural arm can only disprove the fallback periods it thinks to try —
+  // the 30-day arm above would not notice a 60-day one. This arm closes that off
+  // at the source instead: if the decision cannot READ a clock, no period exists.
+  const sig = DELTA_TS.slice(
+    DELTA_TS.indexOf('export function decideStandup(input: {'),
+    DELTA_TS.indexOf('}): StandupDecision {'));
+  assert.ok(sig.length > 0, 'found the decideStandup signature');
+  assert.ok(!/\bnow\b/.test(sig), 'decideStandup must not take a clock');
+  assert.ok(!/lastDispatchAt/.test(sig), 'nor the last dispatch time');
+  assert.ok(!/maxAge/i.test(sig), 'nor a maximum age');
+
+  const body = DELTA_TS.slice(
+    DELTA_TS.indexOf('}): StandupDecision {', DELTA_TS.indexOf('export function decideStandup')),
+    DELTA_TS.indexOf('export interface StandupTickDeps'));
+  assert.ok(!/maxAge/i.test(body), 'and no age comparison survives in the body');
+  assert.ok(!/'max-age'/.test(DELTA_TS), "and 'max-age' is not a reason any more");
+});
+
+test('MUTANT GUARD: the gate type offers no period to configure', () => {
+  // Removing the reason but leaving the field would invite it straight back.
+  const gate = DELTA_TS.slice(
+    DELTA_TS.indexOf('export interface DeltaGate {'),
+    DELTA_TS.indexOf('export type StandupReason'));
+  assert.ok(!/maxAge/i.test(gate), 'DeltaGate carries no maxAgeMs');
+  assert.ok(!/DEFAULT_MAX_AGE_MS/.test(DELTA_TS), 'and no default to fall back on');
+  const cfg = fs.readFileSync(path.join(__dirname, '..', 'src', 'main', 'config.ts'), 'utf8');
+  assert.ok(!/maxAge/i.test(cfg), 'config.ts declares and seeds no period either');
 });
 
 // ─── Main-side integration (structural: fire() needs a live Electron main) ────

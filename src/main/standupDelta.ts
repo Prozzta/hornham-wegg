@@ -51,23 +51,42 @@ import { createHash } from 'node:crypto';
  * floor facts, and none of them move because a standup happened.
  *
  * A cost worth naming: an agent working hard while changing none of the above
- * reads as "unchanged". That is acceptable — the standup exists to catch stalls,
- * blocks and unowned work, which are all content-level — and the max-age expiry
- * covers a floor that is genuinely frozen.
+ * reads as "unchanged". That is acceptable — the standup exists to catch blocks
+ * and unowned work, which are all content-level. STALLS ARE NOT THIS MODULE'S
+ * JOB: the floor has a purpose-built quiet/stall detector (the heartbeat), and
+ * the owner ruled that stall detection stays there rather than being rebuilt
+ * inside the gate. See RULE 3.
  *
  * ─── RULE 2: FAIL OPEN ───
  *
  * Every path that cannot prove "nothing changed" must DISPATCH. Missing baseline,
- * gate disabled, unreadable state, forced by the operator, too long since the last
- * real standup — all dispatch. The cost of a wrong dispatch is one standup we
- * did not need; the cost of a wrong suppression is an unattended floor. Those are
- * not the same mistake, so they do not get the same default.
+ * gate disabled, unreadable state, forced by the operator — all dispatch. The
+ * cost of a wrong dispatch is one standup we did not need; the cost of a wrong
+ * suppression is an unattended floor. Those are not the same mistake, so they do
+ * not get the same default.
+ *
+ * ─── RULE 3: NO PERIODIC FALLBACK ───
+ *
+ * There is deliberately NO maximum age. A provably unchanged floor may go
+ * INDEFINITELY without a standup. That is the point of TE0 rather than an
+ * oversight, and it is an owner ruling: "Do NOT run a standup merely because a
+ * maximum age has elapsed... Do not add a periodic 12h or 24h fallback."
+ *
+ * An earlier revision of this file had a 24h expiry and argued for it in these
+ * comments. The argument was that a frozen board is not proof that nothing needs
+ * review. That is true, but it is an argument for a STALL DETECTOR, and answering
+ * it here would have built a second one beside the heartbeat — two controls
+ * owning one question, which is exactly the failure this codebase already paid
+ * for once, when compact-maintenance and the context trigger both owned
+ * compaction. A periodic fallback also stops meaning anything as the period
+ * approaches the cadence: at the live 6h cadence a 6h max-age suppresses nothing
+ * at all, so the knob only ever looked like a safety net.
+ *
+ * The structural consequence, and the reason it stays gone: `decideStandup` TAKES
+ * NO CLOCK. It cannot dispatch on elapsed time because it cannot observe elapsed
+ * time. Reintroducing an age-based reason is therefore not a one-line change to a
+ * comparison — it requires widening the signature, which is asserted against.
  */
-
-/** How long a floor may stay provably unchanged before a standup runs anyway.
- *  A frozen board is not proof that nothing needs a human-visible review, so the
- *  gate expires. 24h at the shipped cadence means at most one forced audit a day. */
-export const DEFAULT_MAX_AGE_MS = 86_400_000;
 
 /** One agent's contribution to the fingerprint. Every field is a floor input that
  *  moves on its own; none of it is written by the standup that reads it. */
@@ -110,10 +129,11 @@ export interface FloorState {
   unknown: string[];
 }
 
-/** Per-mission gate settings. Absent ⇒ off ⇒ today's unconditional dispatch. */
+/** Per-mission gate settings. Absent ⇒ off ⇒ today's unconditional dispatch.
+ *
+ *  One field, and that is the whole knob. There is no `maxAgeMs` — see RULE 3. */
 export interface DeltaGate {
   enabled: boolean;
-  maxAgeMs?: number;
 }
 
 export type StandupReason =
@@ -122,8 +142,8 @@ export type StandupReason =
   | 'state-unknown' // the floor could not be fully read — never suppress on that
   | 'no-baseline'   // nothing to compare against yet
   | 'delta'         // the floor moved
-  | 'max-age'       // provably unchanged, but the gate has expired
-  | 'no-delta';     // the only outcome that suppresses a model turn
+  | 'no-delta';     // the only outcome that suppresses a model turn — and it may
+                    // now repeat indefinitely, by design (RULE 3)
 
 export interface StandupDecision {
   dispatch: boolean;
@@ -210,13 +230,16 @@ export function fingerprintFloor(state: FloorState): string {
  * Order matters. `gate-off` and `forced` come before any comparison so neither
  * can be defeated by a hashing bug, and `no-baseline` precedes the comparison so
  * a first run (or a cleared config) always dispatches.
+ *
+ * NOTE THE ABSENT PARAMETERS. There is no `now` and no `lastDispatchAt`, because
+ * after RULE 3 there is nothing left for a clock to decide. Every dispatch reason
+ * is a fact about the floor or about the operator; none is a fact about the
+ * calendar. Keeping the clock out of the signature is what makes that permanent.
  */
 export function decideStandup(input: {
   state: FloorState;
   gate?: DeltaGate;
   lastFingerprint?: string;
-  lastDispatchAt?: number;
-  now: number;
   forced?: boolean;
 }): StandupDecision {
   const fingerprint = fingerprintFloor(input.state);
@@ -228,12 +251,9 @@ export function decideStandup(input: {
   if (input.state.unknown.length) return { dispatch: true, reason: 'state-unknown', fingerprint };
   if (!input.lastFingerprint) return { dispatch: true, reason: 'no-baseline', fingerprint };
   if (input.lastFingerprint !== fingerprint) return { dispatch: true, reason: 'delta', fingerprint };
-  const maxAgeMs = input.gate.maxAgeMs && input.gate.maxAgeMs > 0
-    ? input.gate.maxAgeMs
-    : DEFAULT_MAX_AGE_MS;
-  if (input.now - (input.lastDispatchAt ?? 0) >= maxAgeMs) {
-    return { dispatch: true, reason: 'max-age', fingerprint };
-  }
+  // Nothing follows this line. A floor that is readable, gated, un-forced, has a
+  // baseline and still matches it is a floor nobody needs to be woken about — for
+  // as long as that stays true, however long that is. RULE 3.
   return { dispatch: false, reason: 'no-delta', fingerprint };
 }
 
@@ -272,7 +292,14 @@ export interface StandupTickDeps {
  *  `lastFiredAt` or syncMissions re-arms with a zero delay and spins the mission.
  *  Only a real dispatch advances the baseline and `lastDispatchAt`; advancing
  *  either on a skip would make the floor look freshly reviewed when no one has
- *  reviewed it. */
+ *  reviewed it.
+ *
+ *  `lastDispatchAt` OUTLIVES the max-age reason it was first added for, and that
+ *  is deliberate rather than leftover: `skipRecord` still reads it to report
+ *  `sinceLastDispatchMs`. It no longer gates anything — the decision cannot see
+ *  it — but it is the only way an operator can answer "how long has this floor
+ *  been quiet", and under RULE 3 that span is unbounded, so the question matters
+ *  MORE than it did when a 24h ceiling answered it. Diagnostics, not control. */
 export function runStandupTick(
   missionId: string,
   deps: StandupTickDeps,
@@ -284,8 +311,6 @@ export function runStandupTick(
     state: deps.collect(),
     gate: m.deltaGate,
     lastFingerprint: m.lastDeltaFingerprint,
-    lastDispatchAt: m.lastDispatchAt,
-    now,
     forced
   });
   if (decision.dispatch) deps.send();

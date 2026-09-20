@@ -11,7 +11,6 @@ import {
   type AgentProvider
 } from '../shared/agentProvider';
 import { defaultMcpDefaults } from '../shared/mcpCatalog';
-import { DEFAULT_MAX_AGE_MS } from './standupDelta';
 import { MAX_AGENT_TOKEN_CAP } from '../shared/tokenCaps';
 import { expandTilde, normalizeHiveHome } from './fs';
 import type { IntegrationRecord } from '../shared/integrations';
@@ -63,11 +62,13 @@ export interface ScheduledMission {
    *  ABSENT ⇒ OFF ⇒ the pre-TE0 unconditional dispatch, so every mission that does
    *  not opt in keeps its exact prior behaviour. See main/standupDelta.ts for what
    *  "unchanged" hashes, and for the two rules that make the answer trustworthy. */
-  deltaGate?: { enabled: boolean; maxAgeMs?: number };
+  deltaGate?: { enabled: boolean };
   /** Scheduler-owned, like `lastFiredAt`: the floor fingerprint as of the last
    *  DISPATCHED run, and when that was. `lastFiredAt` cannot stand in for the
    *  latter — it advances on suppressed ticks too (it has to, or the timer
-   *  re-arms with zero delay), so the max-age safeguard needs its own clock. */
+   *  re-arms with zero delay). `lastDispatchAt` no longer gates anything: it is
+   *  read only to report how long a suppressed floor has been quiet, which under
+   *  the gate's RULE 3 is an unbounded span and therefore worth reporting. */
   lastDeltaFingerprint?: string;
   lastDispatchAt?: number;
 }
@@ -92,9 +93,11 @@ export const OPS_STANDUP_MISSION: ScheduledMission = {
   enabled: true,
   // TE0. A standup whose only finding is "nothing changed" still costs a full
   // model turn over god's whole session prefix, because the dispatch wakes him.
-  // The gate answers that question locally instead; the max-age expiry means a
-  // frozen floor still gets a real review once a day.
-  deltaGate: { enabled: true, maxAgeMs: DEFAULT_MAX_AGE_MS }
+  // The gate answers that question locally instead. There is NO periodic
+  // fallback: a provably unchanged floor may go indefinitely without a standup,
+  // which is the owner's ruling and the whole point of the gate. Stall detection
+  // is the HEARTBEAT's job, not this mission's — see standupDelta.ts RULE 3.
+  deltaGate: { enabled: true }
   // NO autoCompact. Compaction belongs to contextTrigger.compact and nothing else.
   // This flag used to live here as well, which meant a default install asked for
   // compaction on TWO cadences — hourly from this standup and 2-hourly from the
