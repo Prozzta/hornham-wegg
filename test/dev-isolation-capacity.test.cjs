@@ -22,6 +22,18 @@
  *            Electron honours `setPath`; nothing short of a real Dev launch can (item 12).
  *
  * It does NOT launch the app.
+ *
+ * HERMETIC, AND PROVEN SO. The first version of this file was REJECTED by Dwight: it passed
+ * 10/0 in a Claude session and 8/2 in his Codex session, from the same checkout. A mutant
+ * here reads `process.env.CODEX_HOME`; in a Claude session that variable is unset, in a Codex
+ * session it is ALREADY SET - to a folder under C:\Dunder\hive - so the mutant was killed by
+ * an earlier assertion than the one that names it. Green only in the environment it was
+ * written in, and this time the environment was the PROVIDER of the agent running it. A fresh
+ * checkout does not catch that. So: every killer runs inside `hermetic()`, which removes
+ * every variable the code under test OR A MUTANT can read, lets the arm that tests the
+ * environment set its own, and restores everything afterwards; and the file RE-RUNS ITSELF
+ * as two registered tests - once with the provider variables unset, once with them set to
+ * hostile paths INSIDE the hive - and both must be all-pass with every mutant dying by name.
  */
 
 const test = require('node:test');
@@ -43,6 +55,17 @@ const STABLE_USERDATA = 'C:\\Users\\FiercePC\\AppData\\Roaming\\munder-difflin';
 const STABLE_HARNESS_HOME = 'C:\\Dunder';
 /** Where a provider keeps its own global state. L0 READS from these; it must never WRITE there. */
 const PROVIDER_HOMES = ['C:\\Users\\FiercePC\\.claude', 'C:\\Users\\FiercePC\\.codex'];
+
+/** Everything the code under test, a mutant of it, or a provider session can put in the
+ *  way. Removed before a killer runs; restored after, whatever the killer did to them. */
+const AMBIENT = ['CODEX_HOME', 'CLAUDE_CONFIG_DIR', 'APPDATA', 'LOCALAPPDATA', 'USERPROFILE', 'HOME', 'HOMEDRIVE', 'HOMEPATH',
+  'XDG_CONFIG_HOME', 'XDG_DATA_HOME', 'MUNDER_DEV', 'MUNDER_DEV_DATA'];
+function hermetic(fn) {
+  const saved = Object.fromEntries(AMBIENT.map((k) => [k, process.env[k]]));
+  for (const k of AMBIENT) delete process.env[k];
+  try { return fn(); }
+  finally { for (const k of AMBIENT) { if (saved[k] === undefined) delete process.env[k]; else process.env[k] = saved[k]; } }
+}
 
 const K = {};
 
@@ -69,19 +92,15 @@ K.theStoreCanNeverResolveOntoStableOrAProviderHome = (mod) => {
   }
   // The path is a function of its argument AND NOTHING ELSE: the environment a Stable agent
   // terminal exports, and the process's own home, must not be able to move it.
-  const saved = { APPDATA: process.env.APPDATA, USERPROFILE: process.env.USERPROFILE, HOME: process.env.HOME, CODEX_HOME: process.env.CODEX_HOME, CLAUDE_CONFIG_DIR: process.env.CLAUDE_CONFIG_DIR };
-  try {
-    Object.assign(process.env, { APPDATA: 'C:\\Users\\FiercePC\\AppData\\Roaming', USERPROFILE: 'C:\\Users\\FiercePC', HOME: 'C:\\Users\\FiercePC', CODEX_HOME: PROVIDER_HOMES[1], CLAUDE_CONFIG_DIR: PROVIDER_HOMES[0] });
-    assert.equal(mod.capacityStorePath(paths.userData), file, 'NO ENVIRONMENT VARIABLE CAN MOVE THE STORE: same argument, same path');
-  } finally {
-    for (const [k, v] of Object.entries(saved)) { if (v === undefined) delete process.env[k]; else process.env[k] = v; }
-  }
+  // (The caller's `hermetic()` started this killer with all of these REMOVED and will restore them.)
+  Object.assign(process.env, { APPDATA: 'C:\\Users\\FiercePC\\AppData\\Roaming', USERPROFILE: 'C:\\Users\\FiercePC', HOME: 'C:\\Users\\FiercePC', CODEX_HOME: PROVIDER_HOMES[1], CLAUDE_CONFIG_DIR: PROVIDER_HOMES[0] });
+  assert.equal(mod.capacityStorePath(paths.userData), file, 'NO ENVIRONMENT VARIABLE CAN MOVE THE STORE: same argument, same path');
   // And it follows its argument: Stable's userData in, Stable's file out. The isolation is
   // the ARGUMENT's - which is exactly why index.ts is pinned below.
   assert.equal(iso.isInside(mod.capacityStorePath(STABLE_USERDATA), STABLE_USERDATA, WIN), true);
 };
 
-for (const [name, killer] of Object.entries(K)) test(`capacity store isolation: ${name}`, () => killer(REAL));
+for (const [name, killer] of Object.entries(K)) test(`capacity store isolation: ${name}`, () => hermetic(() => killer(REAL)));
 
 // ---- EFFECT: a real write into a sandboxed userData -----------------------------------------
 const T0 = 1_800_000_000_000;
@@ -183,7 +202,7 @@ test('MUTANT CENSUS: every mutant applies exactly once, and dies at the assertio
   try {
     for (const [i, mutant] of MUTANTS.entries()) {
       await t.test(`mutant: ${mutant.name}`, () => {
-        K[mutant.killer](REAL);
+        hermetic(() => K[mutant.killer](REAL));
         let text = source;
         for (const [from, to] of mutant.edits) {
           assert.equal(text.split(from).length - 1, 1, `mutant "${mutant.name}": edit target must match EXACTLY ONCE`);
@@ -193,10 +212,8 @@ test('MUTANT CENSUS: every mutant applies exactly once, and dies at the assertio
         const file = path.join(MUTANT_DIR, `m${i}.ts`);
         fs.writeFileSync(file, text, 'utf8');
         const mod = loadTs(path.relative(path.resolve(__dirname, '..'), file));
-        const savedEnv = process.env.CODEX_HOME;
         let died = null;
-        try { K[mutant.killer](mod); } catch (e) { died = e; }
-        finally { if (savedEnv === undefined) delete process.env.CODEX_HOME; else process.env.CODEX_HOME = savedEnv; }
+        try { hermetic(() => K[mutant.killer](mod)); } catch (e) { died = e; }
         assert.ok(died, `SURVIVED: "${mutant.name}" was not killed by ${mutant.killer}`);
         assert.ok(died instanceof assert.AssertionError, `"${mutant.name}" must die by ASSERTION, got: ${died && died.stack}`);
         assert.match(died.message, mutant.dies, `"${mutant.name}" died at the wrong assertion`);
@@ -206,3 +223,26 @@ test('MUTANT CENSUS: every mutant applies exactly once, and dies at the assertio
     fs.rmSync(MUTANT_DIR, { recursive: true, force: true });
   }
 });
+
+// ---- THE FILE RE-RUNS ITSELF under both ambient environments a validator can have ----------
+const RERUN = 'L0_ISO_CAPACITY_RERUN';
+const AMBIENTS = {
+  'a CLAUDE-like session: the provider variables UNSET': { CODEX_HOME: undefined, CLAUDE_CONFIG_DIR: undefined },
+  'a CODEX-like session: the provider variables set to HOSTILE paths INSIDE the hive': {
+    CODEX_HOME: 'C:/Dunder/hive/agents/x/.codex', CLAUDE_CONFIG_DIR: 'C:/Dunder/hive/agents/x/.claude',
+    APPDATA: 'C:/Dunder/hive/agents/x/AppData', HOME: 'C:/Dunder/hive/agents/x', USERPROFILE: 'C:/Dunder/hive/agents/x'
+  }
+};
+for (const [label, vars] of Object.entries(AMBIENTS)) {
+  test(`HERMETIC: this whole file passes, every mutant dying BY NAME, under ${label}`, (t) => {
+    if (process.env[RERUN]) { t.skip('this IS the re-run'); return; }
+    const env = { ...process.env, [RERUN]: '1' };
+    delete env.NODE_TEST_CONTEXT; // set by the outer runner; a nested runner that inherits it reports nothing readable
+    for (const [k, v] of Object.entries(vars)) { if (v === undefined) delete env[k]; else env[k] = v; }
+    const r = require('node:child_process').spawnSync(process.execPath, ['--test', __filename], { env, encoding: 'utf8' });
+    const out = `${r.stdout}\n${r.stderr}`;
+    assert.equal(r.status, 0, `the file is NOT HERMETIC under ${label}:\n${out.split('\n').filter((l) => /not ok|error:/.test(l)).join('\n')}`);
+    assert.match(out, /# fail 0/);
+    assert.match(out, /# pass 10\b/, 'the 10 tests really ran in the child (2 re-run tests skip themselves there)');
+  });
+}
