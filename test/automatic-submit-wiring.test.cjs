@@ -107,7 +107,7 @@ function rig(over = {}) {
     },
     now: () => r.now, setTimer
   });
-  r.owner = new AutomaticSubmitOwner(r.deps);
+  r.owner = new (over.Owner ?? AutomaticSubmitOwner)(r.deps);
   r.at = (ms, fn) => { r.timers.push({ at: r.now + ms, seq: (r.seq += 1), fn, ms }); };
   r.state = () => r.tracker.pool(POOL)?.state;
   r.settle = async (promise) => {
@@ -820,6 +820,54 @@ K1A.theProbeFacesEveryHumanInterferenceGate = async (classes) => {
     '"send queued message" gives the ONE probe back; it was never used');
 };
 
+/** The single post-reset probe, INTERFERED by a human in the gap. Returns the rig mid-hold. */
+async function interferedProbe(classes) {
+  const r = spentAndStale(classes);
+  passTheReset(r);
+  r.onStaged = () => { r.at(40, () => { r.session.gen += 1; r.session.lastHumanAt = r.now; r.prompt += 'x'; }); };
+  const out = await r.settle(wake(r, 'probe'));
+  assert.deepEqual([out.kind, out.reason], ['INTERFERED', 'HUMAN_INPUT_AFTER_STAGE'], 'precondition: the one probe was interfered with');
+  r.onStaged = null;
+  return r;
+}
+const probeReason = (r) => r.runtime.admission.probe('jim', 'ORDINARY_TURN').reason;
+
+K1A.aDeadTerminalSpendsTheProbeAndOnlyAFreshReadingLiftsIt = async (classes) => {
+  // EXIT 4 (unproven list, 13c) - STATED AS FACT, NOT FIXED. Ruling (b): a hold that outlives
+  // its terminal is SPENT, because nobody can say whether Enter was pressed. For this grant
+  // that can strand the pool: if no turn ran, no reading comes and the key never changes.
+  // Returning the probe instead would risk a SECOND probe, which is the direction A15 says
+  // not to fail in.
+  const r = await interferedProbe(classes);
+  r.session = { ...r.session, incarnation: 2, gen: 0, lastHumanAt: undefined, promptState: { block: null } }; // died, respawned
+  r.prompt = '';
+  assert.equal(r.owner.inhibition('pty-jim'), null, 'the hold does not outlive its terminal');
+  assert.equal(probeReason(r), ADMISSION_REASON.POST_RESET_PROBE_SPENT, 'TERMINAL DEATH SPENDS THE HELD PROBE - it is not handed back');
+  elapse(r, TEN_MINUTES);
+  const again = await r.settle(wake(r, 'after-death'));
+  assert.deepEqual([again.kind, again.reason, r.writes.filter((d) => d === '\r').length], ['REFUSED', 'CAPACITY_HOLD', 0],
+    'NO SECOND PROBE goes out on the same evidence: automatic delivery stays held, ten minutes on');
+  assert.deepEqual({ ...gateFor(r, 'jim') }, { evidence: 'POST_RESET_PROBE_SPENT', holds: true, basis: ADMISSION_REASON.POST_RESET_PROBE_SPENT });
+  // The way out: a fresh accepted reading from ANY agent on the pool - not only this one.
+  r.runtime.ingest('dwight', healthy(r, 2));
+  assert.equal(gateFor(r, 'jim').evidence, 'FRESH_HEALTHY', 'A FRESH READING FROM ANOTHER AGENT ON THE POOL LIFTS IT');
+  assert.equal((await r.settle(wake(r, 'lifted'))).kind, 'COMMITTED');
+};
+
+K1A.alreadyHandledSpendsTheProbeAndTheHumansOwnReadingEndsIt = async (classes) => {
+  // EXIT 2. "Already handled" CONFIRMS the probe as spent; the person's own submitted turn
+  // is a real turn on the pool and produces the reading that ends POST_RESET_PROBE_SPENT.
+  const r = await interferedProbe(classes);
+  assert.equal(r.owner.resolveInterference('pty-jim', 'ALREADY_HANDLED'), true);
+  r.prompt = ''; r.session.promptState = { block: null };
+  elapse(r, TEN_MINUTES);
+  assert.equal(probeReason(r), ADMISSION_REASON.POST_RESET_PROBE_SPENT, '"already handled" CONFIRMS the probe: spent for good on this evidence, reservation TTL or not');
+  assert.equal((await r.settle(wake(r, 'still-held'))).kind, 'REFUSED');
+  r.runtime.ingest('jim', healthy(r, 2)); // the reading the human's own turn produced
+  assert.equal(gateFor(r, 'jim').evidence, 'FRESH_HEALTHY', 'the human\u2019s own turn\u2019s reading ends the state');
+  assert.equal((await r.settle(wake(r, 'after-reading'))).kind, 'COMMITTED');
+};
+
 for (const [name, killer] of Object.entries(K1A)) test(`L0-UNKNOWN 1a: ${name}`, () => killer({}));
 
 KR.ownPostResetProbeIsNotARefusal = (Runtime) => { // the carve-out, for the probe's own claim
@@ -838,6 +886,14 @@ KR.ownPostResetProbeIsNotARefusal = (Runtime) => { // the carve-out, for the pro
 test('TOCTOU on revalidate: ownPostResetProbeIsNotARefusal', () => KR.ownPostResetProbeIsNotARefusal(CapacityRuntime));
 
 const POST_RESET_MUTANTS = [
+  // (Simply DROPPING `held.confirmed = true` is an EQUIVALENT mutant on this path and was
+  // tried first: the grant is already exempt from the TTL as held-for-human, so nothing
+  // observable changes. The defect that matters is a resolution that releases the human
+  // hold WITHOUT confirming - the reservation is then abandoned after 60 s and a second
+  // probe goes out.)
+  { name: '"already handled" releases the human hold without confirming the launch',
+    edits: [['    held.confirmed = true;\n', '    held.heldForHuman = false;\n']],
+    killer: 'alreadyHandledSpendsTheProbeAndTheHumansOwnReadingEndsIt', dies: /CONFIRMS the probe: spent for good/ },
   { name: 'the probe is never spent',
     edits: [['            if (held && held.epoch === POST_RESET_EPOCH && held.probeKey === probeKey && !this.abandoned(held)) {', '            if (false) {']],
     killer: 'oneProbePerPassedReset', dies: /ONE PROBE PER PASSED RESET/ },
@@ -851,6 +907,29 @@ const POST_RESET_MUTANTS = [
     edits: [['          if (probeKey !== null) {', '          if (true) {']],
     killer: 'aPassedKnownResetExitsTheHoldAsItsOwnState', dies: /before the reset the pool is simply held/ }
 ];
+
+test('MUTANT (automaticSubmit.ts): terminal death RETURNING the held probe lets a SECOND probe go out', async () => {
+  const from = '      if (held.decision) this.deps.capacity.confirmLaunch(held.decision);\n      if (this.known';
+  const source = read('src/main/automaticSubmit.ts');
+  assert.equal(source.split(from).length - 1, 1, 'the edit target matches EXACTLY ONCE');
+  await K1A.aDeadTerminalSpendsTheProbeAndOnlyAFreshReadingLiftsIt({});
+  const dir = RUNTIME_MUTANT_DIR + '-own';
+  fs.rmSync(dir, { recursive: true, force: true });
+  fs.mkdirSync(dir, { recursive: true });
+  try {
+    const text = source.replace(from, () => '      if (held.decision) this.deps.capacity.cancelGrant(held.decision);\n      if (this.known')
+      .replace(/from '\.\/(\w+)'/g, "from '../../src/main/$1'").replace(/from '\.\.\/shared\//g, "from '../../src/shared/");
+    const file = path.join(dir, 'o0.ts');
+    fs.writeFileSync(file, text, 'utf8');
+    const Owner = loadTs(path.relative(path.resolve(__dirname, '..'), file)).AutomaticSubmitOwner;
+    let died = null;
+    try { await K1A.aDeadTerminalSpendsTheProbeAndOnlyAFreshReadingLiftsIt({ Owner }); } catch (e) { died = e; }
+    assert.ok(died instanceof assert.AssertionError, `must die by ASSERTION, got: ${died && died.stack}`);
+    assert.match(died.message, /TERMINAL DEATH SPENDS THE HELD PROBE|NO SECOND PROBE goes out/);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
 
 test('MUTANT CENSUS (capacityAdmission, the post-reset probe): every mutant applies exactly once and dies at the named assertion', async (t) => {
   const source = read('src/main/capacityAdmission.ts');

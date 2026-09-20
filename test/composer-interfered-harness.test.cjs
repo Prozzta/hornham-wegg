@@ -101,6 +101,16 @@ test('what remains is the ENDLESS capacity hold: named, and "send now" is offere
   assert.equal(released.resolveCalls, 0, 'and "send now" never touches resolveInterference');
 });
 
+test('a SPENT post-reset probe: the rendered hint says what normally happens AND the way out if it does not', async () => {
+  const { spentProbe } = await result();
+  assert.equal(spentProbe.shown, true);
+  assert.match(spentProbe.text, /held — reset passed and the one probe turn has been used; waiting for a new capacity reading — if none arrives, use "send now" \(or any turn by an agent on this account\)/,
+    'on the PAGE, in the hint - not only in a tooltip');
+  assert.ok(!/nothing will lift/.test(spentProbe.text), 'and it does not claim to be endless, which would be false in the common case');
+  assert.match(spentProbe.title, /cannot be promised/);
+  assert.equal(spentProbe.sendNowButtons, 1, 'and "send now" is on the row');
+});
+
 test('no pool: the queue moves and is said to be OUTSIDE CAPACITY GATING - never available', async () => {
   const { noPool } = await result();
   assert.equal(noPool.noted, true);

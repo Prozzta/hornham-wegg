@@ -122,6 +122,12 @@ window.__harnessRun = async () => {
     await until(() => rows()[0]?.id === 'm3', 2_000);
     result.released = { click: click2, trusted: trusted.slice(), rows: rows(), resolveCalls: bridge.resolveCalls.length };
 
+    // ── STEP 4b: the spent post-reset probe - usually ends by itself, cannot be promised to. ─
+    bridge.snapshot = { autoDeliveryPaused: false, capacityHold: true, capacityEvidence: 'POST_RESET_PROBE_SPENT', interfered: null };
+    useStore.setState({ messageQueues: { a1: [{ id: 'm9', text: 'waiting on a probe', ts: 9 }] } } as never);
+    const probeShown = await until(() => /waiting for a new capacity reading/.test(pageText()), 4_000);
+    result.spentProbe = { shown: probeShown, text: pageText(), title: titleOfHint(), sendNowButtons: buttons('send now').length };
+
     // ── STEP 5: no pool. The queue moves, and it is NOT called available. ───────────
     useStore.setState({ messageQueues: { a1: [{ id: 'm3', text: 'moving', ts: 3 }] } } as never);
     bridge.snapshot = { autoDeliveryPaused: false, capacityHold: false, capacityEvidence: 'NO_POOL', interfered: null };

@@ -39,6 +39,10 @@ const EVIDENCE = [
 /** The hold with no exit but a person: case 2 of the revised L0-UNKNOWN ruling ("2a": it
  *  stays held). Case 1 was ruled "1a" - one post-reset probe - and is no longer endless. */
 const ENDLESS = ['LIMITED_NO_KNOWN_RESET'];
+/** Usually ends by itself, but CANNOT BE PROMISED TO (unproven list, 13c: an interfered
+ *  post-reset probe whose terminal died never ran, so no reading is coming). Worded for the
+ *  worst case without lying about the common one: the hint keeps the state AND names the way out. */
+const MAY_NOT_END = ['POST_RESET_PROBE_SPENT'];
 /** Delivery flows on these, and NONE of them is a measured all-clear. */
 const PROCEEDS_BUT_NOT_HEALTHY = ['NO_POOL', 'STALE_AFTER_HEALTHY', 'RECOVERING', 'POST_RESET_PROBE'];
 const CLAIMS_HEALTH = /\bavailable\b|\bhealthy\b|\ballowed\b|\bok\b|\bfine\b/i;
@@ -75,6 +79,13 @@ K.endlessHoldsSayThatSendNowIsTheWayOut = async (mod) => {
       assert.match(v.hint, /nothing will lift this on its own/, `${e}: the hint says nothing will lift it`);
       assert.match(v.hint, /send now/, `${e}: the hint ITSELF names the way out, not only the tooltip`);
       assert.match(v.title, /NOTHING AUTOMATIC WILL RELEASE IT/, `${e}: the title does not promise a release`);
+    } else if (MAY_NOT_END.includes(e)) {
+      assert.equal(mod.CAPACITY_WORDING[e].endsByItself, false, `${e} is NOT PROMISED to end by itself`);
+      assert.match(v.hint, /waiting for a new capacity reading/, `${e}: the hint still says what normally happens`);
+      assert.match(v.hint, /if none arrives, use "send now" \(or any turn by an agent on this account\)/, `${e}: and the HINT ITSELF names the way out if it does not`);
+      assert.ok(!/nothing will lift/.test(v.hint) && !/NOTHING AUTOMATIC WILL RELEASE IT/.test(v.title), `${e}: it does not LIE about the common case by calling itself endless`);
+      assert.match(v.title, /cannot be promised/);
+      assert.ok(!CLAIMS_HEALTH.test(v.hint), `${e}: and the banned words stay out of it`);
     } else {
       assert.equal(mod.CAPACITY_WORDING[e].endsByItself, true, `${e} can end by itself`);
       assert.ok(!/nothing will lift/.test(v.hint), `${e}: an ordinary hold is not called endless`);
@@ -171,6 +182,15 @@ const MUTANTS = [
   { name: 'an endless hold worded as one that will lift',
     edits: [["  LIMITED_NO_KNOWN_RESET: { state: 'limited, no known reset', endsByItself: false }", "  LIMITED_NO_KNOWN_RESET: { state: 'limited, no known reset', endsByItself: true }"]],
     killer: 'endlessHoldsSayThatSendNowIsTheWayOut', dies: /LIMITED_NO_KNOWN_RESET NEVER ends by itself/ },
+  { name: 'a spent probe promised to end by itself',
+    edits: [["    endsByItself: false,\n    ifItDoesNot:", "    endsByItself: true,\n    ifItDoesNot:"]],
+    killer: 'endlessHoldsSayThatSendNowIsTheWayOut', dies: /POST_RESET_PROBE_SPENT is NOT PROMISED to end by itself/ },
+  { name: 'the spent probe\u2019s way out left to the tooltip',
+    edits: [['        hint: `held — ${w.state} — ${w.ifItDoesNot}`,', '        hint: `held — ${w.state}`,']],
+    killer: 'endlessHoldsSayThatSendNowIsTheWayOut', dies: /the HINT ITSELF names the way out if it does not/ },
+  { name: 'a spent probe called endless',
+    edits: [['    if (!w.endsByItself && w.ifItDoesNot) {', '    if (false) {']],
+    killer: 'endlessHoldsSayThatSendNowIsTheWayOut', dies: /the hint still says what normally happens|the HINT ITSELF names the way out|does not LIE about the common case/ },
   { name: 'a post-reset probe worded as a healthy pool',
     edits: [["state: 'the spent window has passed its reset; one probe turn may go out, nothing is confirmed'", "state: 'capacity available again after reset'"]],
     killer: 'noPoolIsOutsideCapacityGating', dies: /POST_RESET_PROBE is NEVER worded as available or healthy/ },

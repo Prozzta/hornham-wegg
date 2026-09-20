@@ -33,3 +33,4 @@ test/.mutants/
 test/.mutants-delivery-hold/
 test/.mutants-capacity-runtime/
 test/.mutants-capacity-runtime-adm/
+test/.mutants-capacity-runtime-own/

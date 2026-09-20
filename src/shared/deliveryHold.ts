@@ -36,8 +36,13 @@ export type CapacityEvidenceName =
 export interface CapacityWording {
   /** The state, in words, whether or not it holds anything. */
   state: string;
-  /** Can a hold on this evidence end without a person? `false` = only "send now" ends it. */
+  /** Can a hold on this evidence be PROMISED to end without a person? `false` = it cannot,
+   *  and the hint itself must then name the way out. */
   endsByItself: boolean;
+  /** Only with `endsByItself: false`: the hold USUALLY ends by itself but cannot be promised
+   *  to. The hint then keeps the state and adds this, instead of claiming nothing will ever
+   *  lift it - worded for the worst case without lying about the common one. */
+  ifItDoesNot?: string;
 }
 
 /** TOTAL over the evidence labels main publishes (checked against main's own union). */
@@ -53,7 +58,14 @@ export const CAPACITY_WORDING: Record<CapacityEvidenceName, CapacityWording> = {
   INDETERMINATE: { state: 'provider capacity could not be determined', endsByItself: true },
   UNCLASSIFIED: { state: 'provider capacity state not recognised', endsByItself: true },
   POST_RESET_PROBE: { state: 'the spent window has passed its reset; one probe turn may go out, nothing is confirmed', endsByItself: true },
-  POST_RESET_PROBE_SPENT: { state: 'reset passed and the one probe turn has been used; waiting for a new capacity reading', endsByItself: true },
+  // Usually the probe turn itself produces the reading that ends this. But if the probe was
+  // interfered with and its terminal died, NO turn ran and no reading is coming (unproven
+  // list, 13c) - and the two cannot be told apart here. So it is not promised to end.
+  POST_RESET_PROBE_SPENT: {
+    state: 'reset passed and the one probe turn has been used; waiting for a new capacity reading',
+    endsByItself: false,
+    ifItDoesNot: 'if none arrives, use "send now" (or any turn by an agent on this account)'
+  },
   LIMITED_NO_KNOWN_RESET: { state: 'limited, no known reset', endsByItself: false }
 };
 
@@ -153,6 +165,16 @@ export function deliveryHoldView(i: DeliveryHoldInput): DeliveryHoldView | null 
   }
   if (i.capacityHold && !i.headManual) {
     const w = wordingOf(i.capacityEvidence);
+    if (!w.endsByItself && w.ifItDoesNot) {
+      return {
+        kind: 'CAPACITY',
+        hint: `held — ${w.state} — ${w.ifItDoesNot}`,
+        title: `Automatic delivery to ${i.agentName} is held (${w.state}). A new reading normally arrives and lifts this by itself, `
+          + 'but that cannot be promised: if the probe turn never actually ran, no reading is coming. '
+          + '"send now" on a message below, or any turn by an agent on this account, is the way out.',
+        action: 'SEND_NOW'
+      };
+    }
     return w.endsByItself
       ? {
           kind: 'CAPACITY',

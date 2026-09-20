@@ -76,6 +76,18 @@ what IS known, what is not, and what would settle it. Nothing here is a claim of
     that pool is probed in that epoch. That is the ruling working as ruled (fail toward
     ALREADY LAUNCHED), not a defect; it ends with a resolution, the terminal's death, or a
     new epoch. Whether a floor with one shared pool can afford it is not measured.
+13c. **An INTERFERED post-reset probe whose terminal dies can strand its pool.** Ruling (b)
+    spends a held grant when its terminal dies, because nobody can say whether Enter was
+    pressed. For a RECOVERING turn that is harmless (the epoch ends on its reset). The
+    post-reset probe is keyed to the READING: if no turn actually ran, no reading arrives,
+    the key never changes, and the pool sits at POST_RESET_PROBE_SPENT until a fresh reading
+    from ANY agent on the pool, or a "send now". **Accepted by Michael, not fixed:** returning
+    the probe on terminal death would trade a visible, recoverable hold for a possible
+    second probe, which is the direction A15 says not to fail in. It is a TESTED FACT
+    (`aDeadTerminalSpendsTheProbeAndOnlyAFreshReadingLiftsIt`, with the mutant that returns
+    the probe), and because this state therefore cannot be promised to end by itself its
+    hint names "send now" on the page. Narrow path: spent window + stale + reset passed +
+    a human interferes with the one probe + that terminal dies before anyone resolves it.
 14. **The callee census has a stated limit:** a PTY smuggled in under an allowlisted
     non-PTY receiver NAME is invisible to a census of names. The no-alias check, the
     node-pty-importer check and the refusal of `write` taken as a value stand in its way;
