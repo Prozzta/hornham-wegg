@@ -85,7 +85,13 @@ async function bundleScenario(entry) {
     platform: 'browser',
     target: 'chrome120',
     sourcemap: 'inline',
-    alias: { '@shared': join(__dirname, '..', '..', 'src', 'shared') },
+    // `@` is the renderer's own root alias (electron.vite / tsconfig.web): a scenario that
+    // mounts a real COMPONENT, not only terminalPool, pulls in modules that use it.
+    alias: {
+      '@shared': join(__dirname, '..', '..', 'src', 'shared'),
+      '@': join(__dirname, '..', '..', 'src', 'renderer', 'src')
+    },
+    jsx: 'automatic',
     plugins: [cssAsStyleTag],
     logLevel: 'silent'
   });
@@ -129,6 +135,16 @@ app.whenReady().then(async () => {
     ipcMain.handle('harness:resize', (_e, { width: w, height: h }) => {
       win.setSize(Math.round(w), Math.round(h));
       return new Promise((resolve) => setTimeout(() => resolve({ size: win.getSize() }), 120));
+    });
+
+    // A REAL CLICK. `element.click()` dispatches an untrusted synthetic event from inside
+    // the page; this goes through Chromium's input pipeline at window coordinates, so it
+    // is hit-tested against what is actually rendered there and arrives `isTrusted`.
+    ipcMain.handle('harness:click', async (_e, { x, y }) => {
+      const at = { x: Math.round(x), y: Math.round(y), button: 'left', clickCount: 1 };
+      win.webContents.sendInputEvent({ type: 'mouseDown', ...at });
+      win.webContents.sendInputEvent({ type: 'mouseUp', ...at });
+      return new Promise((resolve) => setTimeout(() => resolve(true), 80));
     });
 
     // THE ACCESSIBILITY TREE, NOT THE DOM. C2.11 #14 asks what a screen reader is
