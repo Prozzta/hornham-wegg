@@ -42,6 +42,7 @@
  * holds without this module knowing anything about it.
  */
 import { existsSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
 import type { CapacityObservation, CapacityWindow } from '../shared/providerCapacity';
 import {
   OBSERVATION_SOURCES, PROVIDER_IDS, WINDOW_APPLICABILITIES, WINDOW_KINDS
@@ -58,6 +59,22 @@ import { RETENTION_CAPS } from './providerCapacityTracker';
  * refused outright rather than read leniently - the fields it holds are exactly the
  * unverified classifying facts this version exists to stop crossing.
  */
+/** The store's file name. Its temp sibling is `<name>.tmp`, in the same directory. */
+export const CAPACITY_STORE_FILE = 'capacity-observations.json';
+
+/**
+ * WHERE THE STORE LIVES - the ONE place that decides it, so it can be PROVEN rather than
+ * described (L0 milestone record, item 10). It is a child of the `userData` directory the
+ * caller hands in, and of nothing else: no home directory, no environment variable, no
+ * provider home, no temp directory. Under MUNDER_DEV=1 main hands in the Dev-isolated
+ * `userData` (index.ts repoints it before anything here runs), so the file - L0's only
+ * on-disk artefact - cannot land on Stable's data. test/dev-isolation-capacity.test.cjs
+ * holds that against the real isolation guard.
+ */
+export function capacityStorePath(userData: string): string {
+  return join(userData, CAPACITY_STORE_FILE);
+}
+
 export const CAPACITY_STORE_VERSION = 2;
 
 /**

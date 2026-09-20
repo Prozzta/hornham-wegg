@@ -36,7 +36,7 @@ import {
 import { HiveManager, type AgentMeta, type HiveMessage, type HiveTask } from './hive';
 import { HookServer } from './hooks';
 import { CapacityRuntime } from './capacityRuntime';
-import { CapacityStore } from './capacityPersistence';
+import { CapacityStore, capacityStorePath } from './capacityPersistence';
 import type { CapacityNotifyIntent } from './capacityNotify';
 import { CircuitBreaker, type BreakerInput } from './breaker';
 import type { UsageProvider } from './usage';
@@ -399,7 +399,7 @@ const automaticSubmit = new AutomaticSubmitOwner(buildOwnerDeps({
 // Dev-isolated root by this point, so F1 holds with nothing special done here.
 // Restored pools are UNKNOWN/restored-unconfirmed, never the verdict they had.
 const capacityStore = new CapacityStore(
-  join(app.getPath('userData'), 'capacity-observations.json'),
+  capacityStorePath(app.getPath('userData')),
   providerCapacity.tracker
 );
 {
