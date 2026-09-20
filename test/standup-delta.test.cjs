@@ -96,6 +96,41 @@ function fakeHive() {
   };
 }
 
+/** Run `fn` with EVERY wall clock the process exposes reporting `t`.
+ *
+ *  Oscar's finding is why this exists. The signature guard proves the DECISION
+ *  takes no clock, but nothing proved the FINGERPRINT takes none — and a
+ *  fingerprint that varies with time is a periodic standup wearing a different
+ *  hat, because every tick then reads as a floor change. His mutant appended
+ *  Date.now() to the canonical form and SURVIVED the whole suite, since the fake
+ *  ticks all run synchronously inside a single millisecond: the arms could not
+ *  have gone red. That is the same shape as my own inert mutant A, and the cure is
+ *  the same — make the thing the code would actually read genuinely differ.
+ *
+ *  The driver's injected `now` is NOT that thing. It is handed to stamp() and
+ *  skipRecord(), and the fingerprint never sees it; a fingerprint reaching for a
+ *  clock would reach for the GLOBAL one. So these arms move the global clocks. */
+function withClocks(t, fn) {
+  const realDate = Date.now;
+  const realPerf = typeof performance !== 'undefined' ? performance.now : null;
+  const realHr = process.hrtime;
+  try {
+    Date.now = () => t;
+    if (realPerf) performance.now = () => t;
+    const hr = (prev) => {
+      const s = Math.floor(t / 1000), ns = (t % 1000) * 1e6;
+      return prev ? [s - prev[0], ns - prev[1]] : [s, ns];
+    };
+    hr.bigint = () => BigInt(t) * 1000000n;
+    process.hrtime = hr;
+    return fn();
+  } finally {
+    Date.now = realDate;
+    if (realPerf) performance.now = realPerf;
+    process.hrtime = realHr;
+  }
+}
+
 /** Drive runStandupTick against a fake hive, recording every effect. */
 function driver(hive, mission = { deltaGate: GATE }) {
   const log = { sends: 0, skips: [], stamps: [] };
@@ -224,10 +259,17 @@ test('NO PERIODIC FALLBACK: an unchanged floor stays silent for 30 days', () => 
   hive.applyStandupEffects(d.at());
   assert.equal(d.log.sends, 1);
 
+  // BOTH clocks advance, and the distinction is the whole of Oscar's finding.
+  // `d.jump` moves the INJECTED clock, which is real enough for the timer and the
+  // skip record but is not what a fingerprint would read; `withClocks` moves the
+  // GLOBAL ones, which is what it would. Before this, thirty "days" all happened
+  // inside one millisecond of wall time and a time-varying fingerprint sailed
+  // straight through.
   const DAY = 86_400_000;
+  const T0 = 1_780_000_000_000;
   for (let day = 1; day <= 30; day += 1) {
     d.jump(DAY);                       // a whole day passes between ticks
-    const r = d.tick();
+    const r = withClocks(T0 + day * DAY, () => d.tick());
     assert.equal(r.reason, 'no-delta', `day ${day} must still read as unchanged`);
     assert.equal(r.dispatch, false, `day ${day} must not dispatch`);
   }
@@ -355,6 +397,42 @@ test('a skip record names the mission, the reason and the age', () => {
   assert.equal(rec.fingerprint, d.fingerprint);
 });
 
+// ─── TEMPORAL: the fingerprint must not be able to tell the time ─────────────
+
+test('TEMPORAL: an identical floor fingerprints the same at two distinct times', () => {
+  // The narrowest statement of Oscar's finding. Same floor, clocks a month apart,
+  // one digest. If this can ever fail, every tick reads as a floor change and the
+  // gate has quietly become the periodic standup the owner just removed.
+  const state = floor();
+  const T = 1_780_000_000_000;
+  const a = withClocks(T, () => fingerprintFloor(state));
+  const b = withClocks(T + 30 * 86_400_000, () => fingerprintFloor(state));
+  assert.equal(a, b, 'the fingerprint must not vary with the wall clock');
+  // canonicalize is where a clock would have to be smuggled in, so pin it too.
+  assert.equal(
+    withClocks(T, () => canonicalize(state)),
+    withClocks(T + 30 * 86_400_000, () => canonicalize(state)),
+    'and neither may the canonical form it hashes'
+  );
+});
+
+test('TEMPORAL: ticks at genuinely different wall-clock times still skip', () => {
+  // The behavioural half, driven through the real tick path rather than the pure
+  // function: two ticks, an unchanged floor, and clocks a day apart.
+  const hive = fakeHive();
+  const d = driver(hive);
+  const T = 1_780_000_000_000;
+
+  assert.equal(withClocks(T, () => d.tick()).reason, 'no-baseline');
+  hive.applyStandupEffects(d.at());
+  assert.equal(d.log.sends, 1);
+
+  const r = withClocks(T + 86_400_000, () => d.tick());
+  assert.equal(r.reason, 'no-delta', 'a day of wall time is not a floor change');
+  assert.equal(r.dispatch, false);
+  assert.equal(d.log.sends, 1, 'still exactly the one send');
+});
+
 // ─── The absence that has to stay absent ─────────────────────────────────────
 
 test('MUTANT GUARD: the decision function cannot observe time at all', () => {
@@ -374,6 +452,32 @@ test('MUTANT GUARD: the decision function cannot observe time at all', () => {
     DELTA_TS.indexOf('export interface StandupTickDeps'));
   assert.ok(!/maxAge/i.test(body), 'and no age comparison survives in the body');
   assert.ok(!/'max-age'/.test(DELTA_TS), "and 'max-age' is not a reason any more");
+});
+
+test('MUTANT GUARD: no clock API appears anywhere in the module CODE', () => {
+  // PARSER-BASED, not a grep, and this module is exactly why. Its header comments
+  // discuss the mtime bug at length — three separate paragraphs say "mtime" — so a
+  // textual search either fails on its own documentation or gets watered down until
+  // it proves nothing. This walks the TypeScript AST (the `typescript` dependency
+  // the harness already uses to load the module) and inspects IDENTIFIERS ONLY, so
+  // comments and string literals are structurally absent rather than filtered out.
+  // There is no parser-based codeOnly helper on this branch; this is it.
+  const ts = require('typescript');
+  const src = ts.createSourceFile('standupDelta.ts', DELTA_TS, ts.ScriptTarget.ES2022, true);
+  const names = new Set();
+  (function walk(n) {
+    if (ts.isIdentifier(n)) names.add(n.text);
+    else if (ts.isStringLiteral(n) || ts.isNoSubstitutionTemplateLiteral(n)) return;
+    ts.forEachChild(n, walk);
+  })(src);
+  for (const forbidden of ['Date', 'performance', 'hrtime', 'mtime', 'mtimeMs', 'uptime']) {
+    assert.ok(!names.has(forbidden),
+      `${forbidden} must not be reachable from the fingerprint module's code`);
+  }
+  // And prove the walk is actually looking: identifiers that ARE there must be found,
+  // or an empty set would pass the loop above and assert nothing at all.
+  assert.ok(names.has('canonicalize') && names.has('fingerprintFloor'),
+    'the AST walk found the module it was meant to inspect');
 });
 
 test('MUTANT GUARD: the gate type offers no period to configure', () => {
