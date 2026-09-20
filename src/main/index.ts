@@ -22,8 +22,8 @@ import {
   modelForRole, OPS_STANDUP_MISSION, HEARTBEAT_MISSION, COMPACT_MAINTENANCE_MISSION, type HarnessConfig, type ScheduledMission
 } from './config';
 import {
-  decideStandup, projectTasks, skipRecord,
-  type FloorState, type StandupDecision
+  runStandupTick, projectTasks,
+  type FloorState, type StandupDecision, type StandupSkipRecord
 } from './standupDelta';
 import { listDir, readFileText, readFileBinary, writeFileText, statAbs, expandTilde } from './fs';
 import { normalizeWeekly, weeklyDelayMs } from '../shared/weeklySchedule';
@@ -780,42 +780,61 @@ function clearMissionTimers(): void {
 /** Read the floor state the TE0 delta gate hashes.
  *
  *  Everything here is a local file read or an in-memory map — no model, no
- *  network, and nothing the standup itself writes. See standupDelta.ts for why
- *  board.md and the task prose are absent: they are god's OUTPUT, and hashing
- *  them would make the gate see a delta after every standup and suppress nothing.
+ *  network, and nothing the standup itself writes. See standupDelta.ts for the
+ *  rule: board.md and the task prose are god's OUTPUT, and coordination MTIMES are
+ *  disturbed by the dispatch itself (god's inbox, then his .done/memory/outbox as
+ *  he handles it, then every agent's files as the standup asks them to summarise
+ *  and compact). Hashing any of them makes the gate see a delta after every
+ *  standup and suppress nothing.
  *
- *  Never throws: a partially-readable floor must not take the scheduler down, and
- *  an unreadable one is handled by the caller as "cannot prove unchanged" — which
- *  dispatches. */
+ *  Never throws, but never silently guesses either: anything it could not read is
+ *  named in `unknown`, and an unknown floor dispatches. */
 function collectFloorState(): FloorState {
-  const reg = hive.registry();
+  const unknown: string[] = [];
   const agents: FloorState['agents'] = [];
-  for (const [id, a] of Object.entries(reg.agents)) {
+  let reg: ReturnType<typeof hive.registry> | null = null;
+  try { reg = hive.registry(); } catch { unknown.push('registry'); }
+  for (const [id, a] of Object.entries(reg?.agents ?? {})) {
     if (a.archived) continue;
     let actionableInbox = 0;
     try {
       // The SAME exclusion the heartbeat already uses. Counting the scheduler's
-      // own beats as floor activity would be the "hash your own exhaust" mistake.
+      // own beats as floor activity would be the "hash your own exhaust" mistake
+      // — it is the dispatch we are deciding about that puts them there.
       actionableInbox = hive.inbox(id).filter((msg) => !SYSTEM_SENDERS.has(msg.from)).length;
-    } catch { /* unreadable inbox reads as zero; a real change elsewhere still fires */ }
+    } catch {
+      // NOT zero. A zero here is indistinguishable from an empty inbox, so two
+      // failed reads in a row would hash identically and the gate would suppress
+      // on the strength of an observation that never happened.
+      unknown.push(`inbox:${id}`);
+    }
     agents.push({
       id,
       onHold: !!a.onHold,
       breaker: breaker.levelFor(id),
       hasLivePty: !!ptyForAgent(id),
-      actionableInbox,
-      lastCoordinationAtMs: lastCoordinationAt(id)
+      actionableInbox
     });
   }
-  const countDir = (p: string): number => {
-    try { return readdirSync(p).length; } catch { return 0; }
+  const countDir = (label: string, p: string): number => {
+    try { return readdirSync(p).length; } catch (e) {
+      // ENOENT is a real answer — the directory does not exist, so nothing is
+      // queued. Anything else is a failure to observe.
+      if ((e as NodeJS.ErrnoException)?.code === 'ENOENT') return 0;
+      unknown.push(label);
+      return 0;
+    }
   };
   const root = hive.root();
+  if (!root) unknown.push('hive-root');
+  let tasks: FloorState['tasks'] = [];
+  try { tasks = projectTasks(hive.tasks()); } catch { unknown.push('tasks'); }
   return {
     agents,
-    tasks: projectTasks(hive.tasks()),
-    spawnRequests: root ? countDir(join(root, 'spawn-requests')) : 0,
-    crashes: root ? countDir(join(root, 'crashes')) : 0
+    tasks,
+    spawnRequests: root ? countDir('spawn-requests', join(root, 'spawn-requests')) : 0,
+    crashes: root ? countDir('crashes', join(root, 'crashes')) : 0,
+    unknown
   };
 }
 
@@ -825,22 +844,13 @@ function collectFloorState(): FloorState {
  *  isFloorQuiet(), so writing a skip there would keep the floor reading "busy"
  *  forever and silently disable the heartbeat's re-engage. The heartbeat ships
  *  disabled, which is exactly how that would have gone unnoticed. */
-function recordStandupSkip(
-  missionId: string,
-  decision: StandupDecision,
-  now: number,
-  lastDispatchAt?: number
-): void {
+function appendStandupSkip(record: StandupSkipRecord): void {
   const root = hive.root();
   if (!root) return;
   try {
-    appendFileSync(
-      join(root, 'standup-skips.jsonl'),
-      JSON.stringify(skipRecord(missionId, decision, now, lastDispatchAt)) + '\n',
-      'utf8'
-    );
+    appendFileSync(join(root, 'standup-skips.jsonl'), JSON.stringify(record) + '\n', 'utf8');
   } catch (e) {
-    console.error('[scheduler] skip record', missionId, e);
+    console.error('[scheduler] skip record', record.missionId, e);
   }
 }
 
@@ -872,7 +882,6 @@ function syncMissions(): void {
         // frozen at app-boot values for the life of the process and the gate would
         // compare every tick against a fingerprint from hours ago. lastFiredAt has
         // always been re-read for the same reason, a few lines down.
-        const live = (readConfig().missions ?? []).find((x) => x.id === m.id) ?? m;
         let gate: StandupDecision | null = null;
         // A 'compact' maintenance mission (maint-1) is compaction-ONLY: it carries
         // no dispatch body/target, so skip the hive.send and just fire auto-compact.
@@ -882,19 +891,24 @@ function syncMissions(): void {
         if (m.kind !== 'compact' && hive.enabled()) {
           // TE0. Without a deltaGate on the mission this decides 'gate-off' and
           // dispatches, so every mission that has not opted in is untouched.
-          gate = decideStandup({
-            state: collectFloorState(),
-            gate: live.deltaGate,
-            lastFingerprint: live.lastDeltaFingerprint,
-            lastDispatchAt: live.lastDispatchAt,
-            now: Date.now(),
-            forced
-          });
-          if (gate.dispatch) {
-            hive.send({ to: m.to, act: 'request', subject: m.label, body: m.body }, 'scheduler');
-          } else {
-            recordStandupSkip(m.id, gate, Date.now(), live.lastDispatchAt);
-          }
+          // The decision, the send, the skip record and the stamp all live in
+          // runStandupTick so a test can drive real ticks against a fake floor —
+          // the only way to catch a defect that is about what a dispatch does to
+          // the NEXT collection.
+          gate = runStandupTick(m.id, {
+            readMission: () => (readConfig().missions ?? []).find((x) => x.id === m.id) ?? m,
+            collect: collectFloorState,
+            now: Date.now,
+            send: () => hive.send(
+              { to: m.to, act: 'request', subject: m.label, body: m.body }, 'scheduler'),
+            recordSkip: (rec) => appendStandupSkip(rec),
+            stamp: (patch) => {
+              const current = readConfig().missions ?? [];
+              writeConfig({
+                missions: current.map((x) => (x.id === m.id ? { ...x, ...patch } : x))
+              });
+            }
+          }, forced);
         }
         // Auto-compact: do NOT jam /compact into busy terminals. Hand it to the
         // renderer, which queues a /compact per agent (deduped — never two at
@@ -909,28 +923,22 @@ function syncMissions(): void {
         if (m.autoCompact || m.kind === 'compact') {
           emitContextTrigger('compact', contextRule('compact'));
         }
-        // lastFiredAt is stamped on EVERY tick, suppressed ones included. It is the
-        // timer's clock, not a record of dispatches: syncMissions arms from
+        // lastFiredAt is stamped on EVERY tick, suppressed ones included: it is the
+        // timer's clock, not a record of dispatches. syncMissions arms from
         // `intervalMs - (now - lastFiredAt)`, so leaving it unstamped after a skip
-        // would compute a zero delay on the next re-arm and spin the mission.
-        // The gate's own clock is lastDispatchAt, advanced only below.
-        const firedAt = Date.now();
-        const current = readConfig().missions ?? [];
-        const next = current.map((x) =>
-          x.id === m.id
-            ? {
-                ...x,
-                lastFiredAt: firedAt,
-                // Only a REAL dispatch moves the comparison baseline and the
-                // max-age clock. Advancing either on a skip would make the floor
-                // look freshly reviewed when no one has reviewed it.
-                ...(gate?.dispatch
-                  ? { lastDeltaFingerprint: gate.fingerprint, lastDispatchAt: firedAt }
-                  : {})
-              }
-            : x
-        );
-        writeConfig({ missions: next });
+        // computes a zero delay on the next re-arm and spins the mission.
+        //
+        // For a GATED dispatch mission runStandupTick above has already stamped it
+        // (and, only on a real dispatch, the baseline and lastDispatchAt with it).
+        // This branch covers the ticks it never saw: a compact-only mission, or a
+        // dispatch mission while the hive is disabled.
+        if (!gate) {
+          const firedAt = Date.now();
+          const current = readConfig().missions ?? [];
+          writeConfig({
+            missions: current.map((x) => (x.id === m.id ? { ...x, lastFiredAt: firedAt } : x))
+          });
+        }
         // Let the SCHEDULES panel refresh its "last fired" without a reload (#2.3).
         try { liveWebContents()?.send('missions:updated'); } catch { /* window gone */ }
       } catch (e) {
