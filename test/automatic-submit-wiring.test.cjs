@@ -464,7 +464,7 @@ test('L0-UNKNOWN: send-now and boot prompts do not consult the capacity mapping 
 // ─── The fail-closed READY gate, through the real tables and predicates ───────────────
 
 test('READY: an unmeasured provider stages nothing for automatic delivery', async () => {
-  for (const provider of ['grok', 'kimi', 'gemini', 'antigravity', 'qwen', 'opencode', 'crush', 'pi', 'copilot', 'cursor', 'custom', undefined]) {
+  for (const provider of ['grok', 'kimi', 'gemini', 'qwen', 'opencode', 'crush', 'pi', 'copilot', 'cursor', 'custom', undefined]) {
     const r = rig({ provider });
     r.runtime.ingest('jim', obs());
     const out = await r.settle(wake(r));
@@ -473,9 +473,11 @@ test('READY: an unmeasured provider stages nothing for automatic delivery', asyn
   }
 });
 
-test('the abort-capability table: two MEASURED rows, everything else UNKNOWN, and it is TOTAL', () => {
-  assert.deepEqual(automaticAbortCapability('claude'), { kind: 'MEASURED', clearControl: '\x15', settleMs: 900 });
-  assert.deepEqual(automaticAbortCapability('codex'), { kind: 'MEASURED', clearControl: '\x15', settleMs: 900 });
+test('the abort-capability table: three MEASURED rows, everything else UNKNOWN, and it is TOTAL', () => {
+  const MEASURED = ['claude', 'codex', 'antigravity'];
+  for (const p of MEASURED) {
+    assert.deepEqual(automaticAbortCapability(p), { kind: 'MEASURED', clearControl: '\x15', settleMs: 900 }, p);
+  }
   // TOTAL against the provider union, read from the union's own source rather than from
   // a list this test would have to be told about.
   const union = read('src/shared/agentProvider.ts').match(/export type AgentProvider =([\s\S]*?);/)[1];
@@ -484,7 +486,7 @@ test('the abort-capability table: two MEASURED rows, everything else UNKNOWN, an
   const table = read('src/shared/providerAutomation.ts').split('const AUTOMATIC_ABORT_CAPABILITY')[1].split('};')[0];
   for (const p of providers) {
     assert.match(table, new RegExp(`\\n  ${p}: (MEASURED_CTRL_U|ABORT_UNKNOWN)`), `${p} has a decided row`);
-    if (p !== 'claude' && p !== 'codex') assert.equal(automaticAbortCapability(p).kind, 'UNKNOWN', `${p} is UNKNOWN`);
+    if (!MEASURED.includes(p)) assert.equal(automaticAbortCapability(p).kind, 'UNKNOWN', `${p} is UNKNOWN`);
   }
   // Every MEASURED row must have a capture behind it in the committed matrix.
   const captures = read('test/electron-harness/scenarios/tui-clear-matrix.ts');

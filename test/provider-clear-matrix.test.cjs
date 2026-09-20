@@ -17,8 +17,9 @@
  *   - An ALREADY-TRUSTED cwd with the provider's real config, so NO CONSENT WAS
  *     GIVEN AND NONE WAS ASKED. Enter was never sent — not to a modal, not to a
  *     box. A provider whose first screen was not positively a composer was aborted
- *     WITHOUT A KEYSTROKE, which is why `agy` has no row: it opened on a trust
- *     dialog. ITS ABSENCE IS UNKNOWN, NOT A PASS.
+ *     WITHOUT A KEYSTROKE, which is why `agy` had no row at first: it opened on a trust
+ *     dialog, and ABSENCE IS UNKNOWN, NOT A PASS. Its row was added only after the HUMAN
+ *     trusted one scratch folder by hand and the same tool was re-run (see the scenario).
  *   - Replayed rather than driven live. A capture is a fixture and re-runs
  *     identically where a live process does not, and the predicate reads xterm's
  *     buffer — the screen does not know what produced its bytes.

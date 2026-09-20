@@ -282,8 +282,16 @@ export function terminalReadyToReceive(
  * any case: every ABORT is verified on the live screen, differentially, and anything
  * short of positive verification is held as INTERFERED rather than settled.
  *
- * `antigravity` is UNKNOWN BY MEASUREMENT, not by omission: the capture aborted on its
- * trust dialog without a keystroke, twice.
+ * `antigravity` WAS UNKNOWN BY MEASUREMENT - the capture aborted on its trust dialog
+ * without a keystroke, twice - and stayed UNKNOWN until the human trusted one scratch
+ * folder BY HAND (the tool never answers a dialog and was not taught to). Oscar then
+ * captured it four times with the same tool, and all four were REPLAYED through the xterm
+ * matrix before the row was flipped: marker on the prompt row, gone from the prompt row AND
+ * the screen after Ctrl-U, a harmless key leaves it in place, mouse tracking 'none' at boot
+ * and after staging+clear. Same limits as the other rows: single-line, composer-idle, the
+ * installed version. agy is ALSO known to treat bracketed-paste markers as literal input
+ * (useHive history, #24), so its MULTI-LINE behaviour is not merely unmeasured but
+ * suspect - and the owner verifies every abort on the live screen regardless.
  */
 export type AutomaticAbortCapability =
   | { kind: 'MEASURED'; clearControl: string; settleMs: number }
@@ -303,7 +311,7 @@ const AUTOMATIC_ABORT_CAPABILITY: Record<AgentProvider, AutomaticAbortCapability
   grok: ABORT_UNKNOWN,
   kimi: ABORT_UNKNOWN,
   gemini: ABORT_UNKNOWN,
-  antigravity: ABORT_UNKNOWN,
+  antigravity: MEASURED_CTRL_U,
   qwen: ABORT_UNKNOWN,
   opencode: ABORT_UNKNOWN,
   crush: ABORT_UNKNOWN,
