@@ -310,10 +310,20 @@ export function resolveAdmission(
  *   STALE_AFTER_UNHEALTHY  stale, last known not an all-clear (held)
  *   RECOVERING             recovering after reset             (one re-probe; NOT healthy)
  *   NO_STATE / INDETERMINATE / UNCLASSIFIED                   (held)
+ *
+ * AND THE TWO HOLDS THAT NEVER END ON THEIR OWN, shown as themselves so a person can see
+ * why mail is waiting and release it with send-now (unnamed cases c1 / c2 of the revised
+ * ruling - reported to the human, and deliberately given NO exit here):
+ *   SPENT_RESET_PASSED     spent, reset passed, no refusal    (held - nothing will lift it)
+ *   LIMITED_NO_KNOWN_RESET limited, no known reset            (held - nothing will lift it)
  */
 export type CapacityEvidence =
   | 'NO_POOL' | 'FRESH_HEALTHY' | 'STALE_AFTER_HEALTHY' | 'FRESH_NOT_HEALTHY' | 'STALE_AFTER_LIMITED'
-  | 'STALE_AFTER_UNHEALTHY' | 'RECOVERING' | 'NO_STATE' | 'INDETERMINATE' | 'UNCLASSIFIED';
+  | 'STALE_AFTER_UNHEALTHY' | 'RECOVERING' | 'NO_STATE' | 'INDETERMINATE' | 'UNCLASSIFIED'
+  | 'SPENT_RESET_PASSED' | 'LIMITED_NO_KNOWN_RESET';
+
+/** The tracker's own answer to "can this hold end by itself?" - see `resetOutlook`. */
+export type ResetOutlook = 'NO_KNOWN_RESET' | 'SPENT_RESET_PASSED' | 'RESET_KNOWN' | null;
 
 export interface CapacityGate {
   evidence: CapacityEvidence;
@@ -325,13 +335,15 @@ export interface CapacityGate {
 /**
  * The gate for a probe of the admission seam, through the same resolver and the same
  * policy every guard uses - so what a snapshot SAYS and what the owner DOES cannot drift.
- * `freshness` is the pool's own published freshness (null when there is no pool); it only
- * ever chooses BETWEEN labels and never changes `holds`.
+ * `freshness` is the pool's own published freshness (null when there is no pool) and
+ * `outlook` the tracker's own `resetOutlook`; both only ever choose BETWEEN labels of a
+ * pool that is ALREADY held, and neither can change `holds`.
  */
 export function capacityGateOf(
   decision: { verdict: AdmissionVerdict; reason: string },
   freshness: 'FRESH' | 'STALE' | null = null,
-  policy: UnknownPolicy = UNKNOWN_POLICY
+  policy: UnknownPolicy = UNKNOWN_POLICY,
+  outlook: ResetOutlook = null
 ): CapacityGate {
   const resolved = resolveAdmission(decision, policy);
   const recovering = decision.reason === ADMISSION_REASON.RECOVERING_GRANT
@@ -341,7 +353,13 @@ export function capacityGateOf(
   else if (decision.verdict === 'ALLOW') evidence = 'FRESH_HEALTHY';
   else if (decision.verdict === 'REFUSE') evidence = freshness === 'STALE' ? 'STALE_AFTER_LIMITED' : 'FRESH_NOT_HEALTHY';
   else evidence = unknownEvidenceOf(decision.reason) ?? 'UNCLASSIFIED';
-  return { evidence, holds: resolved.action === 'HOLD', basis: resolved.basis };
+  const holds = resolved.action === 'HOLD';
+  // A more specific NAME for a hold that is already a hold. Never for anything that
+  // proceeds: an outlook must not be able to relabel a pool that delivery is flowing to.
+  if (holds && outlook === 'SPENT_RESET_PASSED' && evidence === 'STALE_AFTER_UNHEALTHY') evidence = 'SPENT_RESET_PASSED';
+  if (holds && outlook === 'NO_KNOWN_RESET' && (evidence === 'FRESH_NOT_HEALTHY' || evidence === 'STALE_AFTER_LIMITED')
+    && decision.reason === ADMISSION_REASON.LIMITED) evidence = 'LIMITED_NO_KNOWN_RESET';
+  return { evidence, holds, basis: resolved.basis };
 }
 
 // ─── Effects ──────────────────────────────────────────────────────────────────────────

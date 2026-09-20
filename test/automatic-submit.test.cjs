@@ -639,6 +639,29 @@ K.resetPassageIsRecoveringNeverHealthy = async (mod) => {
   assert.equal(mod.capacityGateOf(CAPACITY.LIMITED, 'FRESH').evidence, 'FRESH_NOT_HEALTHY');
 };
 
+K.anOutlookNamesAHoldAndLiftsNothing = async (mod) => {
+  // The two holds that never end on their own are shown as themselves. The outlook that
+  // names them is a LABEL: it must never change whether delivery is held, and it must
+  // never rename a pool that delivery is flowing to.
+  const P = mod.UNKNOWN_POLICY;
+  assert.deepEqual(mod.capacityGateOf(CAPACITY.STALE_UNHEALTHY, 'STALE', P, 'SPENT_RESET_PASSED'),
+    { evidence: 'SPENT_RESET_PASSED', holds: true, basis: 'UNKNOWN:STALE_AFTER_UNHEALTHY' }, 'spent, reset passed, no refusal: NAMED, and still HELD');
+  assert.deepEqual(mod.capacityGateOf(CAPACITY.LIMITED, 'STALE', P, 'NO_KNOWN_RESET'),
+    { evidence: 'LIMITED_NO_KNOWN_RESET', holds: true, basis: ADMISSION_REASON.LIMITED }, 'limited, no known reset: NAMED, and still HELD');
+  for (const outlook of ['SPENT_RESET_PASSED', 'NO_KNOWN_RESET', 'RESET_KNOWN', null]) {
+    for (const [state, fresh] of [['AVAILABLE', 'FRESH'], ['STALE_HEALTHY', 'STALE'], ['NO_POOL', null], ['RECOVERING', 'STALE']]) {
+      const plain = mod.capacityGateOf(CAPACITY[state], fresh, P, null);
+      assert.deepEqual(mod.capacityGateOf(CAPACITY[state], fresh, P, outlook), plain,
+        `an outlook NEVER relabels or holds a pool that delivery flows to (${state} / ${outlook})`);
+    }
+    for (const state of ['LIMITED', 'STALE_UNHEALTHY', 'STALE', 'NO_STATE']) {
+      assert.equal(mod.capacityGateOf(CAPACITY[state], 'STALE', P, outlook).holds, true, `an outlook LIFTS NOTHING (${state} / ${outlook})`);
+    }
+  }
+  assert.equal(mod.capacityGateOf(CAPACITY.LIMITED, 'STALE', P, 'RESET_KNOWN').evidence, 'STALE_AFTER_LIMITED',
+    'a limit whose reset IS known keeps its ordinary name');
+};
+
 K.noPoolIsNeverCalledAvailable = async (mod) => {
   const gate = mod.capacityGateOf(CAPACITY.NO_POOL);
   assert.deepEqual({ evidence: gate.evidence, holds: gate.holds }, { evidence: 'NO_POOL', holds: false },
@@ -1054,6 +1077,17 @@ const MUTANTS = [
     killer: 'noPoolIsNeverCalledAvailable', dies: /NEVER reported as ALLOWED/
   });
   MUTANTS.push({
+    name: 'an outlook that lifts the hold it names',
+    edits: [["  const holds = resolved.action === 'HOLD';", "  const holds = resolved.action === 'HOLD' && outlook !== 'SPENT_RESET_PASSED';"]],
+    killer: 'anOutlookNamesAHoldAndLiftsNothing', dies: /NAMED, and still HELD|LIFTS NOTHING/
+  });
+  MUTANTS.push({
+    name: 'an outlook that relabels a pool delivery flows to',
+    edits: [["  if (holds && outlook === 'SPENT_RESET_PASSED' && evidence === 'STALE_AFTER_UNHEALTHY') evidence = 'SPENT_RESET_PASSED';",
+      "  if (outlook === 'SPENT_RESET_PASSED') evidence = 'SPENT_RESET_PASSED';"]],
+    killer: 'anOutlookNamesAHoldAndLiftsNothing', dies: /NEVER relabels or holds a pool that delivery flows to/
+  });
+  MUTANTS.push({
     name: 'a stale all-clear relabelled healthy',
     edits: [["  else evidence = unknownEvidenceOf(decision.reason) ?? 'UNCLASSIFIED';",
       "  else evidence = unknownEvidenceOf(decision.reason) === 'STALE_AFTER_HEALTHY' ? 'FRESH_HEALTHY' : (unknownEvidenceOf(decision.reason) ?? 'UNCLASSIFIED');"]],
@@ -1071,8 +1105,7 @@ const MUTANTS = [
   });
   MUTANTS.push({
     name: 'the snapshot gate computed by the old inequality',
-    edits: [["  return { evidence, holds: resolved.action === 'HOLD', basis: resolved.basis };",
-      "  return { evidence, holds: decision.verdict === 'REFUSE', basis: resolved.basis };"]],
+    edits: [["  const holds = resolved.action === 'HOLD';", "  const holds = decision.verdict === 'REFUSE';"]],
     killer: 'noPoolIsNeverCalledAvailable', dies: /HELD through the resolver/
   });
 }

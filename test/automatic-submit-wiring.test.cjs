@@ -245,7 +245,8 @@ function elapse(r, ms) {
 /** The gate exactly as the control snapshot computes it: probe + the pool's own freshness. */
 const gateFor = (r, agentId) => {
   const probed = r.runtime.admission.probe(agentId, 'ORDINARY_TURN');
-  return capacityGateOf(probed, probed.poolKey ? r.tracker.pool(probed.poolKey)?.freshness ?? null : null);
+  return capacityGateOf(probed, probed.poolKey ? r.tracker.pool(probed.poolKey)?.freshness ?? null : null,
+    undefined, probed.poolKey ? r.tracker.resetOutlook(probed.poolKey) : null);
 };
 const RESET_AT = T0 + 3_600_000; // the five-hour window's reset in `win()`
 const healthy = (r, seq) => obs({ observedAt: r.now, receivedAt: r.now, sourceSequence: seq });
@@ -390,11 +391,15 @@ test('UNNAMED CASE (c): stale after a NUMERICALLY SPENT window holds - and nothi
   assert.equal(r.state(), 'RESERVE_ONLY');
   assert.equal(r.tracker.pool(POOL).limitEpochAt, null, 'no refusal, so no epoch');
   elapse(r, L0_SEM_POLICY.liveTtlMs + 1_000);
+  assert.equal(r.tracker.resetOutlook(POOL), 'RESET_KNOWN', 'while the reset is still ahead the hold CAN end by itself');
   assert.equal(gateFor(r, 'jim').evidence, 'STALE_AFTER_UNHEALTHY');
   assert.equal((await r.settle(wake(r, 'w1'))).kind, 'REFUSED');
   elapse(r, RESET_AT - r.now + 60_000);
   assert.equal(r.state(), 'UNKNOWN', 'the known reset has PASSED and the tracker still says UNKNOWN - there is no epoch to hint');
-  assert.equal(gateFor(r, 'jim').evidence, 'STALE_AFTER_UNHEALTHY');
+  // VISIBLE AS ITSELF (god, stage 5.4): a person must be able to SEE that nothing will lift
+  // this, and release the mail with send-now. The label names the hold; it lifts nothing.
+  assert.deepEqual({ ...gateFor(r, 'jim') }, { evidence: 'SPENT_RESET_PASSED', holds: true, basis: 'UNKNOWN:STALE_AFTER_UNHEALTHY' },
+    '"spent, reset passed, no refusal" is shown as its own state - and is STILL held');
   assert.equal((await r.settle(wake(r, 'w2'))).kind, 'REFUSED', 'STILL HELD: this is the deadlock class, and it is the human\u2019s to rule on');
 });
 
@@ -405,6 +410,8 @@ test('UNNAMED CASE (c): stale after a refusal with NO known reset time holds wit
   assert.equal(r.state(), 'LIMITED');
   elapse(r, 7 * 24 * 60 * 60 * 1000);
   assert.equal(r.state(), 'LIMITED', 'a week on: no reset boundary was ever known, so no RECOVERING hint can fire');
+  assert.deepEqual({ ...gateFor(r, 'jim') }, { evidence: 'LIMITED_NO_KNOWN_RESET', holds: true, basis: ADMISSION_REASON.LIMITED },
+    '"limited, no known reset" is shown as its own state - and is STILL held');
   assert.equal((await r.settle(wake(r))).kind, 'REFUSED');
 });
 
@@ -435,8 +442,10 @@ test('L0-UNKNOWN: the control snapshot is computed through the ONE resolver, and
   const handler = index.slice(index.indexOf("ipcMain.handle('control:snapshot'"));
   const body = handler.slice(0, handler.indexOf('\n});'));
   assert.match(body, /const probed = providerCapacity\.admission\.probe\(agentId, 'ORDINARY_TURN'\);/);
-  assert.match(body, /capacityGateOf\(probed, probed\.poolKey \? providerCapacity\.tracker\.pool\(probed\.poolKey\)\?\.freshness \?\? null : null\)/,
+  assert.match(body, /probed\.poolKey \? providerCapacity\.tracker\.pool\(probed\.poolKey\)\?\.freshness \?\? null : null,/,
     'the pool\u2019s own published freshness chooses between labels; it never changes `holds`');
+  assert.match(body, /probed\.poolKey \? providerCapacity\.tracker\.resetOutlook\(probed\.poolKey\) : null\)/,
+    'and the TRACKER answers whether a hold can end by itself - the handler does not re-derive it');
   assert.match(body, /capacityHold: gate\.holds, capacityEvidence: gate\.evidence/);
   assert.ok(!/providerCapacity\.holds\(/.test(index), 'index.ts no longer reads the boolean collapse at all');
 });

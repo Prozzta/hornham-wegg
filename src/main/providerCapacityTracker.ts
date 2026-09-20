@@ -682,6 +682,41 @@ export class ProviderCapacityTracker {
   }
 
   /**
+   * CAN THIS POOL'S HOLD END ON ITS OWN? A LABEL for whoever shows the state - it decides
+   * nothing, changes no state and no verdict.
+   *
+   * It exists because two holds never end without a human, and a person looking at a
+   * waiting message deserves to see that rather than wonder (L0-UNKNOWN, unnamed cases
+   * c1 and c2 - reported to the human, deliberately NOT given an exit here):
+   *
+   *   'NO_KNOWN_RESET'      a provider REFUSAL is open and no reset boundary is known that
+   *                         could ever become its recovery hint. LIMITED until a newer
+   *                         reading arrives.
+   *   'SPENT_RESET_PASSED'  the reading went stale with a window at exactly zero and NO
+   *                         refusal, so no limit epoch exists to hint - and that window's
+   *                         known reset has now PASSED. Still held.
+   *   'RESET_KNOWN'         a boundary is known and still ahead: the hold can end by itself.
+   *   null                  not a held pool of either kind.
+   *
+   * Asked of the tracker's OWN record with the tracker's OWN boundary rule
+   * (`nextResetBoundary`), not re-derived from a snapshot by a caller.
+   */
+  resetOutlook(poolKey: string): 'NO_KNOWN_RESET' | 'SPENT_RESET_PASSED' | 'RESET_KNOWN' | null {
+    const rec = this.pools.get(poolKey);
+    if (!rec || rec.restoredUnconfirmed) return null;
+    const p = rec.projection;
+    if (rec.epoch) {
+      if (p.state !== 'LIMITED') return null; // RECOVERING has already been hinted
+      return nextResetBoundary(rec.observation, rec.epoch) === null ? 'NO_KNOWN_RESET' : 'RESET_KNOWN';
+    }
+    if (staleLastKnown(p) !== 'NOT_HEALTHY') return null;
+    const spent = rec.observation.windows.filter((w) => p.numericallyExhaustedWindowIds.includes(w.windowId));
+    if (!spent.length) return null;
+    if (spent.some((w) => w.resetsAt === null)) return 'NO_KNOWN_RESET';
+    return spent.every((w) => (w.resetsAt as number) <= this.clock()) ? 'SPENT_RESET_PASSED' : 'RESET_KNOWN';
+  }
+
+  /**
    * How long until the SOONEST moment a projection could change with no new
    * reading at all, or null when nothing is pending.
    *

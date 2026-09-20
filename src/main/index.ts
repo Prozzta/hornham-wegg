@@ -4056,7 +4056,10 @@ ipcMain.handle('control:snapshot', (_evt, agentId: unknown) => {
   // requires "no pool" (outside capacity gating), "held for want of evidence" and
   // "allowed" to stay three different things for anything that shows them.
   const probed = providerCapacity.admission.probe(agentId, 'ORDINARY_TURN');
-  const gate = capacityGateOf(probed, probed.poolKey ? providerCapacity.tracker.pool(probed.poolKey)?.freshness ?? null : null);
+  const gate = capacityGateOf(probed,
+    probed.poolKey ? providerCapacity.tracker.pool(probed.poolKey)?.freshness ?? null : null,
+    undefined,
+    probed.poolKey ? providerCapacity.tracker.resetOutlook(probed.poolKey) : null);
   return { ...control.snapshot(agentId), capacityHold: gate.holds, capacityEvidence: gate.evidence };
 });
 
