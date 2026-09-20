@@ -10,7 +10,48 @@
  * existing ones.
  */
 const { spawn } = require('node:child_process');
+const { existsSync, mkdtempSync, rmSync } = require('node:fs');
+const { tmpdir } = require('node:os');
 const { join } = require('node:path');
+
+/**
+ * THE SANDBOX LIFECYCLE IS OWNED HERE, BY THE PARENT.
+ *
+ * Each Electron child gets a throwaway `userData`. The child used to create it and delete
+ * it on the way out inside a swallowed `catch`; on Windows its own Chromium handles were
+ * still open, the delete failed, nothing said so, and about 1,400 directories / 14 GB built
+ * up in %TEMP%. So: the parent creates the directory, the child is TOLD where it is, and the
+ * parent removes it once the child has EXITED - retrying for a bounded time, because
+ * Windows releases a dead process's handles a moment after `close`.
+ *
+ * AND IT FAILS LOUDLY. A sandbox that still exists after the retries REJECTS the run with
+ * the path in the message. A silent leftover is the defect; a red test is the fix working.
+ */
+const SANDBOX_REMOVE_ATTEMPTS = 25;
+const SANDBOX_REMOVE_WAIT_MS = 200;
+
+/** @param {string} prefix @param {string} [root] */
+function createSandbox(prefix, root = tmpdir()) {
+  return mkdtempSync(join(root, prefix));
+}
+
+/** Remove `dir`, retrying for a bounded time. Resolves when it is GONE; rejects, naming it,
+ *  when it is not. @param {string} dir */
+async function removeSandbox(dir, attempts = SANDBOX_REMOVE_ATTEMPTS, waitMs = SANDBOX_REMOVE_WAIT_MS) {
+  let last = null;
+  for (let i = 0; i < attempts; i += 1) {
+    try { rmSync(dir, { recursive: true, force: true }); } catch (e) { last = e; }
+    if (!existsSync(dir)) return;
+    await new Promise((r) => setTimeout(r, waitMs));
+  }
+  throw new Error(`HARNESS SANDBOX LEAK: could not remove ${dir} after ${attempts} attempts over ${attempts * waitMs} ms`
+    + `${last ? ` (${last.code || last.message})` : ''}. It is still on disk - remove it by hand, and find out what is holding it.`);
+}
+
+/** Settle a child's result ONLY after its sandbox is gone; a leak outranks a result. */
+function settleAfterCleanup(sandbox, resolve, reject, settle) {
+  removeSandbox(sandbox).then(settle, (leak) => reject(leak));
+}
 
 const MARKER = '__HARNESS_RESULT__';
 
@@ -22,8 +63,10 @@ const MARKER = '__HARNESS_RESULT__';
 function runScenario(scenario, opts = {}) {
   const electron = require('electron');
   const root = join(__dirname, '..', '..');
+  const sandbox = createSandbox('l0-harness-', opts.tempRoot);
   const args = [
     join(__dirname, 'harness-main.cjs'),
+    '--sandbox', sandbox,
     '--scenario', scenario,
     '--width', String(opts.width ?? 1280),
     '--height', String(opts.height ?? 800),
@@ -48,8 +91,8 @@ function runScenario(scenario, opts = {}) {
     child.stdout.on('data', (d) => { out += d.toString(); });
     child.stderr.on('data', (d) => { err += d.toString(); });
 
-    child.on('error', reject);
-    child.on('close', (code) => {
+    child.on('error', (e) => settleAfterCleanup(sandbox, resolve, reject, () => reject(e)));
+    child.on('close', (code) => settleAfterCleanup(sandbox, resolve, reject, () => {
       const at = out.lastIndexOf(MARKER);
       if (at < 0) {
         reject(new Error(
@@ -63,7 +106,7 @@ function runScenario(scenario, opts = {}) {
       } catch (e) {
         reject(new Error(`harness result was not JSON: ${line}\n${e}`));
       }
-    });
+    }));
   });
 }
 
@@ -81,8 +124,10 @@ function runScenario(scenario, opts = {}) {
 function runIpcOrder(opts = {}) {
   const electron = require('electron');
   const root = join(__dirname, '..', '..');
+  const sandbox = createSandbox('l0-ipcorder-', opts.tempRoot);
   const args = [
     join(__dirname, 'ipc-order-main.cjs'),
+    '--sandbox', sandbox,
     '--phase1', String(opts.phase1 ?? 200),
     '--phase2', String(opts.phase2 ?? 500),
     '--phase3', String(opts.phase3 ?? 5)
@@ -97,8 +142,8 @@ function runIpcOrder(opts = {}) {
     let err = '';
     child.stdout.on('data', (d) => { out += d.toString(); });
     child.stderr.on('data', (d) => { err += d.toString(); });
-    child.on('error', reject);
-    child.on('close', (code) => {
+    child.on('error', (e) => settleAfterCleanup(sandbox, resolve, reject, () => reject(e)));
+    child.on('close', (code) => settleAfterCleanup(sandbox, resolve, reject, () => {
       const at = out.lastIndexOf(MARKER);
       if (at < 0) {
         reject(new Error(
@@ -108,8 +153,8 @@ function runIpcOrder(opts = {}) {
       }
       try { resolve(JSON.parse(out.slice(at + MARKER.length).split('\n')[0])); }
       catch (e) { reject(e); }
-    });
+    }));
   });
 }
 
-module.exports = { runScenario, runIpcOrder };
+module.exports = { runScenario, runIpcOrder, createSandbox, removeSandbox };

@@ -23,9 +23,8 @@
  * shown.
  */
 const { app, BrowserWindow, ipcMain } = require('electron');
-const { mkdtempSync, rmSync, writeFileSync } = require('node:fs');
+const { writeFileSync } = require('node:fs');
 const { join } = require('node:path');
-const { tmpdir } = require('node:os');
 
 /** `--scenario <abs.ts>` `--width N` `--height N` `--timeout N` */
 function argOf(name, fallback = null) {
@@ -39,7 +38,17 @@ const height = Number(argOf('height', '800'));
 const timeoutMs = Number(argOf('timeout', '30000'));
 
 // Isolated before anything can resolve a default path off the package name.
-const sandboxRoot = mkdtempSync(join(tmpdir(), 'l0-harness-'));
+// THE SANDBOX BELONGS TO THE PARENT (run.cjs), which creates it, passes it here as
+// `--sandbox`, and removes it AFTER this process has exited. This process used to create
+// it and `rmSync` it on the way out, inside a swallowed `catch` - and on Windows Chromium
+// still holds files open at that moment, so the removal failed silently, every time. That
+// is how about 1,400 directories and 14 GB accumulated in %TEMP% before anyone noticed. A
+// child cannot reliably delete the directory its own open handles live in; its parent can.
+const sandboxRoot = argOf('sandbox', null);
+if (!sandboxRoot) {
+  process.stderr.write('harness: refusing to run without --sandbox <dir>; the parent (run.cjs) owns the sandbox lifecycle\n');
+  process.exit(2);
+}
 app.setPath('userData', sandboxRoot);
 app.setPath('sessionData', sandboxRoot);
 
@@ -49,7 +58,6 @@ function finish(payload) {
   if (finished) return;
   finished = true;
   process.stdout.write(`\n__HARNESS_RESULT__${JSON.stringify(payload)}\n`);
-  try { rmSync(sandboxRoot, { recursive: true, force: true }); } catch { /* temp dir */ }
   app.exit(0);
 }
 
