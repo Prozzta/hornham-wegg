@@ -1451,10 +1451,12 @@ test('the prompt mirror is re-derived at every site that changes it, and caches 
   const pool = read('src/renderer/src/components/terminalPool.ts');
   const calls = pool.split('reportPromptState(entry)').length - 1;
   assert.equal(calls, 4, 'four sites: the onData pass, the picker release, the user clear, and the tick');
-  for (const site of ['function releasePickerBlock(', 'export function clearTerminalDraft(', 'function startPromptMirror(']) {
+  for (const site of ['function releasePickerBlock(', 'export function clearTerminalDraft(']) {
     const at = pool.indexOf(site);
     assert.ok(at > 0 && pool.slice(at, pool.indexOf('\n}\n', at)).includes('reportPromptState(entry)'), `${site} re-derives the mirror`);
   }
+  // The tick is a pool timer now (it used to start once and never stop; test/pool-timer.test.cjs).
+  assert.match(pool, /const promptMirror = createPoolTimer\(\(\) => \{\s*for \(const entry of pool\.values\(\)\) reportPromptState\(entry\);/, 'the tick re-derives the mirror');
   const start = pool.indexOf('function reportPromptState(');
   const body = pool.slice(start, pool.indexOf('\n}\n', start));
   const ack = body.indexOf('r && r.ok');

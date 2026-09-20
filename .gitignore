@@ -36,3 +36,4 @@ test/.mutants-capacity-runtime-adm/
 test/.mutants-capacity-runtime-own/
 test/.mutants-dev-isolation-capacity/
 test/electron-harness/.mutant-run-*.cjs
+test/.mutants-pool-timer/

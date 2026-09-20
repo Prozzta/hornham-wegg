@@ -13,6 +13,7 @@
  * unmount — the rendered content moves with it, so the terminal is always
  * visible immediately, no repaint required.
  */
+import { createPoolTimer } from './poolTimer';
 import { useEffect, useState } from 'react';
 import { Terminal } from '@xterm/xterm';
 import { FitAddon } from '@xterm/addon-fit';
@@ -477,7 +478,7 @@ export function acquireTerminal(ptyId: string, theme?: ThemeMap, fontSize = 14):
   // Tab; and every pooled terminal adds a live "Terminal input" textbox to the accessibility
   // tree with nothing on screen. Detached keeps fit() inert, which is what those paths rely on.
   openTerminalOnce(entry);
-  startPromptMirror();
+  promptMirror.sync(pool.size);
   ensureScreenReadResponder();
   return entry;
 }
@@ -612,14 +613,11 @@ function releasePickerBlock(entry: TerminalEntry): void {
  *  a draft or picker going stale, the echo grace elapsing - so the mirror is re-derived
  *  on a slow tick as well as on every input. One timer for the whole pool. */
 const PROMPT_MIRROR_TICK_MS = 500;
-let promptMirrorTimer: ReturnType<typeof setInterval> | null = null;
-
-function startPromptMirror(): void {
-  if (promptMirrorTimer) return;
-  promptMirrorTimer = setInterval(() => {
-    for (const entry of pool.values()) reportPromptState(entry);
-  }, PROMPT_MIRROR_TICK_MS);
-}
+/** ABSENT while the pool is empty, PRESENT from the first terminal, EXACTLY ONE at any size
+ *  (poolTimer.ts). It used to start once and never stop - 7,200 empty callbacks an hour. */
+const promptMirror = createPoolTimer(() => {
+  for (const entry of pool.values()) reportPromptState(entry);
+}, PROMPT_MIRROR_TICK_MS);
 
 function currentPromptBlock(entry: TerminalEntry): PromptBlock {
   return terminalAutomationBlock(automationStateOf(entry));
@@ -1076,6 +1074,7 @@ export function disposeTerminal(ptyId: string): void {
   try { entry.term.dispose(); } catch { /* noop */ }
   entry.host.remove();
   pool.delete(ptyId);
+  promptMirror.sync(pool.size); // the last terminal takes the timer with it
 }
 
 // ─── v0.3.4: ⌘-click a path in terminal output ──────────────────────────────
