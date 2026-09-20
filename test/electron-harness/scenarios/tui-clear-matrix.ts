@@ -31,7 +31,7 @@
  * which is an order artifact that happens to support the conclusion.
  */
 import {
-  acquireTerminal, attachTerminal, hasTerminalDraft, disposeTerminal
+  acquireTerminal, attachTerminal, hasTerminalDraft, disposeTerminal, readScreenForNeedle
 } from '../../../src/renderer/src/components/terminalPool';
 
 declare global {
@@ -152,6 +152,10 @@ window.__harnessRun = async () => {
       const stagedHasDraft = hasTerminalDraft('A-' + name, stagedNow);
       const stagedShowsMark = stagedScreen.some((l) => l.includes(cap.mark));
       const stagedPromptRow = promptRow(a);
+      // L0-FUSION stage 5.4c: THE PRODUCTION ERASE ORACLE on the same rendered screen.
+      // `promptRow` / `screen` above are this scenario's own reading; this is the function
+      // main's submit owner actually asks, read beside them so the two can be compared.
+      const stagedOracle = readScreenForNeedle('A-' + name, cap.mark);
 
       await write(a.term, cap.afterClear);
       const clearedNow = Date.now() + ECHO_GRACE_MS + 50;
@@ -159,6 +163,7 @@ window.__harnessRun = async () => {
       const clearedHasDraft = hasTerminalDraft('A-' + name, clearedNow);
       const clearedShowsMark = clearedScreen.some((l) => l.includes(cap.mark));
       const clearedPromptRow = promptRow(a);
+      const clearedOracle = readScreenForNeedle('A-' + name, cap.mark);
 
       // ---- branch B: staged again, then a harmless key
       const b = acquireTerminal('B-' + name);
@@ -178,12 +183,17 @@ window.__harnessRun = async () => {
       const noopHasDraft = hasTerminalDraft('B-' + name, noopNow);
       const noopShowsMark = noopScreen.some((l) => l.includes(cap.mark));
       const noopPromptRow = promptRow(b);
+      const noopOracle = readScreenForNeedle('B-' + name, cap.mark);
+      const absentOracle = readScreenForNeedle('B-' + name, 'NEVER-STAGED-' + cap.mark);
+      const emptyNeedleOracle = readScreenForNeedle('B-' + name, '');
       // Read again at the end: a mode set later would be just as fatal as one set
       // at boot, and a single reading cannot tell "never" from "not yet".
       const modesAtEnd = readModes(a);
 
       (result.providers as Record<string, unknown>)[name] = {
         opened: a.opened && b.opened,
+        oracle: { staged: stagedOracle, afterClear: clearedOracle, afterNoop: noopOracle, absent: absentOracle, emptyNeedle: emptyNeedleOracle,
+          stagedScreenCount: stagedScreen.filter((l) => l.includes(cap.mark)).length },
         modes: { atBoot: modesAtBoot, atEnd: modesAtEnd },
         staged: { hasDraft: stagedHasDraft, showsMark: stagedShowsMark, onPromptRow: stagedPromptRow.includes(cap.mark), promptRow: stagedPromptRow, screen: stagedScreen.slice(-6) },
         afterClear: { hasDraft: clearedHasDraft, showsMark: clearedShowsMark, onPromptRow: clearedPromptRow.includes(cap.mark), promptRow: clearedPromptRow, screen: clearedScreen.slice(-6) },

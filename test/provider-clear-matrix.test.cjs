@@ -102,5 +102,26 @@ test('L0-TERMMATRIX: the clear control, measured per provider on a rendered scre
       + `${JSON.stringify(p.afterClear.promptRow)}`);
     assert.equal(p.afterClear.showsMark, false,
       `${name}: and gone from the screen — not merely pushed off the prompt row`);
+
+    // ── L0-FUSION STAGE 5.4c: THE PRODUCTION ERASE ORACLE, ON THE REAL CAPTURES ──────
+    // Everything above is the scenario's OWN reading of the screen. The submit owner
+    // does not ask the scenario; it asks `readScreenForNeedle` (terminalPool.ts), twice
+    // around a clear, and applies ONE rule (automaticSubmit.ts): before must be on the
+    // prompt row with count >= 1; after must be OFF the prompt row AND counted FEWER
+    // times. These arms run that function on this provider's real rendered capture and
+    // apply that rule written out here, so "the oracle works on claude / codex /
+    // antigravity" is a measurement and not an inference from a fake TUI.
+    const o = p.oracle;
+    assert.deepEqual(o.staged && o.staged.onPromptRow, true, `${name}: the production oracle SEES the staged text on the prompt row: ${JSON.stringify(o.staged)}`);
+    assert.equal(o.staged.screenCount, o.stagedScreenCount, `${name}: and counts the rows the independent reading counts`);
+    assert.ok(o.staged.screenCount >= 1, `${name}: the owner's "before" precondition holds`);
+    const erased = (before, after) => !!before && before.onPromptRow && before.screenCount >= 1
+      && !!after && !after.onPromptRow && after.screenCount < before.screenCount;
+    assert.equal(erased(o.staged, o.afterClear), true,
+      `${name}: AFTER THE MEASURED CLEAR the owner's rule says ERASED: ${JSON.stringify([o.staged, o.afterClear])}`);
+    assert.equal(erased(o.staged, o.afterNoop), false,
+      `${name}: AFTER A HARMLESS KEY the owner's rule says NOT ERASED - it would hold the prompt as INTERFERED rather than claim an abort: ${JSON.stringify([o.staged, o.afterNoop])}`);
+    assert.deepEqual(o.absent, { onPromptRow: false, screenCount: 0 }, `${name}: text that was never staged is found nowhere`);
+    assert.equal(o.emptyNeedle, null, `${name}: an empty needle is NO reading - never "found everywhere"`);
   }
 });
