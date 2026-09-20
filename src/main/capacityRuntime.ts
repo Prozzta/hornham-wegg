@@ -211,6 +211,15 @@ export class CapacityRuntime {
    * is a reservation swallowed by a caller that never used it. That report is a
    * PRECONDITION the deliverer waits on, so "may have landed" is a statement about
    * causation here and not about message ordering.
+   *
+   * STATUS (L0-FUSION stage 5.5a): THE RENDERER NO LONGER HOLDS A TICKET AT ALL. Since
+   * stage 5.3 the ticket door - `beginAutomaticDelivery`, `markAutomaticDeliveryWriting`,
+   * `settleAutomaticDelivery` - and the boolean `maySubmitNow` / `holds` have NO
+   * production caller: main's one submit owner admits, revalidates (`revalidate`, below)
+   * and confirms in-process. Everything above describes a path that no longer runs. The
+   * methods remain ONLY because their tests remain, and those are removed together, in
+   * their own commit, once a validator has signed the test-by-test successor mapping
+   * (test/l0-fusion-stage5-successor-mapping.md). Do not add a caller.
    */
   beginAutomaticDelivery(
     agentId: string,

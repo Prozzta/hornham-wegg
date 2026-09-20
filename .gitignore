@@ -31,3 +31,4 @@ docs/blog-preview-*/
 # L0-FUSION mutant census scratch (test/automatic-submit.test.cjs); removed on exit, ignored in case of a crash
 test/.mutants/
 test/.mutants-delivery-hold/
+test/.mutants-capacity-runtime/

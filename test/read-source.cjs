@@ -35,4 +35,33 @@ function bothEolRenderings(text) {
   return { lf, crlf: lf.replace(/\n/g, '\r\n') };
 }
 
-module.exports = { ROOT, normaliseEol, readSource, bothEolRenderings };
+/**
+ * Source with its COMMENTS blanked out, for a check that something is ABSENT from code (the
+ * files that removed a thing are exactly the files whose comments explain the removal).
+ *
+ * PARSED, NOT PATTERN-MATCHED. The first version was two regexes, and a `/*` inside a
+ * STRING in src/main/index.ts made it swallow about two thousand lines of real code as one
+ * "comment" - an absence check that could not see the code it was checking. Here the
+ * TypeScript parser decides what a token is, and only the comment ranges between tokens
+ * are blanked (with spaces, so offsets and line numbers survive).
+ */
+function codeOnly(text, fileName = 'x.tsx') {
+  const ts = require('typescript');
+  const sf = ts.createSourceFile(fileName, text, ts.ScriptTarget.ES2022, true, ts.ScriptKind.TSX);
+  const ranges = [];
+  const visit = (node) => {
+    const kids = node.getChildren(sf);
+    if (!kids.length || node.kind === ts.SyntaxKind.JsxText) {
+      for (const r of ts.getLeadingCommentRanges(text, node.getFullStart()) ?? []) ranges.push(r);
+      for (const r of ts.getTrailingCommentRanges(text, node.getEnd()) ?? []) ranges.push(r);
+      return;
+    }
+    kids.forEach(visit);
+  };
+  visit(sf);
+  let out = text;
+  for (const r of ranges) out = out.slice(0, r.pos) + out.slice(r.pos, r.end).replace(/[^\n]/g, ' ') + out.slice(r.end);
+  return out;
+}
+
+module.exports = { ROOT, normaliseEol, readSource, bothEolRenderings, codeOnly };

@@ -26,7 +26,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 const loadTs = require('./load-ts.cjs');
-const { readSource } = require('./read-source.cjs');
+const { readSource, codeOnly } = require('./read-source.cjs');
 
 const SRC = 'src/shared/deliveryHold.ts';
 const REAL = loadTs(SRC);
@@ -173,7 +173,8 @@ test('the wording table is TOTAL over exactly the evidence labels main publishes
 });
 
 // ── STATIC WIRING TRIPWIRES (a literal shape in the source; see the header) ───────────
-const codeOnly = (text) => text.replace(/\/\*[\s\S]*?\*\//g, '').replace(/(^|[^:'"`])\/\/.*$/gm, '$1');
+// `codeOnly` comes from read-source.cjs: parser-based. (A regex stripper stood here first and
+// could swallow real code as a comment - see the note there.)
 const handlerBody = (text, channel) => {
   const at = text.indexOf(`ipcMain.handle('${channel}'`);
   assert.ok(at >= 0, `handler ${channel} exists`);

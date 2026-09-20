@@ -18,8 +18,10 @@
  */
 const test = require('node:test');
 const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const path = require('node:path');
 const loadTs = require('./load-ts.cjs');
-const { readSource: read } = require('./read-source.cjs');
+const { readSource: read, codeOnly } = require('./read-source.cjs');
 
 const { AutomaticSubmitOwner, GAP_MS } = loadTs('src/main/automaticSubmit.ts');
 const { buildOwnerDeps, ScreenReadingBroker, isScreenReading } = loadTs('src/main/automaticSubmitWiring.ts');
@@ -66,7 +68,7 @@ function rig(over = {}) {
   };
   const setTimer = (fn, ms) => { const t = { at: r.now + ms, seq: (r.seq += 1), fn, ms }; r.timers.push(t); return { id: t.seq, unref() { return this; } }; };
   r.tracker = new ProviderCapacityTracker(L0_SEM_POLICY, () => r.now, () => r.mono);
-  r.runtime = new CapacityRuntime({
+  r.runtime = new (over.Runtime ?? CapacityRuntime)({
     deliver: () => {}, now: () => r.now, setTimer,
     clearTimer: (h) => { r.timers = r.timers.filter((t) => t.seq !== (h && h.id)); }
   }, r.tracker);
@@ -224,6 +226,208 @@ test('revalidate keeps the verdict tri-state and names each structural refusal',
   assert.deepEqual(r.runtime.revalidate(claim, 'pty-jim'), { verdict: 'REFUSE', reason: CLAIM_REASON.EPOCH });
   assert.equal(r.runtime.maySubmitNow(claim, 'pty-jim'), false, 'the legacy boolean agrees while it still exists');
 });
+
+// ─── The owner against the REAL PtyManager (stage 5.5a) ───────────────────────────────
+//
+// Every arm above uses a PTY double that RESTATES pty.ts's accounting. This one does not:
+// the real `PtyManager` is the `pty` handed to `buildOwnerDeps`, its mirrors are set
+// through its real setters, and the human's keystroke goes in through its real
+// `write(id, data, 'HUMAN')`. The only fake is the OS process behind the session (node-pty
+// is not spawned), injected the way test/input-provenance.test.cjs already injects one.
+// So the generation the owner compares, the timestamp it reads and the incarnation it
+// scopes to are the production ones.
+
+function realPtyRig(humanInGap) {
+  const { PtyManager } = loadTs('src/main/pty.ts');
+  const pm = new PtyManager();
+  const r = rig();
+  const procWrites = [];
+  pm.sessions.set('pty-jim', {
+    id: 'pty-jim', cwd: '', command: '', owner: null, lastOutputAt: 0, hasOutput: true,
+    humanInputGeneration: 0, incarnation: 7,
+    proc: { write: (d) => {
+      procWrites.push(d);
+      // A person types the moment our payload lands - through the REAL human ingress.
+      if (humanInGap && d.includes('inbox') && !procWrites.includes('x')) r.at(40, () => { pm.write('pty-jim', 'x', 'HUMAN'); });
+    } }
+  });
+  assert.deepEqual(pm.setInputState('pty-jim', { mouseTrackingMode: 'none', inputOriginAttached: true, selfTest: 'pass' }), { ok: true });
+  assert.deepEqual(pm.setPromptState('pty-jim', { block: null }), { ok: true });
+  r.runtime.ingest('jim', obs());
+  const owner = new AutomaticSubmitOwner(buildOwnerDeps({
+    pty: pm, capacity: r.runtime,
+    ptyForAgent: (agentId) => (agentId === 'jim' ? 'pty-jim' : undefined),
+    providerForPty: () => 'codex',
+    requestScreenReading: () => Promise.resolve(null),
+    now: () => r.now,
+    setTimer: (fn, ms) => { const t = { at: r.now + ms, seq: (r.seq += 1), fn, ms }; r.timers.push(t); return t; }
+  }));
+  return { r, pm, owner, procWrites };
+}
+
+test('REAL PtyManager: nobody types - the owner’s PROGRAMMATIC writes never move the human generation, and it commits', async () => {
+  const { r, pm, owner, procWrites } = realPtyRig(false);
+  const out = await r.settle(owner.submit({ requestId: 'rp1', agentId: 'jim', admissionClass: 'CAPACITY_GATED', text: 'read your inbox' }));
+  assert.deepEqual(out, { kind: 'COMMITTED' });
+  assert.deepEqual(procWrites, ['read your inbox', '\r'], 'text, then Enter, into the real manager’s process');
+  assert.equal(pm.humanInputGeneration('pty-jim'), 0, 'the owner cannot interfere with itself: PROGRAMMATIC never advances the REAL generation');
+  assert.equal(pm.lastHumanInputAt('pty-jim'), undefined);
+});
+
+test('REAL PtyManager: a HUMAN write through the real ingress, in the gap -> INTERFERED, and no Enter reaches the process', async () => {
+  const { r, pm, owner, procWrites } = realPtyRig(true);
+  const out = await r.settle(owner.submit({ requestId: 'rp2', agentId: 'jim', admissionClass: 'CAPACITY_GATED', text: 'read your inbox' }));
+  assert.deepEqual(out, { kind: 'INTERFERED', reason: 'HUMAN_INPUT_AFTER_STAGE' });
+  assert.deepEqual(procWrites, ['read your inbox', 'x'], 'our payload, their key - and NOTHING after it: no Enter, no clear');
+  assert.equal(pm.humanInputGeneration('pty-jim'), 1, 'the REAL generation is what moved');
+  assert.ok(owner.inhibition('pty-jim'), 'and the terminal is held for a person');
+  // The hold is scoped to the REAL incarnation: a same-id respawn is a different terminal.
+  pm.sessions.get('pty-jim').incarnation = 8;
+  assert.equal(owner.inhibition('pty-jim'), null, 'a new incarnation under the same id does not inherit the hold');
+});
+
+// ─── L0-TOCTOU, MIGRATED ONTO `revalidate` (stage 5.5a; nothing is deleted by this) ────
+//
+// The five L0-TOCTOU tests and the L0-WAKE shared check in
+// provider-capacity-delivery-death.test.cjs ask their question through the TICKET door
+// (`markAutomaticDeliveryWriting`) and the legacy boolean (`maySubmitNow`), neither of
+// which has a production caller any more. The question itself is alive: it is what the
+// owner asks inside its critical section, through `revalidate`. These are the same five
+// schedules asked through THAT door, with the full answer (verdict AND reason) pinned
+// rather than a boolean - so when the ticket door is removed (its own commit, after a
+// validator signs the successor mapping) nothing the old tests held is left unheld.
+// The old tests stay until then; both sets pass side by side.
+
+/** Killers: each takes the CapacityRuntime CLASS under test, so the census below can hand
+ *  it a mutant. They run against the real class as ordinary tests. */
+const KR = {};
+
+/** A claim admitted on a healthy pool, as the owner holds one between ADMIT and COMMIT. */
+function claimOnHealthyPool(Runtime, target = 'pty-jim') {
+  const r = rig({ Runtime });
+  r.runtime.ingest('jim', obs());
+  assert.equal(r.state(), 'AVAILABLE', 'precondition: admitted on a healthy pool');
+  const decision = r.runtime.admit('jim');
+  assert.equal(decision.verdict, 'ALLOW');
+  return { r, claim: { decision, agentId: 'jim', workClass: 'ORDINARY_TURN', target } };
+}
+
+KR.limitedAfterAdmission = (Runtime) => { // TOCTOU on revalidate: a pool that goes LIMITED after admission REFUSES, and says the EPOCH changed
+  const { r, claim } = claimOnHealthyPool(Runtime);
+  assert.deepEqual(r.runtime.revalidate(claim, 'pty-jim'), { verdict: 'ALLOW', reason: ADMISSION_REASON.AVAILABLE },
+    'precondition: while the pool is healthy the Enter is authorised');
+  r.runtime.ingest('jim', LIMIT(T0 + 1_000));
+  assert.equal(r.state(), 'LIMITED', 'the pool really did move');
+  assert.deepEqual(r.runtime.revalidate(claim, 'pty-jim'), { verdict: 'REFUSE', reason: CLAIM_REASON.EPOCH },
+    'a claim admitted on a healthy pool authorises NOTHING once that pool is LIMITED');
+};
+
+KR.reserveOnlyAfterAdmission = (Runtime) => { // TOCTOU on revalidate: a pool that goes RESERVE_ONLY refuses an ORDINARY turn - a different path from LIMITED
+  // No refusal, so no limit epoch: the structural checks all pass and the answer has to
+  // come from re-asking admission. A revalidation that only compared epochs passes this.
+  const { r, claim } = claimOnHealthyPool(Runtime);
+  r.runtime.ingest('jim', obs({ observedAt: T0 + 1_000, receivedAt: T0 + 1_000, windows: [win(0)] }));
+  assert.equal(r.state(), 'RESERVE_ONLY', 'a fresh numeric zero without attribution');
+  const now = r.runtime.revalidate(claim, 'pty-jim');
+  assert.equal(now.verdict, 'REFUSE', 'ordinary work is suppressed, so this Enter is not authorised');
+  assert.ok(!Object.values(CLAIM_REASON).includes(now.reason),
+    `and the reason is ADMISSION's own (${now.reason}), not a structural one: the claim is intact, the pool is spent`);
+};
+
+KR.poolMoved = (Runtime) => { // TOCTOU on revalidate: an agent whose readings moved to ANOTHER pool is not this claim's agent
+  const { r, claim } = claimOnHealthyPool(Runtime);
+  r.runtime.ingest('jim', obs({ poolKey: 'codex:acct-b:codex', accountScope: 'acct-b', observedAt: T0 + 1_000, receivedAt: T0 + 1_000 }));
+  assert.deepEqual(r.runtime.revalidate(claim, 'pty-jim'), { verdict: 'REFUSE', reason: CLAIM_REASON.POOL },
+    'both pools are healthy - the refusal is that the decision was about a pool this agent no longer draws on');
+};
+
+KR.boundToOneTerminal = (Runtime) => { // TOCTOU on revalidate: a claim is bound to ONE terminal - another, or none, is refused; its own is not
+  const { r, claim } = claimOnHealthyPool(Runtime, 'pty-A');
+  assert.deepEqual(r.runtime.revalidate(claim, 'pty-B'), { verdict: 'REFUSE', reason: CLAIM_REASON.TARGET }, 'another terminal cannot spend it');
+  assert.deepEqual(r.runtime.revalidate(claim, null), { verdict: 'REFUSE', reason: CLAIM_REASON.TARGET }, 'nor can an Enter that will not say which terminal it is for');
+  assert.deepEqual(r.runtime.revalidate(claim, 'pty-A'), { verdict: 'ALLOW', reason: ADMISSION_REASON.AVAILABLE }, 'the binding is a match, not a ban');
+};
+
+KR.ownReservationIsNotARefusal = (Runtime) => { // TOCTOU on revalidate: a RECOVERING claim is NOT refused by its own reservation - and a stranger is
+  const r = rig({ Runtime });
+  recovering(r);
+  const decision = r.runtime.admit('jim');
+  assert.equal(decision.verdict, 'ALLOW');
+  assert.ok(decision.grantId, 'precondition: the epoch granted its one turn to THIS decision');
+  const claim = { decision, agentId: 'jim', workClass: 'ORDINARY_TURN', target: 'pty-jim' };
+  assert.deepEqual({ ...r.runtime.admission.probe('jim', 'ORDINARY_TURN') }.verdict, 'REFUSE',
+    'the probe DOES refuse right now - which is exactly why a naive revalidation breaks');
+  assert.deepEqual(r.runtime.revalidate(claim, 'pty-jim'), { verdict: 'ALLOW', reason: ADMISSION_REASON.RECOVERING_GRANT },
+    'the pool refuses everyone ELSE because of this claim; that is not a refusal of it');
+  const second = r.runtime.admit('jim');
+  assert.equal(second.verdict, 'REFUSE', 'a second asker gets no turn');
+  assert.equal(r.runtime.revalidate({ ...claim, decision: second }, 'pty-jim').verdict, 'REFUSE',
+    'and a claim that does NOT hold the grant is refused by the same pool');
+  r.runtime.cancelGrant(decision);
+  assert.deepEqual(r.runtime.revalidate(claim, 'pty-jim'), { verdict: 'REFUSE', reason: CLAIM_REASON.GRANT },
+    'once the grant is handed back the claim that held it authorises nothing');
+};
+
+for (const [name, killer] of Object.entries(KR)) test(`TOCTOU on revalidate: ${name}`, () => killer(CapacityRuntime));
+
+const RUNTIME_MUTANTS = [
+  { name: 'the terminal binding dropped',
+    edits: [["    if (held.target !== target) return { verdict: 'REFUSE', reason: CLAIM_REASON.TARGET };\n", '']],
+    killer: 'boundToOneTerminal', dies: /another terminal cannot spend it/ },
+  { name: 'a moved pool goes unnoticed',
+    edits: [["    if ((this.poolForAgent.get(held.agentId) ?? null) !== held.decision.poolKey) {\n      return { verdict: 'REFUSE', reason: CLAIM_REASON.POOL };\n    }\n", '']],
+    killer: 'poolMoved', dies: /no longer draws on/ },
+  { name: 'the epoch comparison dropped (the refusal loses its name)',
+    edits: [["    if ((pool?.limitEpochAt ?? null) !== held.decision.limitEpochAt) {\n      return { verdict: 'REFUSE', reason: CLAIM_REASON.EPOCH };\n    }\n", '']],
+    killer: 'limitedAfterAdmission', dies: /authorises NOTHING once that pool is LIMITED/ },
+  { name: 'structural checks only - admission is never re-asked',
+    edits: [['    return { verdict: now.verdict, reason: now.reason };', "    return { verdict: 'ALLOW', reason: ADMISSION_REASON.AVAILABLE };"]],
+    killer: 'reserveOnlyAfterAdmission', dies: /ordinary work is suppressed/ },
+  { name: 'the carve-out removed: the guard refuses its own reservation',
+    edits: [["now.reason === ADMISSION_REASON.RECOVERING_SPENT\n", "now.reason === 'NEVER'\n"]],
+    killer: 'ownReservationIsNotARefusal', dies: /that is not a refusal of it/ },
+  { name: 'the carve-out opened to strangers',
+    edits: [["RECOVERING_SPENT\n      && this.admission.holdsGrant(held.decision)) {", 'RECOVERING_SPENT) {']],
+    killer: 'ownReservationIsNotARefusal', dies: /does NOT hold the grant/ },
+  { name: 'a lost grant still authorises',
+    edits: [['    if (held.decision.grantId && !this.admission.holdsGrant(held.decision)) {', '    if (false) {']],
+    killer: 'ownReservationIsNotARefusal', dies: /handed back/ }
+];
+
+const RUNTIME_MUTANT_DIR = path.join(__dirname, '.mutants-capacity-runtime');
+
+test('MUTANT CENSUS (capacityRuntime.revalidate): every mutant applies exactly once and dies at the named assertion', async (t) => {
+  const source = read('src/main/capacityRuntime.ts');
+  fs.rmSync(RUNTIME_MUTANT_DIR, { recursive: true, force: true });
+  fs.mkdirSync(RUNTIME_MUTANT_DIR, { recursive: true });
+  try {
+    for (const [i, mutant] of RUNTIME_MUTANTS.entries()) {
+      await t.test(`mutant: ${mutant.name}`, () => {
+        assert.ok(KR[mutant.killer], `killer ${mutant.killer} exists`);
+        KR[mutant.killer](CapacityRuntime); // passes on the real class...
+        let text = source;
+        for (const [from, to] of mutant.edits) {
+          const hits = text.split(from).length - 1;
+          assert.equal(hits, 1, `mutant "${mutant.name}": edit target must match EXACTLY ONCE, matched ${hits}`);
+          text = text.replace(from, () => to);
+        }
+        // The copy lives two directories away from src/main, so its relative imports move.
+        text = text.replace(/from '\.\/(\w+)'/g, "from '../../src/main/$1'").replace(/from '\.\.\/shared\//g, "from '../../src/shared/");
+        const file = path.join(RUNTIME_MUTANT_DIR, `m${i}.ts`);
+        fs.writeFileSync(file, text, 'utf8');
+        const Mutant = loadTs(path.relative(path.resolve(__dirname, '..'), file)).CapacityRuntime;
+        let died = null;
+        try { KR[mutant.killer](Mutant); } catch (e) { died = e; }
+        assert.ok(died, `SURVIVED: "${mutant.name}" was not killed by ${mutant.killer}`);
+        assert.ok(died instanceof assert.AssertionError, `"${mutant.name}" must die by ASSERTION, got: ${died && died.stack}`);
+        assert.match(died.message, mutant.dies, `"${mutant.name}" died at the wrong assertion`);
+      });
+    }
+  } finally {
+    fs.rmSync(RUNTIME_MUTANT_DIR, { recursive: true, force: true });
+  }
+});
+
 
 // ─── L0-UNKNOWN (human ruling, option B) against the REAL tracker ─────────────────────
 
@@ -615,7 +819,9 @@ const nodeFs = require('node:fs');
 const nodePath = require('node:path');
 /** Source with its comments removed. An ABSENCE check must look at code: the files that
  *  removed a thing are exactly the files whose comments explain that it was removed. */
-const codeOnly = (text) => text.replace(/\/\*[\s\S]*?\*\//g, '').replace(/(^|[^:'"`])\/\/.*$/gm, '$1');
+// `codeOnly` is the PARSER-BASED stripper from read-source.cjs. The regex pair that stood
+// here until stage 5.5a swallowed ~2000 lines of index.ts as one comment (a `/*` inside a
+// string), so every absence check over index.ts was looking at half a file.
 
 /** Every .ts/.tsx under a subtree, so a census cannot be dodged by adding a new file. */
 function walkSrc(rel) {
@@ -628,16 +834,28 @@ function walkSrc(rel) {
   return out;
 }
 
-test('EXHAUSTIVE CENSUS: a bare Enter is WRITTEN in exactly two places, and one is a declared private PTY', () => {
-  // The design's closing claim (section 10): "no current automatic caller uses raw Enter,
-  // by exhaustive call-graph". Every source file, not a named list. A line that WRITES a
-  // lone carriage return is a programmatic submit; comparisons against '\r' are not.
+/** THE BARE-ENTER WALK. It looks for a line that writes a lone carriage return SPELLED AS A
+ *  LITERAL. Widened in stage 5.5a to the spellings Dwight showed the first version missed
+ *  ('\r', '\x0d', '\u000d', '\u{d}', String.fromCharCode(13)) - and it STILL cannot see a
+ *  named constant, a computed string, or an Enter on the end of a longer payload. */
+const BARE_ENTER = /(write|writePty|safeWrite)\w*\([^)]*(['"`]\\(r|x0[dD]|u000[dD]|u\{0*[dD]\})['"`]|String\.fromCharCode\(\s*(13|0x0?[dD])\s*\))\s*(,[^)]*)?\)/;
+function bareEnterWriters(readFile) {
   const writers = [];
   for (const f of walkSrc('src')) {
-    read(f).split('\n').forEach((line, i) => {
-      if (/(write|writePty|safeWrite)\w*\([^)]*['"`]\\r['"`]\s*\)/.test(line)) writers.push(`${f}:${i + 1}`);
-    });
+    readFile(f).split('\n').forEach((line, i) => { if (BARE_ENTER.test(line)) writers.push(`${f}:${i + 1}`); });
   }
+  return writers;
+}
+
+test('TRIPWIRE, NOT THE GUARANTEE: a bare Enter is SPELLED in exactly two places, and one is a declared private PTY', () => {
+  // WHAT THIS IS WORTH (Dwight, validating stage 5.3): it proves a LITERAL CONVENTION and
+  // no more. A regex over the DATA argument cannot enumerate the ways to spell a carriage
+  // return, so it can never carry the design's closing claim (section 10: "no current
+  // automatic caller uses raw Enter, by exhaustive call-graph"). That claim is carried by
+  // the CALLEE census below, which enumerates who can write to an agent terminal AT ALL
+  // and is indifferent to how the data is spelled. This walk stays as a cheap tripwire
+  // for the ordinary case - someone pasting `write(id, '\r')` somewhere new.
+  const writers = bareEnterWriters(read);
   const files = writers.map((w) => w.split(':')[0]).sort();
   assert.deepEqual(files, ['src/main/automaticSubmit.ts', 'src/main/hiddenClaude.ts'],
     `a bare Enter is written ONLY by the submit owner and by hiddenClaude's private PTY; found ${writers.join(', ')}`);
@@ -650,6 +868,155 @@ test('EXHAUSTIVE CENSUS: a bare Enter is WRITTEN in exactly two places, and one 
   assert.match(hidden, /NOT routed through the main-owned submit transaction, and\s+\/\/ deliberately: this is a PRIVATE, hidden, single-use PTY/);
   assert.ok(!/ptyManager/.test(codeOnly(hidden)), 'hiddenClaude never touches an AGENT terminal: its code has no reference to ptyManager at all');
 });
+
+// ─── THE CALLEE CENSUS: who can write to an agent terminal AT ALL (design section 10) ───
+//
+// Indifferent to how the data is spelled, because it never looks at the data. It
+// enumerates RECEIVERS: every `<receiver>.write(` call in main and preload, code only.
+//   - a receiver that is a PTY is pinned to an exact file and an exact COUNT;
+//   - a receiver that is not a PTY must be on a per-file allowlist written out here;
+//   - a `write` taken as a value, or reached by a computed name, is refused outright;
+//   - ANY OTHER RECEIVER FAILS THE CENSUS, so a new writer has to be classified by a person.
+// Around it: node-pty is imported by exactly two files; the PTY manager is never aliased;
+// the raw process write exists once, inside a method whose signature REQUIRES an origin;
+// the 'pty:write' channel has one sender and one handler; the owner writes at three named
+// points. The renderer's six `writePty` sites and the single PROGRAMMATIC producer are
+// pinned in test/input-provenance.test.cjs and are not repeated here.
+//
+// KNOWN LIMIT, stated rather than hoped away: a PTY smuggled in under an allowlisted
+// non-PTY NAME (a variable called `stream` that is really the manager) is invisible to a
+// census of names. The no-alias and node-pty-importer checks are what stand in its way.
+const PTY_WRITERS = {
+  'src/main/pty.ts': { 's.proc': 1 },                       // THE raw write, inside write(id, data, origin)
+  'src/main/index.ts': { ptyManager: 1 },                   // the pty:write handler (renderer origin; PROGRAMMATIC refused)
+  'src/main/automaticSubmitWiring.ts': { 'w.pty': 1 },      // the ONLY PROGRAMMATIC producer
+  'src/main/automaticSubmit.ts': { deps: 1 },               // safeWrite - the owner's one write
+  'src/main/hiddenClaude.ts': { ptyProc: 2 }                // a PRIVATE hidden PTY, declared, never an agent's
+};
+const NON_PTY_WRITERS = {
+  'src/main/index.ts': ['stream', 'roster'],                // a download stream; the roster file
+  'src/main/slack.ts': ['req']                              // an https request body
+};
+
+/** Parsed, not pattern-matched. A first version stripped comments with a regex and then
+ *  searched the text - and a `/*` inside a STRING in index.ts swallowed two thousand lines
+ *  of real code, `ptyManager.write(` among them: a census that silently could not see the
+ *  thing it counts. The TypeScript AST has no such blind spot: a string is a string, a
+ *  comment is trivia, and a call is a call. (Generated hook scripts in hive.ts are string
+ *  CONTENT, not calls main makes, and are correctly not counted.) */
+const tsc = require('typescript');
+function walkAst(file, text, visit) {
+  const sf = tsc.createSourceFile(file, text, tsc.ScriptTarget.ES2022, true, file.endsWith('x') ? tsc.ScriptKind.TSX : tsc.ScriptKind.TS);
+  const go = (node) => { visit(node, sf); tsc.forEachChild(node, go); };
+  go(sf);
+}
+
+/** @param readFile (relPath) => source. The census takes its reader so a mutant can be
+ *  handed to it as an overlay; it asserts, and returns nothing. */
+function calleeCensus(readFile) {
+  const files = [...walkSrc('src/main'), ...walkSrc('src/preload')];
+  const found = {};
+  const importers = [];
+  const channel = [];
+  let bareManager = 0;
+  let safeWrites = 0;
+  let managerWrite = null;
+  for (const f of files) {
+    walkAst(f, readFile(f), (node, sf) => {
+      const named = (n) => (tsc.isPropertyAccessExpression(n) && n.name.text === 'write')
+        || (tsc.isElementAccessExpression(n) && tsc.isStringLiteralLike(n.argumentExpression) && n.argumentExpression.text === 'write');
+      if (named(node)) {
+        const called = tsc.isCallExpression(node.parent) && node.parent.expression === node;
+        assert.ok(called && tsc.isPropertyAccessExpression(node),
+          `CALLEE CENSUS: ${f}: \`${node.getText(sf)}\` is a write taken as a VALUE or reached by a computed name (alias, bind, call, apply) - invisible to a census of calls, so it is refused outright`);
+        const receiver = node.expression.getText(sf).replace(/\s+/g, '');
+        (found[f] ??= {})[receiver] = ((found[f] ?? {})[receiver] ?? 0) + 1;
+      }
+      if (tsc.isStringLiteralLike(node)) {
+        if (node.text === 'node-pty' && (tsc.isImportDeclaration(node.parent) || tsc.isCallExpression(node.parent) || tsc.isExternalModuleReference(node.parent))) importers.push(f);
+        if (node.text === 'pty:write') channel.push(f);
+      }
+      if (f === 'src/main/index.ts' && tsc.isIdentifier(node) && node.text === 'ptyManager'
+        && !(tsc.isPropertyAccessExpression(node.parent) && node.parent.expression === node)) bareManager += 1;
+      if (f === 'src/main/automaticSubmit.ts' && tsc.isCallExpression(node) && tsc.isIdentifier(node.expression) && node.expression.text === 'safeWrite') safeWrites += 1;
+      if (f === 'src/main/pty.ts' && tsc.isMethodDeclaration(node) && node.name.getText(sf) === 'write'
+        && tsc.isClassDeclaration(node.parent) && node.parent.name?.text === 'PtyManager') managerWrite = { node, sf };
+    });
+  }
+  for (const [f, receivers] of Object.entries(found)) {
+    for (const [receiver, count] of Object.entries(receivers)) {
+      const pinned = PTY_WRITERS[f]?.[receiver];
+      if (pinned !== undefined) { assert.equal(count, pinned, `CALLEE CENSUS: ${f} writes to the PTY receiver \`${receiver}\` ${count}x, pinned at ${pinned}x - a NEW WRITER TO A TERMINAL must go through the submit owner`); continue; }
+      assert.ok((NON_PTY_WRITERS[f] ?? []).includes(receiver), `CALLEE CENSUS: unclassified writer \`${receiver}.write(\` in ${f} (${count}x) - say what it writes to before it ships`);
+    }
+  }
+  for (const [f, receivers] of Object.entries(PTY_WRITERS)) {
+    for (const receiver of Object.keys(receivers)) assert.ok(found[f]?.[receiver], `CALLEE CENSUS: the pinned writer \`${receiver}\` is still in ${f} (a stale pin proves nothing)`);
+  }
+  for (const [f, receivers] of Object.entries(NON_PTY_WRITERS)) {
+    for (const receiver of receivers) assert.ok(found[f]?.[receiver], `CALLEE CENSUS: the allowlisted non-PTY writer \`${receiver}\` is still in ${f} (a stale allowance is a hole waiting for a name)`);
+  }
+  assert.deepEqual([...new Set(importers)].sort(), ['src/main/hiddenClaude.ts', 'src/main/pty.ts'], 'CALLEE CENSUS: only these two files can hold a PTY process at all');
+  assert.equal(bareManager, 2, 'CALLEE CENSUS: the PTY manager appears as a bare value exactly twice in index.ts - its construction and its hand-off to the owner wiring - so it is never aliased');
+  assert.deepEqual(channel.sort(), ['src/main/index.ts', 'src/preload/index.ts'], "CALLEE CENSUS: 'pty:write' is named once by its handler and once by its sender");
+  assert.equal(safeWrites, 3, 'CALLEE CENSUS: the owner writes at exactly three points - the payload, the Enter, the measured clear');
+  assert.ok(managerWrite, 'CALLEE CENSUS: PtyManager.write exists');
+  const params = managerWrite.node.parameters;
+  assert.equal(params.length, 3);
+  assert.ok(params[2].name.getText(managerWrite.sf) === 'origin' && !params[2].questionToken && !params[2].initializer,
+    'CALLEE CENSUS: PtyManager.write REQUIRES an origin - not optional, no default');
+  assert.ok(managerWrite.node.body.getText(managerWrite.sf).includes('s.proc.write(data)'), 'CALLEE CENSUS: and the one raw process write is inside it');
+}
+
+test('codeOnly is PARSER-BASED: a `/*` inside a line comment or a string swallows no code (the stage-5.5a blind spot)', () => {
+  // The exact shape that blinded the regex stripper: `google/*` in a LINE comment opened a
+  // fake block comment, and the next real `*/` was 399 lines later.
+  const sample = [
+    '// inject both so google/* authenticates',
+    'ptyManager.write(id, data, origin);',
+    "const glob = 'src/**/*.ts';",
+    '/* a real block comment */ const kept = 1; // a real tail comment */',
+    'const after = 2;'
+  ].join('\n');
+  const code = codeOnly(sample, 'sample.ts');
+  for (const kept of ['ptyManager.write(id, data, origin);', "'src/**/*.ts'", 'const kept = 1;', 'const after = 2;']) {
+    assert.ok(code.includes(kept), `real code survives: ${kept}`);
+  }
+  for (const gone of ['google', 'a real block comment', 'a real tail comment']) assert.ok(!code.includes(gone), `comment text is gone: ${gone}`);
+  assert.equal(code.split('\n').length, sample.split('\n').length, 'and line numbers survive');
+  const regexPair = (t) => t.replace(/\/\*[\s\S]*?\*\//g, '').replace(/(^|[^:'"`])\/\/.*$/gm, '$1');
+  assert.ok(!regexPair(sample).includes('ptyManager.write('), 'the regex pair this replaced DID swallow the write - which is why it was replaced');
+});
+
+test('CALLEE CENSUS (section 10): every call that can write to an agent terminal is enumerated, with who it is', () => {
+  calleeCensus(read);
+});
+
+// Dwight's four spellings of Enter, each as a NEW AUTOMATIC WRITER outside the owner. The
+// point of the pair of assertions: the literal walk is BLIND to three of the four (which
+// is why it is only a tripwire), and the callee census kills all four without ever
+// reading the data.
+const ENTER_SPELLINGS = [
+  { name: "'\\x0d'", code: "ptyManager.write(id, '\\x0d', 'CONTROL');", walkSees: true },
+  { name: "'\\u000d'", code: "ptyManager.write(id, '\\u000d', 'CONTROL');", walkSees: true },
+  { name: 'String.fromCharCode(13)', code: "ptyManager.write(id, String.fromCharCode(13), 'CONTROL');", walkSees: true },
+  { name: 'a named constant', code: "ptyManager.write(id, SUBMIT_KEY, 'CONTROL');", walkSees: false },
+  { name: 'Enter on the end of a payload', code: "ptyManager.write(id, text + ENTER, 'CONTROL');", walkSees: false },
+  { name: 'an aliased manager', code: "const sink = ptyManager; sink.write(id, SUBMIT_KEY, 'CONTROL');", walkSees: false }
+];
+for (const spelling of ENTER_SPELLINGS) {
+  test(`CALLEE CENSUS mutant: a new automatic Enter spelled as ${spelling.name} dies at the census`, () => {
+    const anchor = "ipcMain.handle('autoSubmit:submit', ";
+    const real = read('src/main/index.ts');
+    assert.equal(real.split(anchor).length - 1, 1, 'the mutant insertion point matches EXACTLY ONCE');
+    const mutated = real.replace(anchor, () => `function rogueWake(id: string, text: string): void { ${spelling.code} }\n${anchor}`);
+    const overlay = (f) => (f === 'src/main/index.ts' ? mutated : read(f));
+    assert.equal(bareEnterWriters(overlay).some((w) => w.startsWith('src/main/index.ts:')), spelling.walkSees,
+      `the literal walk ${spelling.walkSees ? 'sees' : 'is BLIND to'} this spelling - which is exactly why it is a tripwire and not the guarantee`);
+    assert.throws(() => calleeCensus(overlay), (e) => e instanceof assert.AssertionError && /CALLEE CENSUS/.test(e.message),
+      'and the callee census kills it without reading the data at all');
+  });
+}
 
 test('the renderer cannot type programmatically: no chain, no order, no ticket, no raw submit', () => {
   const hive = read('src/renderer/src/hooks/useHive.ts');

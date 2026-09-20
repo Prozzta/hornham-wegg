@@ -4049,7 +4049,9 @@ ipcMain.handle('control:snapshot', (_evt, agentId: unknown) => {
   // It PROBES rather than admits: this handler runs on every queue tick, and admitting
   // would spend the epoch's single recovery turn on the question.
   //
-  // L0-UNKNOWN (human ruling, option B). The flag used to be `verdict === 'REFUSE'`, one
+  // L0-UNKNOWN (the human's REVISED ruling, option ii - `UNKNOWN_POLICY` in
+  // automaticSubmit.ts is the mapping in force; the first ruling, option B, which held
+  // every UNKNOWN, is superseded). The flag used to be `verdict === 'REFUSE'`, one
   // of the four places UNKNOWN proceeded by an inequality nobody chose. It now comes
   // through the ONE resolver and the ONE ratified mapping, so this hint and the submit
   // owner cannot disagree - and the EVIDENCE rides along undissolved, because the ruling
