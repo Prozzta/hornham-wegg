@@ -4060,7 +4060,11 @@ ipcMain.handle('control:snapshot', (_evt, agentId: unknown) => {
     probed.poolKey ? providerCapacity.tracker.pool(probed.poolKey)?.freshness ?? null : null,
     undefined,
     probed.poolKey ? providerCapacity.tracker.resetOutlook(probed.poolKey) : null);
-  return { ...control.snapshot(agentId), capacityHold: gate.holds, capacityEvidence: gate.evidence };
+  // INTERFERED, read from the one owner (stage 5.4b). It is reported, never decided, here.
+  const heldPty = ptyForAgent(agentId);
+  const held = heldPty ? automaticSubmit.inhibition(heldPty) : null;
+  const interfered = held ? { requestId: held.requestId, reason: held.reason, at: held.at } : null;
+  return { ...control.snapshot(agentId), capacityHold: gate.holds, capacityEvidence: gate.evidence, interfered };
 });
 
 /**
@@ -4090,6 +4094,21 @@ ipcMain.handle('autoSubmit:submit', (_evt, req: unknown) => {
     requestId: r.requestId, agentId: r.agentId, admissionClass: r.admissionClass as AdmissionClass,
     text: r.text, settleMs
   });
+});
+
+/**
+ * L0-FUSION stage 5.4b - A HUMAN RESOLVES AN INTERFERED HOLD.
+ *
+ * The only caller is a person's click in the composer. It types nothing, clears nothing
+ * and sends no Enter: it lifts the owner's refusal for that terminal and releases the held
+ * request id, and whatever is delivered next goes through the full gate again - which
+ * still refuses a prompt that has text on it. There is deliberately no timer, no expiry
+ * and no main-side caller: automation does not get to decide a human's text is finished.
+ */
+ipcMain.handle('autoSubmit:resolveInterference', (_evt, agentId: unknown) => {
+  if (typeof agentId !== 'string' || !agentId) return false;
+  const ptyId = ptyForAgent(agentId);
+  return ptyId ? automaticSubmit.resolveInterference(ptyId) : false;
 });
 
 // ─── IPC: scheduled missions (recurring auto-dispatch) ──────────────────────

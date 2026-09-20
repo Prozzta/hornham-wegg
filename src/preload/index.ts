@@ -507,10 +507,17 @@ export interface AgentControlSnapshot {
    * Provider capacity refuses an ORDINARY automatic turn for this agent's pool.
    * Computed in MAIN at the IPC boundary from the admission seam; never derived on
    * this side. Separate from `autoDeliveryPaused`, which means a person paused the
-   * agent and is rendered as such — this one gates automatic delivery and is not
-   * shown anywhere.
+   * agent and is rendered as such — this one gates automatic delivery and is shown as
+   * a capacity hold, in the words of `capacityEvidence` (shared/deliveryHold.ts).
    */
   capacityHold?: boolean;
+  /**
+   * L0-FUSION stage 5.4b - an unresolved INTERFERED on this agent's terminal, or null. A
+   * human typed onto automation's staged text: main sent no Enter, cleared nothing, and
+   * refuses every programmatic delivery to that terminal until a HUMAN resolves it
+   * (`autoSubmit:resolveInterference`). Read from the one owner; it has no timer.
+   */
+  interfered?: { requestId: string; reason: string; at: number } | null;
   /** Why (L0-UNKNOWN ruling, state invariant): 'NO_POOL' = outside capacity gating, NEVER
    *  "available"; 'STALE_AFTER_HEALTHY' proceeds but is NOT healthy; 'RECOVERING' is a
    *  post-reset re-probe and is NOT healthy; the rest are held. Computed in main through
@@ -1107,6 +1114,14 @@ const api = {
    */
   autoSubmit: (req: { requestId: string; agentId: string; admissionClass: AutoSubmitClass; text: string; settleMs?: number }): Promise<AutoSubmitOutcome> =>
     ipcRenderer.invoke('autoSubmit:submit', req),
+  /**
+   * L0-FUSION stage 5.4b - A HUMAN says the prompt that was interfered with is dealt with.
+   * The only way an INTERFERED hold ends while its terminal lives. Call it from a person's
+   * click and from nowhere else: no timer, no retry loop, no automation may decide that a
+   * human's text no longer matters. Types nothing, clears nothing, sends no Enter.
+   */
+  resolveInterference: (agentId: string): Promise<boolean> =>
+    ipcRenderer.invoke('autoSubmit:resolveInterference', agentId),
   /** Subscribe to gate/deny events (a tool was blocked); returns unsubscribe fn. */
   onApprovalRequest: (cb: (e: { agentId: string; tool?: string; reason?: string }) => void): (() => void) => {
     const listener = (_e: IpcRendererEvent, payload: { agentId: string; tool?: string; reason?: string }) => cb(payload);

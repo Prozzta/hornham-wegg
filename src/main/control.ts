@@ -36,9 +36,16 @@ export interface AgentControlSnapshot {
    * It is deliberately SEPARATE from `autoDeliveryPaused`: that flag means a person
    * paused this agent and is shown as such, so folding capacity into it would tell a
    * user they paused something they did not. This one gates automatic delivery and
-   * is not rendered.
+   * is shown as what it is - a capacity hold, in the words of `capacityEvidence`.
    */
   capacityHold?: boolean;
+  /**
+   * L0-FUSION stage 5.4b - an unresolved INTERFERED on this agent's terminal, or null. A
+   * human typed onto automation's staged text: main sent no Enter, cleared nothing, and
+   * refuses every programmatic delivery to that terminal until a HUMAN resolves it
+   * (`autoSubmit:resolveInterference`). Read from the one owner; it has no timer.
+   */
+  interfered?: { requestId: string; reason: string; at: number } | null;
   /**
    * WHY capacity answers as it does, kept distinct (L0-UNKNOWN ruling, state invariant):
    * 'NO_POOL' is OUTSIDE capacity gating and never "available"; 'STALE_AFTER_HEALTHY'

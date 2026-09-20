@@ -5,6 +5,7 @@ import { Icon } from './Icon';
 import { useStore, type Agent, type QueuedMessage } from '@/store/store';
 import { clearTerminalDraft, dismissTerminalPicker, terminalAutomationBlockFor } from './terminalPool';
 import type { TerminalAutomationBlock } from './terminalAutomation';
+import { capacityStateNote, deliveryHoldView, isHeldQueueItem, type CapacityEvidenceName, type InterferedView } from '@shared/deliveryHold';
 import { freeflowRecorder, useFreeflow } from '@/freeflow/recorder';
 import { useTerminalFontSize } from './terminalFontSize';
 
@@ -153,24 +154,42 @@ export function MessageQueueComposer({ agent }: MessageQueueComposerProps) {
   // the hint claimed it was sending while nothing moved — so poll it and say so.
   const block = useTerminalBlock(agent.ptyId, queue.length > 0 && idle);
 
-  // Floor-wide auto-delivery pause (Command Center switch) also holds the queue.
-  // Without saying so — and without the per-row "send now" override — messages
-  // look permanently stuck with no explanation and no escape hatch.
-  const deliveryPaused = useDeliveryPaused(agent.id, queue.length > 0);
+  // What MAIN is holding this queue for: the floor-wide pause (Command Center switch),
+  // provider capacity, or an unresolved INTERFERED. Without saying so — and without the
+  // per-row "send now" override — messages look permanently stuck with no explanation
+  // and no escape hatch. Main computes all three; this only words them (L0-FUSION 5.4b).
+  const delivery = useDeliveryState(agent.id);
+  const hold = deliveryHoldView({
+    agentName: agent.name,
+    interfered: delivery.interfered,
+    paused: delivery.paused,
+    headManual: !!queue[0]?.manual,
+    capacityHold: delivery.capacityHold,
+    capacityEvidence: delivery.capacityEvidence
+  });
+  // "send now" is the way out of a pause or a capacity hold. It is NOT a way out of
+  // INTERFERED: main refuses every programmatic delivery to that terminal, so offering it
+  // would be offering something that cannot happen.
+  const releasable = !delivery.interfered && (delivery.paused || delivery.capacityHold);
+  const capacityNote = capacityStateNote(delivery.capacityEvidence);
 
-  const statusHint = queue.length === 0
+  // INTERFERED is shown even with nothing queued: a worker wake can be the held request,
+  // and the terminal stays refused until a person resolves it.
+  const statusHint = hold?.kind === 'INTERFERED'
+    ? hold.hint
+    : queue.length === 0
     ? null
     : !idle
     ? `${agent.name} is busy — ${queue.length} queued`
-    : deliveryPaused && !queue[0]?.manual
-    ? 'held — delivery paused floor-wide'
+    : hold
+    ? hold.hint
     : block === 'draft'
     ? `held — ${agent.name}'s terminal has unsent text on its prompt`
     : block === 'picker'
     ? `held — a slash-command picker is open in ${agent.name}'s terminal`
     : block === 'exited'
     ? `held — ${agent.name}'s terminal has exited`
-    : `sending to ${agent.name} one-by-one…`;
+    : `sending to ${agent.name} one-by-one…${capacityNote ? ` (${capacityNote})` : ''}`;
 
   return (
     <div
@@ -214,15 +233,28 @@ export function MessageQueueComposer({ agent }: MessageQueueComposerProps) {
         )}
         {statusHint && (
           <span
-            title={deliveryPaused && !queue[0]?.manual
-              ? 'Auto-delivery is paused for the whole floor. Resume it in the Command Center, or use "send now" on a message below.'
-              : statusHint}
+            title={hold ? hold.title : statusHint}
             style={{
               fontSize: 12,
               color: idle ? 'var(--cth-ink-700)' : 'var(--cth-ink-500)',
               whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis'
             }}
           >{statusHint}</span>
+        )}
+        {hold?.action === 'RESOLVE_INTERFERENCE' && (
+          <button
+            // A PERSON'S CLICK, and nothing else, ends an INTERFERED hold. It types
+            // nothing, clears nothing and sends no Enter; delivery that resumes goes
+            // through main's full gate again, which still refuses a prompt with text on it.
+            onClick={() => { void window.cth.resolveInterference(agent.id).then(delivery.refresh); }}
+            title={"I have dealt with the text on this agent's prompt - let queued messages be delivered again. "
+              + 'Nothing is typed, erased or submitted by pressing this.'}
+            style={{
+              border: 'none', background: 'transparent', cursor: 'pointer', padding: 0,
+              fontFamily: 'var(--cth-font-ui)', fontSize: 12,
+              color: 'var(--cth-ink-900)', textDecoration: 'underline'
+            }}
+          >resolved</button>
         )}
         {(block === 'draft' || block === 'picker') && agent.ptyId && (
           <button
@@ -273,7 +305,8 @@ export function MessageQueueComposer({ agent }: MessageQueueComposerProps) {
               key={m.id}
               index={i}
               message={m}
-              paused={deliveryPaused}
+              releasable={releasable}
+              held={isHeldQueueItem(delivery.interfered, m.id)}
               onSendNow={() => releaseQueuedMessage(agent.id, m.id)}
               onRemove={() => removeQueuedMessage(agent.id, m.id)}
             />
@@ -398,24 +431,43 @@ function useTerminalBlock(ptyId: string | undefined, active: boolean): TerminalA
   return block === 'settling' ? null : block;
 }
 
-/** Poll the floor-wide auto-delivery pause (main-process control state) while
- * this agent has messages waiting. 2s is plenty — the pause flips on human
- * timescales, and the drain re-reads the live snapshot before every send. */
-function useDeliveryPaused(agentId: string, active: boolean): boolean {
-  const [paused, setPaused] = useState(false);
+interface DeliveryState {
+  paused: boolean;
+  capacityHold: boolean;
+  capacityEvidence: CapacityEvidenceName | null;
+  interfered: InterferedView | null;
+}
+const NOT_HELD: DeliveryState = { paused: false, capacityHold: false, capacityEvidence: null, interfered: null };
+
+/** Poll what MAIN is holding this agent's delivery for: the floor-wide pause, provider
+ * capacity, an unresolved INTERFERED. All three are computed in main and only READ here.
+ * 2s is plenty — they flip on human timescales, and the drain re-reads the live
+ * snapshot before every send. Polled even with an empty queue, because an INTERFERED
+ * raised by a worker wake has no queue row to hang on and still needs a person. */
+function useDeliveryState(agentId: string): DeliveryState & { refresh: () => void } {
+  const [state, setState] = useState<DeliveryState>(NOT_HELD);
+  const readRef = useRef<() => void>(() => {});
   useEffect(() => {
-    if (!active) { setPaused(false); return; }
     let alive = true;
     const read = () => {
       window.cth.controlSnapshot(agentId)
-        .then((s) => { if (alive) setPaused(!!s?.autoDeliveryPaused); })
-        .catch(() => { /* main not ready — assume not paused */ });
+        .then((s) => {
+          if (!alive) return;
+          setState({
+            paused: !!s?.autoDeliveryPaused,
+            capacityHold: !!s?.capacityHold,
+            capacityEvidence: s?.capacityEvidence ?? null,
+            interfered: s?.interfered ?? null
+          });
+        })
+        .catch(() => { /* main not ready — assume nothing is held */ });
     };
+    readRef.current = read;
     read();
     const iv = setInterval(read, 2000);
     return () => { alive = false; clearInterval(iv); };
-  }, [agentId, active]);
-  return paused;
+  }, [agentId]);
+  return { ...state, refresh: () => readRef.current() };
 }
 
 /**
@@ -424,11 +476,15 @@ function useDeliveryPaused(agentId: string, active: boolean): boolean {
  * toggle only renders when the text actually clips, so short messages stay tidy.
  */
 function QueuedMessageRow(
-  { index, message, paused, onSendNow, onRemove }: {
+  { index, message, releasable, held, onSendNow, onRemove }: {
     index: number;
     message: QueuedMessage;
-    /** Floor-wide auto-delivery is paused — offer the per-message override. */
-    paused: boolean;
+    /** Main is holding automatic delivery (floor pause or provider capacity) — offer
+     *  the per-message "send now" override. Never true while INTERFERED. */
+    releasable: boolean;
+    /** THIS is the message a human typed over after it was staged. Main sent no Enter and
+     *  holds it; it is never retried into the prompt and never dropped. */
+    held: boolean;
     onSendNow: () => void;
     onRemove: () => void;
   }
@@ -482,7 +538,7 @@ function QueuedMessageRow(
                 })
           }}
         >{message.text}</div>
-        {(clipped || expanded || paused) && (
+        {(clipped || expanded || releasable || held || message.manual) && (
           <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
             {(clipped || expanded) && (
               <button
@@ -495,10 +551,16 @@ function QueuedMessageRow(
                 }}
               >{expanded ? 'see less' : 'see more'}</button>
             )}
-            {paused && !message.manual && (
+            {held && (
+              <span
+                title={'This message was typed onto the prompt and someone typed before it was submitted. It was NOT submitted and nothing was erased. Deal with the prompt, then press "resolved" above — or remove this message.'}
+                style={{ fontSize: 12, lineHeight: '16px', color: 'var(--cth-coral)' }}
+              >held — typed over, not submitted</span>
+            )}
+            {releasable && !message.manual && (
               <button
                 onClick={onSendNow}
-                title="Deliver this message even though auto-delivery is paused. It moves to the front of the queue and types in as soon as the terminal is free."
+                title="Deliver this message even though automatic delivery is held. It moves to the front of the queue and types in as soon as the terminal is free."
                 style={{
                   border: 'none', background: 'transparent', cursor: 'pointer', padding: 0,
                   fontFamily: 'var(--cth-font-ui)', fontSize: 12, lineHeight: '16px',
@@ -506,7 +568,7 @@ function QueuedMessageRow(
                 }}
               >send now</button>
             )}
-            {paused && message.manual && (
+            {message.manual && !held && (
               <span style={{ fontSize: 12, lineHeight: '16px', color: 'var(--cth-ink-500)' }}>
                 sending when free…
               </span>

@@ -854,6 +854,9 @@ export function useHive(config: HarnessConfig | null): void {
         // INTERFERED: a human wrote onto our staged text. Main sent no Enter and cleared
         // nothing, and it now refuses automatic delivery to that terminal until a human
         // resolves it. The item is HELD — never retried into the prompt, never dropped.
+        // It is SHOWN as held by the composer, which reads the hold from main's control
+        // snapshot (`interfered`) rather than from a flag kept here: main owns the hold,
+        // and a copy in this window would outlive the terminal it was raised on.
         if (outcome.kind === 'INTERFERED') {
           console.warn(`[queue-drain] message ${next.id} for ${target.id} is HELD: a human typed after it was staged (${outcome.reason})`);
           return { sent: false };
