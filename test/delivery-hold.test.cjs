@@ -34,12 +34,13 @@ const REAL = loadTs(SRC);
 const EVIDENCE = [
   'NO_POOL', 'FRESH_HEALTHY', 'STALE_AFTER_HEALTHY', 'FRESH_NOT_HEALTHY', 'STALE_AFTER_LIMITED',
   'STALE_AFTER_UNHEALTHY', 'RECOVERING', 'NO_STATE', 'INDETERMINATE', 'UNCLASSIFIED',
-  'SPENT_RESET_PASSED', 'LIMITED_NO_KNOWN_RESET'
+  'POST_RESET_PROBE', 'POST_RESET_PROBE_SPENT', 'LIMITED_NO_KNOWN_RESET'
 ];
-/** The two holds with no exit but a person (revised L0-UNKNOWN ruling, cases c1 / c2). */
-const ENDLESS = ['SPENT_RESET_PASSED', 'LIMITED_NO_KNOWN_RESET'];
+/** The hold with no exit but a person: case 2 of the revised L0-UNKNOWN ruling ("2a": it
+ *  stays held). Case 1 was ruled "1a" - one post-reset probe - and is no longer endless. */
+const ENDLESS = ['LIMITED_NO_KNOWN_RESET'];
 /** Delivery flows on these, and NONE of them is a measured all-clear. */
-const PROCEEDS_BUT_NOT_HEALTHY = ['NO_POOL', 'STALE_AFTER_HEALTHY', 'RECOVERING'];
+const PROCEEDS_BUT_NOT_HEALTHY = ['NO_POOL', 'STALE_AFTER_HEALTHY', 'RECOVERING', 'POST_RESET_PROBE'];
 const CLAIMS_HEALTH = /\bavailable\b|\bhealthy\b|\ballowed\b|\bok\b|\bfine\b/i;
 
 const INTERFERED = { requestId: 'queue:alice:m1', reason: 'HUMAN_INPUT_AFTER_STAGE', at: 1 };
@@ -79,14 +80,15 @@ K.endlessHoldsSayThatSendNowIsTheWayOut = async (mod) => {
       assert.ok(!/nothing will lift/.test(v.hint), `${e}: an ordinary hold is not called endless`);
     }
   }
-  assert.equal(mod.CAPACITY_WORDING.SPENT_RESET_PASSED.state, 'spent, reset passed, no refusal', 'c1 in god’s words');
+  assert.match(mod.CAPACITY_WORDING.POST_RESET_PROBE.state, /passed its reset; one probe turn may go out, nothing is confirmed/, '"1a": the post-reset probe is worded as ONE UNCONFIRMED probe');
+  assert.match(mod.CAPACITY_WORDING.POST_RESET_PROBE_SPENT.state, /the one probe turn has been used; waiting for a new capacity reading/, 'and once used, as waiting for fresh evidence - which a reading WILL end, so it is not called endless');
   assert.equal(mod.CAPACITY_WORDING.LIMITED_NO_KNOWN_RESET.state, 'limited, no known reset', 'c2 in god’s words');
   const unknown = mod.deliveryHoldView(input({ capacityHold: true, capacityEvidence: null }));
   assert.equal(unknown.kind, 'CAPACITY', 'a hold with no evidence attached is STILL shown as a hold');
 };
 
 K.interferedOutranksEverythingAndIsNeverSendNow = async (mod) => {
-  for (const over of [{}, { paused: true }, { capacityHold: true, capacityEvidence: 'SPENT_RESET_PASSED' }, { headManual: true },
+  for (const over of [{}, { paused: true }, { capacityHold: true, capacityEvidence: 'LIMITED_NO_KNOWN_RESET' }, { headManual: true },
     { paused: true, capacityHold: true, capacityEvidence: 'NO_POOL', headManual: true }]) {
     const v = mod.deliveryHoldView(input({ interfered: INTERFERED, ...over }));
     assert.equal(v && v.kind, 'INTERFERED', `INTERFERED outranks every other hold (${JSON.stringify(over)})`);
@@ -167,8 +169,11 @@ const MUTANTS = [
     edits: [["  if (!evidence || evidence === 'FRESH_HEALTHY') return null;", "  if (!evidence || evidence === 'FRESH_HEALTHY' || evidence === 'NO_POOL') return null;"]],
     killer: 'noPoolIsOutsideCapacityGating', dies: /silence would read as an all-clear/ },
   { name: 'an endless hold worded as one that will lift',
-    edits: [["  SPENT_RESET_PASSED: { state: 'spent, reset passed, no refusal', endsByItself: false },", "  SPENT_RESET_PASSED: { state: 'spent, reset passed, no refusal', endsByItself: true },"]],
-    killer: 'endlessHoldsSayThatSendNowIsTheWayOut', dies: /SPENT_RESET_PASSED NEVER ends by itself/ },
+    edits: [["  LIMITED_NO_KNOWN_RESET: { state: 'limited, no known reset', endsByItself: false }", "  LIMITED_NO_KNOWN_RESET: { state: 'limited, no known reset', endsByItself: true }"]],
+    killer: 'endlessHoldsSayThatSendNowIsTheWayOut', dies: /LIMITED_NO_KNOWN_RESET NEVER ends by itself/ },
+  { name: 'a post-reset probe worded as a healthy pool',
+    edits: [["state: 'the spent window has passed its reset; one probe turn may go out, nothing is confirmed'", "state: 'capacity available again after reset'"]],
+    killer: 'noPoolIsOutsideCapacityGating', dies: /POST_RESET_PROBE is NEVER worded as available or healthy/ },
   { name: 'the way out left to the tooltip',
     edits: [[": nothing will lift this on its own — use \"send now\"`,",': nothing will lift this on its own`,']],
     killer: 'endlessHoldsSayThatSendNowIsTheWayOut', dies: /the hint ITSELF names the way out/ },

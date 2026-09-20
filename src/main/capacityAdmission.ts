@@ -81,6 +81,15 @@ export const ADMISSION_REASON = {
   RESERVE_CLOSURE: 'POOL_RESERVE_ONLY_CLOSURE_PERMITTED',
   RECOVERING_GRANT: 'RECOVERING_SINGLE_TURN_GRANTED',
   RECOVERING_SPENT: 'RECOVERING_SINGLE_TURN_ALREADY_GRANTED',
+  /**
+   * L0-UNKNOWN "1a" - THE POST-RESET PROBE. A SEPARATE state: not AVAILABLE, not
+   * RECOVERING. The last reading went stale with a window at zero and no provider refusal,
+   * and that window's KNOWN reset has passed. Exactly ONE real queued turn may go out to
+   * find out; a second ask is refused until fresh evidence arrives. The pool's published
+   * state stays UNKNOWN throughout.
+   */
+  POST_RESET_PROBE_GRANT: 'POST_RESET_SINGLE_PROBE_GRANTED',
+  POST_RESET_PROBE_SPENT: 'POST_RESET_SINGLE_PROBE_ALREADY_GRANTED',
   UNKNOWN: 'CAPACITY_UNKNOWN',
   /** L0-UNKNOWN option (ii): UNKNOWN because the reading went stale, and the reading was
    *  an all-clear. Still UNKNOWN - the seam does not infer safety - but DIFFERENT EVIDENCE
@@ -133,6 +142,12 @@ export interface AdmissionDeps {
    */
   staleLastKnown?: (pool: PoolCapacitySnapshot) => 'HEALTHY' | 'NOT_HEALTHY' | null;
   /**
+   * L0-UNKNOWN "1a": the tracker's `postResetProbeKey` - non-null exactly when a reading
+   * went stale with a window at zero, no refusal, and that window's known reset has passed.
+   * Optional, and ABSENT MEANS NO PROBE: the case stays plain STALE_AFTER_UNHEALTHY, held.
+   */
+  postResetProbeKey?: (poolKey: string) => string | null;
+  /**
    * Wall-clock milliseconds, for the reservation TTL below and nothing else.
    *
    * REQUIRED RATHER THAN DEFAULTED, on purpose. This module must contain no clock
@@ -180,6 +195,17 @@ export class CapacityAdmission {
     // inside the decision, is what lets `probe()` share this logic instead of
     // duplicating it - a second copy of the state table is exactly the drift this
     // module cannot afford.
+    if (decision.reason === ADMISSION_REASON.POST_RESET_PROBE_GRANT && decision.poolKey) {
+      // The same reservation machinery as a recovery turn - confirm, cancel, hold-for-human
+      // and the abandonment TTL all apply unchanged - but keyed to the PASSED RESET, not to
+      // an epoch (there is none). `epoch` is a value no real limit epoch can equal.
+      const probeKey = this.deps.postResetProbeKey?.(decision.poolKey) ?? null;
+      const grantId = `${decision.poolKey}#post-reset:${probeKey}#${++this.grantSeq}`;
+      this.recoveryGrants.set(decision.poolKey, {
+        epoch: POST_RESET_EPOCH, probeKey, grantId, confirmed: false, reservedAt: this.deps.now()
+      });
+      return { ...decision, grantId };
+    }
     if (decision.reason === ADMISSION_REASON.RECOVERING_GRANT && decision.poolKey) {
       const grantId = `${decision.poolKey}#${decision.limitEpochAt ?? 0}#${++this.grantSeq}`;
       this.recoveryGrants.set(decision.poolKey, {
@@ -242,7 +268,19 @@ export class CapacityAdmission {
         // caller's ONE named mapping (L0-UNKNOWN), never decided here.
         const was = this.deps.staleLastKnown?.(pool) ?? null;
         if (was === 'HEALTHY') return at('UNKNOWN_NOT_INFERRED_SAFE', ADMISSION_REASON.STALE_AFTER_HEALTHY);
-        if (was === 'NOT_HEALTHY') return at('UNKNOWN_NOT_INFERRED_SAFE', ADMISSION_REASON.STALE_AFTER_UNHEALTHY);
+        if (was === 'NOT_HEALTHY') {
+          // "1a": has the spent window's KNOWN reset passed? The tracker answers, from what
+          // it already holds. One probe per passed reset; spent until fresh evidence.
+          const probeKey = this.deps.postResetProbeKey?.(poolKey) ?? null;
+          if (probeKey !== null) {
+            const held = this.recoveryGrants.get(poolKey);
+            if (held && held.epoch === POST_RESET_EPOCH && held.probeKey === probeKey && !this.abandoned(held)) {
+              return at('REFUSE', ADMISSION_REASON.POST_RESET_PROBE_SPENT);
+            }
+            return at('ALLOW', ADMISSION_REASON.POST_RESET_PROBE_GRANT);
+          }
+          return at('UNKNOWN_NOT_INFERRED_SAFE', ADMISSION_REASON.STALE_AFTER_UNHEALTHY);
+        }
         return at('UNKNOWN_NOT_INFERRED_SAFE', ADMISSION_REASON.UNKNOWN);
       }
 
@@ -329,8 +367,14 @@ export class CapacityAdmission {
   }
 }
 
+/** The `epoch` of a post-reset probe grant. No limit epoch (a wall-clock ms) can equal it,
+ *  so a probe reservation can never be mistaken for a recovery turn's, or the reverse. */
+const POST_RESET_EPOCH = -1;
+
 interface RecoveryGrant {
   epoch: number;
+  /** Set only on a post-reset probe grant: WHICH passed reset it was granted for. */
+  probeKey?: string | null;
   grantId: string;
   confirmed: boolean;
   reservedAt: number;

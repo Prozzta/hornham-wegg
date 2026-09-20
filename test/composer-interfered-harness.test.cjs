@@ -90,7 +90,8 @@ test('a held WAKE (not a queue item) is worded as what it is, flags no row, and 
 test('what remains is the ENDLESS capacity hold: named, and "send now" is offered and works', async () => {
   const { capacity, released } = await result();
   assert.equal(capacity.offered, true);
-  assert.match(capacity.text, /held — spent, reset passed, no refusal: nothing will lift this on its own — use "send now"/);
+  assert.match(capacity.text, /held — limited, no known reset: nothing will lift this on its own — use "send now"/,
+    'CASE 2 ("2a": stays held): the rendered hint ITSELF names send-now as the way out');
   assert.match(capacity.title, /NOTHING AUTOMATIC WILL RELEASE IT/);
   assert.equal(capacity.sendNowButtons, 2, '"send now" on every row under a capacity hold');
   assert.equal(capacity.heldTags, 0, 'no row is flagged held any more');

@@ -55,7 +55,7 @@ window.__harnessRun = async () => {
       { id: 'm2', text: 'a later message', ts: 2 },
       { id: 'm3', text: 'a third message', ts: 3 }
     ] } } as never);
-    bridge.snapshot = { autoDeliveryPaused: false, capacityHold: true, capacityEvidence: 'SPENT_RESET_PASSED',
+    bridge.snapshot = { autoDeliveryPaused: false, capacityHold: true, capacityEvidence: 'LIMITED_NO_KNOWN_RESET',
       interfered: { requestId: 'queue:a1:m1', reason: 'HUMAN_INPUT_AFTER_STAGE', at: 1 } };
     createRoot(document.getElementById('root')!).render(<MessageQueueComposer agent={agent} />);
 

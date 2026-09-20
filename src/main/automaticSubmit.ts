@@ -311,16 +311,17 @@ export function resolveAdmission(
  *   RECOVERING             recovering after reset             (one re-probe; NOT healthy)
  *   NO_STATE / INDETERMINATE / UNCLASSIFIED                   (held)
  *
- * AND THE TWO HOLDS THAT NEVER END ON THEIR OWN, shown as themselves so a person can see
- * why mail is waiting and release it with send-now (unnamed cases c1 / c2 of the revised
- * ruling - reported to the human, and deliberately given NO exit here):
- *   SPENT_RESET_PASSED     spent, reset passed, no refusal    (held - nothing will lift it)
- *   LIMITED_NO_KNOWN_RESET limited, no known reset            (held - nothing will lift it)
+ * THE TWO UNNAMED CASES of the revised ruling, as the human then ruled them ("1a, 2a"):
+ *   POST_RESET_PROBE       a spent window (no refusal) whose KNOWN reset has passed: a
+ *                          SEPARATE state - one probe turn; NOT healthy, NOT RECOVERING
+ *   POST_RESET_PROBE_SPENT the one probe has been used                (held until fresh evidence)
+ *   LIMITED_NO_KNOWN_RESET limited, no known reset            (held - nothing will lift it;
+ *                          shown as itself so a person can release the mail with send-now)
  */
 export type CapacityEvidence =
   | 'NO_POOL' | 'FRESH_HEALTHY' | 'STALE_AFTER_HEALTHY' | 'FRESH_NOT_HEALTHY' | 'STALE_AFTER_LIMITED'
   | 'STALE_AFTER_UNHEALTHY' | 'RECOVERING' | 'NO_STATE' | 'INDETERMINATE' | 'UNCLASSIFIED'
-  | 'SPENT_RESET_PASSED' | 'LIMITED_NO_KNOWN_RESET';
+  | 'POST_RESET_PROBE' | 'POST_RESET_PROBE_SPENT' | 'LIMITED_NO_KNOWN_RESET';
 
 /** The tracker's own answer to "can this hold end by itself?" - see `resetOutlook`. */
 export type ResetOutlook = 'NO_KNOWN_RESET' | 'SPENT_RESET_PASSED' | 'RESET_KNOWN' | null;
@@ -350,13 +351,16 @@ export function capacityGateOf(
     || decision.reason === ADMISSION_REASON.RECOVERING_SPENT;
   let evidence: CapacityEvidence;
   if (recovering) evidence = 'RECOVERING';
+  // "1a": its OWN state. Never FRESH_HEALTHY (an ALLOW here is one probe, not an all-clear)
+  // and never RECOVERING (there is no limit epoch behind it).
+  else if (decision.reason === ADMISSION_REASON.POST_RESET_PROBE_GRANT) evidence = 'POST_RESET_PROBE';
+  else if (decision.reason === ADMISSION_REASON.POST_RESET_PROBE_SPENT) evidence = 'POST_RESET_PROBE_SPENT';
   else if (decision.verdict === 'ALLOW') evidence = 'FRESH_HEALTHY';
   else if (decision.verdict === 'REFUSE') evidence = freshness === 'STALE' ? 'STALE_AFTER_LIMITED' : 'FRESH_NOT_HEALTHY';
   else evidence = unknownEvidenceOf(decision.reason) ?? 'UNCLASSIFIED';
   const holds = resolved.action === 'HOLD';
   // A more specific NAME for a hold that is already a hold. Never for anything that
   // proceeds: an outlook must not be able to relabel a pool that delivery is flowing to.
-  if (holds && outlook === 'SPENT_RESET_PASSED' && evidence === 'STALE_AFTER_UNHEALTHY') evidence = 'SPENT_RESET_PASSED';
   if (holds && outlook === 'NO_KNOWN_RESET' && (evidence === 'FRESH_NOT_HEALTHY' || evidence === 'STALE_AFTER_LIMITED')
     && decision.reason === ADMISSION_REASON.LIMITED) evidence = 'LIMITED_NO_KNOWN_RESET';
   return { evidence, holds, basis: resolved.basis };

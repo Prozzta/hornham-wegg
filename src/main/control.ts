@@ -52,7 +52,7 @@ export interface AgentControlSnapshot {
    * proceeds but is NOT healthy; 'RECOVERING' is a post-reset re-probe and is NOT healthy;
    * the rest are held. See `CapacityEvidence` in automaticSubmit.ts.
    */
-  capacityEvidence?: 'NO_POOL' | 'FRESH_HEALTHY' | 'STALE_AFTER_HEALTHY' | 'FRESH_NOT_HEALTHY' | 'STALE_AFTER_LIMITED' | 'STALE_AFTER_UNHEALTHY' | 'RECOVERING' | 'NO_STATE' | 'INDETERMINATE' | 'UNCLASSIFIED' | 'SPENT_RESET_PASSED' | 'LIMITED_NO_KNOWN_RESET';
+  capacityEvidence?: 'NO_POOL' | 'FRESH_HEALTHY' | 'STALE_AFTER_HEALTHY' | 'FRESH_NOT_HEALTHY' | 'STALE_AFTER_LIMITED' | 'STALE_AFTER_UNHEALTHY' | 'RECOVERING' | 'NO_STATE' | 'INDETERMINATE' | 'UNCLASSIFIED' | 'POST_RESET_PROBE' | 'POST_RESET_PROBE_SPENT' | 'LIMITED_NO_KNOWN_RESET';
   paused: boolean;
   halted: boolean;
   autoDeliveryPaused: boolean;

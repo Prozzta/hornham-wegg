@@ -137,6 +137,7 @@ export class CapacityRuntime {
       poolState: (poolKey) => this.tracker.pool(poolKey),
       collectionAdmission: () => this.tracker.collectionAdmission(),
       staleLastKnown,
+      postResetProbeKey: (poolKey) => this.tracker.postResetProbeKey(poolKey),
       now: this.now
     });
   }
@@ -420,6 +421,12 @@ export class CapacityRuntime {
     if (now.verdict === 'REFUSE' && now.reason === ADMISSION_REASON.RECOVERING_SPENT
       && this.admission.holdsGrant(held.decision)) {
       return { verdict: 'ALLOW', reason: ADMISSION_REASON.RECOVERING_GRANT };
+    }
+    // The same carve-out for the post-reset probe ("1a"): the pool refuses everyone ELSE
+    // because THIS claim holds the one probe. That is not a refusal of it.
+    if (now.verdict === 'REFUSE' && now.reason === ADMISSION_REASON.POST_RESET_PROBE_SPENT
+      && this.admission.holdsGrant(held.decision)) {
+      return { verdict: 'ALLOW', reason: ADMISSION_REASON.POST_RESET_PROBE_GRANT };
     }
     return { verdict: now.verdict, reason: now.reason };
   }

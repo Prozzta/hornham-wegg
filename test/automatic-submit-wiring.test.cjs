@@ -506,6 +506,9 @@ const RUNTIME_MUTANTS = [
   { name: 'the carve-out opened to strangers',
     edits: [["RECOVERING_SPENT\n      && this.admission.holdsGrant(held.decision)) {", 'RECOVERING_SPENT) {']],
     killer: 'ownReservationIsNotARefusal', dies: /does NOT hold the grant/ },
+  { name: 'the post-reset probe refused by its own reservation',
+    edits: [["now.reason === ADMISSION_REASON.POST_RESET_PROBE_SPENT\n", "now.reason === 'NEVER-PROBE'\n"]],
+    killer: 'ownPostResetProbeIsNotARefusal', dies: /that is not a refusal of it/ },
   { name: 'a lost grant still authorises',
     edits: [['    if (held.decision.grantId && !this.admission.holdsGrant(held.decision)) {', '    if (false) {']],
     killer: 'ownReservationIsNotARefusal', dies: /handed back/ }
@@ -702,26 +705,181 @@ test('UNNAMED CASE (b): an INDETERMINATE pool that is NOT stale still HOLDS (pre
   assert.equal((await r.settle(wake(r, 'w2'))).kind, 'REFUSED');
 });
 
-test('UNNAMED CASE (c): stale after a NUMERICALLY SPENT window holds - and nothing ends it, even after its known reset', async () => {
-  // REPORTED, NOT DECIDED. A window at exactly zero WITHOUT a provider refusal is
-  // RESERVE_ONLY: no limit epoch is opened, so there is no RECOVERING hint to fire when the
-  // window's known reset passes. Once stale it is STALE_AFTER_UNHEALTHY and rule 5 holds
-  // it; the ruling names no exit for it, and none is invented here.
-  const r = rig();
+// --- L0-UNKNOWN, THE HUMAN'S RULING "1a": the post-reset probe, against the REAL tracker ---
+//
+// CASE 1 of the two unnamed cases. A window at exactly zero WITHOUT a provider refusal is
+// RESERVE_ONLY: no limit epoch opens, so there is no RECOVERING hint to fire when its known
+// reset passes, and once stale it was held for ever. The ruling: a SEPARATE explicit state -
+// not AVAILABLE, not RECOVERING - that allows ONE re-probe once the known reset has passed,
+// under final revalidation and every human-interference gate; any new reading restores the
+// ordinary behaviour; a second ask is refused until fresh evidence. The tracker's own
+// projection never changes for it: it stays UNKNOWN. Named to mirror rule 6's tests above.
+
+/** A spent window (no refusal), gone stale, with its known reset now PASSED. */
+function spentAndStale(classes = {}) {
+  const r = rig(classes);
   r.runtime.ingest('jim', obs({ windows: [win(0)] }));
   assert.equal(r.state(), 'RESERVE_ONLY');
-  assert.equal(r.tracker.pool(POOL).limitEpochAt, null, 'no refusal, so no epoch');
+  assert.equal(r.tracker.pool(POOL).limitEpochAt, null, 'precondition: no refusal, so no epoch - RECOVERING cannot apply');
   elapse(r, L0_SEM_POLICY.liveTtlMs + 1_000);
-  assert.equal(r.tracker.resetOutlook(POOL), 'RESET_KNOWN', 'while the reset is still ahead the hold CAN end by itself');
-  assert.equal(gateFor(r, 'jim').evidence, 'STALE_AFTER_UNHEALTHY');
-  assert.equal((await r.settle(wake(r, 'w1'))).kind, 'REFUSED');
-  elapse(r, RESET_AT - r.now + 60_000);
-  assert.equal(r.state(), 'UNKNOWN', 'the known reset has PASSED and the tracker still says UNKNOWN - there is no epoch to hint');
-  // VISIBLE AS ITSELF (god, stage 5.4): a person must be able to SEE that nothing will lift
-  // this, and release the mail with send-now. The label names the hold; it lifts nothing.
-  assert.deepEqual({ ...gateFor(r, 'jim') }, { evidence: 'SPENT_RESET_PASSED', holds: true, basis: 'UNKNOWN:STALE_AFTER_UNHEALTHY' },
-    '"spent, reset passed, no refusal" is shown as its own state - and is STILL held');
-  assert.equal((await r.settle(wake(r, 'w2'))).kind, 'REFUSED', 'STILL HELD: this is the deadlock class, and it is the human\u2019s to rule on');
+  return r;
+}
+const passTheReset = (r) => elapse(r, RESET_AT - r.now + 60_000);
+const K1A = {};
+
+K1A.aPassedKnownResetExitsTheHoldAsItsOwnState = async (classes) => {
+  const r = spentAndStale(classes);
+  assert.equal(r.tracker.resetOutlook(POOL), 'RESET_KNOWN');
+  assert.equal(r.tracker.postResetProbeKey(POOL), null, 'BEFORE the reset there is no probe');
+  assert.equal(gateFor(r, 'jim').evidence, 'STALE_AFTER_UNHEALTHY', 'before the reset the pool is simply held');
+  assert.equal((await r.settle(wake(r, 'before'))).kind, 'REFUSED', 'and delivery is held');
+  passTheReset(r);
+  assert.equal(r.state(), 'UNKNOWN', 'RESET PASSAGE NEVER MANUFACTURES AVAILABLE - nor RECOVERING: the tracker still publishes UNKNOWN');
+  assert.deepEqual({ ...gateFor(r, 'jim') }, { evidence: 'POST_RESET_PROBE', holds: false, basis: ADMISSION_REASON.POST_RESET_PROBE_GRANT },
+    'KNOWN RESET PASSAGE EXITS THE HOLD - as the SEPARATE post-reset state, never FRESH_HEALTHY and never RECOVERING');
+  const out = await r.settle(wake(r, 'probe'));
+  assert.equal(out.kind, 'COMMITTED', 'the one probe turn is delivered');
+  assert.deepEqual(r.record, [`enter:UNKNOWN`], 'and it went out against a pool the tracker still calls UNKNOWN');
+};
+
+K1A.oneProbePerPassedReset = async (classes) => {
+  const r = spentAndStale(classes);
+  passTheReset(r);
+  assert.equal((await r.settle(wake(r, 'probe'))).kind, 'COMMITTED');
+  const second = await r.settle(wake(r, 'second'));
+  assert.deepEqual([second.kind, second.reason, second.detail], ['REFUSED', 'CAPACITY_HOLD', ADMISSION_REASON.POST_RESET_PROBE_SPENT],
+    'ONE PROBE PER PASSED RESET: a second ask after the probe is refused until fresh evidence');
+  assert.deepEqual({ ...gateFor(r, 'jim') }, { evidence: 'POST_RESET_PROBE_SPENT', holds: true, basis: ADMISSION_REASON.POST_RESET_PROBE_SPENT });
+  elapse(r, 3_600_000);
+  assert.equal((await r.settle(wake(r, 'hour-later'))).kind, 'REFUSED', 'an hour on, with no new reading, it is STILL refused: no timer re-arms the probe');
+  assert.equal(r.writes.filter((d) => d === '\r').length, 1, 'exactly one Enter ever went out on this evidence');
+};
+
+K1A.aLaterPassedResetIsANewProbe = async (classes) => {
+  const r = spentAndStale(classes);
+  passTheReset(r);
+  assert.equal((await r.settle(wake(r, 'probe-1'))).kind, 'COMMITTED');
+  const firstKey = r.tracker.postResetProbeKey(POOL);
+  // Fresh evidence: spent AGAIN, with a LATER reset. Then stale, then that reset passes too.
+  const laterReset = r.now + 3_600_000;
+  r.runtime.ingest('jim', obs({ observedAt: r.now, receivedAt: r.now, sourceSequence: 2, windows: [{ ...win(0), resetsAt: laterReset }] }));
+  assert.equal(r.state(), 'RESERVE_ONLY', 'fresh evidence restores the ordinary behaviour at once');
+  assert.equal((await r.settle(wake(r, 'while-spent'))).kind, 'REFUSED');
+  elapse(r, laterReset - r.now + 60_000);
+  assert.notEqual(r.tracker.postResetProbeKey(POOL), firstKey, 'a different reading and a different reset: a different key');
+  assert.equal((await r.settle(wake(r, 'probe-2'))).kind, 'COMMITTED', 'a LATER passed reset on NEWER evidence is allowed its own single probe');
+  assert.equal((await r.settle(wake(r, 'probe-2b'))).kind, 'REFUSED', 'and only one');
+};
+
+K1A.postProbeDeliveryStillUndergoesFinalRevalidation = async (classes) => {
+  const r = spentAndStale(classes);
+  passTheReset(r);
+  r.onStaged = () => { r.at(40, () => r.runtime.ingest('jim', limited(r, 2))); };
+  const out = await r.settle(wake(r, 'probe'));
+  assert.equal(out.kind, 'ABORTED', 'POST-RESET DELIVERY STILL UNDERGOES FINAL REVALIDATION: a refusal in the gap stops it');
+  assert.deepEqual(r.record, ['abort:LIMITED'], 'abort:LIMITED - and no Enter');
+};
+
+K1A.aNewLimitedObservationImmediatelyRestoresTheHold = async (classes) => {
+  const r = spentAndStale(classes);
+  passTheReset(r);
+  assert.equal(gateFor(r, 'jim').holds, false, 'precondition: the probe is on offer');
+  r.runtime.ingest('jim', limited(r, 2));
+  assert.equal(r.state(), 'LIMITED');
+  assert.equal(gateFor(r, 'jim').holds, true, 'A NEW LIMITED OBSERVATION IMMEDIATELY RESTORES THE HOLD');
+  assert.equal(r.tracker.postResetProbeKey(POOL), null, 'and the probe is off the table');
+  assert.deepEqual(r.writes, []);
+  assert.equal((await r.settle(wake(r, 'after-limit'))).kind, 'REFUSED');
+};
+
+K1A.aNewHealthyObservationRestoresNormalFreshHealthBehaviour = async (classes) => {
+  const r = spentAndStale(classes);
+  passTheReset(r);
+  assert.equal((await r.settle(wake(r, 'probe'))).kind, 'COMMITTED');
+  r.runtime.ingest('jim', healthy(r, 2));
+  assert.equal(r.state(), 'AVAILABLE');
+  assert.deepEqual({ ...gateFor(r, 'jim') }, { evidence: 'FRESH_HEALTHY', holds: false, basis: ADMISSION_REASON.AVAILABLE },
+    'A NEW HEALTHY OBSERVATION RESTORES NORMAL FRESH-HEALTH BEHAVIOUR - measured, not manufactured');
+  for (const id of ['h1', 'h2', 'h3']) { elapse(r, 2_000); assert.equal((await r.settle(wake(r, id))).kind, 'COMMITTED', `${id}: no single-probe limit on a healthy pool`); }
+};
+
+K1A.theProbeFacesEveryHumanInterferenceGate = async (classes) => {
+  const r = spentAndStale(classes);
+  passTheReset(r);
+  r.session.promptState = { block: 'draft' };
+  assert.deepEqual([(await r.settle(wake(r, 'onto-a-draft'))).kind, r.writes], ['REFUSED', []], 'a human draft refuses the probe: nothing typed');
+  r.session.promptState = { block: null };
+  r.onStaged = () => { r.at(40, () => { r.session.gen += 1; r.session.lastHumanAt = r.now; r.prompt += 'x'; }); };
+  const out = await r.settle(wake(r, 'probe'));
+  assert.deepEqual([out.kind, out.reason], ['INTERFERED', 'HUMAN_INPUT_AFTER_STAGE'], 'a human in the gap: INTERFERED, no Enter');
+  assert.equal(r.writes.includes('\r'), false);
+  assert.equal(r.runtime.admission.probe('jim', 'ORDINARY_TURN').reason, ADMISSION_REASON.POST_RESET_PROBE_SPENT,
+    'and the probe is IN SUSPENSE with the hold - not handed to someone else');
+  assert.equal(r.owner.resolveInterference('pty-jim', 'SEND_AGAIN'), true);
+  assert.equal(r.runtime.admission.probe('jim', 'ORDINARY_TURN').reason, ADMISSION_REASON.POST_RESET_PROBE_GRANT,
+    '"send queued message" gives the ONE probe back; it was never used');
+};
+
+for (const [name, killer] of Object.entries(K1A)) test(`L0-UNKNOWN 1a: ${name}`, () => killer({}));
+
+KR.ownPostResetProbeIsNotARefusal = (Runtime) => { // the carve-out, for the probe's own claim
+  const r = spentAndStale({ Runtime });
+  passTheReset(r);
+  const decision = r.runtime.admit('jim');
+  assert.deepEqual([decision.verdict, decision.reason, !!decision.grantId], ['ALLOW', ADMISSION_REASON.POST_RESET_PROBE_GRANT, true]);
+  const claim = { decision, agentId: 'jim', workClass: 'ORDINARY_TURN', target: 'pty-jim' };
+  assert.equal(r.runtime.admission.probe('jim', 'ORDINARY_TURN').verdict, 'REFUSE', 'the pool now refuses everyone...');
+  assert.deepEqual(r.runtime.revalidate(claim, 'pty-jim'), { verdict: 'ALLOW', reason: ADMISSION_REASON.POST_RESET_PROBE_GRANT },
+    '...because of THIS claim - and that is not a refusal of it (or no probe could ever pass its own final revalidation)');
+  const stranger = r.runtime.admit('jim');
+  assert.equal(r.runtime.revalidate({ ...claim, decision: stranger }, 'pty-jim').verdict, 'REFUSE', 'a claim that does not hold the probe is refused');
+};
+
+test('TOCTOU on revalidate: ownPostResetProbeIsNotARefusal', () => KR.ownPostResetProbeIsNotARefusal(CapacityRuntime));
+
+const POST_RESET_MUTANTS = [
+  { name: 'the probe is never spent',
+    edits: [['            if (held && held.epoch === POST_RESET_EPOCH && held.probeKey === probeKey && !this.abandoned(held)) {', '            if (false) {']],
+    killer: 'oneProbePerPassedReset', dies: /ONE PROBE PER PASSED RESET/ },
+  { name: 'one probe for ever: a later reset on newer evidence is refused too',
+    edits: [['held.epoch === POST_RESET_EPOCH && held.probeKey === probeKey && !this.abandoned(held)', 'held.epoch === POST_RESET_EPOCH && !this.abandoned(held)']],
+    killer: 'aLaterPassedResetIsANewProbe', dies: /a LATER passed reset on NEWER evidence/ },
+  { name: 'the probe is granted without being reserved',
+    edits: [['    if (decision.reason === ADMISSION_REASON.POST_RESET_PROBE_GRANT && decision.poolKey) {', '    if (false) {']],
+    killer: 'oneProbePerPassedReset', dies: /ONE PROBE PER PASSED RESET/ },
+  { name: 'the probe is offered before the reset has passed',
+    edits: [['          if (probeKey !== null) {', '          if (true) {']],
+    killer: 'aPassedKnownResetExitsTheHoldAsItsOwnState', dies: /before the reset the pool is simply held/ }
+];
+
+test('MUTANT CENSUS (capacityAdmission, the post-reset probe): every mutant applies exactly once and dies at the named assertion', async (t) => {
+  const source = read('src/main/capacityAdmission.ts');
+  const dir = RUNTIME_MUTANT_DIR + '-adm';
+  fs.mkdirSync(dir, { recursive: true });
+  try {
+    for (const [i, mutant] of POST_RESET_MUTANTS.entries()) {
+      await t.test(`mutant: ${mutant.name}`, async () => {
+        await K1A[mutant.killer]({});
+        let text = source;
+        for (const [from, to] of mutant.edits) {
+          const hits = text.split(from).length - 1;
+          assert.equal(hits, 1, `mutant "${mutant.name}": edit target must match EXACTLY ONCE, matched ${hits}`);
+          text = text.replace(from, () => to);
+        }
+        text = text.replace(/from '\.\/(\w+)'/g, "from '../../src/main/$1'").replace(/from '\.\.\/shared\//g, "from '../../src/shared/");
+        const file = path.join(dir, `p${i}.ts`);
+        fs.writeFileSync(file, text, 'utf8');
+        const Admission = loadTs(path.relative(path.resolve(__dirname, '..'), file)).CapacityAdmission;
+        let died = null;
+        try { await K1A[mutant.killer]({ Admission }); } catch (e) { died = e; }
+        assert.ok(died, `SURVIVED: "${mutant.name}" was not killed by ${mutant.killer}`);
+        assert.ok(died instanceof assert.AssertionError, `"${mutant.name}" must die by ASSERTION, got: ${died && died.stack}`);
+        assert.match(died.message, mutant.dies, `"${mutant.name}" died at the wrong assertion`);
+      });
+    }
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 test('UNNAMED CASE (c): stale after a refusal with NO known reset time holds with no exit', async () => {

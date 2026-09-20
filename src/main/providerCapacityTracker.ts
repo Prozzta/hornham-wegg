@@ -687,14 +687,15 @@ export class ProviderCapacityTracker {
    *
    * It exists because two holds never end without a human, and a person looking at a
    * waiting message deserves to see that rather than wonder (L0-UNKNOWN, unnamed cases
-   * c1 and c2 - reported to the human, deliberately NOT given an exit here):
+   * c1 and c2 - reported to the human; c1 was then given ONE post-reset probe, c2 none):
    *
    *   'NO_KNOWN_RESET'      a provider REFUSAL is open and no reset boundary is known that
    *                         could ever become its recovery hint. LIMITED until a newer
    *                         reading arrives.
    *   'SPENT_RESET_PASSED'  the reading went stale with a window at exactly zero and NO
    *                         refusal, so no limit epoch exists to hint - and that window's
-   *                         known reset has now PASSED. Still held.
+   *                         known reset has now PASSED. The admission seam allows ONE
+   *                         post-reset probe for it (`postResetProbeKey`, ruling "1a").
    *   'RESET_KNOWN'         a boundary is known and still ahead: the hold can end by itself.
    *   null                  not a held pool of either kind.
    *
@@ -714,6 +715,28 @@ export class ProviderCapacityTracker {
     if (!spent.length) return null;
     if (spent.some((w) => w.resetsAt === null)) return 'NO_KNOWN_RESET';
     return spent.every((w) => (w.resetsAt as number) <= this.clock()) ? 'SPENT_RESET_PASSED' : 'RESET_KNOWN';
+  }
+
+  /**
+   * L0-UNKNOWN, the human's ruling "1a": WHICH passed reset is this? Non-null exactly when
+   * `resetOutlook` is 'SPENT_RESET_PASSED' - the reading went stale with a window at zero
+   * and NO provider refusal, and every spent window's known reset has now passed.
+   *
+   * The admission seam allows ONE re-probe per value of this key and no more. The key names
+   * the READING (its time and sequence) and the RESET (the latest spent boundary), so a
+   * second ask on the same evidence finds the same key and is refused, and ANY newer
+   * accepted reading - limited, healthy or spent again - makes a different key or leaves
+   * this case altogether. Read from what the tracker already holds. Nothing is inferred,
+   * nothing is polled, no state changes, and the projection stays UNKNOWN: a passed reset
+   * never manufactures AVAILABLE here, and it does not manufacture RECOVERING either -
+   * RECOVERING's single turn is keyed to a limit EPOCH, and this case has none.
+   */
+  postResetProbeKey(poolKey: string): string | null {
+    if (this.resetOutlook(poolKey) !== 'SPENT_RESET_PASSED') return null;
+    const rec = this.pools.get(poolKey)!;
+    const spent = rec.observation.windows.filter((w) => rec.projection.numericallyExhaustedWindowIds.includes(w.windowId));
+    const latest = Math.max(...spent.map((w) => w.resetsAt as number));
+    return `${rec.observation.observedAt}#${rec.observation.sourceSequence}#${latest}`;
   }
 
   /**

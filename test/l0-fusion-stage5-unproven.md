@@ -8,8 +8,13 @@ what IS known, what is not, and what would settle it. Nothing here is a claim of
 1. **(c1) stale after a numerically spent window, known reset passed.** Held forever; shown
    as `SPENT_RESET_PASSED`; "send now" is the only exit. god recommends a separate explicit
    post-reset state with one re-probe. No exit is built.
+   **RULED at stage 5.7: "1a".** Built as the admission state POST_RESET_PROBE: one probe per
+   passed reset, keyed to the reading and the reset, under every gate; the tracker still
+   publishes UNKNOWN. `SPENT_RESET_PASSED` is retired as a displayed label. No longer open.
 2. **(c2) a refusal with no known reset time.** Held forever; shown as
    `LIMITED_NO_KNOWN_RESET`. No exit is built.
+   **RULED at stage 5.7: "2a" - it stays held.** Nothing added. Its wording names "send
+   now" in the hint itself, pinned in the wording module and on the rendered page.
 3. **L0-S5-RESOLVED-UX — duplicate delivery after "resolved".** If the human presses Enter on
    our staged payload THEMSELVES and then clicks "resolved", the message is still queued and
    is delivered again; the gate cannot see it because the prompt is empty by then. Measured:

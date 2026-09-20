@@ -12,8 +12,10 @@
  *      allowed - nothing was measured, so nothing is claimed (the L0-UNKNOWN ruling keeps
  *      "no pool", "held for want of evidence" and "allowed" three different things).
  *   2. A stale all-clear and a recovering pool are never worded as healthy.
- *   3. The two holds that never end on their own say so, and say that "send now" is the
- *      way out - a person must not be left waiting on something that will not happen.
+ *   3. A hold that never ends on its own ("limited, no known reset") says so, and says that
+ *      "send now" is the way out - a person must not be left waiting on something that will
+ *      not happen. (Its old sibling, "spent, reset passed", is no longer endless: the human
+ *      ruled it ONE post-reset probe, worded as one unconfirmed probe and never as healthy.)
  *
  * INTERFERED outranks everything: a human typed onto automation's staged text, main sent
  * no Enter and cleared nothing, and main refuses EVERY programmatic delivery to that
@@ -29,7 +31,7 @@
 export type CapacityEvidenceName =
   | 'NO_POOL' | 'FRESH_HEALTHY' | 'STALE_AFTER_HEALTHY' | 'FRESH_NOT_HEALTHY' | 'STALE_AFTER_LIMITED'
   | 'STALE_AFTER_UNHEALTHY' | 'RECOVERING' | 'NO_STATE' | 'INDETERMINATE' | 'UNCLASSIFIED'
-  | 'SPENT_RESET_PASSED' | 'LIMITED_NO_KNOWN_RESET';
+  | 'POST_RESET_PROBE' | 'POST_RESET_PROBE_SPENT' | 'LIMITED_NO_KNOWN_RESET';
 
 export interface CapacityWording {
   /** The state, in words, whether or not it holds anything. */
@@ -50,7 +52,8 @@ export const CAPACITY_WORDING: Record<CapacityEvidenceName, CapacityWording> = {
   NO_STATE: { state: 'no capacity reading for this provider pool yet', endsByItself: true },
   INDETERMINATE: { state: 'provider capacity could not be determined', endsByItself: true },
   UNCLASSIFIED: { state: 'provider capacity state not recognised', endsByItself: true },
-  SPENT_RESET_PASSED: { state: 'spent, reset passed, no refusal', endsByItself: false },
+  POST_RESET_PROBE: { state: 'the spent window has passed its reset; one probe turn may go out, nothing is confirmed', endsByItself: true },
+  POST_RESET_PROBE_SPENT: { state: 'reset passed and the one probe turn has been used; waiting for a new capacity reading', endsByItself: true },
   LIMITED_NO_KNOWN_RESET: { state: 'limited, no known reset', endsByItself: false }
 };
 

@@ -57,6 +57,9 @@ const CAPACITY = {
   STALE_UNHEALTHY: { verdict: 'UNKNOWN_NOT_INFERRED_SAFE', reason: ADMISSION_REASON.STALE_AFTER_UNHEALTHY },
   RECOVERING: { verdict: 'ALLOW', reason: ADMISSION_REASON.RECOVERING_GRANT },
   RECOVERING_SPENT: { verdict: 'REFUSE', reason: ADMISSION_REASON.RECOVERING_SPENT },
+  // L0-UNKNOWN "1a": the separate post-reset state - one probe, then spent until fresh evidence.
+  POST_RESET_PROBE: { verdict: 'ALLOW', reason: ADMISSION_REASON.POST_RESET_PROBE_GRANT },
+  POST_RESET_PROBE_SPENT: { verdict: 'REFUSE', reason: ADMISSION_REASON.POST_RESET_PROBE_SPENT },
   NOVEL_UNKNOWN: { verdict: 'UNKNOWN_NOT_INFERRED_SAFE', reason: 'SOME_FUTURE_UNKNOWN' }
 };
 
@@ -642,26 +645,55 @@ K.resetPassageIsRecoveringNeverHealthy = async (mod) => {
 };
 
 K.anOutlookNamesAHoldAndLiftsNothing = async (mod) => {
-  // The two holds that never end on their own are shown as themselves. The outlook that
-  // names them is a LABEL: it must never change whether delivery is held, and it must
-  // never rename a pool that delivery is flowing to.
+  // The hold that never ends on its own ("limited, no known reset") is shown as itself.
+  // The outlook that names it is a LABEL: it must never change whether delivery is held,
+  // and it must never rename a pool that delivery is flowing to. (Its sibling, "spent,
+  // reset passed", stopped being a label when the human ruled "1a": it is an ADMISSION
+  // state now, decided by the seam - see `aPostResetProbeIsItsOwnState`.)
   const P = mod.UNKNOWN_POLICY;
   assert.deepEqual(mod.capacityGateOf(CAPACITY.STALE_UNHEALTHY, 'STALE', P, 'SPENT_RESET_PASSED'),
-    { evidence: 'SPENT_RESET_PASSED', holds: true, basis: 'UNKNOWN:STALE_AFTER_UNHEALTHY' }, 'spent, reset passed, no refusal: NAMED, and still HELD');
+    { evidence: 'STALE_AFTER_UNHEALTHY', holds: true, basis: 'UNKNOWN:STALE_AFTER_UNHEALTHY' },
+    'the GATE never turns a passed reset into a probe by itself: only the admission seam can grant one - NAMED, and still HELD');
   assert.deepEqual(mod.capacityGateOf(CAPACITY.LIMITED, 'STALE', P, 'NO_KNOWN_RESET'),
     { evidence: 'LIMITED_NO_KNOWN_RESET', holds: true, basis: ADMISSION_REASON.LIMITED }, 'limited, no known reset: NAMED, and still HELD');
   for (const outlook of ['SPENT_RESET_PASSED', 'NO_KNOWN_RESET', 'RESET_KNOWN', null]) {
-    for (const [state, fresh] of [['AVAILABLE', 'FRESH'], ['STALE_HEALTHY', 'STALE'], ['NO_POOL', null], ['RECOVERING', 'STALE']]) {
+    for (const [state, fresh] of [['AVAILABLE', 'FRESH'], ['STALE_HEALTHY', 'STALE'], ['NO_POOL', null], ['RECOVERING', 'STALE'], ['POST_RESET_PROBE', 'STALE']]) {
       const plain = mod.capacityGateOf(CAPACITY[state], fresh, P, null);
       assert.deepEqual(mod.capacityGateOf(CAPACITY[state], fresh, P, outlook), plain,
         `an outlook NEVER relabels or holds a pool that delivery flows to (${state} / ${outlook})`);
     }
-    for (const state of ['LIMITED', 'STALE_UNHEALTHY', 'STALE', 'NO_STATE']) {
+    for (const state of ['LIMITED', 'STALE_UNHEALTHY', 'STALE', 'NO_STATE', 'POST_RESET_PROBE_SPENT']) {
       assert.equal(mod.capacityGateOf(CAPACITY[state], 'STALE', P, outlook).holds, true, `an outlook LIFTS NOTHING (${state} / ${outlook})`);
     }
   }
   assert.equal(mod.capacityGateOf(CAPACITY.LIMITED, 'STALE', P, 'RESET_KNOWN').evidence, 'STALE_AFTER_LIMITED',
     'a limit whose reset IS known keeps its ordinary name');
+};
+
+K.aPostResetProbeIsItsOwnState = async (mod) => {
+  // The human's ruling "1a": a SEPARATE explicit state. Not AVAILABLE, not RECOVERING.
+  const P = mod.UNKNOWN_POLICY;
+  const probe = mod.capacityGateOf(CAPACITY.POST_RESET_PROBE, 'STALE', P, 'SPENT_RESET_PASSED');
+  assert.deepEqual(probe, { evidence: 'POST_RESET_PROBE', holds: false, basis: ADMISSION_REASON.POST_RESET_PROBE_GRANT },
+    'the one probe PROCEEDS, and is reported as POST_RESET_PROBE');
+  assert.notEqual(probe.evidence, 'FRESH_HEALTHY', 'RESET PASSAGE NEVER MANUFACTURES AVAILABLE: an ALLOW for one probe is not an all-clear');
+  assert.notEqual(probe.evidence, 'RECOVERING', 'and it is NOT RECOVERING: there is no limit epoch behind it');
+  assert.deepEqual(mod.capacityGateOf(CAPACITY.POST_RESET_PROBE_SPENT, 'STALE', P, 'SPENT_RESET_PASSED'),
+    { evidence: 'POST_RESET_PROBE_SPENT', holds: true, basis: ADMISSION_REASON.POST_RESET_PROBE_SPENT },
+    'once the probe is used the pool HOLDS again, as its own state, until fresh evidence');
+  // Through the owner: the probe is a delivery like any other - full gate, final revalidation.
+  const w = world({ capacity: 'POST_RESET_PROBE' });
+  const out = await settle(w, owner(mod, w).submit(req()));
+  assert.equal(out.kind, 'COMMITTED');
+  assert.ok(w.revalidations >= 1, 'the probe turn was revalidated before its Enter');
+  const w2 = world({ capacity: 'POST_RESET_PROBE' });
+  w2.at(50, () => { w2.capacity = 'LIMITED'; });
+  const late = await settle(w2, owner(mod, w2).submit(req()));
+  assert.deepEqual([late.kind, enters(w2), w2.record], ['ABORTED', 0, ['abort:LIMITED']],
+    'POST-PROBE DELIVERY IS STILL REVALIDATED: a refusal in the gap aborts - abort:LIMITED, no Enter');
+  const w3 = world({ capacity: 'POST_RESET_PROBE_SPENT' });
+  const held = await settle(w3, owner(mod, w3).submit(req()));
+  assert.deepEqual([held.kind, held.reason, w3.writes], ['REFUSED', 'CAPACITY_HOLD', []], 'a second ask types nothing');
 };
 
 K.noPoolIsNeverCalledAvailable = async (mod) => {
@@ -1241,14 +1273,29 @@ const MUTANTS = [
   });
   MUTANTS.push({
     name: 'an outlook that lifts the hold it names',
-    edits: [["  const holds = resolved.action === 'HOLD';", "  const holds = resolved.action === 'HOLD' && outlook !== 'SPENT_RESET_PASSED';"]],
+    edits: [["  const holds = resolved.action === 'HOLD';", "  const holds = resolved.action === 'HOLD' && outlook !== 'NO_KNOWN_RESET';"]],
     killer: 'anOutlookNamesAHoldAndLiftsNothing', dies: /NAMED, and still HELD|LIFTS NOTHING/
   });
   MUTANTS.push({
     name: 'an outlook that relabels a pool delivery flows to',
-    edits: [["  if (holds && outlook === 'SPENT_RESET_PASSED' && evidence === 'STALE_AFTER_UNHEALTHY') evidence = 'SPENT_RESET_PASSED';",
-      "  if (outlook === 'SPENT_RESET_PASSED') evidence = 'SPENT_RESET_PASSED';"]],
+    edits: [["  if (holds && outlook === 'NO_KNOWN_RESET' && (evidence", "  if (outlook === 'NO_KNOWN_RESET' && (evidence === 'FRESH_HEALTHY' || evidence"],
+      ["    && decision.reason === ADMISSION_REASON.LIMITED) evidence = 'LIMITED_NO_KNOWN_RESET';", "    ) evidence = 'LIMITED_NO_KNOWN_RESET';"]],
     killer: 'anOutlookNamesAHoldAndLiftsNothing', dies: /NEVER relabels or holds a pool that delivery flows to/
+  });
+  MUTANTS.push({
+    name: 'the gate grants a post-reset probe on the outlook alone',
+    edits: [["  const holds = resolved.action === 'HOLD';", "  const holds = resolved.action === 'HOLD' && !(outlook === 'SPENT_RESET_PASSED' && evidence === 'STALE_AFTER_UNHEALTHY');"]],
+    killer: 'anOutlookNamesAHoldAndLiftsNothing', dies: /only the admission seam can grant one/
+  });
+  MUTANTS.push({
+    name: 'a post-reset probe reported as a healthy pool',
+    edits: [["  else if (decision.reason === ADMISSION_REASON.POST_RESET_PROBE_GRANT) evidence = 'POST_RESET_PROBE';\n", '']],
+    killer: 'aPostResetProbeIsItsOwnState', dies: /reported as POST_RESET_PROBE/
+  });
+  MUTANTS.push({
+    name: 'a post-reset probe folded into RECOVERING',
+    edits: [["  const recovering = decision.reason === ADMISSION_REASON.RECOVERING_GRANT\n", "  const recovering = decision.reason === ADMISSION_REASON.POST_RESET_PROBE_GRANT || decision.reason === ADMISSION_REASON.RECOVERING_GRANT\n"]],
+    killer: 'aPostResetProbeIsItsOwnState', dies: /reported as POST_RESET_PROBE/
   });
   MUTANTS.push({
     name: 'a stale all-clear relabelled healthy',
@@ -1258,7 +1305,7 @@ const MUTANTS = [
   });
   MUTANTS.push({
     name: 'reset passage manufacturing a healthy state',
-    edits: [["  if (recovering) evidence = 'RECOVERING';\n  else if (decision.verdict === 'ALLOW')", "  if (decision.verdict === 'ALLOW')"]],
+    edits: [["  if (recovering) evidence = 'RECOVERING';\n", "  if (false) evidence = 'RECOVERING';\n"]],
     killer: 'resetPassageIsRecoveringNeverHealthy', dies: /reported as RECOVERING, never as healthy/
   });
   MUTANTS.push({
