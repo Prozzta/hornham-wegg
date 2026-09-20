@@ -2,6 +2,7 @@ import { contextBridge, ipcRenderer, webUtils, type IpcRendererEvent } from 'ele
 import type { AgentProvider } from '../shared/agentProvider';
 import type { InputOrigin } from '../shared/inputOrigin';
 import type { Eligibility, TerminalInputState } from '../shared/inputProvenance';
+import type { TerminalPromptState } from '../shared/promptState';
 import type { HireManifest } from '../shared/hire';
 export type { HireManifest } from '../shared/hire';
 import type { IntegrationRecord, IntegrationTemplate } from '../shared/integrations';
@@ -597,6 +598,22 @@ const api = {
    *  terminal (mouse tracking mode, DOM attachment, self-test) to main, on change. */
   reportTerminalInputState: (id: string, state: TerminalInputState): Promise<{ ok: boolean; error?: string }> =>
     ipcRenderer.invoke('pty:inputState', id, state),
+  /** L0-FUSION stage 5: whose the prompt is (picker latch / human draft / settle),
+   *  mirrored to main on change so the main-owned submit transaction can READ it before
+   *  STAGE and inside its critical section. Not provenance; see shared/promptState.ts. */
+  reportTerminalPromptState: (id: string, state: TerminalPromptState): Promise<{ ok: boolean; error?: string }> =>
+    ipcRenderer.invoke('pty:promptState', id, state),
+  /** L0-FUSION stage 5: main asks this renderer to READ A RENDERED SCREEN for the submit
+   *  owner's erase verification. The renderer answers with `answerScreenReading`; it
+   *  decides nothing, and silence is read by main as "no reading", never as "erased". */
+  onScreenReadRequest: (cb: (req: { requestId: string; ptyId: string; needle: string }) => void): (() => void) => {
+    const listener = (_e: IpcRendererEvent, req: { requestId: string; ptyId: string; needle: string }) => cb(req);
+    ipcRenderer.on('autoSubmit:readScreen', listener);
+    return () => ipcRenderer.removeListener('autoSubmit:readScreen', listener);
+  },
+  answerScreenReading: (requestId: string, reading: { onPromptRow: boolean; screenCount: number } | null): void => {
+    ipcRenderer.send('autoSubmit:screenReading', requestId, reading);
+  },
   /** May automatic delivery arm on this terminal RIGHT NOW? Evaluated fresh in main on
    *  every call from the mirrored state; never cached. */
   automaticDeliveryEligibility: (id: string): Promise<Eligibility> =>

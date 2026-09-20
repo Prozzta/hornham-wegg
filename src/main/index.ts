@@ -25,6 +25,9 @@ import { listDir, readFileText, readFileBinary, writeFileText, statAbs, expandTi
 import { normalizeWeekly, weeklyDelayMs } from '../shared/weeklySchedule';
 import { isInputOrigin } from '../shared/inputOrigin';
 import { automaticDeliveryEligibility, isTerminalInputState } from '../shared/inputProvenance';
+import { isTerminalPromptState } from '../shared/promptState';
+import { AutomaticSubmitOwner } from './automaticSubmit';
+import { buildOwnerDeps, ScreenReadingBroker } from './automaticSubmitWiring';
 import {
   getBranch, getStatus, getLog, getBranches, getAheadBehind, isRepo, getDiff, mainRepoRoot,
   addWorktree, removeWorktree, worktreeHasUnintegratedWork, worktreeIsGcSafe,
@@ -71,7 +74,7 @@ import { validateBaseUrl, buildAuthHeaders, resolveUpstreamUrl, secretRefFor, IN
 import { RosterStore } from './roster';
 import { buildWorkerLaunch } from './workerLaunch';
 import { ControlRegistry } from './control';
-import { WorkerWakeWatchdog, submitWorkerNudge, type WorkerWakeFacts } from './workerWake';
+import { WorkerWakeWatchdog, type WorkerWakeFacts } from './workerWake';
 import { inboxNudgeText } from '../shared/hiveNudge';
 import { fetchHireManifest, readHireManifestFiles } from './hire';
 import { parseHireDeepLink, type HireManifest } from '../shared/hire';
@@ -283,6 +286,9 @@ async function enableCodexRemoteForSpawn(
 /** Live PTY id → its hive agent id, recorded at spawn. The pty:kill handler only
  *  gets the PTY id, so this lets a closed tab archive the right registry agent. */
 const ptyToAgent = new Map<string, string>();
+/** ptyId -> the provider resolved for it at spawn. The submit owner asks this for
+ *  readiness and for abort capability; a PTY that is not in here is UNKNOWN to it. */
+const ptyProvider = new Map<string, AgentProvider>();
 /** PTY id → the spawn it should auto restart-and-continue into once a first-time
  *  CLI install finishes. The missing-CLI short-circuit runs the engine's installer
  *  in this PTY; when it exits cleanly the exit handler re-runs the SAME spawn (with
@@ -368,6 +374,25 @@ const providerCapacity = new CapacityRuntime({
     }
   }
 });
+// L0-FUSION stage 5 - THE ONE OWNER of programmatic stage -> final revalidation -> Enter.
+// Main resolves the PTY, main holds it against other programmatic writers, and main's
+// final check sits next to main's Enter with nothing that can yield between them. See
+// automaticSubmit.ts for the transaction and automaticSubmitWiring.ts for what each of
+// its effects means here.
+const screenReadings = new ScreenReadingBroker((ptyId, requestId, needle) =>
+  ptyManager.sendToOwner(ptyId, 'autoSubmit:readScreen', { requestId, ptyId, needle }));
+const automaticSubmit = new AutomaticSubmitOwner(buildOwnerDeps({
+  pty: ptyManager,
+  capacity: providerCapacity,
+  ptyForAgent: (agentId) => ptyForAgent(agentId),
+  providerForPty: (ptyId) => ptyProvider.get(ptyId),
+  requestScreenReading: (ptyId, needle) => screenReadings.request(ptyId, needle),
+  onOutcome: (r) => {
+    if (r.outcome.kind === 'COMMITTED') return;
+    const why = 'reason' in r.outcome ? r.outcome.reason : '';
+    console.log(`[auto-submit] ${r.admissionClass} ${r.agentId} on ${r.ptyId ?? '-'}: ${r.outcome.kind} ${why}`);
+  }
+}));
 // Durable capacity observations (L0-TAIL). Restored BEFORE any live reading can
 // arrive, so ordering resolves naturally: every live observation is newer than the
 // one that crossed the restart and simply replaces it. `userData` is already the
@@ -534,6 +559,7 @@ function teardownPty(id: string): void {
   const agentId = ptyToAgent.get(id);
   if (agentId) {
     ptyToAgent.delete(id);
+    ptyProvider.delete(id);
     // Drop watchdog state so a dead agent can't get nudged or leak its grace.
     try { workerWake.forget(agentId, id); } catch { /* best-effort */ }
     // Drop breaker state so a dead agent can't leak/zombie a tripped level.
@@ -2954,6 +2980,7 @@ async function spawnAgentCore(opts: AgentSpawnOptions, owner: Electron.WebConten
   // live terminal means active — ensureAgent above already cleared `archived`.
   if (opts.hive?.id) {
     ptyToAgent.set(opts.id, opts.hive.id);
+    ptyProvider.set(opts.id, provider);
     // Worker inbox-wake watchdog (#151): boot grace starts at spawn so the
     // initial orientation prompt is never mistaken for an idle agent.
     workerWake.noteSpawn(opts.id);
@@ -3065,6 +3092,20 @@ ipcMain.handle('pty:inputState', (_evt, id: string, state: unknown) => {
 ipcMain.handle('pty:automaticDeliveryEligibility', (_evt, id: string) => {
   if (typeof id !== 'string') return { eligible: false, reason: 'NO_STATE', detail: 'invalid args' };
   return automaticDeliveryEligibility(ptyManager.inputState(id));
+});
+// L0-FUSION stage 5. Whose the prompt is (picker latch / human draft / settle), mirrored
+// for the same reason the provenance mirror is: main must READ it, before STAGE and inside
+// the critical section, and cannot if it lives only in the renderer. Validated at the
+// boundary; a malformed report is refused rather than stored as something it is not.
+ipcMain.handle('pty:promptState', (_evt, id: string, state: unknown) => {
+  if (typeof id !== 'string') return { ok: false, error: 'invalid args' };
+  if (!isTerminalPromptState(state)) return { ok: false, error: 'invalid prompt state' };
+  return ptyManager.setPromptState(id, state);
+});
+// The renderer's answer to `autoSubmit:readScreen`. A malformed answer, or one for an id
+// that is not pending, is no answer - the owner then holds the item rather than guess.
+ipcMain.on('autoSubmit:screenReading', (_evt, requestId: unknown, reading: unknown) => {
+  screenReadings.answer(requestId, reading);
 });
 ipcMain.handle('pty:resize', (_evt, id: string, cols: number, rows: number) => {
   if (typeof id !== 'string' || typeof cols !== 'number' || typeof rows !== 'number') return { ok: false, error: 'invalid args' };
@@ -5140,43 +5181,8 @@ function bootstrapHiveServices(): void {
 const WORKER_WAKE_POLL_MS = 15_000;
 let workerWakeTimer: ReturnType<typeof setInterval> | null = null;
 
-/** Type the renderer's guarded nudge into one worker's PTY — text first, Enter a
- *  tick later (the exact submitToPty pattern: a single-chunk write would land the
- *  "\r" inside the input box and never submit). Best-effort + never throws.
- *
- *  `onSubmitted` reports whether the turn ACTUALLY STARTED, which the caller cannot
- *  otherwise know: the Enter write happens on a later tick, so this function has
- *  already returned by the time either outcome exists. It used to return void, and
- *  the one caller that needed the answer - the admission seam's recovery grant -
- *  confirmed the launch immediately after the call, spending the epoch's single
- *  attempt on a turn that might never have been typed. Called exactly once, with
- *  true only if BOTH writes succeeded. */
-function nudgeWorker(
-  ptyId: string,
-  ids: string[] = [],
-  onSubmitted?: (ok: boolean) => void,
-  /**
-   * L0-WAKE: re-asked immediately before anything is typed. The admission decision was
-   * taken earlier in the beat, and a limit arriving since then must stop this nudge.
-   */
-  maySubmit?: () => boolean
-): void {
-  // Same text the renderer queues (#187's inboxNudgeText), so the two wake paths
-  // produce byte-identical nudges: the queue's one-pending rule recognises either
-  // via isInboxNudge, and a watchdog nudge names its ids so the agent can still
-  // tell "I filed this last turn" from "woken for nothing".
-  //
-  // The ORDER lives in workerWake.ts, where a test can reach it, for the same reason
-  // the renderer's lives in queueDelivery.ts: it is the invariant, not the plumbing.
-  submitWorkerNudge({
-    maySubmit,
-    writeText: () => ptyManager.write(ptyId, inboxNudgeText(ids), 'PROGRAMMATIC'),
-    delaySubmit: (fn) => { setTimeout(fn, 140); },
-    writeSubmit: () => ptyManager.write(ptyId, '\r', 'PROGRAMMATIC'),
-    onSubmitted,
-    warn: (message) => console.warn(`[worker-wake] ${ptyId}: ${message}`)
-  });
-}
+/** Monotonic per-process suffix for worker-wake request ids. */
+let workerWakeSeq = 0;
 
 /** Main-process inbox-wake beat (issue #151, fix A): the renderer's idle nudge
  *  (useHive.ts) is the only path that wakes a worker parked on an undrained
@@ -5217,31 +5223,27 @@ function runWorkerWakeBeat(): void {
     // is the exact staleness #187 exists to stop.
     const ids = hive.inbox(agentId).map((m) => m.id).filter(Boolean);
     if (!ids.length) { console.log(`[worker-wake] ${agentId} drained before delivery, skipping`); continue; }
-    // L0-SEAM. A nudge starts a PROVIDER TURN that nobody asked for in this moment,
-    // so it is exactly the automatic start the admission seam exists to gate: with
-    // the pool LIMITED this would have been a retry against a provider that just
-    // refused. UNKNOWN is NOT a refusal - the seam declines to infer safety and this
-    // caller's configured behaviour is to proceed, which keeps a pool we have never
-    // observed behaving as it did before capacity existed.
-    const decision = providerCapacity.admit(agentId, 'ORDINARY_TURN');
-    if (decision.verdict === 'REFUSE') {
-      console.log(`[worker-wake] ${agentId} held: ${decision.reason} (${decision.poolKey})`);
-      continue;
-    }
+    // L0-FUSION stage 5. A nudge starts a PROVIDER TURN that nobody asked for in this
+    // moment, so it is CAPACITY_GATED work and goes through the one submit owner like
+    // every other programmatic text+Enter: admission, the fail-closed READY gate, the
+    // final revalidation next to the Enter, ABORT or INTERFERED if it cannot commit. This
+    // path used to keep its own copy of that order (and its own `!== 'REFUSE'`), and it
+    // typed with no view of a human draft or an open picker at all.
+    //
+    // Same text the renderer queues (#187's inboxNudgeText), so the two wake paths produce
+    // byte-identical nudges and the queue's one-pending rule recognises either.
     console.log(`[worker-wake] nudging ${agentId} on ${ptyId} (${ids.length} pending)`);
-    // Confirm on the SUBMISSION, not on the call. The Enter write lands on a later
-    // tick, so confirming here would spend the epoch's one recovery attempt before
-    // anything had been typed - and a dead PTY would spend it on a turn that never
-    // happened at all. A failed submission returns the reservation instead.
-    // L0-WAKE. The decision above was taken before the nudge text, the 140 ms pause and
-    // the Enter - a window in which the pool can go LIMITED or RESERVE_ONLY and this
-    // turn would have started anyway. THE SAME CHECK THE RENDERER DELIVERY USES, called
-    // directly because this path holds its decision in-process and needs no ticket.
-    nudgeWorker(ptyId, ids, (ok) => {
-      if (ok) providerCapacity.confirmLaunch(decision);
-      else providerCapacity.cancelGrant(decision);
-    }, () => providerCapacity.maySubmitNow(
-      { decision, agentId, workClass: 'ORDINARY_TURN', target: ptyId }, ptyId));
+    void automaticSubmit.submit({
+      requestId: `wake-${agentId}-${(workerWakeSeq += 1)}`,
+      agentId,
+      admissionClass: 'CAPACITY_GATED',
+      text: inboxNudgeText(ids)
+    }).then((outcome) => {
+      // Nothing was delivered, so these ids were not announced: let the next beat past
+      // the cooldown try again instead of waiting for NEW mail to arrive. An INTERFERED
+      // PTY refuses until a human resolves it, so this cannot become a typing loop.
+      if (outcome.kind !== 'COMMITTED') workerWake.retract(agentId);
+    });
   }
 }
 

@@ -26,8 +26,11 @@
  *  - a per-worker cooldown (NUDGE_COOLDOWN_MS) so the watchdog and the renderer
  *    nudge don't stack on top of each other.
  *
- * Deliberately the renderer's own nudge text, and the same type pattern the
- * renderer's submitToPty uses (text first, Enter as a separate keystroke).
+ * Deliberately the renderer's own nudge text. THIS MODULE DECIDES WHO TO NUDGE AND
+ * NOTHING ELSE: since L0-FUSION stage 5 the typing itself - text, the TUI gap, the final
+ * revalidation and the Enter - belongs to the one main-owned submit transaction
+ * (`automaticSubmit.ts`), which every programmatic text+Enter path shares. This file used
+ * to carry its own copy of that order; two copies of an order is how they drift.
  *
  * No electron import — unit-testable (mirrors ControlRegistry).
  */
@@ -146,75 +149,19 @@ export class WorkerWakeWatchdog {
     return out;
   }
 
+  /**
+   * The nudge `decide` chose was NOT delivered (capacity held it, the prompt was a
+   * human's, the terminal could not be proven safe to type into). Forget that its ids
+   * were announced, so the same undrained mail is tried again on a later beat instead of
+   * waiting for NEW mail that may never come. The cooldown is deliberately KEPT: a retry
+   * is at most one attempt per WORKER_WAKE_COOLDOWN_MS, never a tight loop.
+   */
+  retract(agentId: string): void {
+    this.announcedInboxIds.delete(agentId);
+  }
+
   /** Last time this worker was nudged (0 = never) — useful for diagnostics. */
   lastNudge(agentId: string): number {
     return this.lastNudgeAt.get(agentId) ?? 0;
   }
-}
-
-/** One PTY write, as `ptyManager.write` answers it. */
-export interface WakeWriteResult { ok: boolean; error?: string }
-
-/** The four effects a wake submission is made of, injected so the ORDER can be tested. */
-export interface WakeSubmitSteps {
-  /**
-   * Asked FIRST. `false` means nothing is typed at all. Absent for a caller that holds
-   * no capacity decision.
-   */
-  maySubmit?: () => boolean;
-  /** Stage the nudge text in the worker's input box. */
-  writeText: () => WakeWriteResult;
-  /** Run the submit keystroke a tick later, as the TUI requires. */
-  delaySubmit: (fn: () => void) => void;
-  /** The submit keystroke. */
-  writeSubmit: () => WakeWriteResult;
-  /** Whether the turn ACTUALLY STARTED. Called exactly once, on every path. */
-  onSubmitted?: (ok: boolean) => void;
-  warn?: (message: string) => void;
-}
-
-/**
- * Type a wake nudge into a worker and submit it - ASK, then type, then submit.
- *
- * L0-WAKE. This path had the same two defects the renderer delivery had, and they were
- * found there first. The admission decision is taken, the text is written, a 140 ms
- * timer elapses and only then does the Enter go out - so A LIMIT ARRIVING IN THAT
- * INTERVAL WAS IGNORED AND THE TURN STARTED ANYWAY. The question admission answered is
- * "may this start", asked at a moment that had passed by the time anything was typed.
- *
- * THE GATE IS BEFORE THE TEXT, NOT BEFORE THE ENTER, AND THAT IS DELIBERATE. Refusing
- * between the text and the Enter would leave the nudge STAGED IN THE WORKER'S PROMPT,
- * where a human can submit it by pressing Enter and where the next wake appends to it.
- * A refusal that leaves sendable text did not refuse. The residual is the 140 ms after
- * the gate, and it fails SAFE: a limit arriving there costs one nudge that should not
- * have gone, against a refusal that silently leaves a message a human can send.
- *
- * `onSubmitted` is called exactly once on every path INCLUDING the refusal, with false,
- * so the caller returns its reservation instead of holding it against a turn that never
- * started.
- */
-export function submitWorkerNudge(steps: WakeSubmitSteps): void {
-  if (steps.maySubmit && !steps.maySubmit()) {
-    steps.warn?.('capacity refused between admission and the keystroke; nothing was typed');
-    steps.onSubmitted?.(false);
-    return;
-  }
-  const wrote = steps.writeText();
-  if (!wrote.ok) {
-    steps.warn?.(`write failed: ${wrote.error}`);
-    steps.onSubmitted?.(false);
-    return;
-  }
-  steps.delaySubmit(() => {
-    try {
-      const submitted = steps.writeSubmit();
-      if (!submitted.ok) steps.warn?.(`submit failed: ${submitted.error}`);
-      steps.onSubmitted?.(submitted.ok === true);
-    } catch (e) {
-      // A throw is not a launch. Reporting it as one would spend the recovery grant on a
-      // turn that certainly did not start.
-      steps.warn?.(`submit threw: ${String(e)}`);
-      steps.onSubmitted?.(false);
-    }
-  });
 }

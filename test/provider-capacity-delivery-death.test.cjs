@@ -66,9 +66,6 @@ const { ADMISSION_REASON } = loadTs('src/main/capacityAdmission.ts');
 // `grep | head -10` -- a pipe capped at ten cannot be evidence of ten. Re-derive it by
 // search against a named revision, never by memory and never off a truncated pipe.
 const { typeAndSubmit } = loadTs('src/renderer/src/hooks/queueDelivery.ts');
-// The main-process wake path's submission sequence. Same invariant, other process;
-// workerWake.ts says in its own header that it imports no electron for this reason.
-const { submitWorkerNudge } = loadTs('src/main/workerWake.ts');
 
 const T0 = 1_800_000_000_000;
 const POOL = 'codex:acct-a:codex';
@@ -514,67 +511,14 @@ test('L0-TOCTOU: a RECOVERING ticket is NOT refused by its own reservation', () 
 // L0-WAKE — the OTHER automatic submit path, asking the same question
 // ═══════════════════════════════════════════════════════════════════════════
 
-/** Records the wake sequence, and runs the delayed submit synchronously. */
-function waker(over = {}) {
-  const log = [];
-  const submitted = [];
-  const steps = {
-    maySubmit: over.maySubmit ?? (() => { log.push('ask'); return true; }),
-    writeText: () => { log.push('text'); return over.text ?? { ok: true }; },
-    delaySubmit: (fn) => { log.push('delay'); fn(); },
-    writeSubmit: () => { log.push('submit'); if (over.throws) throw new Error('pty exploded'); return over.submit ?? { ok: true }; },
-    onSubmitted: (ok) => { submitted.push(ok); },
-    warn: () => {}
-  };
-  if (over.noGate) delete steps.maySubmit;
-  return { log, submitted, steps };
-}
-
-test('L0-WAKE: a refused wake types NOTHING - not the nudge text either', () => {
-  // THE ARM THE CURRENT PATH FAILS. index.ts writes the nudge text, waits 140 ms and
-  // then writes Enter with nothing re-checked in between, so a pool that goes LIMITED
-  // after admission still gets a turn. And gating only the Enter would leave the nudge
-  // STAGED in the worker\u2019s prompt, which is the refusal-that-did-not-refuse again.
-  const w = waker({ maySubmit: () => false });
-  submitWorkerNudge(w.steps);
-  assert.deepEqual(w.log, [], 'nothing typed: no text staged and no keystroke');
-  assert.deepEqual(w.submitted, [false],
-    'and it reports NOT submitted exactly once, so the caller returns the reservation');
-});
-
-test('L0-WAKE: a permitted wake types, in order - the gate is not a blanket refusal', () => {
-  // The pair. "Types nothing when refused" is satisfied perfectly by a wake path that
-  // never nudges anyone, which would silently disable the watchdog #151 exists to be.
-  const w = waker();
-  submitWorkerNudge(w.steps);
-  assert.deepEqual(w.log, ['ask', 'text', 'delay', 'submit'],
-    'asked FIRST, then the nudge, then the TUI delay, then Enter');
-  assert.deepEqual(w.submitted, [true], 'and the turn is reported as started');
-});
-
-test('L0-WAKE: a caller holding no decision is not gated', () => {
-  // Both-sides on the other axis: `maySubmit` is optional and its absence must not be
-  // read as a refusal, or every ungated caller would stop working.
-  const w = waker({ noGate: true });
-  submitWorkerNudge(w.steps);
-  assert.deepEqual(w.log, ['text', 'delay', 'submit']);
-});
-
-test('L0-WAKE: a failed text write never presses Enter, and reports NOT submitted', () => {
-  // Pre-existing behaviour, re-asserted because the extraction could have lost it.
-  const w = waker({ text: { ok: false, error: 'no pty: w1' } });
-  submitWorkerNudge(w.steps);
-  assert.deepEqual(w.log, ['ask', 'text'], 'it stopped at the failed stage');
-  assert.deepEqual(w.submitted, [false]);
-});
-
-test('L0-WAKE: a submit that THROWS is not a launch', () => {
-  // The grant is spent by a turn that started. A throw is the clearest case of one that
-  // did not, and reporting it as started would spend the epoch on nothing.
-  const w = waker({ throws: true });
-  submitWorkerNudge(w.steps);
-  assert.deepEqual(w.submitted, [false], 'reported exactly once, as NOT started');
-});
+// L0-FUSION stage 5: the wake path no longer has a submission sequence OF ITS OWN to
+// test here. `submitWorkerNudge` - the private ask -> text -> delay -> Enter order five
+// tests in this section pinned - is deleted; the wake beat submits CAPACITY_GATED work to
+// the one main-owned submit transaction. Each of those five guarantees (a refused wake
+// types nothing; a permitted wake types in order; an ungated caller is not refused; a
+// failed text write never presses Enter; a throwing Enter is not a launch) is re-asserted
+// against the path that actually runs, in test/automatic-submit-wiring.test.cjs, together
+// with the one the old order could not give: a limit arriving INSIDE the gap.
 
 test('L0-WAKE: the shared check answers for a claim that holds NO ticket', () => {
   // The wake path has no ticket - it holds its decision in-process. The check is the

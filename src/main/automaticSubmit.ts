@@ -32,6 +32,9 @@
  * provable main-only, and a mutant of any of them can be killed by name.
  */
 import { ADMISSION_REASON, type AdmissionDecision, type AdmissionVerdict, type WorkClass } from './capacityAdmission';
+import type { PromptBlock } from '../shared/promptState';
+
+export type { PromptBlock };
 
 // ─── Admission classes: a bypass is DECLARED, never INHERITED (section 3 / 19) ─────────
 
@@ -57,9 +60,111 @@ export type AdmissionClass = 'CAPACITY_GATED' | 'USER_RELEASED' | 'BOOT_SEQUENCE
 
 export const ADMISSION_CLASSES: readonly AdmissionClass[] = ['CAPACITY_GATED', 'USER_RELEASED', 'BOOT_SEQUENCE'];
 
-/** Does this class ask capacity, provenance eligibility and abort capability? */
-export function isCapacityGated(cls: AdmissionClass): boolean {
-  return cls === 'CAPACITY_GATED';
+/** Which classes ask provider capacity at all. Total, so a new class cannot be added
+ *  without deciding. Only a class that asks capacity can be refused LATE by it, so only
+ *  such a class can ever reach ABORT. */
+export const ASKS_CAPACITY: Readonly<Record<AdmissionClass, boolean>> = {
+  CAPACITY_GATED: true,
+  USER_RELEASED: false,
+  BOOT_SEQUENCE: false
+};
+
+/**
+ * What can stand between a submission and the prompt, as main can know it.
+ *
+ *   ABORT_CAPABILITY_UNVERIFIED  the provider has no MEASURED clear/erase (section 8)
+ *   PROVENANCE_INELIGIBLE        the input-provenance mirror says human input cannot be
+ *                                proven visible on this terminal right now
+ *   PROMPT_UNKNOWN               the renderer has not mirrored the prompt's state at all
+ *   PROMPT_PICKER                a user-opened picker owns the input line
+ *   PROMPT_DRAFT                 a human draft is sitting on the prompt
+ *   PROMPT_SETTLING              the TUI is repainting after a human clear/dismiss
+ *   HUMAN_INPUT_RECENT           main itself took a HUMAN write on this PTY moments ago
+ *
+ * The first three are SUPPORT UNPROVEN. The last four are POSITIVE EVIDENCE that the
+ * prompt is a human's right now.
+ *
+ * WHY HUMAN_INPUT_RECENT EXISTS WHEN PROMPT_DRAFT DOES. The draft arrives by a mirror; the
+ * keystroke that started it arrives by the write ingress, one IPC message EARLIER. A
+ * submission admitted between those two messages sees a generation that already counts
+ * the keystroke (so the pre-STAGE comparison is quiet) and a mirror that still says the
+ * prompt is free. Main's own record of when it last took a human write has no such
+ * window: it is set in the same operation as the write.
+ */
+export type GateCondition =
+  | 'ABORT_CAPABILITY_UNVERIFIED'
+  | 'PROVENANCE_INELIGIBLE'
+  | 'PROMPT_UNKNOWN'
+  | 'PROMPT_PICKER'
+  | 'PROMPT_DRAFT'
+  | 'PROMPT_SETTLING'
+  | 'HUMAN_INPUT_RECENT';
+
+export const GATE_CONDITIONS: readonly GateCondition[] = [
+  'ABORT_CAPABILITY_UNVERIFIED', 'PROVENANCE_INELIGIBLE', 'PROMPT_UNKNOWN',
+  'PROMPT_PICKER', 'PROMPT_DRAFT', 'PROMPT_SETTLING', 'HUMAN_INPUT_RECENT'
+];
+
+export type GateAction = 'REFUSE' | 'PROCEED';
+
+/**
+ * THE ONE POLICY POINT: class x condition -> refuse | proceed. Total in both
+ * dimensions; every guard in this file that depends on the class reads it from HERE, so
+ * changing an answer is a one-cell edit, and each cell has its own test.
+ *
+ * HUMAN RULING, 2026-09-20 (card L0-S5-BOOT-GATE, option A), verbatim: "A: automatic
+ * delivery gets the full gate with no exceptions. Boot prompts and send-now still go
+ * through the one owner, still revalidate before Enter, and still stop on human
+ * interference. They are not refused up front just because the provider is unmeasured."
+ *
+ * So the three SUPPORT-UNPROVEN rows refuse CAPACITY_GATED and nothing else. The four
+ * HUMAN-OWNS-THE-LINE rows refuse EVERY class: they are not "unmeasured", they are evidence that a
+ * human owns the line, and typing a boot prompt into an open picker loses the prompt
+ * and feeds the picker garbage exactly as a queued message would. A refusal types
+ * nothing, so the caller simply asks again.
+ */
+export const READY_GATE_POLICY: Readonly<Record<AdmissionClass, Readonly<Record<GateCondition, GateAction>>>> = {
+  CAPACITY_GATED: {
+    ABORT_CAPABILITY_UNVERIFIED: 'REFUSE',
+    PROVENANCE_INELIGIBLE: 'REFUSE',
+    PROMPT_UNKNOWN: 'REFUSE',
+    PROMPT_PICKER: 'REFUSE',
+    PROMPT_DRAFT: 'REFUSE',
+    PROMPT_SETTLING: 'REFUSE',
+    HUMAN_INPUT_RECENT: 'REFUSE'
+  },
+  USER_RELEASED: {
+    ABORT_CAPABILITY_UNVERIFIED: 'PROCEED',
+    PROVENANCE_INELIGIBLE: 'PROCEED',
+    PROMPT_UNKNOWN: 'PROCEED',
+    PROMPT_PICKER: 'REFUSE',
+    PROMPT_DRAFT: 'REFUSE',
+    PROMPT_SETTLING: 'REFUSE',
+    HUMAN_INPUT_RECENT: 'REFUSE'
+  },
+  BOOT_SEQUENCE: {
+    ABORT_CAPABILITY_UNVERIFIED: 'PROCEED',
+    PROVENANCE_INELIGIBLE: 'PROCEED',
+    PROMPT_UNKNOWN: 'PROCEED',
+    PROMPT_PICKER: 'REFUSE',
+    PROMPT_DRAFT: 'REFUSE',
+    PROMPT_SETTLING: 'REFUSE',
+    HUMAN_INPUT_RECENT: 'REFUSE'
+  }
+};
+
+export function gateRefuses(cls: AdmissionClass, condition: GateCondition): boolean {
+  return READY_GATE_POLICY[cls][condition] === 'REFUSE';
+}
+
+type PromptCondition = 'PROMPT_UNKNOWN' | 'PROMPT_PICKER' | 'PROMPT_DRAFT' | 'PROMPT_SETTLING';
+
+function promptCondition(block: PromptBlock | undefined): PromptCondition | null {
+  if (block === undefined) return 'PROMPT_UNKNOWN';
+  if (block === 'picker') return 'PROMPT_PICKER';
+  if (block === 'draft') return 'PROMPT_DRAFT';
+  if (block === 'settling') return 'PROMPT_SETTLING';
+  return null; // null = free; 'exited' is answered by the incarnation, not by policy
 }
 
 // ─── UNKNOWN is one decision, made by name (section 3) ────────────────────────────────
@@ -163,8 +268,14 @@ export interface OwnerDeps {
   terminalReady: (ptyId: string, agentId: string, waitedMs: number) => 'READY' | 'WAIT' | 'GONE';
   /** Provenance eligibility from the live mirror. Evaluated fresh on every guard. */
   eligibility: (ptyId: string) => ProvenanceEligibility;
-  /** The picker latch as mirrored into main. `undefined` = not known. */
-  pickerLatched: (ptyId: string) => boolean | undefined;
+  /** The prompt's state as the renderer mirrors it into main: picker latch, human
+   *  draft, settle. Re-read before STAGE and inside the critical section (section 5.3:
+   *  a latch consulted once is a latch that can open afterwards). `undefined` = never
+   *  mirrored. NEVER an interference or erase oracle: it only says whose the line is. */
+  promptBlock: (ptyId: string) => PromptBlock | undefined;
+  /** When main last took a declared-HUMAN write on this PTY, set in the same operation
+   *  as the write. Undefined = never. */
+  lastHumanInputAt: (ptyId: string) => number | undefined;
   abortCapability: (agentId: string) => AbortCapability;
   /** Read the rendered screen for `needle`. Resolves null when nothing can answer. */
   readScreen: (ptyId: string, needle: string) => Promise<ScreenReading | null>;
@@ -206,15 +317,18 @@ export type RefusalReason =
   | 'TERMINAL_NOT_READY'
   | 'PTY_GONE'
   | 'PTY_REPLACED'
-  | 'PICKER_LATCHED'
-  | 'PICKER_UNKNOWN'
+  | 'PROMPT_UNKNOWN'
+  | 'PROMPT_PICKER'
+  | 'PROMPT_DRAFT'
+  | 'PROMPT_SETTLING'
+  | 'HUMAN_INPUT_RECENT'
   | 'HUMAN_INPUT_BEFORE_STAGE'
   | 'STAGE_WRITE_FAILED';
 
 export type InterferenceReason =
   | 'HUMAN_INPUT_AFTER_STAGE'
   | 'PICKER_LATCHED_AFTER_STAGE'
-  | 'PICKER_UNKNOWN_AFTER_STAGE'
+  | 'PROMPT_UNKNOWN_AFTER_STAGE'
   | 'PROVENANCE_LOST_AFTER_STAGE'
   | 'ABORT_CAPABILITY_UNVERIFIED'
   | 'STAGED_TEXT_NOT_POSITIVELY_VISIBLE'
@@ -257,6 +371,10 @@ export const SCREEN_ORACLE_TIMEOUT_MS = 2_000;
 /** How long a settled outcome stays replayable — long enough to cover a lost reply or a
  *  renderer reload, short enough that the map stays bounded. */
 export const OUTCOME_REPLAY_TTL_MS = 5 * 60_000;
+/** A human write this recent means the line is theirs, whatever the mirror says yet.
+ *  Longer than the renderer's own ECHO_GRACE (1000 ms), inside which even the renderer
+ *  does not trust the screen to overrule a keystroke. */
+export const HUMAN_QUIET_MS = 1_500;
 /** A needle shorter than this matches too easily to be evidence of anything. */
 export const MIN_NEEDLE = 4;
 const MAX_NEEDLE = 16;
@@ -321,10 +439,16 @@ function postStageGuard(s: Staged, deps: OwnerDeps): CommitVerdict | null {
   if (deps.humanGeneration(s.ptyId) !== s.humanStage) {
     return { kind: 'INTERFERED', reason: 'HUMAN_INPUT_AFTER_STAGE' };
   }
-  const picker = deps.pickerLatched(s.ptyId);
-  if (picker === true) return { kind: 'INTERFERED', reason: 'PICKER_LATCHED_AFTER_STAGE' };
-  if (isCapacityGated(s.req.admissionClass)) {
-    if (picker === undefined) return { kind: 'INTERFERED', reason: 'PICKER_UNKNOWN_AFTER_STAGE' };
+  const cls = s.req.admissionClass;
+  // A draft or a settle after STAGE can only come from a human action, which the
+  // generation above already caught. The picker latch and an unmirrored prompt are the
+  // two prompt facts the generation cannot stand in for.
+  const block = deps.promptBlock(s.ptyId);
+  if (block === 'picker') return { kind: 'INTERFERED', reason: 'PICKER_LATCHED_AFTER_STAGE' };
+  if (block === undefined && gateRefuses(cls, 'PROMPT_UNKNOWN')) {
+    return { kind: 'INTERFERED', reason: 'PROMPT_UNKNOWN_AFTER_STAGE' };
+  }
+  if (gateRefuses(cls, 'PROVENANCE_INELIGIBLE')) {
     // RUNTIME AND RE-ENTRANT: a TUI that turned mouse tracking on inside the gap has
     // opened an input path the generation cannot see, so "nobody typed" is no longer
     // provable. Not provable is not safe to Enter and not safe to erase.
@@ -472,7 +596,7 @@ export class AutomaticSubmitOwner {
 
   private async run(req: SubmitRequest, ptyId: string): Promise<SubmitOutcome> {
     const deps = this.deps;
-    const gated = isCapacityGated(req.admissionClass);
+    const cls = req.admissionClass;
     const policy = deps.unknownPolicy ?? PROVISIONAL_UNKNOWN_POLICY;
 
     // ── ADMIT ────────────────────────────────────────────────────────────────────────
@@ -480,7 +604,7 @@ export class AutomaticSubmitOwner {
     const incarnation = deps.incarnation(ptyId);
     if (incarnation === undefined) return this.refuse(null, 'PTY_GONE');
     let decision: AdmissionDecision | null = null;
-    if (gated) {
+    if (ASKS_CAPACITY[cls]) {
       decision = deps.capacity.admit(req.agentId, 'ORDINARY_TURN');
       const admitted = resolveAdmission(decision, policy);
       if (admitted.action !== 'PROCEED') return this.refuse(decision, 'CAPACITY_HOLD', admitted.basis);
@@ -488,10 +612,12 @@ export class AutomaticSubmitOwner {
     const humanAdmit = deps.humanGeneration(ptyId);
 
     // ── READY: fail closed BEFORE anything is staged ─────────────────────────────────
-    if (gated) {
-      // Nothing is ever typed that cannot be un-typed (section 8). Capability UNKNOWN is
-      // not capacity UNKNOWN and takes no proceed mapping from it.
-      if (deps.abortCapability(req.agentId).kind !== 'VERIFIED') return this.refuse(decision, 'PROVIDER_ABORT_UNVERIFIED');
+    // Nothing is ever typed that cannot be un-typed (section 8). Capability UNKNOWN is
+    // not capacity UNKNOWN and takes no proceed mapping from it.
+    if (gateRefuses(cls, 'ABORT_CAPABILITY_UNVERIFIED') && deps.abortCapability(req.agentId).kind !== 'VERIFIED') {
+      return this.refuse(decision, 'PROVIDER_ABORT_UNVERIFIED');
+    }
+    if (gateRefuses(cls, 'PROVENANCE_INELIGIBLE')) {
       const e = deps.eligibility(ptyId);
       if (!e.eligible) return this.refuse(decision, 'PROVENANCE_INELIGIBLE', e.reason);
     }
@@ -509,13 +635,18 @@ export class AutomaticSubmitOwner {
     // The wait above yielded, so nothing read before it is evidence about now.
     if (deps.incarnation(ptyId) !== incarnation) return this.refuse(decision, 'PTY_REPLACED');
     if (this.inhibition(ptyId)) return this.refuse(decision, 'PTY_INHIBITED');
-    const picker = deps.pickerLatched(ptyId);
-    if (picker === true) return this.refuse(decision, 'PICKER_LATCHED');
-    if (gated) {
-      if (picker === undefined) return this.refuse(decision, 'PICKER_UNKNOWN');
+    const prompt = promptCondition(deps.promptBlock(ptyId));
+    if (prompt && gateRefuses(cls, prompt)) return this.refuse(decision, prompt);
+    const lastHuman = deps.lastHumanInputAt(ptyId);
+    if (lastHuman !== undefined && deps.now() - lastHuman < HUMAN_QUIET_MS && gateRefuses(cls, 'HUMAN_INPUT_RECENT')) {
+      return this.refuse(decision, 'HUMAN_INPUT_RECENT');
+    }
+    if (gateRefuses(cls, 'PROVENANCE_INELIGIBLE')) {
       const e = deps.eligibility(ptyId);
       if (!e.eligible) return this.refuse(decision, 'PROVENANCE_INELIGIBLE', e.reason);
-      const claim: OwnerClaim = { decision: decision!, agentId: req.agentId, workClass: decision!.workClass, target: ptyId };
+    }
+    if (decision) {
+      const claim: OwnerClaim = { decision, agentId: req.agentId, workClass: decision.workClass, target: ptyId };
       const again = resolveAdmission(deps.capacity.revalidate(claim), policy);
       if (again.action !== 'PROCEED') return this.refuse(decision, 'CAPACITY_HOLD', again.basis);
     }

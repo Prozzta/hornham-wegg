@@ -1,6 +1,7 @@
 import * as pty from 'node-pty';
 import type { InputOrigin } from '../shared/inputOrigin';
 import type { TerminalInputState } from '../shared/inputProvenance';
+import type { TerminalPromptState } from '../shared/promptState';
 import type { WebContents } from 'electron';
 import { existsSync, readFileSync, statSync } from 'node:fs';
 import { delimiter, join, win32 } from 'node:path';
@@ -61,7 +62,23 @@ interface PtySession {
    *  terminal. Absent until the renderer has attached and reported - and ABSENT MEANS
    *  UNKNOWN, which the eligibility predicate refuses. Dies with the session. */
   inputState?: TerminalInputState;
+  /** L0-FUSION stage 5: WHICH live process this is. A same-id respawn gets a new value,
+   *  so a human-input generation captured on the dead process can never be compared
+   *  against the replacement's fresh counter as though they were one terminal's. Opaque;
+   *  compared for identity only. */
+  incarnation: number;
+  /** When a declared-HUMAN write was last accepted, set in the same operation as the
+   *  write and the generation. Closes the one-IPC-message window in which the generation
+   *  already counts a keystroke and the prompt mirror does not yet show its draft. */
+  lastHumanInputAt?: number;
+  /** L0-FUSION stage 5: the renderer's mirror of whose the prompt is (picker latch, human
+   *  draft, settle). Absent = UNKNOWN, which automatic delivery refuses. Dies with the
+   *  session. NOT a provenance fact and not an erase oracle - see shared/promptState.ts. */
+  promptState?: TerminalPromptState;
 }
+
+/** Process-wide, never reused, so two incarnations can never compare equal. */
+let incarnationSeq = 0;
 
 export interface SpawnOptions {
   id: string;
@@ -373,6 +390,17 @@ export class PtyManager {
     try { wc.send(channel, payload); } catch { /* window tore down mid-send */ }
   }
 
+  /** Send to the renderer that owns a LIVE pty. False when there is nobody to send to —
+   *  no such session, or its window is gone — so the caller can answer "no reading"
+   *  at once instead of waiting out a timeout. (L0-FUSION: the screen oracle request.) */
+  sendToOwner(id: string, channel: string, payload: unknown): boolean {
+    const s = this.sessions.get(id);
+    if (!s) return false;
+    const wc = s.owner ?? this.webContents;
+    if (!wc || wc.isDestroyed()) return false;
+    try { wc.send(channel, payload); return true; } catch { return false; }
+  }
+
   /** Whether an engine CLI is actually installed/locatable on this machine.
    *  Used PRE-SPAWN by the missing-CLI auto-install path: a bare `claude`/`codex`
    *  that resolveCommand can't locate would otherwise be spawned and die with
@@ -680,7 +708,8 @@ export class PtyManager {
         lastOutputAt: Date.now(),
         hasOutput: false,
         owner,
-        humanInputGeneration: 0
+        humanInputGeneration: 0,
+        incarnation: (incarnationSeq += 1)
       };
       this.sessions.set(opts.id, session);
 
@@ -721,7 +750,7 @@ export class PtyManager {
     if (!s) return { ok: false, error: `no pty: ${id}` };
     try {
       s.proc.write(data);
-      if (origin === 'HUMAN') s.humanInputGeneration++;
+      if (origin === 'HUMAN') { s.humanInputGeneration++; s.lastHumanInputAt = Date.now(); }
       return { ok: true };
     } catch (e) {
       return { ok: false, error: e instanceof Error ? e.message : String(e) };
@@ -733,6 +762,34 @@ export class PtyManager {
    *  the number itself carries no meaning and must not be persisted. */
   humanInputGeneration(id: string): number | undefined {
     return this.sessions.get(id)?.humanInputGeneration;
+  }
+
+  /** The identity of the LIVE process behind this id, or undefined when there is none. */
+  incarnation(id: string): number | undefined {
+    return this.sessions.get(id)?.incarnation;
+  }
+
+  /** When a HUMAN write was last accepted on this LIVE pty, or undefined if never. */
+  lastHumanInputAt(id: string): number | undefined {
+    return this.sessions.get(id)?.lastHumanInputAt;
+  }
+
+  /** Whether this LIVE pty has emitted its first frame; undefined when there is none. */
+  hasOutput(id: string): boolean | undefined {
+    return this.sessions.get(id)?.hasOutput;
+  }
+
+  /** Store the renderer's prompt mirror for a LIVE pty. */
+  setPromptState(id: string, state: TerminalPromptState): { ok: boolean; error?: string } {
+    const s = this.sessions.get(id);
+    if (!s) return { ok: false, error: `no pty: ${id}` };
+    s.promptState = state;
+    return { ok: true };
+  }
+
+  /** The prompt mirror as last reported, or undefined (= UNKNOWN) if never reported or dead. */
+  promptState(id: string): TerminalPromptState | undefined {
+    return this.sessions.get(id)?.promptState;
   }
 
   /** Store the renderer's provenance mirror for a LIVE pty. */

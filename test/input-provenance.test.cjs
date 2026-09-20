@@ -215,7 +215,15 @@ test('SOURCE CENSUS: the PROGRAMMATIC literal appears ONLY in the two allowed ow
   // the two automatic owners - so a new main/renderer file using it is caught, not just a
   // wrong count in pre-named files (Dwight 23.4). The shared type definition names the
   // union member and is allowed; call sites are not.
-  const owners = { 'src/renderer/src/hooks/useHive.ts': 2, 'src/main/index.ts': 2 };
+  //
+  // L0-FUSION stage 5.2: main's two call sites LEFT index.ts. The worker-wake beat no longer
+  // writes to a PTY at all - it submits to the one main-owned submit transaction - and that
+  // owner's single write is declared in automaticSubmitWiring.ts (once in the `OwnerPty`
+  // slice that types it, once at the call). index.ts holding ZERO is asserted below, not
+  // merely tolerated. The renderer's two go the same way at the stage 5.3 cutover.
+  const owners = { 'src/renderer/src/hooks/useHive.ts': 2, 'src/main/automaticSubmitWiring.ts': 2 };
+  assert.equal((src('src/main/index.ts').match(/'PROGRAMMATIC'/g) || []).length, 0,
+    'index.ts no longer types anything programmatically itself');
   const allowedDefs = new Set(['src/shared/inputOrigin.ts']);
   const found = {};
   for (const f of [...walk('src/renderer'), ...walk('src/main'), ...walk('src/shared')]) {

@@ -59,6 +59,14 @@ const MAX_DELAY_MS = 6 * 60 * 60 * 1000;
  */
 const AUTO_DELIVERY_TTL_MS = 30_000;
 
+/** Why a claim is structurally dead at revalidation — see `CapacityRuntime.revalidate`. */
+export const CLAIM_REASON = {
+  TARGET: 'CLAIM_TARGET_MISMATCH',
+  POOL: 'CLAIM_POOL_MOVED',
+  EPOCH: 'CLAIM_EPOCH_CHANGED',
+  GRANT: 'CLAIM_GRANT_LOST'
+} as const;
+
 /** What a deliverer receives. On refusal, no ticket exists to settle. */
 export type AutomaticDeliveryGrant =
   | { ok: true; ticket: string }
@@ -361,15 +369,44 @@ export class CapacityRuntime {
    * is a guard whose test is owed the day the constant moves.
    */
   maySubmitNow(held: DeliveryClaim, target: string | null): boolean {
-    if (held.target !== target) return false;
-    if ((this.poolForAgent.get(held.agentId) ?? null) !== held.decision.poolKey) return false;
+    // The renderer ticket path's boolean. It is the collapse `revalidate` exists to
+    // replace, kept only until that path is removed; the main-owned submit transaction
+    // never reads it.
+    return this.revalidate(held, target).verdict !== 'REFUSE';
+  }
+
+  /**
+   * `maySubmitNow`'s question with its answer LEFT INTACT: the tri-state verdict and the
+   * reason, for the main-owned submit transaction (`automaticSubmit.ts`).
+   *
+   * L0-FUSION section 3. The boolean above collapses three verdicts against `REFUSE`, so
+   * UNKNOWN proceeded by an inequality nobody chose. The owner applies ONE named,
+   * exhaustive resolver to what this returns — at ADMIT, before STAGE and at the final
+   * revalidation — and that is only possible if the verdict reaches it uncollapsed.
+   *
+   * The four structural clauses are the same four, each now answering REFUSE under its
+   * own reason rather than a bare `false`, and the carve-out is the same carve-out: a
+   * RECOVERING pool whose single turn THIS claim reserved is ALLOW, not a refusal of the
+   * claim by its own reservation.
+   */
+  revalidate(held: DeliveryClaim, target: string | null): { verdict: AdmissionDecision['verdict']; reason: string } {
+    if (held.target !== target) return { verdict: 'REFUSE', reason: CLAIM_REASON.TARGET };
+    if ((this.poolForAgent.get(held.agentId) ?? null) !== held.decision.poolKey) {
+      return { verdict: 'REFUSE', reason: CLAIM_REASON.POOL };
+    }
     const pool = held.decision.poolKey ? this.tracker.pool(held.decision.poolKey) : null;
-    if ((pool?.limitEpochAt ?? null) !== held.decision.limitEpochAt) return false;
-    if (held.decision.grantId && !this.admission.holdsGrant(held.decision)) return false;
+    if ((pool?.limitEpochAt ?? null) !== held.decision.limitEpochAt) {
+      return { verdict: 'REFUSE', reason: CLAIM_REASON.EPOCH };
+    }
+    if (held.decision.grantId && !this.admission.holdsGrant(held.decision)) {
+      return { verdict: 'REFUSE', reason: CLAIM_REASON.GRANT };
+    }
     const now = this.admission.probe(held.agentId, held.workClass);
-    if (now.verdict !== 'REFUSE') return true;
-    return now.reason === ADMISSION_REASON.RECOVERING_SPENT
-      && this.admission.holdsGrant(held.decision);
+    if (now.verdict === 'REFUSE' && now.reason === ADMISSION_REASON.RECOVERING_SPENT
+      && this.admission.holdsGrant(held.decision)) {
+      return { verdict: 'ALLOW', reason: ADMISSION_REASON.RECOVERING_GRANT };
+    }
+    return { verdict: now.verdict, reason: now.reason };
   }
 
   /**

@@ -44,7 +44,7 @@ function world(over = {}) {
     writes: [],
     /** Pin-6 record: what capacity said at the instant each Enter / clear went out. */
     record: [],
-    gen: 0, inc: { n: 1 }, picker: false,
+    gen: 0, inc: { n: 1 }, promptBlock: null, lastHumanAt: undefined,
     eligible: { eligible: true },
     cap: { kind: 'VERIFIED', clearControl: '\x15', settleMs: 300 },
     ready: ['READY'],
@@ -57,7 +57,7 @@ function world(over = {}) {
     ...over
   };
   w.at = (ms, fn) => { w.timers.push({ at: w.vt + ms, seq: (w.seq += 1), fn }); };
-  w.human = (text) => { w.gen += 1; w.prompt += text; };
+  w.human = (text) => { w.gen += 1; w.prompt += text; w.lastHumanAt = w.vt; };
   w.decisionFor = (agentId, workClass) => ({
     ...CAPACITY[w.capacity], poolKey: 'pool', state: null, workClass, limitEpochAt: null,
     grantId: null, _agent: agentId
@@ -80,7 +80,8 @@ function world(over = {}) {
     },
     terminalReady: () => { w.readyAsks += 1; return w.ready.length > 1 ? w.ready.shift() : w.ready[0]; },
     eligibility: () => w.eligible,
-    pickerLatched: () => w.picker,
+    promptBlock: () => w.promptBlock,
+    lastHumanInputAt: () => w.lastHumanAt,
     abortCapability: () => w.cap,
     readScreen: (ptyId, needle) => {
       w.reads += 1;
@@ -190,7 +191,9 @@ K.abortInhibitsNothing = async (mod) => {
 
 K.preStageHumanIsRefusalNotInterference = async (mod) => {
   const w = world({ ready: ['WAIT', 'READY'] });
-  w.at(50, () => w.human('hello'));
+  // Advances the GENERATION only. `lastHumanInputAt` is left untouched so this killer
+  // stays a test of the two baselines and is not answered by the recency guard instead.
+  w.at(50, () => { w.gen += 1; w.prompt += 'hello'; });
   const o = owner(mod, w);
   const out = await settle(w, o.submit(req()));
   assert.deepEqual(w.writes, [], 'PRE-STAGE human input: NOTHING is typed — no residue');
@@ -236,7 +239,8 @@ K.inhibitionDiesWithItsIncarnation = async (mod) => {
   w.at(50, () => w.human('x'));
   const o = owner(mod, w);
   await settle(w, o.submit(req()));
-  w.inc = { n: 2 }; w.gen = 0; w.prompt = '';
+  // Everything per-incarnation dies with the process, main's human-write record included.
+  w.inc = { n: 2 }; w.gen = 0; w.prompt = ''; w.lastHumanAt = undefined;
   const out = await settle(w, o.submit(req({ requestId: 'r2' })));
   assert.equal(out.kind, 'COMMITTED', 'a respawned terminal has a clean prompt and inherits no inhibition');
 };
@@ -318,30 +322,107 @@ K.repeatedTextInScrollbackStillVerifies = async (mod) => {
 
 K.pickerInGapIsInterfered = async (mod) => {
   const w = world();
-  w.at(50, () => { w.picker = true; });
+  w.at(50, () => { w.promptBlock = 'picker'; });
   const out = await settle(w, owner(mod, w).submit(req()));
   assert.equal(enters(w), 0, 'a picker latched after STAGE: NO Enter into it');
   assert.equal(out.kind, 'INTERFERED');
   assert.equal(out.reason, 'PICKER_LATCHED_AFTER_STAGE');
 };
 
-K.pickerBeforeStageRefuses = async (mod) => {
-  for (const admissionClass of mod.ADMISSION_CLASSES) {
-    const w = world({ picker: true });
-    const out = await settle(w, owner(mod, w).submit(req({ admissionClass })));
-    assert.deepEqual(w.writes, [], `${admissionClass}: a latched picker before STAGE means NOTHING is typed`);
-    assert.deepEqual(out, { kind: 'REFUSED', reason: 'PICKER_LATCHED' });
+// ─── THE ONE POLICY POINT: class x condition -> refuse | proceed, a test per cell ─────
+//
+// HUMAN RULING 2026-09-20 (L0-S5-BOOT-GATE, option A): "automatic delivery gets the full
+// gate with no exceptions. Boot prompts and send-now still go through the one owner, still
+// revalidate before Enter, and still stop on human interference. They are not refused up
+// front just because the provider is unmeasured."
+//
+// THE EXPECTED TABLE IS WRITTEN OUT HERE, NOT READ FROM THE MODULE. A test that asked the
+// module what the module should do would pass under every cell flip.
+const RULED = {
+  CAPACITY_GATED: {
+    ABORT_CAPABILITY_UNVERIFIED: 'REFUSE', PROVENANCE_INELIGIBLE: 'REFUSE', PROMPT_UNKNOWN: 'REFUSE',
+    PROMPT_PICKER: 'REFUSE', PROMPT_DRAFT: 'REFUSE', PROMPT_SETTLING: 'REFUSE', HUMAN_INPUT_RECENT: 'REFUSE'
+  },
+  USER_RELEASED: {
+    ABORT_CAPABILITY_UNVERIFIED: 'PROCEED', PROVENANCE_INELIGIBLE: 'PROCEED', PROMPT_UNKNOWN: 'PROCEED',
+    PROMPT_PICKER: 'REFUSE', PROMPT_DRAFT: 'REFUSE', PROMPT_SETTLING: 'REFUSE', HUMAN_INPUT_RECENT: 'REFUSE'
+  },
+  BOOT_SEQUENCE: {
+    ABORT_CAPABILITY_UNVERIFIED: 'PROCEED', PROVENANCE_INELIGIBLE: 'PROCEED', PROMPT_UNKNOWN: 'PROCEED',
+    PROMPT_PICKER: 'REFUSE', PROMPT_DRAFT: 'REFUSE', PROMPT_SETTLING: 'REFUSE', HUMAN_INPUT_RECENT: 'REFUSE'
   }
 };
 
-K.unknownPickerFailsClosedForGatedOnly = async (mod) => {
-  const w = world({ picker: undefined });
+const CONDITION = {
+  ABORT_CAPABILITY_UNVERIFIED: { over: { cap: { kind: 'UNKNOWN' } }, reason: 'PROVIDER_ABORT_UNVERIFIED' },
+  PROVENANCE_INELIGIBLE: { over: { eligible: { eligible: false, reason: 'SELFTEST_UNKNOWN' } }, reason: 'PROVENANCE_INELIGIBLE' },
+  PROMPT_UNKNOWN: { over: { promptBlock: undefined }, reason: 'PROMPT_UNKNOWN' },
+  PROMPT_PICKER: { over: { promptBlock: 'picker' }, reason: 'PROMPT_PICKER' },
+  PROMPT_DRAFT: { over: { promptBlock: 'draft' }, reason: 'PROMPT_DRAFT' },
+  PROMPT_SETTLING: { over: { promptBlock: 'settling' }, reason: 'PROMPT_SETTLING' },
+  // A keystroke main took 200 ms before the clock the world starts at; the mirror has
+  // not caught up and still says the prompt is free.
+  HUMAN_INPUT_RECENT: { over: { vt: 10_000, lastHumanAt: 9_800, promptBlock: null }, reason: 'HUMAN_INPUT_RECENT' }
+};
+
+const cellName = (cls, condition) => `cell ${cls} x ${condition}`;
+
+for (const cls of Object.keys(RULED)) {
+  for (const condition of Object.keys(RULED[cls])) {
+    K[cellName(cls, condition)] = async (mod) => {
+      const w = world(CONDITION[condition].over);
+      const out = await settle(w, owner(mod, w).submit(req({ admissionClass: cls })));
+      if (RULED[cls][condition] === 'REFUSE') {
+        assert.deepEqual(w.writes, [], `${cls} x ${condition} REFUSES: nothing is typed`);
+        assert.equal(out.kind, 'REFUSED', `${cls} x ${condition} REFUSES`);
+        assert.equal(out.reason, CONDITION[condition].reason);
+        assert.equal(owner(mod, w).inhibition('pty-alice'), null, 'a refusal inhibits nothing');
+      } else {
+        assert.equal(out.kind, 'COMMITTED',
+          `${cls} x ${condition} PROCEEDS: not refused up front just because support is unproven`);
+      }
+    };
+  }
+}
+
+K.policyTableIsTotal = async (mod) => {
+  assert.deepEqual([...mod.ADMISSION_CLASSES].sort(), Object.keys(RULED).sort(), 'every class is ruled');
+  for (const cls of mod.ADMISSION_CLASSES) {
+    assert.deepEqual(Object.keys(mod.READY_GATE_POLICY[cls]).sort(), [...mod.GATE_CONDITIONS].sort(),
+      `${cls}: every condition has a cell`);
+    assert.deepEqual([...mod.GATE_CONDITIONS].sort(), Object.keys(RULED[cls]).sort());
+    assert.equal(typeof mod.ASKS_CAPACITY[cls], 'boolean', `${cls}: asks-capacity is decided`);
+  }
+};
+
+K.wakeOntoAHumanDraftTypesNothing = async (mod) => {
+  // READING 3 (god, accepted): the main wake beat used to type with NO draft or picker
+  // check at all - it could not see them - and could fuse a nudge onto text a human was
+  // writing. With the prompt mirrored into main, an automatic start onto a draft types
+  // nothing, returns its grant, and inhibits nothing: the human did nothing wrong.
+  const w = world({ promptBlock: 'draft' });
+  w.prompt = 'a sentence I am halfway throu';
+  const o = owner(mod, w);
+  const out = await settle(w, o.submit(req()));
+  assert.deepEqual(w.writes, [], 'an automatic start onto a HUMAN DRAFT types NOTHING');
+  assert.deepEqual(out, { kind: 'REFUSED', reason: 'PROMPT_DRAFT' });
+  assert.equal(w.prompt, 'a sentence I am halfway throu', "the human's draft is untouched");
+  assert.equal(w.cancelled.length, 1, 'the grant is returned');
+  assert.equal(o.inhibition('pty-alice'), null, 'and nothing is inhibited');
+};
+
+K.aQuietHumanIsNotRecent = async (mod) => {
+  const w = world({ vt: 10_000, lastHumanAt: 10_000 - mod.HUMAN_QUIET_MS });
+  assert.equal((await settle(w, owner(mod, w).submit(req()))).kind, 'COMMITTED',
+    'a human write exactly HUMAN_QUIET_MS ago no longer holds the line');
+};
+
+K.unmirroredPromptAfterStageIsInterferedForGated = async (mod) => {
+  const w = world();
+  w.at(50, () => { w.promptBlock = undefined; });
   const out = await settle(w, owner(mod, w).submit(req()));
-  assert.deepEqual(w.writes, [], 'gated + picker state UNKNOWN: nothing typed');
-  assert.deepEqual(out, { kind: 'REFUSED', reason: 'PICKER_UNKNOWN' });
-  const w2 = world({ picker: undefined });
-  const boot = await settle(w2, owner(mod, w2).submit(req({ admissionClass: 'BOOT_SEQUENCE' })));
-  assert.equal(boot.kind, 'COMMITTED', 'a declared bypass class is not refused for an unmirrored picker');
+  assert.equal(enters(w), 0, 'gated: a prompt that stopped being mirrored inside the GAP gets NO Enter');
+  assert.equal(out.reason, 'PROMPT_UNKNOWN_AFTER_STAGE');
 };
 
 K.abortCapabilityFailsClosedAtReady = async (mod) => {
@@ -646,27 +727,36 @@ const MUTANTS = [
       ['after.screenCount >= before.screenCount) {', 'after.screenCount > before.screenCount) {']],
     killer: 'silentOracleIsNotAnErase', dies: /resolves to INTERFERED/ },
   { name: 'the picker latch not read inside the critical section',
-    edits: [["  if (picker === true) return { kind: 'INTERFERED', reason: 'PICKER_LATCHED_AFTER_STAGE' };\n", '']],
+    edits: [["  if (block === 'picker') return { kind: 'INTERFERED', reason: 'PICKER_LATCHED_AFTER_STAGE' };\n", '']],
     killer: 'pickerInGapIsInterfered', dies: /NO Enter into it/ },
-  { name: 'the picker latch not read before STAGE',
-    edits: [["    if (picker === true) return this.refuse(decision, 'PICKER_LATCHED');\n", '']],
-    killer: 'pickerBeforeStageRefuses', dies: /NOTHING is typed/ },
-  { name: 'an unmirrored picker treated as closed',
-    edits: [["      if (picker === undefined) return this.refuse(decision, 'PICKER_UNKNOWN');\n", '']],
-    killer: 'unknownPickerFailsClosedForGatedOnly', dies: /picker state UNKNOWN/ },
+  { name: 'the prompt mirror not read before STAGE',
+    edits: [["    if (prompt && gateRefuses(cls, prompt)) return this.refuse(decision, prompt);\n", '']],
+    killer: 'wakeOntoAHumanDraftTypesNothing', dies: /onto a HUMAN DRAFT types NOTHING/ },
+  { name: 'the recency guard removed',
+    edits: [["    if (lastHuman !== undefined && deps.now() - lastHuman < HUMAN_QUIET_MS && gateRefuses(cls, 'HUMAN_INPUT_RECENT')) {\n      return this.refuse(decision, 'HUMAN_INPUT_RECENT');\n    }\n", '']],
+    killer: cellName('CAPACITY_GATED', 'HUMAN_INPUT_RECENT'), dies: /REFUSES: nothing is typed/ },
+  { name: 'a recency guard that never lets go',
+    edits: [['deps.now() - lastHuman < HUMAN_QUIET_MS &&', 'deps.now() - lastHuman <= HUMAN_QUIET_MS &&']],
+    killer: 'aQuietHumanIsNotRecent', dies: /no longer holds the line/ },
+  { name: 'an unmirrored prompt treated as a free prompt',
+    edits: [["  if (block === undefined) return 'PROMPT_UNKNOWN';\n", '']],
+    killer: cellName('CAPACITY_GATED', 'PROMPT_UNKNOWN'), dies: /REFUSES: nothing is typed/ },
+  { name: 'an unmirrored prompt not re-read inside the critical section',
+    edits: [["  if (block === undefined && gateRefuses(cls, 'PROMPT_UNKNOWN')) {\n    return { kind: 'INTERFERED', reason: 'PROMPT_UNKNOWN_AFTER_STAGE' };\n  }\n", '']],
+    killer: 'unmirroredPromptAfterStageIsInterferedForGated', dies: /stopped being mirrored inside the GAP gets NO Enter/ },
   { name: 'the abort-capability gate removed from READY',
-    edits: [["      if (deps.abortCapability(req.agentId).kind !== 'VERIFIED') return this.refuse(decision, 'PROVIDER_ABORT_UNVERIFIED');\n", '']],
+    edits: [["    if (gateRefuses(cls, 'ABORT_CAPABILITY_UNVERIFIED') && deps.abortCapability(req.agentId).kind !== 'VERIFIED') {\n      return this.refuse(decision, 'PROVIDER_ABORT_UNVERIFIED');\n    }\n", '']],
     killer: 'abortCapabilityFailsClosedAtReady', dies: /BEFORE any payload is staged/ },
   { name: 'capability UNKNOWN resolved through the capacity UNKNOWN policy',
-    edits: [["      if (deps.abortCapability(req.agentId).kind !== 'VERIFIED') return this.refuse(decision, 'PROVIDER_ABORT_UNVERIFIED');",
-      "      if (deps.abortCapability(req.agentId).kind !== 'VERIFIED' && policy.NO_STATE !== 'PROCEED') return this.refuse(decision, 'PROVIDER_ABORT_UNVERIFIED');"]],
+    edits: [["    if (gateRefuses(cls, 'ABORT_CAPABILITY_UNVERIFIED') && deps.abortCapability(req.agentId).kind !== 'VERIFIED') {",
+      "    if (gateRefuses(cls, 'ABORT_CAPABILITY_UNVERIFIED') && deps.abortCapability(req.agentId).kind !== 'VERIFIED' && policy.NO_STATE !== 'PROCEED') {"]],
     killer: 'capabilityUnknownNeverInheritsCapacityProceed', dies: /capability UNKNOWN refuses/ },
   { name: 'the provenance gate removed from READY and STAGE',
-    edits: [["      const e = deps.eligibility(ptyId);\n      if (!e.eligible) return this.refuse(decision, 'PROVENANCE_INELIGIBLE', e.reason);\n    }\n    const started", "    }\n    const started"],
-      ["      const e = deps.eligibility(ptyId);\n      if (!e.eligible) return this.refuse(decision, 'PROVENANCE_INELIGIBLE', e.reason);\n      const claim", '      const claim']],
+    edits: [["    if (gateRefuses(cls, 'PROVENANCE_INELIGIBLE')) {\n      const e = deps.eligibility(ptyId);\n      if (!e.eligible) return this.refuse(decision, 'PROVENANCE_INELIGIBLE', e.reason);\n    }\n    const started", "    const started"],
+      ["    if (gateRefuses(cls, 'PROVENANCE_INELIGIBLE')) {\n      const e = deps.eligibility(ptyId);\n      if (!e.eligible) return this.refuse(decision, 'PROVENANCE_INELIGIBLE', e.reason);\n    }\n    if (decision) {", "    if (decision) {"]],
     killer: 'provenanceFailsClosedAtReady', dies: /unproven provenance means NOTHING is typed/ },
   { name: 'provenance asked once at READY and cached',
-    edits: [["      const e = deps.eligibility(ptyId);\n      if (!e.eligible) return this.refuse(decision, 'PROVENANCE_INELIGIBLE', e.reason);\n      const claim", '      const claim']],
+    edits: [["    if (gateRefuses(cls, 'PROVENANCE_INELIGIBLE')) {\n      const e = deps.eligibility(ptyId);\n      if (!e.eligible) return this.refuse(decision, 'PROVENANCE_INELIGIBLE', e.reason);\n    }\n    if (decision) {", "    if (decision) {"]],
     killer: 'provenanceIsReReadImmediatelyBeforeStage', dies: /re-read IMMEDIATELY before STAGE/ },
   { name: 'provenance not re-read inside the critical section',
     edits: [["    const e = deps.eligibility(s.ptyId);\n    if (!e.eligible) return { kind: 'INTERFERED', reason: 'PROVENANCE_LOST_AFTER_STAGE', detail: e.reason };\n", '']],
@@ -690,7 +780,7 @@ const MUTANTS = [
     edits: [["      if (!evidence) return { action: 'HOLD', basis: `UNCLASSIFIED_UNKNOWN:${decision.reason}` };", "      if (!evidence) return { action: 'PROCEED', basis: `UNCLASSIFIED_UNKNOWN:${decision.reason}` };"]],
     killer: 'unclassifiedUnknownHolds', dies: /missing fact, never permission/ },
   { name: 'every class treated as a bypass',
-    edits: [["  return cls === 'CAPACITY_GATED';", '  return false;']],
+    edits: [['  CAPACITY_GATED: true,', '  CAPACITY_GATED: false,']],
     killer: 'bypassIsDeclaredNotInherited', dies: /CAPACITY_GATED under a LIMITED pool types nothing/ },
   { name: 'a bypass class that skips the final revalidation',
     edits: [["  const blocked = postStageGuard(s, deps);\n  if (blocked) return blocked;\n  if (s.decision) {", "  const blocked = s.decision ? postStageGuard(s, deps) : null;\n  if (blocked) return blocked;\n  if (s.decision) {"]],
@@ -714,6 +804,25 @@ const MUTANTS = [
     edits: [['    await this.sleep(GAP_MS);', '    await this.sleep(0);']],
     killer: 'gapIsHonoured', dies: /one GAP after the payload/ }
 ];
+
+// ONE MUTANT PER POLICY CELL. Each flips exactly one answer of READY_GATE_POLICY and must
+// be killed by that cell's own test. A cell line is not unique on its own (the three
+// class blocks share their keys), so the edit target is the block from the class header
+// down to the cell - unique, and therefore subject to the same exactly-once rule.
+for (const cls of Object.keys(RULED)) {
+  const conditions = Object.keys(RULED[cls]);
+  conditions.forEach((condition, i) => {
+    const line = (c, v) => `    ${c}: '${v}'${c === conditions[conditions.length - 1] ? '' : ','}\n`;
+    const head = `  ${cls}: {\n` + conditions.slice(0, i).map((c) => line(c, RULED[cls][c])).join('');
+    const flipped = RULED[cls][condition] === 'REFUSE' ? 'PROCEED' : 'REFUSE';
+    MUTANTS.push({
+      name: `policy cell flipped: ${cls} x ${condition} -> ${flipped}`,
+      edits: [[head + line(condition, RULED[cls][condition]), head + line(condition, flipped)]],
+      killer: cellName(cls, condition),
+      dies: RULED[cls][condition] === 'REFUSE' ? /REFUSES/ : /PROCEEDS/
+    });
+  });
+}
 
 const MUTANT_DIR = path.join(__dirname, '.mutants');
 

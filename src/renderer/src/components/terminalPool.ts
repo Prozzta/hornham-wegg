@@ -27,6 +27,7 @@ import {
 } from './inputOrigin';
 import type { InputOrigin } from '@shared/inputOrigin';
 import { sameInputState, type TerminalInputState } from '@shared/inputProvenance';
+import type { PromptBlock } from '@shared/promptState';
 import {
   createTerminalRecoveryState,
   normalizePtyChunk,
@@ -94,6 +95,11 @@ export interface TerminalEntry {
   inputOriginProbe?: ProbeConsumer;
   /** Last provenance state reported to main, so we report only on change. */
   inputStateReported?: TerminalInputState;
+  /** Last prompt block main ACKED, and the incarnation it was ACKED under - so the
+   *  mirror reports on change and re-reports to every new incarnation. */
+  promptStateReported?: PromptBlock;
+  promptStateReportedGen?: number;
+  promptStateInFlight?: boolean;
   /** Self-test outcome for this incarnation; 'unknown' until it has run. */
   inputSelfTest: 'unknown' | 'pass' | 'fail';
   /** The INCARNATION TOKEN. Bumped on every establish (open/reset/relaunch) and on
@@ -442,6 +448,8 @@ export function acquireTerminal(ptyId: string, theme?: ThemeMap, fontSize = 14):
     // Re-stamped on every keystroke, so the staleness clock measures time since
     // the user last touched the draft — not since they started it.
     if (entry.inputDirty) entry.inputDirtyAt = Date.now();
+    // The draft or the picker latch may just have changed: tell main (deduped on ACK).
+    reportPromptState(entry);
   });
 
   pool.set(ptyId, entry);
@@ -469,6 +477,8 @@ export function acquireTerminal(ptyId: string, theme?: ThemeMap, fontSize = 14):
   // Tab; and every pooled terminal adds a live "Terminal input" textbox to the accessibility
   // tree with nothing on screen. Detached keeps fit() inert, which is what those paths rely on.
   openTerminalOnce(entry);
+  startPromptMirror();
+  ensureScreenReadResponder();
   return entry;
 }
 
@@ -580,6 +590,114 @@ function releasePickerBlock(entry: TerminalEntry): void {
   entry.automationBlocked = false;
   entry.automationBlockedAt = 0;
   entry.automationSettleUntil = Date.now() + 500;
+  reportPromptState(entry);
+}
+
+// ── THE PROMPT MIRROR (L0-FUSION stage 5) ──────────────────────────────────────────
+// The picker latch, the human draft and the settle window live on the pool entry, and
+// until stage 5 only the renderer's own queue drain could consult them. The main-owned
+// submit transaction must read them IN MAIN (design section 5.3: before STAGE and again
+// inside its critical section), and the main-process worker wake typed with no view of
+// them at all. So the block this module already computes is mirrored, exactly as
+// computed - including the half-hour expiry of an untouched draft or picker, so main and
+// the composer never disagree about why a message is waiting.
+//
+// SAME DISCIPLINE AS THE PROVENANCE MIRROR: the cache is set only on main's ACK, a
+// rejected report is retried on the next tick rather than recorded as delivered, and a
+// terminal main has never heard from stays UNKNOWN, which main refuses for automatic
+// delivery. It is NOT an interference or erase oracle - `inputDirty` only ever sees
+// keystrokes xterm saw, so it is blind to automatically staged text by construction.
+
+/** Several of the block's inputs change with no event at all - a settle window ending,
+ *  a draft or picker going stale, the echo grace elapsing - so the mirror is re-derived
+ *  on a slow tick as well as on every input. One timer for the whole pool. */
+const PROMPT_MIRROR_TICK_MS = 500;
+let promptMirrorTimer: ReturnType<typeof setInterval> | null = null;
+
+function startPromptMirror(): void {
+  if (promptMirrorTimer) return;
+  promptMirrorTimer = setInterval(() => {
+    for (const entry of pool.values()) reportPromptState(entry);
+  }, PROMPT_MIRROR_TICK_MS);
+}
+
+function currentPromptBlock(entry: TerminalEntry): PromptBlock {
+  return terminalAutomationBlock(automationStateOf(entry));
+}
+
+function reportPromptState(entry: TerminalEntry): void {
+  if (entry.exited) return;
+  const block = currentPromptBlock(entry);
+  const gen = entry.generation;
+  // `undefined` = nothing ACKED for this incarnation yet, so even `null` (free) is news.
+  if (entry.promptStateReportedGen === gen && entry.promptStateReported === block) return;
+  if (entry.promptStateInFlight) return; // the tick re-derives; never queue a stale value
+  const p = window.cth.reportTerminalPromptState?.(entry.ptyId, { block });
+  if (!p) return; // no bridge (harness): main stays UNKNOWN, the fail-closed answer
+  entry.promptStateInFlight = true;
+  void p.then((r) => {
+    entry.promptStateInFlight = false;
+    if (r && r.ok && entry.generation === gen) {
+      entry.promptStateReported = block;
+      entry.promptStateReportedGen = gen;
+    }
+    // Not ACKED (no session yet, bridge error) or superseded: the next tick re-sends.
+  }).catch(() => { entry.promptStateInFlight = false; });
+}
+
+/**
+ * THE ERASE ORACLE (design section 5.1) - what the RENDERED SCREEN says about `needle`.
+ *
+ *   onPromptRow  is it on the row at `buffer.active.baseY + buffer.active.cursorY`?
+ *                Where the cursor sits is which line is the prompt.
+ *   screenCount  how many visible rows contain it, prompt row included.
+ *
+ * The main-owned submit transaction asks this twice around a clear and compares: it must
+ * first SEE its text on the prompt row, and afterwards find it gone from that row AND
+ * fewer times on the screen. This function only READS. It never consults `inputDirty` or
+ * `hasTerminalDraft` - both are blind to automatically staged text - and it is never
+ * asked whether a human typed.
+ *
+ * Null = the screen is not evidence: no such terminal, it has exited, or the buffer could
+ * not be read. Main treats null as "no reading" and holds the item.
+ */
+export function readScreenForNeedle(ptyId: string, needle: string): { onPromptRow: boolean; screenCount: number } | null {
+  const entry = pool.get(ptyId);
+  if (!entry || entry.exited || !entry.opened || !needle) return null;
+  try {
+    const buf = entry.term.buffer.active;
+    const promptLine = buf.getLine(buf.baseY + buf.cursorY);
+    if (!promptLine) return null;
+    let screenCount = 0;
+    for (let y = 0; y < entry.term.rows; y += 1) {
+      const line = buf.getLine(buf.baseY + y);
+      if (line && line.translateToString(true).includes(needle)) screenCount += 1;
+    }
+    return { onPromptRow: promptLine.translateToString(true).includes(needle), screenCount };
+  } catch {
+    return null;
+  }
+}
+
+/** Answer main's screen-reading requests for terminals in THIS renderer's pool. Wired
+ *  once, on the first acquire (by then the preload bridge exists); a bridge without the
+ *  method (the Electron harness stub) simply never asks. */
+let screenReadResponderInstalled = false;
+function ensureScreenReadResponder(): void {
+  if (screenReadResponderInstalled) return;
+  screenReadResponderInstalled = true;
+  window.cth?.onScreenReadRequest?.((req) => {
+    if (!req || typeof req.requestId !== 'string') return;
+    const entry = typeof req.ptyId === 'string' ? pool.get(req.ptyId) : undefined;
+    if (!entry) { window.cth.answerScreenReading(req.requestId, null); return; }
+    // Read only after xterm has parsed everything already queued for this terminal: an
+    // empty write is ordered behind pending PTY output (the same public FIFO barrier the
+    // provenance self-test uses), so the reading reflects the repaint a clear provoked
+    // rather than the frame before it.
+    entry.term.write('', () => {
+      window.cth.answerScreenReading(req.requestId, readScreenForNeedle(req.ptyId, String(req.needle ?? '')));
+    });
+  });
 }
 
 /** Why queue delivery is currently held back for this pty, or null if it isn't.
@@ -619,6 +737,7 @@ export function clearTerminalDraft(ptyId: string): string {
   // got garbage. The latch is released by a real Enter/Esc/Ctrl-C, or it expires.
   // Let the TUI repaint the cleared line before automation types into it.
   entry.automationSettleUntil = Date.now() + 300;
+  reportPromptState(entry);
   return discarded;
 }
 
