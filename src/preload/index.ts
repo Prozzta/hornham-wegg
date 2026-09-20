@@ -502,6 +502,10 @@ export interface AgentControlSnapshot {
    * shown anywhere.
    */
   capacityHold?: boolean;
+  /** Why (L0-UNKNOWN ruling): 'NO_POOL' = outside capacity gating, NEVER "available";
+   *  'NO_STATE' / 'INDETERMINATE' = held for want of usable evidence; 'REFUSED' = a
+   *  provider limit. Computed in main through the one resolver; never derived here. */
+  capacityEvidence?: 'ALLOWED' | 'REFUSED' | 'NO_POOL' | 'NO_STATE' | 'INDETERMINATE' | 'UNCLASSIFIED';
   paused: boolean;
   halted: boolean;
   autoDeliveryPaused: boolean;

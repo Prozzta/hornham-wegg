@@ -169,31 +169,59 @@ function promptCondition(block: PromptBlock | undefined): PromptCondition | null
 
 // ─── UNKNOWN is one decision, made by name (section 3) ────────────────────────────────
 
-/** The three EVIDENCE conditions behind an UNKNOWN verdict. Different evidence even
- *  where the human assigns the same action to all three (Dwight section 19). */
-export type UnknownEvidence = 'NO_POOL' | 'NO_STATE' | 'STALE_STATE';
+/**
+ * The three EVIDENCE conditions behind an UNKNOWN verdict (Dwight section 19: different
+ * evidence, whatever action each is given).
+ *
+ *   NO_POOL        the agent maps to no capacity pool at all. There is no capacity-control
+ *                  surface for it. This is OUTSIDE CAPACITY GATING - it is NOT "available",
+ *                  and nothing may label or present it as such.
+ *   NO_STATE       a pool is known for the agent and nothing has been observed for it.
+ *   INDETERMINATE  a pool is known and observed, and its state cannot be resolved: the
+ *                  reading went stale, two readings conflict, a retention cap was breached,
+ *                  it was restored across a restart and not yet confirmed, or a window's
+ *                  applicability is unknown. (`ADMISSION_REASON.UNKNOWN`.)
+ */
+export type UnknownEvidence = 'NO_POOL' | 'NO_STATE' | 'INDETERMINATE';
 export type AdmissionAction = 'PROCEED' | 'HOLD';
 export type UnknownPolicy = Readonly<Record<UnknownEvidence, AdmissionAction>>;
 
 /**
- * TODAY'S BEHAVIOUR, NAMED. Proceed-for-all-three is what four scattered `!== 'REFUSE'`
- * inequalities used to do by accident. It is retained as a PROVISIONAL compatibility
- * default; section 19 explicitly does not ratify it. The mapping is a value, not a
- * design — change it here and every guard changes with it.
+ * THE UNKNOWN MAPPING, RATIFIED. One named value; every guard reads it through
+ * `resolveAdmission`, so changing an answer is a one-line edit here.
+ *
+ * HUMAN RULING, 2026-09-20 (card L0-UNKNOWN, OPTION B), verbatim: "Automatic delivery
+ * mapping: (1) NO POOL CONFIGURED -> PROCEED; (2) POOL CONFIGURED, NO OBSERVATION YET ->
+ * HOLD; (3) INDETERMINATE / UNKNOWN OBSERVATION -> HOLD. Reason: 'No pool configured' means
+ * Hornham does not currently have a capacity-control surface for that provider. Preserve
+ * existing delivery behaviour there. But once a capacity pool IS configured, absence of
+ * usable evidence must not silently collapse to AVAILABLE. UNKNOWN != AVAILABLE. [...] The
+ * final revalidation remains required regardless. Do not label the no-pool case AVAILABLE.
+ * It is simply outside capacity gating until a pool is configured."
+ *
+ * It replaces the proceed-for-all-three that four scattered `!== 'REFUSE'` inequalities
+ * used to produce by accident, which stage 5.1 had named and kept only provisionally.
+ *
+ * HOLD IS A HOLD, NOT A DROP AND NOT AN INTERFERENCE. Nothing is typed, the item stays
+ * queued, nothing is inhibited, and the caller simply asks again. THERE IS NO TIMEOUT: a
+ * hold that lapsed into proceeding would be the silent collapse the ruling forbids. It
+ * ends when an accepted observation gives the pool a resolvable state.
  *
  * THIS IS CAPACITY-STATE UNKNOWN ONLY. Provider abort-capability UNKNOWN and provenance
- * UNKNOWN never pass through here and must never inherit a proceed from it.
+ * UNKNOWN never pass through here and must never inherit a proceed from it. And only
+ * classes that ask capacity at all (`ASKS_CAPACITY`) ever reach it: send-now and boot
+ * prompts do not consult this mapping anywhere.
  */
-export const PROVISIONAL_UNKNOWN_POLICY: UnknownPolicy = {
+export const UNKNOWN_POLICY: UnknownPolicy = {
   NO_POOL: 'PROCEED',
-  NO_STATE: 'PROCEED',
-  STALE_STATE: 'PROCEED'
+  NO_STATE: 'HOLD',
+  INDETERMINATE: 'HOLD'
 };
 
 function unknownEvidenceOf(reason: string): UnknownEvidence | null {
   if (reason === ADMISSION_REASON.NO_POOL) return 'NO_POOL';
   if (reason === ADMISSION_REASON.NO_STATE) return 'NO_STATE';
-  if (reason === ADMISSION_REASON.UNKNOWN) return 'STALE_STATE';
+  if (reason === ADMISSION_REASON.UNKNOWN) return 'INDETERMINATE';
   return null;
 }
 
@@ -225,6 +253,34 @@ export function resolveAdmission(
       return { action: 'HOLD', basis: `UNRECOGNISED_VERDICT:${String(unreachable)}` };
     }
   }
+}
+
+/**
+ * What capacity says about an agent, KEPT DISTINCT for anything that displays or reports
+ * it. The ruling: "UI/state should preserve that distinction rather than presenting all
+ * three cases as the same kind of healthy capacity." So this is never a boolean, and
+ * NO_POOL is its own value - outside capacity gating - not a flavour of ALLOWED.
+ */
+export type CapacityEvidence = 'ALLOWED' | 'REFUSED' | UnknownEvidence | 'UNCLASSIFIED';
+
+export interface CapacityGate {
+  evidence: CapacityEvidence;
+  /** Would automatic delivery be held right now? Derived through the ONE resolver. */
+  holds: boolean;
+  basis: string;
+}
+
+/** The gate for a probe of the admission seam, through the same resolver and the same
+ *  policy every guard uses - so what a snapshot SAYS and what the owner DOES cannot drift. */
+export function capacityGateOf(
+  decision: { verdict: AdmissionVerdict; reason: string },
+  policy: UnknownPolicy = UNKNOWN_POLICY
+): CapacityGate {
+  const resolved = resolveAdmission(decision, policy);
+  const evidence: CapacityEvidence = decision.verdict === 'ALLOW' ? 'ALLOWED'
+    : decision.verdict === 'REFUSE' ? 'REFUSED'
+      : unknownEvidenceOf(decision.reason) ?? 'UNCLASSIFIED';
+  return { evidence, holds: resolved.action === 'HOLD', basis: resolved.basis };
 }
 
 // ─── Effects ──────────────────────────────────────────────────────────────────────────
@@ -480,7 +536,7 @@ export function commitSection(s: Staged, deps: OwnerDeps): CommitVerdict {
     const claim: OwnerClaim = {
       decision: s.decision, agentId: s.req.agentId, workClass: s.decision.workClass, target: s.ptyId
     };
-    const now = resolveAdmission(deps.capacity.revalidate(claim), deps.unknownPolicy ?? PROVISIONAL_UNKNOWN_POLICY);
+    const now = resolveAdmission(deps.capacity.revalidate(claim), deps.unknownPolicy ?? UNKNOWN_POLICY);
     if (now.action !== 'PROCEED') return { kind: 'LATE_REFUSAL', basis: now.basis };
   }
   const entered = safeWrite(deps, s.ptyId, '\r');
@@ -597,7 +653,7 @@ export class AutomaticSubmitOwner {
   private async run(req: SubmitRequest, ptyId: string): Promise<SubmitOutcome> {
     const deps = this.deps;
     const cls = req.admissionClass;
-    const policy = deps.unknownPolicy ?? PROVISIONAL_UNKNOWN_POLICY;
+    const policy = deps.unknownPolicy ?? UNKNOWN_POLICY;
 
     // ── ADMIT ────────────────────────────────────────────────────────────────────────
     if (this.inhibition(ptyId)) return this.refuse(null, 'PTY_INHIBITED');

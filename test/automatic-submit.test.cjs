@@ -452,9 +452,9 @@ K.abortCapabilityFailsClosedAtReady = async (mod) => {
 };
 
 K.capabilityUnknownNeverInheritsCapacityProceed = async (mod) => {
-  // Two different unknowns. Capacity UNKNOWN proceeds under the provisional policy;
-  // capability UNKNOWN must not ride along with it.
-  const w = world({ cap: { kind: 'UNKNOWN' }, capacity: 'NO_STATE' });
+  // Two different unknowns. The one capacity unknown that PROCEEDS under the ratified
+  // mapping is NO_POOL; capability UNKNOWN must not ride along with it.
+  const w = world({ cap: { kind: 'UNKNOWN' }, capacity: 'NO_POOL' });
   const out = await settle(w, owner(mod, w).submit(req()));
   assert.deepEqual(w.writes, [], 'capability UNKNOWN refuses even when capacity UNKNOWN proceeds');
   assert.equal(out.reason, 'PROVIDER_ABORT_UNVERIFIED');
@@ -501,40 +501,121 @@ K.respawnInGapNeverReceivesTheEnter = async (mod) => {
   assert.equal(w.cancelled.length, 1);
 };
 
-K.unknownPolicyIsAppliedByNameAtAdmit = async (mod) => {
-  for (const [state, evidence] of [['NO_POOL', 'NO_POOL'], ['NO_STATE', 'NO_STATE'], ['STALE', 'STALE_STATE']]) {
-    const proceed = world({ capacity: state });
-    assert.equal((await settle(proceed, owner(mod, proceed).submit(req()))).kind, 'COMMITTED',
-      `${evidence}: the provisional policy proceeds`);
-    const hold = world({ capacity: state, unknownPolicy: { ...mod.PROVISIONAL_UNKNOWN_POLICY, [evidence]: 'HOLD' } });
-    const out = await settle(hold, owner(mod, hold).submit(req()));
-    assert.deepEqual(hold.writes, [], `${evidence}: a HOLD policy types nothing`);
-    // Pre-STAGE revalidation would ALSO catch this, which is exactly how an inequality
-    // left at ADMIT hides: same outcome, one readiness wait and one held grant later.
-    assert.equal(hold.readyAsks, 0, `${evidence}: the policy is applied AT ADMIT, before READY is ever asked`);
-    assert.deepEqual(out, { kind: 'REFUSED', reason: 'CAPACITY_HOLD', detail: `UNKNOWN:${evidence}` },
-      `ADMIT applies the NAMED UNKNOWN policy for ${evidence}, not an inequality against REFUSE`);
+// ─── L0-UNKNOWN: the ratified mapping, a test per mapping, at all three sites ─────────
+//
+// HUMAN RULING 2026-09-20 (L0-UNKNOWN, OPTION B): "(1) NO POOL CONFIGURED -> PROCEED;
+// (2) POOL CONFIGURED, NO OBSERVATION YET -> HOLD; (3) INDETERMINATE / UNKNOWN OBSERVATION
+// -> HOLD ... UNKNOWN != AVAILABLE ... Add explicit tests for all three mappings."
+//
+// WRITTEN OUT HERE, NOT READ FROM THE MODULE, for the same reason the gate table is.
+const RULED_UNKNOWN = { NO_POOL: 'PROCEED', NO_STATE: 'HOLD', INDETERMINATE: 'HOLD' };
+/** evidence -> the world state that produces it */
+const UNKNOWN_WORLD = { NO_POOL: 'NO_POOL', NO_STATE: 'NO_STATE', INDETERMINATE: 'STALE' };
+const unknownName = (evidence) => `unknown mapping ${evidence}`;
+
+for (const evidence of Object.keys(RULED_UNKNOWN)) {
+  K[unknownName(evidence)] = async (mod) => {
+    // SITE 1 - ADMIT.
+    const w = world({ capacity: UNKNOWN_WORLD[evidence] });
+    const out = await settle(w, owner(mod, w).submit(req()));
+    if (RULED_UNKNOWN[evidence] === 'PROCEED') {
+      assert.equal(out.kind, 'COMMITTED', `${evidence} PROCEEDS at ADMIT: existing delivery behaviour is preserved`);
+    } else {
+      assert.deepEqual(w.writes, [], `${evidence} HOLDS at ADMIT: nothing is typed`);
+      // Pre-STAGE revalidation would ALSO catch this, which is exactly how an inequality
+      // left at ADMIT hides: same outcome, one readiness wait and one held grant later.
+      assert.equal(w.readyAsks, 0, `${evidence}: the mapping is applied AT ADMIT, before READY is ever asked`);
+      assert.deepEqual(out, { kind: 'REFUSED', reason: 'CAPACITY_HOLD', detail: `UNKNOWN:${evidence}` });
+    }
+    // SITE 2 - PRE-STAGE revalidation: the evidence appears during the readiness wait.
+    const pre = world({ ready: ['WAIT', 'READY'] });
+    pre.at(50, () => { pre.capacity = UNKNOWN_WORLD[evidence]; });
+    const preOut = await settle(pre, owner(mod, pre).submit(req()));
+    if (RULED_UNKNOWN[evidence] === 'PROCEED') assert.equal(preOut.kind, 'COMMITTED', `${evidence} PROCEEDS before STAGE`);
+    else {
+      assert.deepEqual(pre.writes, [], `${evidence} HOLDS at PRE-STAGE revalidation: nothing is typed`);
+      assert.equal(preOut.detail, `UNKNOWN:${evidence}`);
+    }
+    // SITE 3 - the FINAL revalidation, next to the Enter: the evidence appears in the gap.
+    const fin = world();
+    fin.at(50, () => { fin.capacity = UNKNOWN_WORLD[evidence]; });
+    const finOut = await settle(fin, owner(mod, fin).submit(req()));
+    if (RULED_UNKNOWN[evidence] === 'PROCEED') assert.equal(finOut.kind, 'COMMITTED', `${evidence} PROCEEDS at the final revalidation`);
+    else {
+      assert.equal(enters(fin), 0, `${evidence} HOLDS at the FINAL revalidation: no Enter`);
+      assert.equal(finOut.kind, 'ABORTED', 'and the staged text is verifiably erased');
+    }
+    // Last, not first: the behaviour above is the guarantee; this only pins the table.
+    assert.equal(mod.UNKNOWN_POLICY[evidence], RULED_UNKNOWN[evidence], `${evidence} is mapped as RULED`);
+  };
+}
+
+K.unknownPolicyIsOneNamedValue = async (mod) => {
+  // The mapping is a VALUE every guard reads through the resolver - so a future ruling is
+  // a one-line change. Proven by injecting the OPPOSITE of each ruled cell and seeing the
+  // owner follow it at ADMIT.
+  for (const evidence of Object.keys(RULED_UNKNOWN)) {
+    const flipped = RULED_UNKNOWN[evidence] === 'PROCEED' ? 'HOLD' : 'PROCEED';
+    const w = world({ capacity: UNKNOWN_WORLD[evidence], unknownPolicy: { ...RULED_UNKNOWN, [evidence]: flipped } });
+    const out = await settle(w, owner(mod, w).submit(req()));
+    assert.equal(out.kind, flipped === 'PROCEED' ? 'COMMITTED' : 'REFUSED', `${evidence}: the owner follows the injected mapping`);
   }
 };
 
 K.unknownPolicyIsAppliedBeforeStage = async (mod) => {
-  const w = world({ ready: ['WAIT', 'READY'], unknownPolicy: { NO_POOL: 'PROCEED', NO_STATE: 'PROCEED', STALE_STATE: 'HOLD' } });
+  const w = world({ ready: ['WAIT', 'READY'] });
   w.at(50, () => { w.capacity = 'STALE'; });
   const out = await settle(w, owner(mod, w).submit(req()));
   assert.deepEqual(w.writes, [], 'PRE-STAGE revalidation applies the NAMED UNKNOWN policy: nothing typed');
-  assert.deepEqual(out, { kind: 'REFUSED', reason: 'CAPACITY_HOLD', detail: 'UNKNOWN:STALE_STATE' });
+  assert.deepEqual(out, { kind: 'REFUSED', reason: 'CAPACITY_HOLD', detail: 'UNKNOWN:INDETERMINATE' });
 };
 
 K.unknownPolicyIsAppliedAtCommit = async (mod) => {
-  const w = world({ unknownPolicy: { NO_POOL: 'PROCEED', NO_STATE: 'PROCEED', STALE_STATE: 'HOLD' } });
+  const w = world();
   w.at(50, () => { w.capacity = 'STALE'; });
   const out = await settle(w, owner(mod, w).submit(req()));
   assert.equal(enters(w), 0, 'FINAL revalidation applies the NAMED UNKNOWN policy: a HOLD writes no Enter');
   assert.equal(out.kind, 'ABORTED');
 };
 
+K.holdIsARealHoldAndOnlyAnObservationReleasesIt = async (mod) => {
+  // (c) of the ruling's build order: HOLD is not a drop and not an INTERFERED, it does not
+  // lapse, and it ends when evidence arrives.
+  const w = world({ capacity: 'STALE' });
+  const o = owner(mod, w);
+  const held = await settle(w, o.submit(req({ requestId: 'h1' })));
+  assert.deepEqual(held, { kind: 'REFUSED', reason: 'CAPACITY_HOLD', detail: 'UNKNOWN:INDETERMINATE' });
+  assert.deepEqual(w.writes, [], 'a HOLD types nothing - the item is still the caller’s to keep queued');
+  assert.equal(o.inhibition('pty-alice'), null, 'a HOLD is not an INTERFERED: nothing is inhibited');
+  w.vt += 10 * 60 * 60 * 1000;
+  const later = await settle(w, o.submit(req({ requestId: 'h2' })));
+  assert.equal(later.kind, 'REFUSED', 'THERE IS NO TIMEOUT-TO-PROCEED: ten hours of silence is still a HOLD');
+  assert.deepEqual(w.writes, []);
+  // The census caught a lapse at ADMIT SURVIVING this killer, because pre-STAGE
+  // revalidation held the same item one readiness wait later. So ADMIT is pinned itself.
+  assert.equal(w.readyAsks, 0, 'NO TIMEOUT-TO-PROCEED AT ADMIT EITHER: ten hours on, READY is still never asked');
+  w.capacity = 'AVAILABLE'; // an accepted observation gives the pool a resolvable state
+  const released = await settle(w, o.submit(req({ requestId: 'h3' })));
+  assert.equal(released.kind, 'COMMITTED', 'the next ask after the observation is admitted');
+};
+
+K.noPoolIsNeverCalledAvailable = async (mod) => {
+  const gate = mod.capacityGateOf(CAPACITY.NO_POOL);
+  assert.deepEqual({ evidence: gate.evidence, holds: gate.holds }, { evidence: 'NO_POOL', holds: false },
+    'NO_POOL is its own value - outside capacity gating - and is NEVER reported as ALLOWED/AVAILABLE');
+  assert.notEqual(gate.evidence, mod.capacityGateOf(CAPACITY.AVAILABLE).evidence, 'it is distinguishable from a healthy pool');
+  assert.deepEqual(mod.capacityGateOf(CAPACITY.NO_STATE), { evidence: 'NO_STATE', holds: true, basis: 'UNKNOWN:NO_STATE' },
+    'a configured pool with no observation is HELD through the resolver, not waved through by an inequality');
+  assert.deepEqual(mod.capacityGateOf(CAPACITY.STALE), { evidence: 'INDETERMINATE', holds: true, basis: 'UNKNOWN:INDETERMINATE' },
+    'an indeterminate observation is HELD through the resolver');
+  assert.equal(mod.capacityGateOf(CAPACITY.LIMITED).evidence, 'REFUSED');
+  assert.equal(mod.capacityGateOf(CAPACITY.NOVEL_UNKNOWN).holds, true, 'an unclassified unknown holds');
+  assert.equal(new Set(['NO_POOL', 'NO_STATE', 'STALE', 'AVAILABLE', 'LIMITED'].map((s) => mod.capacityGateOf(CAPACITY[s]).evidence)).size, 5,
+    'five situations, five different values: the UI is never handed one "healthy" bucket');
+};
+
 K.unclassifiedUnknownHolds = async (mod) => {
-  const r = mod.resolveAdmission(CAPACITY.NOVEL_UNKNOWN, mod.PROVISIONAL_UNKNOWN_POLICY);
+  const r = mod.resolveAdmission(CAPACITY.NOVEL_UNKNOWN, mod.UNKNOWN_POLICY);
   assert.equal(r.action, 'HOLD', 'an UNKNOWN whose reason is not classified is a missing fact, never permission');
 };
 
@@ -811,7 +892,7 @@ const MUTANTS = [
     killer: 'abortCapabilityFailsClosedAtReady', dies: /BEFORE any payload is staged/ },
   { name: 'capability UNKNOWN resolved through the capacity UNKNOWN policy',
     edits: [["    if (gateRefuses(cls, 'ABORT_CAPABILITY_UNVERIFIED') && deps.abortCapability(req.agentId).kind !== 'VERIFIED') {",
-      "    if (gateRefuses(cls, 'ABORT_CAPABILITY_UNVERIFIED') && deps.abortCapability(req.agentId).kind !== 'VERIFIED' && policy.NO_STATE !== 'PROCEED') {"]],
+      "    if (gateRefuses(cls, 'ABORT_CAPABILITY_UNVERIFIED') && deps.abortCapability(req.agentId).kind !== 'VERIFIED' && policy.NO_POOL !== 'PROCEED') {"]],
     killer: 'capabilityUnknownNeverInheritsCapacityProceed', dies: /capability UNKNOWN refuses/ },
   { name: 'the provenance gate removed from READY and STAGE',
     edits: [["    if (gateRefuses(cls, 'PROVENANCE_INELIGIBLE')) {\n      const e = deps.eligibility(ptyId);\n      if (!e.eligible) return this.refuse(decision, 'PROVENANCE_INELIGIBLE', e.reason);\n    }\n    const started", "    const started"],
@@ -828,12 +909,12 @@ const MUTANTS = [
     killer: 'respawnInGapNeverReceivesTheEnter', dies: /SCOPED TO ONE INCARNATION/ },
   { name: 'the inequality restored at ADMIT',
     edits: [["      const admitted = resolveAdmission(decision, policy);\n      if (admitted.action !== 'PROCEED')", "      const admitted = { action: decision.verdict !== 'REFUSE' ? 'PROCEED' : 'HOLD', basis: decision.reason };\n      if (admitted.action !== 'PROCEED')"]],
-    killer: 'unknownPolicyIsAppliedByNameAtAdmit', dies: /applied AT ADMIT, before READY is ever asked/ },
+    killer: unknownName('INDETERMINATE'), dies: /HOLDS at ADMIT|applied AT ADMIT, before READY is ever asked/ },
   { name: 'the inequality restored before STAGE',
     edits: [["      const again = resolveAdmission(deps.capacity.revalidate(claim), policy);", "      const again = { action: deps.capacity.revalidate(claim).verdict !== 'REFUSE' ? 'PROCEED' : 'HOLD', basis: 'x' };"]],
     killer: 'unknownPolicyIsAppliedBeforeStage', dies: /PRE-STAGE revalidation applies the NAMED UNKNOWN policy/ },
   { name: 'the inequality restored at final COMMIT revalidation',
-    edits: [["    const now = resolveAdmission(deps.capacity.revalidate(claim), deps.unknownPolicy ?? PROVISIONAL_UNKNOWN_POLICY);", "    const now = { action: deps.capacity.revalidate(claim).verdict !== 'REFUSE' ? 'PROCEED' : 'HOLD', basis: 'x' };"]],
+    edits: [["    const now = resolveAdmission(deps.capacity.revalidate(claim), deps.unknownPolicy ?? UNKNOWN_POLICY);", "    const now = { action: deps.capacity.revalidate(claim).verdict !== 'REFUSE' ? 'PROCEED' : 'HOLD', basis: 'x' };"]],
     killer: 'unknownPolicyIsAppliedAtCommit', dies: /FINAL revalidation applies the NAMED UNKNOWN policy/ },
   { name: 'final revalidation removed (the admission decision trusted at the Enter)',
     edits: [["    if (now.action !== 'PROCEED') return { kind: 'LATE_REFUSAL', basis: now.basis };\n", '']],
@@ -866,6 +947,39 @@ const MUTANTS = [
     edits: [['    await this.sleep(GAP_MS);', '    await this.sleep(0);']],
     killer: 'gapIsHonoured', dies: /one GAP after the payload/ }
 ];
+
+// ONE MUTANT PER CELL OF THE RATIFIED UNKNOWN MAPPING (L0-UNKNOWN, option B), each killed
+// by that mapping's own test - at the behaviour, not at a read of the table.
+{
+  const block = (m) => `  NO_POOL: '${m.NO_POOL}',\n  NO_STATE: '${m.NO_STATE}',\n  INDETERMINATE: '${m.INDETERMINATE}'\n};`;
+  for (const evidence of Object.keys(RULED_UNKNOWN)) {
+    const flipped = RULED_UNKNOWN[evidence] === 'PROCEED' ? 'HOLD' : 'PROCEED';
+    MUTANTS.push({
+      name: `unknown mapping flipped: ${evidence} -> ${flipped}`,
+      edits: [[block(RULED_UNKNOWN), block({ ...RULED_UNKNOWN, [evidence]: flipped })]],
+      killer: unknownName(evidence),
+      dies: RULED_UNKNOWN[evidence] === 'PROCEED' ? /PROCEEDS at ADMIT/ : /HOLDS at ADMIT/
+    });
+  }
+  MUTANTS.push({
+    name: 'a HOLD that lapses into proceeding',
+    edits: [["      if (admitted.action !== 'PROCEED') return this.refuse(decision, 'CAPACITY_HOLD', admitted.basis);",
+      "      if (admitted.action !== 'PROCEED' && deps.now() < 3_600_000) return this.refuse(decision, 'CAPACITY_HOLD', admitted.basis);"]],
+    killer: 'holdIsARealHoldAndOnlyAnObservationReleasesIt', dies: /NO TIMEOUT-TO-PROCEED AT ADMIT EITHER/
+  });
+  MUTANTS.push({
+    name: 'NO_POOL reported as ALLOWED',
+    edits: [["      : unknownEvidenceOf(decision.reason) ?? 'UNCLASSIFIED';",
+      "      : (unknownEvidenceOf(decision.reason) === 'NO_POOL' ? 'ALLOWED' : unknownEvidenceOf(decision.reason) ?? 'UNCLASSIFIED');"]],
+    killer: 'noPoolIsNeverCalledAvailable', dies: /NEVER reported as ALLOWED/
+  });
+  MUTANTS.push({
+    name: 'the snapshot gate computed by the old inequality',
+    edits: [["  return { evidence, holds: resolved.action === 'HOLD', basis: resolved.basis };",
+      "  return { evidence, holds: decision.verdict === 'REFUSE', basis: resolved.basis };"]],
+    killer: 'noPoolIsNeverCalledAvailable', dies: /HELD through the resolver/
+  });
+}
 
 // ONE MUTANT PER POLICY CELL. Each flips exactly one answer of READY_GATE_POLICY and must
 // be killed by that cell's own test. A cell line is not unique on its own (the three

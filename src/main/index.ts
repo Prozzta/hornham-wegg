@@ -26,7 +26,7 @@ import { normalizeWeekly, weeklyDelayMs } from '../shared/weeklySchedule';
 import { isInputOrigin } from '../shared/inputOrigin';
 import { automaticDeliveryEligibility, isTerminalInputState } from '../shared/inputProvenance';
 import { isTerminalPromptState } from '../shared/promptState';
-import { AutomaticSubmitOwner } from './automaticSubmit';
+import { AutomaticSubmitOwner, capacityGateOf } from './automaticSubmit';
 import { buildOwnerDeps, ScreenReadingBroker } from './automaticSubmitWiring';
 import {
   getBranch, getStatus, getLog, getBranches, getAheadBehind, isRepo, getDiff, mainRepoRoot,
@@ -4039,9 +4039,17 @@ ipcMain.handle('control:snapshot', (_evt, agentId: unknown) => {
   // gate costs no send attempt and drops no queued message - which the other
   // candidate seam, refusing the pty write, would do after three attempts.
   //
-  // `holds` PROBES rather than admits: this handler runs on every queue tick, and
-  // admitting would spend the epoch's single recovery turn on the question.
-  return { ...control.snapshot(agentId), capacityHold: providerCapacity.holds(agentId, 'ORDINARY_TURN') };
+  // It PROBES rather than admits: this handler runs on every queue tick, and admitting
+  // would spend the epoch's single recovery turn on the question.
+  //
+  // L0-UNKNOWN (human ruling, option B). The flag used to be `verdict === 'REFUSE'`, one
+  // of the four places UNKNOWN proceeded by an inequality nobody chose. It now comes
+  // through the ONE resolver and the ONE ratified mapping, so this hint and the submit
+  // owner cannot disagree - and the EVIDENCE rides along undissolved, because the ruling
+  // requires "no pool" (outside capacity gating), "held for want of evidence" and
+  // "allowed" to stay three different things for anything that shows them.
+  const gate = capacityGateOf(providerCapacity.admission.probe(agentId, 'ORDINARY_TURN'));
+  return { ...control.snapshot(agentId), capacityHold: gate.holds, capacityEvidence: gate.evidence };
 });
 
 /**

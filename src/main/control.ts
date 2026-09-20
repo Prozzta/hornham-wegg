@@ -39,6 +39,12 @@ export interface AgentControlSnapshot {
    * is not rendered.
    */
   capacityHold?: boolean;
+  /**
+   * WHY capacity answers as it does, kept distinct (L0-UNKNOWN ruling): 'NO_POOL' is
+   * OUTSIDE capacity gating and must never be shown as available; 'NO_STATE' and
+   * 'INDETERMINATE' are held for want of usable evidence; 'REFUSED' is a provider limit.
+   */
+  capacityEvidence?: 'ALLOWED' | 'REFUSED' | 'NO_POOL' | 'NO_STATE' | 'INDETERMINATE' | 'UNCLASSIFIED';
   paused: boolean;
   halted: boolean;
   autoDeliveryPaused: boolean;

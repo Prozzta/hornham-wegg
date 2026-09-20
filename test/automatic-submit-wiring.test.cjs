@@ -25,8 +25,8 @@ const { AutomaticSubmitOwner, GAP_MS } = loadTs('src/main/automaticSubmit.ts');
 const { buildOwnerDeps, ScreenReadingBroker, isScreenReading } = loadTs('src/main/automaticSubmitWiring.ts');
 const { CapacityRuntime, CLAIM_REASON } = loadTs('src/main/capacityRuntime.ts');
 const { ADMISSION_REASON } = loadTs('src/main/capacityAdmission.ts');
-const { ProviderCapacityTracker } = loadTs('src/main/providerCapacityTracker.ts');
-const { L0_SEM_POLICY } = loadTs('src/shared/providerCapacity.ts');
+const { ProviderCapacityTracker, L0_SEM_POLICY } = loadTs('src/main/providerCapacityTracker.ts');
+assert.ok(L0_SEM_POLICY && L0_SEM_POLICY.liveTtlMs > 0, 'the production policy really loaded (an undefined one silently falls back to the default parameter)');
 const { automaticAbortCapability } = loadTs('src/shared/providerAutomation.ts');
 const { isTerminalPromptState } = loadTs('src/shared/promptState.ts');
 const { WorkerWakeWatchdog, WORKER_WAKE_IDLE_MS, WORKER_WAKE_COOLDOWN_MS } = loadTs('src/main/workerWake.ts');
@@ -223,6 +223,97 @@ test('revalidate keeps the verdict tri-state and names each structural refusal',
   r.runtime.ingest('jim', LIMIT(T0 + 1_000));
   assert.deepEqual(r.runtime.revalidate(claim, 'pty-jim'), { verdict: 'REFUSE', reason: CLAIM_REASON.EPOCH });
   assert.equal(r.runtime.maySubmitNow(claim, 'pty-jim'), false, 'the legacy boolean agrees while it still exists');
+});
+
+// ─── L0-UNKNOWN (human ruling, option B) against the REAL tracker ─────────────────────
+
+const { capacityGateOf, UNKNOWN_POLICY } = loadTs('src/main/automaticSubmit.ts');
+const gateFor = (r, agentId) => capacityGateOf(r.runtime.admission.probe(agentId, 'ORDINARY_TURN'));
+
+/** Let wall and monotonic time pass and let the tracker's own boundary timers run, the
+ *  way production does: nothing here calls `evaluate()` by hand. */
+function elapse(r, ms) {
+  const until = r.now + ms;
+  for (;;) {
+    r.timers.sort((a, b) => a.at - b.at || a.seq - b.seq);
+    if (!r.timers.length || r.timers[0].at > until) break;
+    const next = r.timers.shift();
+    const dt = Math.max(0, next.at - r.now); r.now += dt; r.mono += dt; next.fn();
+  }
+  const dt = until - r.now; r.now += dt; r.mono += dt;
+}
+
+test('L0-UNKNOWN (1) NO POOL: delivery proceeds, and the state says OUTSIDE GATING - never "available"', async () => {
+  // An agent none of whose readings has ever been accepted maps to no pool. That is every
+  // agent at startup: membership is learned only from the agent's own accepted reading.
+  const r = rig();
+  assert.deepEqual({ ...gateFor(r, 'jim') }, { evidence: 'NO_POOL', holds: false, basis: 'UNKNOWN:NO_POOL' });
+  const out = await r.settle(wake(r));
+  assert.equal(out.kind, 'COMMITTED', 'NO POOL CONFIGURED -> PROCEED: existing delivery behaviour is preserved');
+  r.runtime.ingest('jim', obs({ observedAt: r.now, receivedAt: r.now }));
+  assert.equal(gateFor(r, 'jim').evidence, 'ALLOWED');
+  assert.notEqual('NO_POOL', 'ALLOWED', 'and the two are different values all the way to the snapshot');
+});
+
+test('L0-UNKNOWN (3) INDETERMINATE: a reading that went STALE holds delivery - for as long as nothing renews it', async () => {
+  // THE MEASURED CONSEQUENCE, EXECUTED ON THE PRODUCTION TRACKER. liveTtlMs is 120 s. A
+  // pool nobody renews for 120 s is STALE, STALE is UNKNOWN, and the ruling holds UNKNOWN.
+  // No poll exists to renew it ("NO POLLING, HERE OR ANYWHERE"): a renewal comes only
+  // from a provider turn by some agent on the pool.
+  assert.equal(L0_SEM_POLICY.liveTtlMs, 120_000, 'the TTL this arm is about');
+  assert.equal(UNKNOWN_POLICY.INDETERMINATE, 'HOLD');
+  const r = rig();
+  r.runtime.ingest('jim', obs());
+  assert.equal(gateFor(r, 'jim').evidence, 'ALLOWED');
+
+  elapse(r, L0_SEM_POLICY.liveTtlMs + 1_000);
+  assert.equal(r.state(), 'UNKNOWN', 'two minutes without a renewal: the pool is UNKNOWN');
+  assert.deepEqual({ ...gateFor(r, 'jim') }, { evidence: 'INDETERMINATE', holds: true, basis: 'UNKNOWN:INDETERMINATE' });
+  const held = await r.settle(wake(r, 'w-stale'));
+  assert.deepEqual(r.writes, [], 'HOLD: nothing is typed');
+  assert.deepEqual(held, { kind: 'REFUSED', reason: 'CAPACITY_HOLD', detail: 'UNKNOWN:INDETERMINATE' });
+  assert.equal(r.owner.inhibition('pty-jim'), null, 'a HOLD inhibits nothing');
+
+  // NOTHING IN THE SYSTEM ENDS THIS ON ITS OWN. Twelve hours of idle floor later:
+  elapse(r, 12 * 60 * 60 * 1000);
+  assert.equal(r.state(), 'UNKNOWN');
+  assert.equal((await r.settle(wake(r, 'w-stale-12h'))).kind, 'REFUSED', 'still held: there is no timeout, and no producer');
+  assert.deepEqual(r.writes, []);
+
+  // WHAT RELEASES IT: an accepted observation. The NEXT ask is admitted - release is not
+  // pushed by the observation, it is found by the next drain pass / wake beat.
+  r.runtime.ingest('jim', obs({ observedAt: r.now, receivedAt: r.now, sourceSequence: 2 }));
+  assert.equal(gateFor(r, 'jim').evidence, 'ALLOWED');
+  assert.equal((await r.settle(wake(r, 'w-released'))).kind, 'COMMITTED');
+});
+
+test('L0-UNKNOWN: the control snapshot is computed through the ONE resolver, and carries the evidence', () => {
+  const index = read('src/main/index.ts');
+  const handler = index.slice(index.indexOf("ipcMain.handle('control:snapshot'"));
+  const body = handler.slice(0, handler.indexOf('\n});'));
+  assert.match(body, /capacityGateOf\(providerCapacity\.admission\.probe\(agentId, 'ORDINARY_TURN'\)\)/);
+  assert.match(body, /capacityHold: gate\.holds, capacityEvidence: gate\.evidence/);
+  assert.ok(!/providerCapacity\.holds\(/.test(index), 'index.ts no longer reads the boolean collapse at all');
+});
+
+test('L0-UNKNOWN: send-now and boot prompts do not consult the capacity mapping anywhere', async () => {
+  // The ruling: "This does not alter the separately approved narrow boot/send-now treatment
+  // unless those paths explicitly consult this automatic-delivery admission mapping."
+  // They do not: ASKS_CAPACITY is false for both, so the seam is never asked.
+  for (const admissionClass of ['USER_RELEASED', 'BOOT_SEQUENCE']) {
+    const r = rig();
+    r.runtime.ingest('jim', obs());
+    elapse(r, L0_SEM_POLICY.liveTtlMs + 1_000);
+    assert.equal(r.state(), 'UNKNOWN');
+    let asked = 0;
+    for (const m of ['admit', 'probe']) {
+      const real = r.runtime.admission[m].bind(r.runtime.admission);
+      r.runtime.admission[m] = (...a) => { asked += 1; return real(...a); };
+    }
+    const out = await r.settle(r.owner.submit({ requestId: `x-${admissionClass}`, agentId: 'jim', admissionClass, text: 'hello there' }));
+    assert.equal(out.kind, 'COMMITTED', `${admissionClass} is delivered under an INDETERMINATE pool`);
+    assert.equal(asked, 0, `${admissionClass} never asks the admission seam, so the mapping cannot reach it`);
+  }
 });
 
 // ─── The fail-closed READY gate, through the real tables and predicates ───────────────
