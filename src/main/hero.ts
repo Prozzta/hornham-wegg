@@ -11,9 +11,12 @@ import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { getText } from './fetchText';
 import { parseHeroPayload, DEFAULT_HERO, type HeroPayload } from '../shared/heroPayload';
+import { REPO } from '../shared/updateState';
 
-const HERO_URL =
-  'https://raw.githubusercontent.com/chaitanyagiri/munder-difflin/main/docs/hero.json';
+// docs/hero.json of THIS app's own repository (see REPO). It is content, not a
+// build, but it is rendered inside the app with its links, so it must come from
+// the same place as every update: never from the upstream project.
+const HERO_URL = `https://raw.githubusercontent.com/${REPO}/main/docs/hero.json`;
 /** Plan copy and sponsors change on a human timescale. */
 const TTL_MS = 6 * 60 * 60 * 1000;
 

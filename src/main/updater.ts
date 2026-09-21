@@ -5,7 +5,7 @@ import { appendFileSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path';
 import { readConfig } from './config';
 import { DEFAULT_DROP_HTML } from '../shared/releaseDrop';
-import { reduceStatus, clampPercent, isNewer, installerUrl, type UpdateStatus } from '../shared/updateState';
+import { reduceStatus, clampPercent, isNewer, installerUrl, REPO, type UpdateStatus } from '../shared/updateState';
 
 /**
  * Auto-update from GitHub releases.
@@ -44,7 +44,10 @@ import { reduceStatus, clampPercent, isNewer, installerUrl, type UpdateStatus } 
  *      downgrade is per-check, not a permanent latch.
  */
 
-const REPO = 'chaitanyagiri/munder-difflin';
+// REPO comes from shared/updateState — the single definition of the release home.
+// This file used to keep a SECOND copy of it, which is how an app ends up
+// half-repointed: the feed moved while the release lookup or the download link
+// did not.
 const CHECK_INTERVAL_MS = 6 * 60 * 60 * 1000; // 6h
 const FALLBACK_CACHE_MS = 60 * 60 * 1000;     // 1h between releases/latest polls
 

@@ -8,8 +8,11 @@ copyright: Copyright © 2026 Chaitanya Giri
 # knows which repo to poll.
 publish:
   provider: github
-  owner: chaitanyagiri
-  repo: munder-difflin
+  # The human's own repository ONLY — never the upstream project this was forked
+  # from. It must agree with REPO in src/shared/updateState.ts; a test holds them
+  # together.
+  owner: Prozzta
+  repo: hornham-wegg
 
 # Notarize + staple after signing, but only when APPLE_* creds are in the env
 # (the hook no-ops otherwise, so contributor builds still work). Root-level hook.
