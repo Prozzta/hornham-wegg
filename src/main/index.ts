@@ -43,6 +43,7 @@ import { CapacityRuntime } from './capacityRuntime';
 import { CapacityStore, capacityStorePath } from './capacityPersistence';
 import type { CapacityNotifyIntent } from './capacityNotify';
 import { CapacityStripPresenter } from './capacityStrip';
+import { deliverCapacityToast, type CapacityToast } from './capacityToast';
 import { agentImpactOf, capacityStateNote, type AgentImpact } from '../shared/deliveryHold';
 import { capacityDetailView } from './capacityDetail';
 import { CAPACITY_DETAIL_CHANNEL, validateCapacityDetail } from '../shared/capacityDetail';
@@ -399,7 +400,9 @@ const providerCapacity = new CapacityRuntime({
   deliver: (intents) => {
     for (const intent of intents) {
       console.log(`[capacity] ${intent.kind} ${intent.poolKey} ${intent.from}->${intent.to} (${intent.stateReason})`);
-      capacityStrip.noteIntent(intent, capacityToast(intent));
+      // §13 (unit #7): the presenter says whether and how this transition toasts; the
+      // delivery outcome (incl. STRIP_ONLY for the ones that do not) is recorded on the notice.
+      capacityStrip.noteIntent(intent, capacityToast(capacityStrip.toastFor(intent, providerCapacity.tracker.pool(intent.poolKey))));
     }
   },
   onChange: () => pushCapacityStrip()
@@ -1395,23 +1398,17 @@ function reengageGod(digest: string): void {
 }
 
 /**
- * A native toast for a capacity transition, gated on the same notifications setting
- * as every other toast. Main-side only: the renderer is not involved in deciding or
- * delivering this, so a closed or throttled window cannot swallow it.
- *
- * WORDING IS THE MAIN-OWNED REASON CODE, not renderer copy and not a percentage.
- * L0 has no approved user-facing wording yet — that is held with the UI card — so
- * this says what happened in the vocabulary the tracker already publishes rather
- * than inventing a phrasing that would then have to be unlearned.
+ * A native toast for a capacity transition (§13, unit #7), gated on the same notifications
+ * setting as every other toast. WHICH transitions toast, and their words, come from the
+ * presenter's `toastFor` (null = strip-only); this only delivers. Main-side only, so a
+ * closed or throttled window cannot swallow it.
  */
-function capacityToast(intent: CapacityNotifyIntent): NoticeDelivery {
-  if (!readConfig().notifications) return 'SUPPRESSED';
-  const body = `${intent.provider} ${intent.from} -> ${intent.to} (${intent.stateReason})`;
-  try {
-    if (!Notification.isSupported()) return 'UNSUPPORTED';
-    new Notification({ title: 'Provider capacity', body }).show();
-    return 'SHOWN';
-  } catch { return 'UNSUPPORTED'; }
+function capacityToast(toast: CapacityToast | null): NoticeDelivery {
+  return deliverCapacityToast(toast, {
+    notificationsOn: () => readConfig().notifications === true,
+    supported: () => Notification.isSupported(),
+    show: (t) => { new Notification({ title: t.title, body: t.body }).show(); }
+  });
 }
 
 /**

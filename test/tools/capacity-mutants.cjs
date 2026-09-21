@@ -1,7 +1,7 @@
 'use strict';
 
 /**
- * Mutant runner for the capacity display milestone (v1.1.45 units #1, #2, #4, #5, #6, #8, the strip polish and CAPUI-MONITOR).
+ * Mutant runner for the capacity display milestone (v1.1.45 units #1, #2, #4, #5, #6, #7, #8, the strip polish and CAPUI-MONITOR).
  *
  * WHY IT IS COMMITTED (Jim's audit, F2). A mutant count that lives in someone's
  * scratchpad cannot be reproduced, and a count nobody can reproduce is not evidence.
@@ -31,7 +31,7 @@ const ROOT = path.resolve(__dirname, '..', '..');
 const TESTS = ['test/capacity-strip-contract.test.cjs', 'test/capacity-strip-ui.test.cjs',
   'test/capacity-agent-impact.test.cjs', 'test/delivery-hold.test.cjs', 'test/capacity-monitor.test.cjs',
   'test/capacity-threshold.test.cjs', 'test/capacity-detail.test.cjs',
-  'test/capacity-banner.test.cjs'];
+  'test/capacity-banner.test.cjs', 'test/capacity-toast.test.cjs'];
 
 const STRIP = 'src/main/capacityStrip.ts';
 const SHARED = 'src/shared/capacityStrip.ts';
@@ -58,6 +58,7 @@ const DETAIL_SCHEMA = 'src/shared/capacityDetail.ts';
 const DETAIL_PANEL = 'src/renderer/src/components/CapacityDetailPanel.tsx';
 const SETTINGS = 'src/renderer/src/components/SettingsModal.tsx';
 const BANNER = 'src/renderer/src/components/CapacityLimitBanner.tsx';
+const TOAST = 'src/main/capacityToast.ts';
 
 /** [name, file, from, to] */
 const MUTANTS = [
@@ -284,7 +285,7 @@ const MUTANTS = [
   ['u6 causal wording without attribution', STRIP,
     '? `${name} reported a usage limit without naming which window.`', '? `${name} reports a usage limit reached.`'],
   ['u6 a figure in the banner', STRIP,
-    'is paused until capacity returns.', 'is paused until capacity returns (0% left).'],
+    'agents is paused until capacity returns. Queued', 'agents is paused until capacity returns (0% left). Queued'],
   ['u6 a dismissed banner still shows', MIRROR,
     "if (n && n.lifecycle === 'OPEN' && n.kind === 'LIMIT_REACHED' && n.banner)", "if (n && n.kind === 'LIMIT_REACHED' && n.banner)"],
   ['u6 a banner for a non-LIMITED notice', MIRROR,
@@ -293,6 +294,21 @@ const MUTANTS = [
     'onDismiss={(id) => { void dismissCapacityNotice(id); }}', 'onDismiss={() => {}}'],
   ['u6 the schema allows a banner on any kind', SHARED,
     "    if (nt.kind !== 'LIMIT_REACHED') errors.push(`${at}.notice.banner: only an entry to LIMITED has a banner`);\n", ''],
+  // ── unit #7: toast alignment (§13) ───────────────────────────────────────────
+  ['u7 every transition toasts again', STRIP,
+    "export const TOASTED_KINDS = ['LIMIT_REACHED', 'RECOVERED'] as const;",
+    "export const TOASTED_KINDS = ['LIMIT_REACHED', 'RECOVERED', 'RESERVE_REACHED', 'RECOVERY_POSSIBLE'] as const;"],
+  ['u7 the toast policy is ignored', STRIP,
+    '    if (!(TOASTED_KINDS as readonly string[]).includes(intent.kind)) return null;\n', ''],
+  ['u7 the toast ignores the notifications setting', TOAST,
+    "  if (!deps.notificationsOn()) return 'SUPPRESSED';\n", ''],
+  ['u7 a strip-only transition recorded as suppressed', TOAST,
+    "  if (!toast) return 'STRIP_ONLY';", "  if (!toast) return 'SUPPRESSED';"],
+  ['u7 main bypasses the presenter policy', INDEX,
+    'capacityToast(capacityStrip.toastFor(intent, providerCapacity.tracker.pool(intent.poolKey)))',
+    "capacityToast({ title: 'Provider capacity', body: intent.kind })"],
+  ['u7 a figure in the recovery toast', STRIP,
+    'agents has resumed.`', 'agents has resumed (100%).`'],
 ];
 
 // THE BASELINE MUST BE GREEN. Against already-failing tests every mutant "dies", and a

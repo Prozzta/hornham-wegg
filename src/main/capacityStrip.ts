@@ -45,6 +45,9 @@ export const DEFAULT_WEEKLY_DISPLAY_THRESHOLD = DEFAULT_CAPACITY_DISPLAY_THRESHO
 /** C2.5: shown → hidden only at `>= min(100, T + band)`. */
 export const HYSTERESIS_BAND = 5;
 
+/** §13: the ONLY transitions that raise an OS toast (unit #7). Everything else is strip-only. */
+export const TOASTED_KINDS = ['LIMIT_REACHED', 'RECOVERED'] as const;
+
 export const STATE_TEXT: Record<CapacityState, string> = {
   UNKNOWN: 'Capacity unknown',
   AVAILABLE: 'Available',
@@ -219,6 +222,22 @@ export class CapacityStripPresenter {
       delivery,
       lifecycle: 'OPEN'
     });
+  }
+
+  /**
+   * v1.1.45 unit #7 (§13): the OS toast for a decided transition, or null when this
+   * transition is not one people are told about. ONLY entering LIMITED and the confirmed
+   * return to ordinary use toast; reserve-only and "recovery possible" are strip changes.
+   * No figure, and the same words as the #6 banner for a LIMITED entry.
+   */
+  toastFor(intent: CapacityNotifyIntent, pool: PoolCapacitySnapshot | null): { title: string; body: string } | null {
+    if (!(TOASTED_KINDS as readonly string[]).includes(intent.kind)) return null;
+    const name = PROVIDER_LABEL[intent.provider as ProviderId] ?? intent.provider;
+    if (intent.kind === 'LIMIT_REACHED') {
+      const b = pool ? this.banner(pool) : null;
+      return b ? { title: b.title, body: `${b.cause} ${b.consequence}` } : { title: `${name} limited`, body: 'Automatic delivery is paused until capacity returns.' };
+    }
+    return { title: `${name} available again`, body: `Automatic delivery to ${name} agents has resumed.` };
   }
 
   /** A person dismissed a notice. True when it changed something (caller re-presents). */

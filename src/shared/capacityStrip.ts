@@ -64,8 +64,15 @@ export type ProvenanceClass = (typeof PROVENANCE_CLASSES)[number];
 export const NOTICE_KINDS = ['LIMIT_REACHED', 'RESERVE_REACHED', 'RECOVERY_POSSIBLE', 'RECOVERED'] as const;
 export type NoticeKind = (typeof NOTICE_KINDS)[number];
 
-/** What happened to the OS toast for this intent. Recorded by main, once. */
-export const NOTICE_DELIVERIES = ['SHOWN', 'SUPPRESSED', 'UNSUPPORTED'] as const;
+/**
+ * What happened to the OS toast for this intent. Recorded by main, once.
+ *   SHOWN        toasted.
+ *   SUPPRESSED   would have toasted; the notifications setting is off.
+ *   UNSUPPORTED  would have toasted; the platform cannot.
+ *   STRIP_ONLY   not a transition §13 toasts (v1.1.45 unit #7): only entering LIMITED and
+ *                returning to ordinary use do. It is shown on the strip, not toasted.
+ */
+export const NOTICE_DELIVERIES = ['SHOWN', 'SUPPRESSED', 'UNSUPPORTED', 'STRIP_ONLY'] as const;
 export type NoticeDelivery = (typeof NOTICE_DELIVERIES)[number];
 
 /** The in-app lifecycle. DISMISSED is main-recorded, so a reload cannot reopen it. */
