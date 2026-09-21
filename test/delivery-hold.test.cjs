@@ -179,6 +179,14 @@ K.impactHasOneBlessedStringPerHoldKind = async (mod) => {
   assert.equal(text({ capacityHold: true, capacityEvidence: 'POST_RESET_PROBE_SPENT', poolState: 'UNKNOWN' }), 'waiting · Codex 2 probe used, awaiting reading', 'a spent probe reads "waiting · <pool> probe used, awaiting reading"');
   assert.equal(text({ autoDeliveryPaused: true }), 'paused · auto-delivery off (floor)', 'the floor pause reads "paused · auto-delivery off (floor)"');
   assert.equal(text({ interfered: true }), 'held · a typed-over message needs you', 'INTERFERED reads "held · a typed-over message needs you"');
+  // F5 / I3 (Jim): a hold with no resolvable pool names no provider - the generic noun.
+  assert.equal(text({ capacityHold: true, capacityEvidence: 'FRESH_NOT_HEALTHY', poolState: null, poolLabel: null }),
+    'paused · capacity limited', 'a hold with no pool reads "paused · capacity limited"');
+  // I1 (blessed): holds for want of evidence.
+  for (const e of ['NO_STATE', 'STALE_AFTER_UNHEALTHY', 'INDETERMINATE', 'UNCLASSIFIED']) {
+    assert.equal(text({ capacityHold: true, capacityEvidence: e, poolState: 'UNKNOWN' }), 'waiting · Codex 2 capacity unknown',
+      `a want-of-evidence hold (${e}) reads "waiting · <pool> capacity unknown"`);
+  }
   for (const over of [{ interfered: true }, { autoDeliveryPaused: true }, { capacityHold: true, capacityEvidence: 'NO_STATE' }]) {
     const v = mod.agentImpactOf(imp(over));
     assert.ok(v.text.startsWith(`${v.verb} · `), 'the badge word is the string\'s own leading word');
@@ -208,6 +216,9 @@ K.impactPrecedenceIsTheHoldPrecedence = async (mod) => {
   const all = imp({ interfered: true, autoDeliveryPaused: true, capacityHold: true, capacityEvidence: 'FRESH_NOT_HEALTHY', poolState: 'LIMITED' });
   assert.equal(mod.agentImpactOf(all).kind, 'INTERFERED', 'INTERFERED outranks every other impact');
   assert.equal(mod.agentImpactOf({ ...all, interfered: false }).kind, 'DELIVERY_PAUSED', 'the pause outranks capacity');
+  // F4 (Jim): a SPENT probe outranks recovering, even while the pool still reads RECOVERING.
+  assert.equal(mod.agentImpactOf(imp({ capacityHold: true, capacityEvidence: 'POST_RESET_PROBE_SPENT', poolState: 'RECOVERING' })).text,
+    'waiting · Codex 2 probe used, awaiting reading', 'a spent probe outranks recovering');
 };
 
 const MUTANTS = [
@@ -275,9 +286,32 @@ const MUTANTS = [
     edits: [['  if (!i.capacityHold) return null;', '  if (!i.capacityHold && !i.capacityEvidence) return null;']],
     killer: 'nothingHeldMeansNoImpact', dies: /no hold, no impact/ },
   { name: 'unit #5: the pause outranks INTERFERED',
-    edits: [["  if (i.interfered) return impact('INTERFERED', 'held', 'a typed-over message needs you');\n  if (i.autoDeliveryPaused) return impact('DELIVERY_PAUSED', 'paused', 'auto-delivery off (floor)');",
-      "  if (i.autoDeliveryPaused) return impact('DELIVERY_PAUSED', 'paused', 'auto-delivery off (floor)');\n  if (i.interfered) return impact('INTERFERED', 'held', 'a typed-over message needs you');"]],
+    edits: [
+      ["  if (i.interfered) return impact('INTERFERED', 'held', 'a typed-over message needs you');\n", ''],
+      ["  if (i.autoDeliveryPaused) return impact('DELIVERY_PAUSED', 'paused', 'auto-delivery off (floor)');",
+        "  if (i.autoDeliveryPaused) return impact('DELIVERY_PAUSED', 'paused', 'auto-delivery off (floor)');\n  if (i.interfered) return impact('INTERFERED', 'held', 'a typed-over message needs you');"]
+    ],
     killer: 'impactPrecedenceIsTheHoldPrecedence', dies: /INTERFERED outranks/ },
+  { name: 'F4: recovering outranks a spent probe',
+    edits: [[[
+      "  if (i.capacityEvidence === 'POST_RESET_PROBE_SPENT') {",
+      "    return impact('CAPACITY_PROBE_USED', 'waiting', `${pool} probe used, awaiting reading`);",
+      '  }',
+      "  if (i.capacityEvidence === 'RECOVERING' || i.poolState === 'RECOVERING') {",
+      "    return impact('CAPACITY_RECOVERING', 'waiting', `${pool} recovering`);",
+      '  }'
+    ].join('\n'), [
+      "  if (i.capacityEvidence === 'RECOVERING' || i.poolState === 'RECOVERING') {",
+      "    return impact('CAPACITY_RECOVERING', 'waiting', `${pool} recovering`);",
+      '  }',
+      "  if (i.capacityEvidence === 'POST_RESET_PROBE_SPENT') {",
+      "    return impact('CAPACITY_PROBE_USED', 'waiting', `${pool} probe used, awaiting reading`);",
+      '  }'
+    ].join('\n')]],
+    killer: 'impactPrecedenceIsTheHoldPrecedence', dies: /a spent probe outranks recovering/ },
+  { name: 'F5: a hold with no pool invents a provider name',
+    edits: [["label ?? 'capacity'", "label ?? 'Codex'"]],
+    killer: 'impactHasOneBlessedStringPerHoldKind', dies: /a hold with no pool reads/ },
   { name: 'unit #5: a figure leaks into the impact',
     edits: [["    return impact('CAPACITY_PROBE_USED', 'waiting', `${pool} probe used, awaiting reading`);", "    return impact('CAPACITY_PROBE_USED', 'waiting', `${pool} probe used (1 of 1), awaiting reading`);"]],
     killer: 'aHeldAgentNeverReadsIdleAndCarriesNoFigure', dies: /no figure in an impact string/ }

@@ -261,15 +261,23 @@ export interface AgentImpactInput {
 const impact = (kind: AgentImpactKind, verb: AgentImpactVerb, rest: string): AgentImpact =>
   ({ kind, verb, text: `${verb} · ${rest}` });
 
-/** A pool with no label (a binding the pool-count cap left unresolved) is named generically. */
+/**
+ * A pool with no label (a binding the pool-count cap left unresolved) is named generically,
+ * "paused · capacity limited" (Jim, I3): a hold with no pool must never invent a provider name.
+ */
 const poolName = (label: string | null): string => label ?? 'capacity';
 
 /** The impact string for one agent, or null when nothing is held. */
 export function agentImpactOf(i: AgentImpactInput): AgentImpact | null {
   if (i.interfered) return impact('INTERFERED', 'held', 'a typed-over message needs you');
+  // "(floor)" is exact today: the only auto-delivery pause in the UI is the Command Center's
+  // floor-wide switch (the per-agent pause was removed in v0.3.4). IF a per-agent pause ever
+  // returns to the UI, main must pass a floor-wide bit here and drop "(floor)" for a solo pause.
   if (i.autoDeliveryPaused) return impact('DELIVERY_PAUSED', 'paused', 'auto-delivery off (floor)');
   if (!i.capacityHold) return null;
   const pool = poolName(i.poolLabel);
+  // A SPENT probe outranks recovering (F4): the pool may still read RECOVERING, but the one
+  // turn it allows is already out, so the agent is waiting for a reading, not recovering.
   if (i.capacityEvidence === 'POST_RESET_PROBE_SPENT') {
     return impact('CAPACITY_PROBE_USED', 'waiting', `${pool} probe used, awaiting reading`);
   }
@@ -282,8 +290,7 @@ export function agentImpactOf(i: AgentImpactInput): AgentImpact | null {
     return impact('CAPACITY_LIMITED', 'paused', `${pool} limited`);
   }
   // Held for want of evidence (the L0-UNKNOWN ruling holds NO_STATE, STALE_AFTER_UNHEALTHY,
-  // INDETERMINATE and anything unclassified). The blessed copy has no line for this, and a
-  // held agent must still not read idle, so it gets the one string that claims nothing.
-  // PROPOSED, NOT BLESSED - flagged for the wording pass.
+  // INDETERMINATE and anything unclassified): the one string that claims nothing, so a held
+  // agent still never reads idle. Blessed (Jim, I1).
   return impact('CAPACITY_UNKNOWN', 'waiting', `${pool} capacity unknown`);
 }
