@@ -1,7 +1,7 @@
 'use strict';
 
 /**
- * Mutant runner for the capacity display milestone (v1.1.45 units #1, #2, #4, #5, #6, #7, #8, the strip polish and CAPUI-MONITOR).
+ * Mutant runner for the capacity display milestone (v1.1.45 units #1, #2, #4, #5, #6, #7, #8, #11, the strip polish and CAPUI-MONITOR).
  *
  * WHY IT IS COMMITTED (Jim's audit, F2). A mutant count that lives in someone's
  * scratchpad cannot be reproduced, and a count nobody can reproduce is not evidence.
@@ -31,7 +31,8 @@ const ROOT = path.resolve(__dirname, '..', '..');
 const TESTS = ['test/capacity-strip-contract.test.cjs', 'test/capacity-strip-ui.test.cjs',
   'test/capacity-agent-impact.test.cjs', 'test/delivery-hold.test.cjs', 'test/capacity-monitor.test.cjs',
   'test/capacity-threshold.test.cjs', 'test/capacity-detail.test.cjs',
-  'test/capacity-banner.test.cjs', 'test/capacity-toast.test.cjs'];
+  'test/capacity-banner.test.cjs', 'test/capacity-toast.test.cjs',
+  'test/capacity-composer-note.test.cjs'];
 
 const STRIP = 'src/main/capacityStrip.ts';
 const SHARED = 'src/shared/capacityStrip.ts';
@@ -59,6 +60,8 @@ const DETAIL_PANEL = 'src/renderer/src/components/CapacityDetailPanel.tsx';
 const SETTINGS = 'src/renderer/src/components/SettingsModal.tsx';
 const BANNER = 'src/renderer/src/components/CapacityLimitBanner.tsx';
 const TOAST = 'src/main/capacityToast.ts';
+const COMPOSER_STATUS = 'src/renderer/src/components/composerStatus.ts';
+const COMPOSER = 'src/renderer/src/components/MessageQueueComposer.tsx';
 
 /** [name, file, from, to] */
 const MUTANTS = [
@@ -309,6 +312,23 @@ const MUTANTS = [
     "capacityToast({ title: 'Provider capacity', body: intent.kind })"],
   ['u7 a figure in the recovery toast', STRIP,
     'agents has resumed.`', 'agents has resumed (100%).`'],
+  // ── unit #11: composer capacity note (unconditional) ──────────────────────────
+  ['u11 the empty queue hides the note again', COMPOSER_STATUS,
+    '  if (i.queueLength === 0) return i.capacityNote ? own(i.capacityNote) : null;',
+    '  if (i.queueLength === 0) return null;'],
+  ['u11 healthy is no longer silent', COMPOSER_STATUS,
+    '  if (i.queueLength === 0) return i.capacityNote ? own(i.capacityNote) : null;',
+    "  if (i.queueLength === 0) return own(i.capacityNote ?? 'provider capacity healthy');"],
+  ['u11 INTERFERED no longer escapes the empty queue', COMPOSER_STATUS,
+    "  if (i.hold?.kind === 'INTERFERED') return { text: i.hold.hint, title: i.hold.title };\n", ''],
+  ['u11 the empty queue shows the hold hint instead of the note', COMPOSER_STATUS,
+    '  if (i.queueLength === 0) return i.capacityNote ? own(i.capacityNote) : null;',
+    '  if (i.queueLength === 0) return i.hold ? { text: i.hold.hint, title: i.hold.title } : i.capacityNote ? own(i.capacityNote) : null;'],
+  ['u11 the moving queue loses its note', COMPOSER_STATUS,
+    "one-by-one…${i.capacityNote ? ` (${i.capacityNote})` : ''}`", 'one-by-one…`'],
+  ['u11 the composer bypasses composerStatus', COMPOSER,
+    '  const status = composerStatus({ agentName: agent.name, queueLength: queue.length, idle, hold, block, capacityNote });',
+    '  const status = queue.length === 0 ? null : composerStatus({ agentName: agent.name, queueLength: queue.length, idle, hold, block, capacityNote });'],
 ];
 
 // THE BASELINE MUST BE GREEN. Against already-failing tests every mutant "dies", and a

@@ -5,6 +5,7 @@ import { Icon } from './Icon';
 import { useStore, type Agent, type QueuedMessage } from '@/store/store';
 import { clearTerminalDraft, dismissTerminalPicker, terminalAutomationBlockFor } from './terminalPool';
 import type { TerminalAutomationBlock } from './terminalAutomation';
+import { composerStatus } from './composerStatus';
 import { capacityStateNote, deliveryHoldView, interferenceChoices, isHeldQueueItem, type CapacityEvidenceName, type InterferenceChoice, type InterferedView } from '@shared/deliveryHold';
 import { freeflowRecorder, useFreeflow } from '@/freeflow/recorder';
 import { useTerminalFontSize } from './terminalFontSize';
@@ -187,22 +188,9 @@ export function MessageQueueComposer({ agent }: MessageQueueComposerProps) {
   };
 
   // INTERFERED is shown even with nothing queued: a worker wake can be the held request,
-  // and the terminal stays refused until a person resolves it.
-  const statusHint = hold?.kind === 'INTERFERED'
-    ? hold.hint
-    : queue.length === 0
-    ? null
-    : !idle
-    ? `${agent.name} is busy — ${queue.length} queued`
-    : hold
-    ? hold.hint
-    : block === 'draft'
-    ? `held — ${agent.name}'s terminal has unsent text on its prompt`
-    : block === 'picker'
-    ? `held — a slash-command picker is open in ${agent.name}'s terminal`
-    : block === 'exited'
-    ? `held — ${agent.name}'s terminal has exited`
-    : `sending to ${agent.name} one-by-one…${capacityNote ? ` (${capacityNote})` : ''}`;
+  // and the terminal stays refused until a person resolves it. So is the capacity note
+  // (unit #11): a limited, recovering or stale pool must not be invisible on an empty queue.
+  const status = composerStatus({ agentName: agent.name, queueLength: queue.length, idle, hold, block, capacityNote });
 
   return (
     <div
@@ -244,15 +232,15 @@ export function MessageQueueComposer({ agent }: MessageQueueComposerProps) {
             fontFamily: 'var(--cth-font-ui)', color: 'var(--cth-ink-900)'
           }}>{queue.length}</span>
         )}
-        {statusHint && (
+        {status && (
           <span
-            title={hold ? hold.title : statusHint}
+            title={status.title}
             style={{
               fontSize: 12,
               color: idle ? 'var(--cth-ink-700)' : 'var(--cth-ink-500)',
               whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis'
             }}
-          >{statusHint}</span>
+          >{status.text}</span>
         )}
         {hold?.action === 'RESOLVE_INTERFERENCE' && interferenceChoices(delivery.interfered).map((choice) => (
           <button
