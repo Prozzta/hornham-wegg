@@ -33,14 +33,15 @@ import type {
   NoticeDelivery, ProvenanceClass, StripPresentation, VisibleWeeklyStrip, WeeklyRevealReason
 } from '../shared/capacityStrip';
 import { CAPACITY_EMPTY_TEXT, validateCapacityStrip } from '../shared/capacityStrip';
+import { DEFAULT_CAPACITY_DISPLAY_THRESHOLD } from '../shared/capacityThreshold';
 import type { CapacityNotifyIntent } from './capacityNotify';
 
 /**
- * The provisional C2.3 default. Unit #8 replaces this with the Settings value; until
- * then it is a constant, which is also what makes the threshold a presentation input
- * only — there is nowhere else for it to go.
+ * The default the presenter falls back to when no `weeklyThreshold` source is given (tests
+ * and the preview). In the app, main passes the Settings value (unit #8, C2.8) and this
+ * is only its default. Either way the threshold is a presentation input only.
  */
-export const DEFAULT_WEEKLY_DISPLAY_THRESHOLD = 15;
+export const DEFAULT_WEEKLY_DISPLAY_THRESHOLD = DEFAULT_CAPACITY_DISPLAY_THRESHOLD;
 /** C2.5: shown → hidden only at `>= min(100, T + band)`. */
 export const HYSTERESIS_BAND = 5;
 

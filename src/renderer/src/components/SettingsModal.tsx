@@ -12,6 +12,7 @@ import {
 } from '@shared/triggers';
 import { PixelPanel } from './PixelPanel';
 import { PixelButton } from './PixelButton';
+import { CapacityDisplaySetting } from './CapacityDisplaySetting';
 import { UpdatesSection } from './UpdatesSection';
 import { SettingsHeroCard } from './SettingsHeroCard';
 import { SetupPanel } from './SetupPanel';
@@ -976,6 +977,12 @@ export function SettingsModal({ config, onClose, initialSection }: SettingsModal
                           </PixelButton>
                         </div>
                       </div>
+
+                      <div style={{ height: 1, background: 'var(--cth-ink-300)' }} />
+
+                      {/* v1.1.45 unit #8 (C2.8): Capacity display, directly after Notifications,
+                          in its own section with its own save lifecycle. */}
+                      <CapacityDisplaySetting />
 
                       <div style={{ height: 1, background: 'var(--cth-ink-300)' }} />
 

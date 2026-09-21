@@ -13,6 +13,7 @@ import {
 import { defaultMcpDefaults } from '../shared/mcpCatalog';
 import { MAX_AGENT_TOKEN_CAP } from '../shared/tokenCaps';
 import { isAgentUsageDisplay } from '../shared/agentUsage';
+import { parseCapacityDisplayThreshold } from '../shared/capacityThreshold';
 import { expandTilde, normalizeHiveHome } from './fs';
 import type { IntegrationRecord } from '../shared/integrations';
 import {
@@ -278,6 +279,9 @@ export interface HarnessConfig {
    *  'fiveHour' / 'weekly' show that provider window's usage AND exempt the agent from the
    *  budget limits (see src/shared/agentUsage.ts). Claude/Codex agents only. */
   agentUsageDisplay?: Record<string, 'budget' | 'fiveHour' | 'weekly'>;
+  /** v1.1.45 unit #8 (C2.8): the capacity-display threshold, an integer 1-99 (default 15).
+   *  Display only: it gates the strip's Weekly reveal and the 5h/Weekly reset hints. */
+  capacityWeeklyDisplayThreshold?: number;
   /** Agent ids whose automatic inbox/queue delivery is paused. Pending messages
    *  stay durable until the operator explicitly resumes delivery. */
   autoDeliveryPausedAgents?: string[];
@@ -759,6 +763,14 @@ export function setAgentUsageDisplay(agentId: unknown, display: unknown): Harnes
   if (display === 'budget') delete agentUsageDisplay[agentId];
   else agentUsageDisplay[agentId] = display;
   return persistConfig({ ...current, agentUsageDisplay });
+}
+
+/** Set the capacity-display threshold (C2.8). An integer 1-99 or it is REFUSED: the stored
+ * value is left exactly as it was, and nothing is clamped into range. */
+export function setCapacityDisplayThreshold(value: unknown): HarnessConfig {
+  const t = parseCapacityDisplayThreshold(value);
+  if (t === null) throw new Error('invalid capacity display threshold');
+  return persistConfig({ ...readConfig(), capacityWeeklyDisplayThreshold: t });
 }
 
 /** Wipe the persisted config back to first-run defaults so the app boots into

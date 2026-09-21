@@ -1,7 +1,7 @@
 'use strict';
 
 /**
- * Mutant runner for the capacity display milestone (v1.1.45 units #1, #2, #5, the strip polish and CAPUI-MONITOR).
+ * Mutant runner for the capacity display milestone (v1.1.45 units #1, #2, #5, #8, the strip polish and CAPUI-MONITOR).
  *
  * WHY IT IS COMMITTED (Jim's audit, F2). A mutant count that lives in someone's
  * scratchpad cannot be reproduced, and a count nobody can reproduce is not evidence.
@@ -29,7 +29,8 @@ const { spawnSync } = require('node:child_process');
 
 const ROOT = path.resolve(__dirname, '..', '..');
 const TESTS = ['test/capacity-strip-contract.test.cjs', 'test/capacity-strip-ui.test.cjs',
-  'test/capacity-agent-impact.test.cjs', 'test/delivery-hold.test.cjs', 'test/capacity-monitor.test.cjs'];
+  'test/capacity-agent-impact.test.cjs', 'test/delivery-hold.test.cjs', 'test/capacity-monitor.test.cjs',
+  'test/capacity-threshold.test.cjs'];
 
 const STRIP = 'src/main/capacityStrip.ts';
 const SHARED = 'src/shared/capacityStrip.ts';
@@ -49,6 +50,8 @@ const USAGE_MAIN = 'src/main/capacityAgentUsage.ts';
 const USAGE_LINE = 'src/renderer/src/components/AgentUsageLine.tsx';
 const PANEL = 'src/renderer/src/components/CommandCenterPanel.tsx';
 const CONFIG = 'src/main/config.ts';
+const THRESHOLD = 'src/shared/capacityThreshold.ts';
+const THRESHOLD_UI = 'src/renderer/src/components/CapacityDisplaySetting.tsx';
 
 /** [name, file, from, to] */
 const MUTANTS = [
@@ -216,7 +219,31 @@ const MUTANTS = [
     '<CapacityMeter percent={view.usedPercent} valueText={view.text} color={STATE_COLOR[view.state]} dataRole="usage" />',
     '<span style={{ width: 96, height: 8 }} />'],
   ['mon text-only usage draws a bar', USAGE_LINE,
-    "  if (view.kind === 'TEXT') {", "  if (view.kind === 'TEXT' && false) {"]
+    "  if (view.kind === 'TEXT') {", "  if (view.kind === 'TEXT' && false) {"],
+  // ── unit #8: the C2.8 threshold setting ─────────────────────────────────────
+  ['u8 the presenter ignores the setting', INDEX,
+    'new CapacityStripPresenter({ weeklyThreshold: capacityThresholdNow })', 'new CapacityStripPresenter()'],
+  ['u8 the setter does not refresh the threshold in force', INDEX,
+    '  capacityDisplayThreshold = capacityDisplayThresholdOf(next);\n', ''],
+  ['u8 the setter does not push the strip live', INDEX,
+    '  capacityDisplayThreshold = capacityDisplayThresholdOf(next);\n  pushCapacityStrip();',
+    '  capacityDisplayThreshold = capacityDisplayThresholdOf(next);'],
+  ['u8 out-of-range input clamped instead of refused', THRESHOLD,
+    '  if (!Number.isInteger(n) || n < MIN_CAPACITY_DISPLAY_THRESHOLD || n > MAX_CAPACITY_DISPLAY_THRESHOLD) return null;',
+    '  n = Math.min(MAX_CAPACITY_DISPLAY_THRESHOLD, Math.max(MIN_CAPACITY_DISPLAY_THRESHOLD, Math.round(n)));'],
+  ['u8 zero (an off state) allowed', THRESHOLD,
+    'export const MIN_CAPACITY_DISPLAY_THRESHOLD = 1;', 'export const MIN_CAPACITY_DISPLAY_THRESHOLD = 0;'],
+  ['u8 an invalid stored value is repaired by clamping', THRESHOLD,
+    '  return parseCapacityDisplayThreshold(config?.capacityWeeklyDisplayThreshold) ?? DEFAULT_CAPACITY_DISPLAY_THRESHOLD;',
+    '  return Math.min(99, Math.max(1, Math.round(Number(config?.capacityWeeklyDisplayThreshold)) || DEFAULT_CAPACITY_DISPLAY_THRESHOLD));'],
+  ['u8 invalid input overwrites the stored value', CONFIG,
+    "  if (t === null) throw new Error('invalid capacity display threshold');",
+    '  if (t === null) return persistConfig({ ...readConfig(), capacityWeeklyDisplayThreshold: DEFAULT_THRESHOLD_MUTANT });\n  const DEFAULT_THRESHOLD_MUTANT = 15;'],
+  ['u8 the control saves an invalid entry', THRESHOLD_UI,
+    "  if (t === null) return { kind: 'invalid', message: CAPACITY_DISPLAY_COPY.invalid(stored) };",
+    "  if (t === null) return { kind: 'save', value: stored };"],
+  ['u8 a forbidden label', THRESHOLD_UI,
+    "  title: 'Provider capacity display',", "  title: 'Weekly limit threshold',"]
 ];
 
 // THE BASELINE MUST BE GREEN. Against already-failing tests every mutant "dies", and a

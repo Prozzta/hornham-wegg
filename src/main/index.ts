@@ -18,7 +18,7 @@ import { resolveCommand as resolveCliCommand, isSafeCommandName } from './shellE
 import { initAutoUpdater, abortPendingRestart } from './updater';
 import { RealtimeFloorWatcher } from './realtimeFloorWatcher';
 import {
-  readConfig, writeConfig, setAgentTokenCap, setAgentUsageDisplay, resetConfig, ensureHarnessHome, ensureClaudePermissionsAccepted,
+  readConfig, writeConfig, setAgentTokenCap, setAgentUsageDisplay, setCapacityDisplayThreshold, resetConfig, ensureHarnessHome, ensureClaudePermissionsAccepted,
   modelForRole, OPS_STANDUP_MISSION, HEARTBEAT_MISSION, COMPACT_MAINTENANCE_MISSION, type HarnessConfig, type ScheduledMission
 } from './config';
 import {
@@ -46,6 +46,7 @@ import { CapacityStripPresenter } from './capacityStrip';
 import { agentImpactOf, type AgentImpact } from '../shared/deliveryHold';
 import { agentUsageView } from './capacityAgentUsage';
 import { CAPACITY_AGENT_USAGE, validateAgentUsageView } from '../shared/agentUsage';
+import { capacityDisplayThresholdOf } from '../shared/capacityThreshold';
 import {
   CAPACITY_STRIP_CHANNEL, CAPACITY_STRIP_CURRENT, CAPACITY_NOTICE_DISMISS,
   type CapacityStripCollection, type NoticeDelivery
@@ -385,7 +386,13 @@ const workerWake = new WorkerWakeWatchdog();
 // v1.1.45 unit #1: the DISPLAY projection. The presenter is downstream of every
 // decision above - it reads the collection after each publication and pushes a
 // display-ready, pool-level object on its own channel (never on control:snapshot).
-const capacityStrip = new CapacityStripPresenter();
+// v1.1.45 unit #8: the C2.8 threshold, from config. Loaded on first use (not at module
+// load, which can precede the Dev-isolated userData path) and then held here, so the strip
+// does not read the config file on every capacity event; the setter below updates it.
+let capacityDisplayThreshold: number | null = null;
+const capacityThresholdNow = (): number =>
+  (capacityDisplayThreshold ??= capacityDisplayThresholdOf(readConfig()));
+const capacityStrip = new CapacityStripPresenter({ weeklyThreshold: capacityThresholdNow });
 const providerCapacity = new CapacityRuntime({
   deliver: (intents) => {
     for (const intent of intents) {
@@ -3500,6 +3507,15 @@ ipcMain.handle('config:update', (_evt, patch: Partial<HarnessConfig>) => {
 ipcMain.handle('config:setAgentTokenCap', (_evt, agentId: unknown, tokenCap: unknown) =>
   setAgentTokenCap(agentId, tokenCap)
 );
+// v1.1.45 unit #8: set the capacity-display threshold. Invalid input throws and changes
+// nothing. A valid one takes effect LIVE: the strip is re-projected and pushed at once
+// (a presentation-only change: no domain revision moves).
+ipcMain.handle('config:setCapacityDisplayThreshold', (_evt, value: unknown) => {
+  const next = setCapacityDisplayThreshold(value);
+  capacityDisplayThreshold = capacityDisplayThresholdOf(next);
+  pushCapacityStrip();
+  return next;
+});
 // v1.1.45 CAPUI-MONITOR: persist an agent's Monitor line. The breaker reads config live,
 // so a 5H / Weekly choice exempts the agent from the budget on the very next beat.
 ipcMain.handle('config:setAgentUsageDisplay', (_evt, agentId: unknown, display: unknown) =>
