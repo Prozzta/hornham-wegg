@@ -42,6 +42,11 @@ import { HookServer } from './hooks';
 import { CapacityRuntime } from './capacityRuntime';
 import { CapacityStore, capacityStorePath } from './capacityPersistence';
 import type { CapacityNotifyIntent } from './capacityNotify';
+import { CapacityStripPresenter } from './capacityStrip';
+import {
+  CAPACITY_STRIP_CHANNEL, CAPACITY_STRIP_CURRENT, CAPACITY_NOTICE_DISMISS,
+  type CapacityStripCollection, type NoticeDelivery
+} from '../shared/capacityStrip';
 import { CircuitBreaker, type BreakerInput } from './breaker';
 import type { UsageProvider } from './usage';
 import { MemoryManager } from './memory';
@@ -369,14 +374,20 @@ const workerWake = new WorkerWakeWatchdog();
 // The runtime owns the three parts together: it evaluates on a single timer armed
 // at the next instant a projection can change (never a poll), decides transitions
 // against the previous collection, and answers the admission question below. UI is
-// still a separate card and nothing here reaches a renderer.
+// still a separate card.
+//
+// v1.1.45 unit #1: the DISPLAY projection. The presenter is downstream of every
+// decision above - it reads the collection after each publication and pushes a
+// display-ready, pool-level object on its own channel (never on control:snapshot).
+const capacityStrip = new CapacityStripPresenter();
 const providerCapacity = new CapacityRuntime({
   deliver: (intents) => {
     for (const intent of intents) {
       console.log(`[capacity] ${intent.kind} ${intent.poolKey} ${intent.from}->${intent.to} (${intent.stateReason})`);
-      capacityToast(intent);
+      capacityStrip.noteIntent(intent, capacityToast(intent));
     }
-  }
+  },
+  onChange: () => pushCapacityStrip()
 });
 // L0-FUSION stage 5 - THE ONE OWNER of programmatic stage -> final revalidation -> Enter.
 // Main resolves the PTY, main holds it against other programmatic writers, and main's
@@ -564,6 +575,8 @@ function teardownPty(id: string): void {
   if (agentId) {
     ptyToAgent.delete(id);
     ptyProvider.delete(id);
+    // Pool membership completeness can change when an agent leaves.
+    pushCapacityStrip();
     // Drop watchdog state so a dead agent can't get nudged or leak its grace.
     try { workerWake.forget(agentId, id); } catch { /* best-effort */ }
     // Drop breaker state so a dead agent can't leak/zombie a tripped level.
@@ -1376,11 +1389,54 @@ function reengageGod(digest: string): void {
  * this says what happened in the vocabulary the tracker already publishes rather
  * than inventing a phrasing that would then have to be unlearned.
  */
-function capacityToast(intent: CapacityNotifyIntent): void {
-  if (!readConfig().notifications) return;
+function capacityToast(intent: CapacityNotifyIntent): NoticeDelivery {
+  if (!readConfig().notifications) return 'SUPPRESSED';
   const body = `${intent.provider} ${intent.from} -> ${intent.to} (${intent.stateReason})`;
-  try { if (Notification.isSupported()) new Notification({ title: 'Provider capacity', body }).show(); }
-  catch { /* unsupported platform */ }
+  try {
+    if (!Notification.isSupported()) return 'UNSUPPORTED';
+    new Notification({ title: 'Provider capacity', body }).show();
+    return 'SHOWN';
+  } catch { return 'UNSUPPORTED'; }
+}
+
+/**
+ * Membership is KNOWN only while every running agent of this provider has produced a
+ * reading (and so has a pool). An agent with no reading yet might draw on any pool of
+ * its provider, and main does not guess which (design section 12: Membership unknown).
+ */
+function capacityMembershipKnown(provider: string): boolean {
+  for (const [ptyId, agentId] of ptyToAgent) {
+    if (ptyProvider.get(ptyId) === provider && !providerCapacity.hasPool(agentId)) return false;
+  }
+  return true;
+}
+
+function presentCapacityStrip(): CapacityStripCollection {
+  return capacityStrip.present({
+    snapshot: providerCapacity.snapshot(),
+    membersOf: (poolKey) => providerCapacity.membersOf(poolKey),
+    membershipKnown: capacityMembershipKnown,
+    freshUntil: (poolKey) => providerCapacity.tracker.freshUntil(poolKey),
+    now: Date.now()
+  });
+}
+
+let lastPushedCapacityStrip = -1;
+/**
+ * Re-project and push the pool collection to EVERY window (each has its own title
+ * bar). Pushes only when the collection revision moved. A projection that fails its
+ * own schema is logged and not sent; the renderer's expiry mask degrades what it has.
+ */
+function pushCapacityStrip(): void {
+  let collection: CapacityStripCollection;
+  try { collection = presentCapacityStrip(); }
+  catch (e) { console.warn('[capacity-strip]', e instanceof Error ? e.message : e); return; }
+  if (collection.collectionRevision === lastPushedCapacityStrip) return;
+  lastPushedCapacityStrip = collection.collectionRevision;
+  for (const w of allWindows) {
+    if (w.isDestroyed() || w.webContents.isDestroyed()) continue;
+    try { w.webContents.send(CAPACITY_STRIP_CHANNEL, collection); } catch { /* window tearing down */ }
+  }
 }
 
 /** A native toast for breaker constrain/stop, gated on the notifications setting. */
@@ -3126,6 +3182,8 @@ async function spawnAgentCore(opts: AgentSpawnOptions, owner: Electron.WebConten
   if (opts.hive?.id) {
     ptyToAgent.set(opts.id, opts.hive.id);
     ptyProvider.set(opts.id, provider);
+    // A new agent with no reading yet makes its provider's membership unknown.
+    pushCapacityStrip();
     // Worker inbox-wake watchdog (#151): boot grace starts at spawn so the
     // initial orientation prompt is never mistaken for an idle agent.
     workerWake.noteSpawn(opts.id);
@@ -4183,6 +4241,19 @@ ipcMain.handle('control:halt', (_evt, agentId: unknown) => {
   if (typeof agentId !== 'string') return null;
   control.halt(agentId);
   return control.snapshot(agentId);
+});
+// v1.1.45 unit #1 - the pool-level capacity collection, pulled by a (re)loaded window.
+// Re-projected on the spot (a no-op revision-wise when nothing changed), so a window
+// that loads before the first publication still gets the restored pools.
+ipcMain.handle(CAPACITY_STRIP_CURRENT, () => {
+  try { return presentCapacityStrip(); }
+  catch (e) { console.warn('[capacity-strip]', e instanceof Error ? e.message : e); return null; }
+});
+// A person dismissed a capacity notice. Recorded in MAIN, so a reload cannot reopen it.
+ipcMain.handle(CAPACITY_NOTICE_DISMISS, (_evt, noticeId: unknown) => {
+  if (typeof noticeId !== 'string' || !capacityStrip.dismissNotice(noticeId)) return false;
+  pushCapacityStrip();
+  return true;
 });
 ipcMain.handle('control:snapshot', (_evt, agentId: unknown) => {
   if (typeof agentId !== 'string') return null;

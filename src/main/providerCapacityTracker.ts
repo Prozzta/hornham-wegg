@@ -682,6 +682,19 @@ export class ProviderCapacityTracker {
   }
 
   /**
+   * The WALL-CLOCK instant this pool's reading stops being fresh, or null once it has
+   * (or for an unknown pool). Read-only and display-only: it exists so the renderer's
+   * one permitted local-time fallback — a mask that may only DEGRADE a row after main's
+   * own deadline (design §17) — is armed from THIS deadline rather than from a second
+   * TTL rule that could disagree with it. It decides nothing here.
+   */
+  freshUntil(poolKey: string, now: number = this.clock(), monoNow: number = this.monotonic()): number | null {
+    const rec = this.pools.get(poolKey);
+    if (!rec || monoNow > rec.staleAt) return null;
+    return now + (rec.staleAt - monoNow);
+  }
+
+  /**
    * CAN THIS POOL'S HOLD END ON ITS OWN? A LABEL for whoever shows the state - it decides
    * nothing, changes no state and no verdict.
    *

@@ -63,6 +63,13 @@ export interface CapacityRuntimeDeps {
   /** Injected so a test can drive the boundary without waiting for a real timer. */
   setTimer?: (fn: () => void, ms: number) => unknown;
   clearTimer?: (handle: unknown) => void;
+  /**
+   * Something a DISPLAY could show changed: a collection was published or an agent's
+   * pool mapping moved. Called after `deliver`, so a notice decided in the same
+   * publication is already recorded when the display re-projects. Optional, and it
+   * feeds nothing back: display is downstream of every decision made here.
+   */
+  onChange?: () => void;
 }
 
 /**
@@ -127,9 +134,23 @@ export class CapacityRuntime {
    */
   ingest(agentId: string | null, obs: CapacityObservation): void {
     const result = this.tracker.ingestDetailed(obs);
+    const moved = !!agentId && result.accepted && this.poolForAgent.get(agentId) !== obs.poolKey;
     if (agentId && result.accepted) this.poolForAgent.set(agentId, obs.poolKey);
     if (result.changed) this.publish();
+    else if (moved) this.deps.onChange?.();
     this.rearm();
+  }
+
+  /** Agents whose own accepted readings landed in this pool. A copy: never a handle. */
+  membersOf(poolKey: string): string[] {
+    const out: string[] = [];
+    for (const [agentId, key] of this.poolForAgent) if (key === poolKey) out.push(agentId);
+    return out;
+  }
+
+  /** Whether this agent has produced any accepted reading, i.e. has a known pool. */
+  hasPool(agentId: string): boolean {
+    return this.poolForAgent.has(agentId);
   }
 
   /** May this agent start this unit of work? See `CapacityAdmission`. */
@@ -248,6 +269,7 @@ export class CapacityRuntime {
   private publish(): void {
     const intents = this.notifier.observe(this.tracker.snapshot(), this.now());
     if (intents.length) this.deps.deliver(intents);
+    this.deps.onChange?.();
   }
 
   /**

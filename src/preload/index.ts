@@ -8,6 +8,8 @@ export type { HireManifest } from '../shared/hire';
 import type { IntegrationRecord, IntegrationTemplate } from '../shared/integrations';
 export type { IntegrationRecord, IntegrationTemplate } from '../shared/integrations';
 import type { UpdateStatus } from '../shared/updateState';
+import type { CapacityStripCollection } from '../shared/capacityStrip';
+export type { CapacityStripCollection } from '../shared/capacityStrip';
 export type { UpdateStatus } from '../shared/updateState';
 import type { ToolStatus } from '../shared/toolCatalog';
 export type { ToolStatus } from '../shared/toolCatalog';
@@ -933,6 +935,21 @@ const api = {
     ipcRenderer.on('hive:contextUpdate', listener);
     return () => ipcRenderer.removeListener('hive:contextUpdate', listener);
   },
+  // --- Provider capacity, pool level (v1.1.45 unit #1) ---------------------------
+  // Channel names are literals because this preload imports no runtime values; a
+  // test pins them to the constants in src/shared/capacityStrip.ts.
+  /** Push: the complete-replace pool collection, on its OWN channel (not control:snapshot). */
+  onCapacityStrip: (cb: (collection: CapacityStripCollection) => void): (() => void) => {
+    const listener = (_e: IpcRendererEvent, payload: CapacityStripCollection) => cb(payload);
+    ipcRenderer.on('capacity:strip', listener);
+    return () => ipcRenderer.removeListener('capacity:strip', listener);
+  },
+  /** Pull the current collection - a reloaded window subscribes after main may have pushed. */
+  capacityStripCurrent: (): Promise<CapacityStripCollection | null> =>
+    ipcRenderer.invoke('capacity:stripCurrent'),
+  /** Record, in main, that a person dismissed a capacity notice. */
+  capacityDismissNotice: (noticeId: string): Promise<boolean> =>
+    ipcRenderer.invoke('capacity:dismissNotice', noticeId),
   onHiveMessage: (cb: (e: HiveRouteEvent) => void): (() => void) => {
     const listener = (_e: IpcRendererEvent, payload: HiveRouteEvent) => cb(payload);
     ipcRenderer.on('hive:message', listener);
