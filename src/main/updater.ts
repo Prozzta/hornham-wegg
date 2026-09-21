@@ -449,7 +449,12 @@ export function initAutoUpdater(getWebContents: () => WebContents | null): void 
   void (async () => {
     try {
       const autoUpdater = await loadAutoUpdater();
-      autoUpdater.autoDownload = true;
+      // STRICTLY NOTIFY-ONLY (human ruling 2026-09-21). Finding an update only
+      // announces it; nothing downloads until the user presses "Download v…"
+      // (update:download -> runDownload -> downloadUpdate), and nothing installs
+      // until they restart on purpose. Held by a regression arm in
+      // test/update-feed-owner.test.cjs.
+      autoUpdater.autoDownload = false;
       autoUpdater.autoInstallOnAppQuit = false; // install ONLY on explicit restart
       autoUpdater.on('update-available', (info) => {
         logLine(`update available: ${info.version}`);

@@ -110,3 +110,26 @@ test('every installer download URL resolves under the human\'s repository', () =
     assert.ok(url.startsWith(`https://github.com/${OWN}/releases/download/`), `${platform}: ${url}`);
   }
 });
+
+test('STRICTLY NOTIFY-ONLY: the packaged updater never downloads or installs by itself', () => {
+  // Human ruling 2026-09-21. Finding an update may only ANNOUNCE it; the user
+  // downloads it on purpose ("Download v…" -> update:download) and installs it by
+  // restarting on purpose. Read from the AST, not by grep, so a comment that
+  // mentions the old value cannot satisfy or trip the arm.
+  const file = path.join(ROOT, 'src', 'main', 'updater.ts');
+  const sf = ts.createSourceFile(file, fs.readFileSync(file, 'utf8'), ts.ScriptTarget.ES2022, true);
+  const sets = {};
+  (function visit(n) {
+    if (ts.isBinaryExpression(n) && n.operatorToken.kind === ts.SyntaxKind.EqualsToken
+        && ts.isPropertyAccessExpression(n.left)
+        && ['autoDownload', 'autoInstallOnAppQuit'].includes(n.left.name.text)) {
+      (sets[n.left.name.text] ??= []).push(n.right.getText(sf));
+    }
+    ts.forEachChild(n, visit);
+  })(sf);
+  // Non-vacuous: an updater that never assigns these would pass "never true"
+  // while inheriting electron-updater's own default, which is autoDownload TRUE.
+  assert.ok(sets.autoDownload && sets.autoDownload.length > 0, 'the updater sets autoDownload explicitly');
+  assert.deepEqual(sets.autoDownload, ['false'], 'autoDownload must be false everywhere it is set');
+  assert.deepEqual(sets.autoInstallOnAppQuit, ['false'], 'and nothing installs on quit');
+});
