@@ -15,6 +15,7 @@ import { HivePicker } from '@/components/HivePicker';
 import { QuitWarningModal, type ClosingTimeState } from '@/components/QuitWarningModal';
 import { CompletionToast } from '@/realtime/CompletionToast';
 import { UpdateToast } from '@/components/UpdateToast';
+import { CapacityStrip } from '@/components/CapacityStrip';
 import { UpdateBadge } from '@/components/UpdateBadge';
 import { useAppTheme, toggleAppTheme } from '@/design/theme';
 import { SettingsModal, type Section as SettingsSection } from '@/components/SettingsModal';
@@ -295,6 +296,9 @@ export function App() {
         }}>
           {config.autoMode ? 'auto mode on' : 'auto mode off'}
         </span>
+        {/* v1.1.45: provider capacity, one inline group per pool (design of record C2).
+            It fills the middle run and never grows the bar (C2.10). */}
+        <CapacityStrip />
         {/* v0.3.4: theme + fullscreen live HERE (top right), not buried in the
             terminal header — and the theme darkens the whole app, terminals
             included (design/theme.ts + tokens.css dark block). */}

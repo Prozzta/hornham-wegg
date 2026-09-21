@@ -119,11 +119,13 @@ export function selectOpenNotices(c: CapacityStripCollection | null): { poolId: 
  * result is never re-exported, and a later push from main simply replaces it.
  * Nothing local can un-mask a row, create a reveal, or pick a blocked frame.
  */
-export function presentPool(pool: CapacityStripPool, now: number): CapacityStripPool & { masked: boolean } {
+export type PresentedPool = CapacityStripPool & { masked: boolean };
+
+export function presentPool(pool: CapacityStripPool, now: number): PresentedPool {
   const f = pool.freshness;
   if (f.expiresAt === null || !f.expired || now <= f.expiresAt) return { ...pool, masked: false };
   const { weekly: _hiddenByMask, ...rest } = pool;
-  const masked: CapacityStripPool & { masked: boolean } = {
+  const masked: PresentedPool = {
     ...rest,
     state: f.expired.state,
     stateText: f.expired.stateText,

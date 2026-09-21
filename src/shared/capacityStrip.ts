@@ -93,10 +93,17 @@ export interface FiveHourStrip {
   resetExpectedAt?: number;
 }
 
-/** C2.9 verbatim, plus nothing. The property is ABSENT when weekly is normally hidden. */
+/**
+ * C2.9, plus ONE field: `compactText`. C2.10's last collapse step compacts BOTH labelled
+ * figures, and a renderer that shortened `text` itself would be composing wording
+ * (C2.11 crit 18), so main supplies the compact form too. The property is ABSENT when
+ * weekly is normally hidden.
+ */
 export interface VisibleWeeklyStrip {
   reason: WeeklyRevealReason;
   text: string;
+  /** The last reducible form. C2.6 UNKNOWN text is already minimal and is repeated verbatim. */
+  compactText: string;
   meter?: DisplayReadyMeter;
   resetText?: string;
   attribution: WeeklyAttribution;
@@ -249,7 +256,7 @@ const fiveHour = object(
 );
 
 const weekly = object(
-  { reason: oneOf(WEEKLY_REVEAL_REASONS), text, attribution: oneOf(WEEKLY_ATTRIBUTIONS) },
+  { reason: oneOf(WEEKLY_REVEAL_REASONS), text, compactText: text, attribution: oneOf(WEEKLY_ATTRIBUTIONS) },
   { meter, resetText: text }
 );
 

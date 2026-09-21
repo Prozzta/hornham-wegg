@@ -70,6 +70,37 @@ function weeklyText(reason: WeeklyRevealReason, display: number | null): string 
   }
 }
 
+/**
+ * WHICH STATES USE THE C2.7 BLOCKED FRAME, and the one atomic five-hour token each
+ * gets. The frame's other preconditions (a fresh 5h figure above zero, and weekly
+ * provider-attributed or freshly at zero) live at the single call site.
+ *
+ * A2 IS PENDING THE HUMAN: whether a RESERVE_ONLY pool with weekly freshly at 0 (no
+ * provider attribution, so no causal wording - crit 16) also takes this frame. If he
+ * says yes, the change is this one entry, with Jim's proposed observational copy:
+ *   RESERVE_ONLY: { text: (n) => `5h · ${n}% remaining · ordinary work held while Weekly is at 0%`,
+ *                   compactText: (n) => `5h ${n}% · held by Weekly 0%` },
+ * Until then RESERVE_ONLY renders the NORMAL frame, which is the current ruling.
+ */
+const BLOCKED_FRAME: Partial<Record<CapacityState, { text: (n: number) => string; compactText: (n: number) => string }>> = {
+  LIMITED: {
+    text: (n) => `5h · ${n}% remaining · unavailable while Weekly is exhausted`,
+    compactText: (n) => `5h ${n}% · blocked by Weekly`
+  }
+};
+
+/** The compact form of each, for C2.10's last collapse step. Same one-copy-per-reason rule. */
+function weeklyCompactText(reason: WeeklyRevealReason, display: number | null): string {
+  switch (reason) {
+    case 'PROVIDER_ATTRIBUTED_LIMITING': return 'Weekly limit reached (provider)';
+    case 'NUMERICALLY_EXHAUSTED': return 'Weekly 0%';
+    case 'UNKNOWN_CAPACITY': return 'Weekly capacity unknown';
+    case 'UNKNOWN_APPLICABILITY': return 'Additional limit status unknown';
+    case 'BELOW_DISPLAY_THRESHOLD':
+    case 'HYSTERESIS_HOLD': return `Weekly ${display}%`;
+  }
+}
+
 const WEEKLY_ATTRIBUTION = {
   PROVIDER_ATTRIBUTED_LIMITING: 'provider',
   NUMERICALLY_EXHAUSTED: 'numeric',
@@ -305,10 +336,12 @@ export class CapacityStripPresenter {
     const fiveRemaining = known && five ? validRemaining(five.remainingPercent) : null;
 
     // C2.7: the blocked frame needs MAIN evidence that weekly blocks ordinary use -
-    // a LIMITED pool whose weekly the provider named, or a fresh reading shows at zero.
-    const blocked = known && pool.state === 'LIMITED' && fiveRemaining !== null && fiveRemaining > 0
-      && (weekly?.reason === 'PROVIDER_ATTRIBUTED_LIMITING' || weekly?.reason === 'NUMERICALLY_EXHAUSTED');
-    const presentation: StripPresentation = !known ? 'UNKNOWN' : blocked ? 'BLOCKED_SUBORDINATE' : 'NORMAL';
+    // a pool in a BLOCKED_FRAME state whose weekly the provider named, or a fresh
+    // reading shows at zero. The state table below is the whole trigger.
+    const frame = known && fiveRemaining !== null && fiveRemaining > 0
+      && (weekly?.reason === 'PROVIDER_ATTRIBUTED_LIMITING' || weekly?.reason === 'NUMERICALLY_EXHAUSTED')
+      ? BLOCKED_FRAME[pool.state] : undefined;
+    const presentation: StripPresentation = !known ? 'UNKNOWN' : frame ? 'BLOCKED_SUBORDINATE' : 'NORMAL';
 
     const fiveHour: FiveHourStrip = {
       label: '5h',
@@ -317,10 +350,10 @@ export class CapacityStripPresenter {
         : `5h · Capacity unknown · last update ${this.formatTime(pool.observedAt, now)}`,
       compactText: '5h · Capacity unknown'
     };
-    if (presentation === 'BLOCKED_SUBORDINATE' && fiveRemaining !== null) {
+    if (frame && fiveRemaining !== null) {
       const shown = Math.floor(fiveRemaining);
-      fiveHour.text = `5h · ${shown}% remaining · unavailable while Weekly is exhausted`;
-      fiveHour.compactText = `5h ${shown}% · blocked by Weekly`;
+      fiveHour.text = frame.text(shown);
+      fiveHour.compactText = frame.compactText(shown);
     } else if (presentation === 'NORMAL' && fiveRemaining !== null && five) {
       const m = meterOf(fiveRemaining);
       fiveHour.text = `5h · ${m.displayPercent}% remaining`;
@@ -340,6 +373,7 @@ export class CapacityStripPresenter {
       visibleWeekly = {
         reason: weekly.reason,
         text: weeklyText(weekly.reason, remaining === null ? null : Math.floor(remaining)),
+        compactText: weeklyCompactText(weekly.reason, remaining === null ? null : Math.floor(remaining)),
         attribution: WEEKLY_ATTRIBUTION[weekly.reason]
       };
       const numeric = weekly.reason !== 'UNKNOWN_CAPACITY' && weekly.reason !== 'UNKNOWN_APPLICABILITY';

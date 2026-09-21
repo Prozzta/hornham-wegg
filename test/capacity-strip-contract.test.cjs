@@ -391,6 +391,26 @@ test('one-way expiry mask: past main\'s expiresAt the row degrades to main\'s ow
   assert.equal(stale.fiveHour.text, m.fiveHour.text);
 });
 
+test('F1 (Jim): a FRESH epoch-held LIMITED pool with weekly HIDDEN — the expired view carries NO weekly row', () => {
+  // The one fixture that reaches the expired-view guard: an open epoch keeps the pool
+  // LIMITED once stale, and a stale LIMITED pool's weekly would project as
+  // UNKNOWN_CAPACITY. The guard stops the mask from adding that row while the LIVE
+  // strip hides weekly (C2.9 absent-when-hidden; §17 the mask may only degrade).
+  const r = rig();
+  const c = r.read(80, 60, { providerReachedType: 'usage' });
+  valid(c);
+  const p = only(c);
+  assert.equal(p.state, 'LIMITED', 'an unattributed reached signal opens an epoch');
+  assert.equal(p.freshness.verdict, 'FRESH');
+  assert.ok(!('weekly' in p), 'weekly 60% with no attribution and no exhaustion is normally hidden');
+  assert.ok(p.freshness.expired, 'a fresh pool carries its expired view');
+  assert.equal(p.freshness.expired.state, 'LIMITED', 'the epoch keeps LIMITED once stale');
+  assert.ok(!('weekly' in p.freshness.expired), 'the expired view must not reveal the hidden weekly');
+  const masked = presentPool(p, p.freshness.expiresAt + 1);
+  assert.equal(masked.masked, true);
+  assert.ok(!('weekly' in masked), 'and neither may the mask');
+});
+
 test('the mask keeps an epoch-held LIMITED as LIMITED (what the tracker does), minus its figures', () => {
   const r = rig();
   const p = only(r.read(63, 0, { providerReachedType: 'usage', providerAttributedLimitingWindowId: 'seven_day' }));
