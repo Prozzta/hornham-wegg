@@ -39,20 +39,22 @@ const held = (poolLabel, state = 'LIMITED') =>
 
 // ─── Main: the pool is named with the strip's own label ─────────────────────────
 
-test('the card names a pool EXACTLY as the strip does — a second Codex account reads "Codex 2" on both', () => {
+test('the card names a pool EXACTLY as the strip does — one pool per provider, so "Codex" and "Claude"', () => {
   const tracker = new ProviderCapacityTracker(L0_SEM_POLICY, () => T0, () => T0);
-  tracker.ingest(obs('acct-a', false));
-  tracker.ingest(obs('acct-b', true));
+  tracker.ingest(obs('acct-a', true));
+  const claude = { ...obs('acct-c', false), poolKey: 'claude:acct-c:claude', provider: 'claude', limitId: 'claude',
+    streamId: 'acct-c', source: 'claude-status-line' };
+  tracker.ingest(claude);
   const presenter = new CapacityStripPresenter({ idKey: Buffer.alloc(32, 3) });
   const strip = presenter.present({ snapshot: tracker.snapshot(), membersOf: () => [], membershipKnown: () => true,
     freshUntil: (k) => tracker.freshUntil(k), now: T0 });
-  const b = tracker.pool('codex:acct-b:codex');
-  assert.equal(b.state, 'LIMITED');
-  const label = presenter.labelOf(b);
-  assert.equal(label, 'Codex 2');
-  assert.ok(strip.pools.some((p) => p.poolLabel === label), 'the strip shows the same label for that pool');
-  assert.equal(held(label).text, 'paused · Codex 2 limited');
-  assert.equal(presenter.labelOf(tracker.pool('codex:acct-a:codex')), 'Codex', 'the first account keeps the plain label');
+  const codex = tracker.pool('codex:acct-a:codex');
+  assert.equal(codex.state, 'LIMITED');
+  for (const [pool, name] of [[codex, 'Codex'], [tracker.pool('claude:acct-c:claude'), 'Claude']]) {
+    assert.equal(presenter.labelOf(pool), name);
+    assert.ok(strip.pools.some((p) => p.poolLabel === name), `the strip shows "${name}" too`);
+  }
+  assert.equal(held(presenter.labelOf(codex)).text, 'paused · Codex limited');
 });
 
 test('main: control:snapshot carries the impact, built from its OWN settled facts and a pool LABEL only', () => {

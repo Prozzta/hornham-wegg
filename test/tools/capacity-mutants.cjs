@@ -1,7 +1,7 @@
 'use strict';
 
 /**
- * Mutant runner for the capacity display milestone (v1.1.45 units #1, #2 and #5).
+ * Mutant runner for the capacity display milestone (v1.1.45 units #1, #2, #5 and the strip polish).
  *
  * WHY IT IS COMMITTED (Jim's audit, F2). A mutant count that lives in someone's
  * scratchpad cannot be reproduced, and a count nobody can reproduce is not evidence.
@@ -42,17 +42,18 @@ const INDEX = 'src/main/index.ts';
 const IMPACT_VIEW = 'src/renderer/src/components/agentImpactView.ts';
 const CARD = 'src/renderer/src/components/AgentCard.tsx';
 const HOLD = 'src/shared/deliveryHold.ts';
+const APP = 'src/renderer/src/App.tsx';
 
 /** [name, file, from, to] */
 const MUTANTS = [
   // ── unit #1: presenter ────────────────────────────────────────────────────────
-  ['u1 no hysteresis hold', STRIP,
-    "else if (latch.shown && value < Math.min(100, T + HYSTERESIS_BAND)) banded = 'HYSTERESIS_HOLD';", ''],
+  ['u1 no hysteresis hold (weekly reveal and reset hints share the band)', STRIP,
+    "else if (latch.shown && value < Math.min(100, T + HYSTERESIS_BAND)) out = 'HOLD';", ''],
   ['u1 hold band uses <=', STRIP,
     'value < Math.min(100, T + HYSTERESIS_BAND)', 'value <= Math.min(100, T + HYSTERESIS_BAND)'],
   ['u1 entry uses <= T', STRIP, 'if (value < T) {', 'if (value <= T) {'],
   ['u1 no re-anchor reset', STRIP,
-    'if (latch.anchor !== wk.resetsAt) latch = { shown: false, anchor: wk.resetsAt };', ''],
+    'if (latch.anchor !== anchor) latch = { shown: false, anchor };', ''],
   ['u1 hidden weekly sent anyway', STRIP,
     'return banded ? { reason: banded, window: wk } : null;',
     "return banded ? { reason: banded, window: wk } : (wk ? { reason: 'HYSTERESIS_HOLD', window: wk } : null);"],
@@ -95,36 +96,64 @@ const MUTANTS = [
   ['u1 control:snapshot carries pool data', INDEX,
     'return { ...snap, capacityHold: gate.holds,',
     'return { ...snap, pools: capacityStrip.current(), capacityHold: gate.holds,'],
-  // ── unit #2: layout ───────────────────────────────────────────────────────────
-  ['u2 collapse drops resets before meters', LAYOUT,
-    "const meters = level < 1 && pool.presentation === 'NORMAL';\n  const resets = level < 2 && pool.presentation === 'NORMAL';",
-    "const meters = level < 2 && pool.presentation === 'NORMAL';\n  const resets = level < 1 && pool.presentation === 'NORMAL';"],
-  ['u2 never compacts', LAYOUT, 'const compact = level >= 3;', 'const compact = false;'],
+  // ── unit #2 + strip-polish: layout ───────────────────────────────────────────
   ['u2 blocked frame puts 5h before weekly', LAYOUT,
-    "    if (pool.weekly && weeklyText) out.push({ kind: 'figure', key: 'weekly', role: 'weekly', text: weeklyText, subordinate: false });\n    out.push({ kind: 'figure', key: 'five-hour', role: 'five-hour', text: fiveText, subordinate: true });",
-    "    out.push({ kind: 'figure', key: 'five-hour', role: 'five-hour', text: fiveText, subordinate: true });\n    if (pool.weekly && weeklyText) out.push({ kind: 'figure', key: 'weekly', role: 'weekly', text: weeklyText, subordinate: false });"],
+    "    if (pool.weekly) out.push({ kind: 'figure', key: 'weekly', role: 'weekly', text: pool.weekly.text, subordinate: false });\n    out.push({ kind: 'figure', key: 'five-hour', role: 'five-hour', text: pool.fiveHour.text, subordinate: true });",
+    "    out.push({ kind: 'figure', key: 'five-hour', role: 'five-hour', text: pool.fiveHour.text, subordinate: true });\n    if (pool.weekly) out.push({ kind: 'figure', key: 'weekly', role: 'weekly', text: pool.weekly.text, subordinate: false });"],
   ['u2 blocked 5h shown twice', LAYOUT,
-    "    out.push({ kind: 'figure', key: 'five-hour', role: 'five-hour', text: fiveText, subordinate: true });\n    return out;",
-    "    out.push({ kind: 'figure', key: 'five-hour', role: 'five-hour', text: fiveText, subordinate: true });\n    out.push({ kind: 'figure', key: 'five-hour-2', role: 'five-hour', text: pool.fiveHour.compactText, subordinate: false });\n    return out;"],
-  ['u2 level choice always full', LAYOUT, 'if (total <= available) return level;', 'return 0;'],
-  ['u2 weekly compact text ignored', LAYOUT,
-    'const weeklyText = pool.weekly ? (compact ? pool.weekly.compactText : pool.weekly.text) : null;',
-    'const weeklyText = pool.weekly ? pool.weekly.text : null;'],
-  // ── unit #2: view ─────────────────────────────────────────────────────────────
+    "    out.push({ kind: 'figure', key: 'five-hour', role: 'five-hour', text: pool.fiveHour.text, subordinate: true });\n    return out;",
+    "    out.push({ kind: 'figure', key: 'five-hour', role: 'five-hour', text: pool.fiveHour.text, subordinate: true });\n    out.push({ kind: 'figure', key: 'five-hour-2', role: 'five-hour', text: pool.fiveHour.compactText, subordinate: false });\n    return out;"],
+  ['polish strip draws the compact form', LAYOUT,
+    "  window('five-hour', pool.fiveHour.text, pool.fiveHour.meter, pool.fiveHour.resetText);",
+    "  window('five-hour', pool.fiveHour.compactText, pool.fiveHour.meter, pool.fiveHour.resetText);"],
+  // ── unit #2 + strip-polish: view ─────────────────────────────────────────────
   ['u2 subordinate token in a positive colour', VIEW,
     "color: token.subordinate ? 'var(--cth-ink-500)' : 'var(--cth-ink-900)',",
     "color: token.subordinate ? 'var(--cth-status-success)' : 'var(--cth-ink-900)',"],
   ['u2 meter drawn as a progressbar', VIEW, 'role="meter"', 'role="progressbar"'],
   ['u2 UNKNOWN shares the healthy token', VIEW, "UNKNOWN: '◌'", "UNKNOWN: '●'"],
-  ['u2 UNKNOWN shares the healthy colour', VIEW,
-    "UNKNOWN: 'var(--cth-status-ghost)'", "UNKNOWN: 'var(--cth-status-success)'"],
+  ['polish UNKNOWN back to the pale ghost ink', VIEW,
+    "UNKNOWN: 'var(--cth-ink-500)'", "UNKNOWN: 'var(--cth-status-ghost)'"],
+  ['polish a state word is visible again', VIEW,
+    '      <StateShape state={pool.state} name={pool.stateText} />',
+    '      <StateShape state={pool.state} name={pool.stateText} />\n      <span>{pool.stateText}</span>'],
+  ['polish healthy loses its shape', VIEW,
+    '      {STATE_TOKEN[state]}', "      {state === 'AVAILABLE' ? '' : STATE_TOKEN[state]}"],
+  ['polish the shape loses its accessible name', VIEW, '      aria-label={name}\n', ''],
   ['u2 connected strip skips the mask', VIEW,
     'const pools = selectPools(collection).map((p) => presentPool(p, now));',
     'const pools = selectPools(collection).map((p) => ({ ...p, masked: false }));'],
-  ['u2 strip grows instead of clipping', VIEW,
-    "flex: '1 1 auto', minWidth: 0, height: 36, overflow: 'hidden',", "flex: '1 1 auto', minWidth: 0,"],
-  ['u2 empty collection drawn', VIEW,
-    '  if (!pools.length) return null;', "  if (!pools.length) return <span>Capacity unknown</span>;"],
+  ['polish marquee runs even when it fits', VIEW,
+    '.cap-strip-host[data-overflow="true"] .cap-strip-track {\n  animation:', '.cap-strip-track {\n  animation:'],
+  ['polish no pause on hover', VIEW,
+    '.cap-strip-host:hover .cap-strip-track, .cap-strip-host:focus-within .cap-strip-track { animation-play-state: paused; }\n', ''],
+  ['polish reduced motion still animates', VIEW,
+    '  .cap-strip-host[data-overflow="true"] .cap-strip-track { animation: none; }\n', ''],
+  ['polish the row grows instead of scrolling', VIEW,
+    '.cap-strip-host { flex: 0 1 auto; min-width: 0; height: 36px; overflow: hidden;',
+    '.cap-strip-host { flex: 0 1 auto; min-width: 0;'],
+  ['polish scroll stops short of the last pixel', VIEW,
+    'Math.max(0, Math.ceil(trackWidth - hostWidth))', 'Math.max(0, Math.floor(trackWidth - hostWidth))'],
+  ['polish overflow never flagged', VIEW,
+    "el.dataset.overflow = d > 0 ? 'true' : 'false';", "el.dataset.overflow = 'false';"],
+  ['polish cold start draws no shape', VIEW,
+    '              <StateShape state="UNKNOWN" name={emptyText} />\n', ''],
+  ['polish cold start ignores main\'s emptyText', VIEW,
+    'emptyText={collection?.emptyText ?? CAPACITY_EMPTY_TEXT}', 'emptyText={CAPACITY_EMPTY_TEXT}'],
+  ['polish auto-mode label back in the title bar', APP,
+    '        <CapacityStrip />',
+    "        <span>{config.autoMode ? 'auto mode on' : 'auto mode off'}</span>\n        <CapacityStrip />"],
+  // ── strip-polish: presenter ──────────────────────────────────────────────────
+  ['polish 5h reset hint shown above the threshold', STRIP,
+    "\n        && this.band(`${pool.poolKey}|reset|five`, fiveRemaining, five.resetsAt, T) !== null", ''],
+  ['polish weekly reset hint ungated', STRIP,
+    " && this.band(`${pool.poolKey}|reset|weekly`, remaining, r, T) !== null", ''],
+  ['polish reset hints share the weekly latch (one key)', STRIP,
+    "this.band(`${pool.poolKey}|reset|five`, fiveRemaining", "this.band(pool.poolKey, fiveRemaining"],
+  ['polish a second-account ordinal comes back', STRIP,
+    '    return PROVIDER_LABEL[pool.provider];', '    return `${PROVIDER_LABEL[pool.provider]} 1`;'],
+  ['polish emptyText not sent', STRIP,
+    '        emptyText: CAPACITY_EMPTY_TEXT,\n        pools\n', '        pools\n'],
   // ── A2 (human ruling): the RESERVE_ONLY held frame ───────────────────────────
   ['a2 RESERVE_ONLY frame removed', STRIP,
     "  RESERVE_ONLY: {\n    text: (n) => `5h · ${n}% remaining · ordinary work held while Weekly is at 0%`,\n    compactText: (n) => `5h ${n}% · held by Weekly 0%`\n  }\n",
@@ -149,9 +178,6 @@ const MUTANTS = [
     '<PixelBadge status={held.status} label={held.label}', "<PixelBadge status={typing ? 'typing' : status} label={undefined}"],
   ['u5 unknown-capacity hold reads idle', HOLD,
     "  return impact('CAPACITY_UNKNOWN', 'waiting', `${pool} capacity unknown`);", '  return null;'],
-  // ── unit #2: presenter copy used by the strip ─────────────────────────────────
-  ['u2 weekly compact text drops its label', STRIP,
-    "case 'HYSTERESIS_HOLD': return `Weekly ${display}%`;", "case 'HYSTERESIS_HOLD': return `${display}%`;"]
 ];
 
 // THE BASELINE MUST BE GREEN. Against already-failing tests every mutant "dies", and a

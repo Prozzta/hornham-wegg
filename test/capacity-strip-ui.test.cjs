@@ -1,14 +1,15 @@
 'use strict';
 
 /**
- * v1.1.45 unit #2 — the title-bar capacity strip.
+ * v1.1.45 — the title-bar capacity strip, as amended at the human's strip review
+ * (2026-09-21): state as a coloured SHAPE only (no state words), stronger colours, full
+ * content that SCROLLS on overflow (replacing the C2.10 collapse ladder), reset hints
+ * only below the threshold, a drawn cold-start chip (F3), and no auto-mode label.
  *
  * Every fixture is a REAL pool object: real tracker -> real presenter -> the renderer's
- * presentPool, then rendered with react-dom/server. So what is asserted about the DOM is
- * what main can actually make the strip draw.
- *
- * Order follows the spec's own (§20): UNKNOWN / stale FIRST, then the healthy path, then
- * the weekly and exhausted frames, then the layout (C2.10) and the structural rules.
+ * presentPool, then rendered with react-dom/server. Order follows the spec's own (§20):
+ * UNKNOWN / stale / cold start FIRST, then the healthy path, then the weekly and
+ * exhausted frames, then scrolling and structure.
  */
 const test = require('node:test');
 const assert = require('node:assert/strict');
@@ -19,9 +20,12 @@ const { readSource, codeOnly } = require('./read-source.cjs');
 
 const { ProviderCapacityTracker, L0_SEM_POLICY } = loadTs('src/main/providerCapacityTracker.ts');
 const { CapacityStripPresenter } = loadTs('src/main/capacityStrip.ts');
+const { CAPACITY_EMPTY_TEXT } = loadTs('src/shared/capacityStrip.ts');
 const { presentPool } = loadTs('src/renderer/src/capacity/capacityStrip.ts');
-const { chooseCollapseLevel, poolTokens, poolWidth, COLLAPSE_LEVELS } = loadTs('src/renderer/src/capacity/stripLayout.ts');
-const { CapacityStripView, STATE_TOKEN, STATE_COLOR } = loadTs('src/renderer/src/components/CapacityStrip.tsx');
+const layout = loadTs('src/renderer/src/capacity/stripLayout.ts');
+const { poolTokens } = layout;
+const { CapacityStripView, STATE_TOKEN, STATE_COLOR, STRIP_CSS, scrollDistance, sweepSeconds } =
+  loadTs('src/renderer/src/components/CapacityStrip.tsx');
 
 const T0 = 1_800_000_000_000;
 const POOL = 'codex:acct-a:codex';
@@ -51,217 +55,219 @@ function pool(windows, over = {}, { stale = false } = {}) {
   return presentPool(c.pools[0], now);
 }
 
-const render = (pools, level) => renderToStaticMarkup(React.createElement(CapacityStripView, { pools, level }));
-/** The visible text, tags stripped (aria-hidden state tokens stripped too). */
-const visibleText = (html) => html.replace(/<span aria-hidden="true"[^>]*>[^<]*<\/span>/g, '').replace(/<[^>]+>/g, '|');
+const render = (pools, emptyText = CAPACITY_EMPTY_TEXT) =>
+  renderToStaticMarkup(React.createElement(CapacityStripView, { pools, emptyText }));
+/** The VISIBLE text nodes (the <style> block and attributes such as aria-label excluded). */
+const visibleNodes = (html) => html.replace(/<style>[\s\S]*?<\/style>/, '').replace(/<[^>]+>/g, '|')
+  .split('|').map((s) => s.trim()).filter(Boolean);
 const count = (s, re) => (s.match(re) || []).length;
 
 const HEALTHY = () => pool(std(80.6, 60));
+const LOW_5H = () => pool(std(10, 60));
 const REVEALED = () => pool(std(80, 14.9));
 const BLOCKED = () => pool(std(63, 0), { providerReachedType: 'usage', providerAttributedLimitingWindowId: 'seven_day' });
+const HELD_A2 = () => pool(std(63, 0));
 const STALE = () => pool(std(80, 60), {}, { stale: true });
+const ALL = [HEALTHY, LOW_5H, REVEALED, BLOCKED, HELD_A2, STALE];
 
-// ─── UNKNOWN / stale FIRST (§20) ─────────────────────────────────────────────
+// ─── UNKNOWN / stale / cold start FIRST (§20) ───────────────────────────────────
 
-test('stale pool: NO meter primitive at any width — no track, no fill, no aria value — only main\'s text', () => {
+test('stale pool: NO meter primitive — no track, no fill, no aria value — only main\'s text', () => {
   const p = STALE();
   assert.equal(p.presentation, 'UNKNOWN');
-  for (const level of COLLAPSE_LEVELS) {
-    const html = render([p], level);
-    assert.ok(!/role="(meter|progressbar)"|aria-valuenow|data-cap-meter/.test(html), `level ${level}: an empty bar is a drawn claim of zero`);
-    assert.ok(!/\d+%/.test(html), `level ${level}: stale removes the number`);
-    assert.match(visibleText(html), /5h · Capacity unknown/, `level ${level}: the 5h status is stated, not silent`);
-    assert.ok(html.includes(`data-cap-state-token="UNKNOWN"`));
-  }
-  assert.match(visibleText(render([p], 0)), /5h · Capacity unknown · last update @/, 'absolute last-update time (A3)');
+  const html = render([p]);
+  assert.ok(!/role="(meter|progressbar)"|aria-valuenow|data-cap-meter/.test(html), 'an empty bar is a drawn claim of zero');
+  assert.ok(!/\d+%/.test(visibleNodes(html).join(' ')), 'stale removes the number');
+  assert.ok(visibleNodes(html).includes('5h · Capacity unknown · last update @1000'), 'absolute last-update time (A3)');
+  assert.ok(html.includes('data-cap-state-token="UNKNOWN"'));
 });
 
 test('C2.6 split: applicable-but-unknown weekly says "Weekly capacity unknown", text only', () => {
   const p = pool(std(80, 60), { providerReachedType: 'usage' }, { stale: true });
   assert.equal(p.state, 'LIMITED', 'A1: the tracker state is kept verbatim');
-  assert.equal(p.presentation, 'UNKNOWN', 'A1: but the figures are removed');
   assert.equal(p.weekly.reason, 'UNKNOWN_CAPACITY');
-  for (const level of COLLAPSE_LEVELS) {
-    const html = render([p], level);
-    assert.ok(visibleText(html).includes('|Weekly capacity unknown|'), `level ${level}`);
-    assert.ok(!/role="meter"|\d+%/.test(html), `level ${level}: no figure, no meter`);
-  }
+  const html = render([p]);
+  assert.ok(visibleNodes(html).includes('Weekly capacity unknown'));
+  assert.ok(!/role="meter"/.test(html));
+  assert.ok(html.includes('data-cap-state-token="LIMITED"'), 'the shape says LIMITED; no word does');
 });
 
 test('C2.6 split: unknown applicability says "Additional limit status unknown", text only', () => {
   const p = pool([win('five_hour', 'FIVE_HOUR', 80, T0 + 3_600_000), win('mystery', 'OTHER', 40, null)],
     { providerReachedType: 'usage' });
   assert.equal(p.weekly.reason, 'UNKNOWN_APPLICABILITY');
-  for (const level of COLLAPSE_LEVELS) {
-    const html = render([p], level);
-    assert.ok(visibleText(html).includes('|Additional limit status unknown|'), `level ${level}`);
-    assert.equal(count(html, /data-cap-meter="weekly"/g), 0);
-  }
+  const html = render([p]);
+  assert.ok(visibleNodes(html).includes('Additional limit status unknown'));
+  assert.equal(count(html, /data-cap-meter="weekly"/g), 0);
+});
+
+test('F3 cold start: no pools draws the unknown shape and main\'s emptyText — never nothing', () => {
+  const html = render([]);
+  assert.ok(html.includes('data-cap-empty'));
+  assert.ok(html.includes('data-cap-state-token="UNKNOWN"'));
+  assert.deepEqual(visibleNodes(html), ['◌', 'Capacity unknown']);
+  assert.ok(!/role="meter"|\d/.test(visibleNodes(html).join(' ')), 'no figure, no meter');
+  assert.ok(visibleNodes(render([], 'from main')).includes('from main'), 'the text is main\'s, not the renderer\'s');
+  const src = codeOnly(readSource('src/renderer/src/components/CapacityStrip.tsx'), 'CapacityStrip.tsx');
+  assert.match(src, /emptyText=\{collection\?\.emptyText \?\? CAPACITY_EMPTY_TEXT\}/,
+    'the connected strip uses main\'s emptyText, and the shared constant only before main has answered');
 });
 
 test('the expiry mask degrades a healthy row to UNKNOWN with no meter', () => {
   const p = HEALTHY();
-  const now = p.freshness.expiresAt + 1;
-  const masked = presentPool(p, now);
-  const html = render([masked], 0);
-  assert.ok(!/role="meter"|\d+%/.test(html));
+  const html = render([presentPool(p, p.freshness.expiresAt + 1)]);
+  assert.ok(!/role="meter"/.test(html));
+  assert.ok(!/\d+%/.test(visibleNodes(html).join(' ')));
   assert.ok(html.includes('data-cap-state-token="UNKNOWN"'));
 });
 
-test('UNKNOWN is never drawn as healthy: its token and colour differ from AVAILABLE', () => {
-  assert.notEqual(STATE_TOKEN.UNKNOWN, STATE_TOKEN.AVAILABLE);
+// ─── State = a coloured shape, never a word ───────────────────────────────────────
+
+test('NO state word is visible in any state — the shape carries it, named for screen readers only', () => {
+  for (const make of ALL) {
+    const p = make();
+    const html = render([p]);
+    const nodes = visibleNodes(html);
+    assert.ok(!nodes.includes(p.stateText), `"${p.stateText}" must not be visible text (${p.presentation})`);
+    for (const word of ['Available', 'Limited', 'Reserve only', 'Recovering', 'Approaching limit']) {
+      assert.ok(!nodes.includes(word), `no bare state word "${word}"`);
+    }
+    assert.match(html, new RegExp(`role="img" aria-label="${p.stateText}" data-cap-state-token="${p.state}"`),
+      'the shape carries the state word as its accessible name');
+    assert.ok(nodes.includes(STATE_TOKEN[p.state]), 'every state shows its shape, healthy included');
+  }
+});
+
+test('colours: six DISTINCT theme tokens; UNKNOWN is strong neutral ink, never ghost and never healthy', () => {
+  assert.equal(new Set(Object.values(STATE_TOKEN)).size, 6, 'every state has its own shape');
+  assert.equal(new Set(Object.values(STATE_COLOR)).size, 6, 'every state has its own colour');
   assert.notEqual(STATE_COLOR.UNKNOWN, STATE_COLOR.AVAILABLE);
-  assert.equal(new Set(Object.values(STATE_TOKEN)).size, 6, 'every state has its own non-colour token');
+  assert.ok(!Object.values(STATE_COLOR).some((c) => /ghost|idle/.test(c)), 'no pale ghost/idle ink carries a state (V3)');
+  assert.equal(STATE_COLOR.UNKNOWN, 'var(--cth-ink-500)');
+  for (const c of Object.values(STATE_COLOR)) assert.match(c, /^var\(--cth-/, 'theme tokens, so the dark theme follows');
 });
 
 // ─── Healthy path ─────────────────────────────────────────────────────────────
 
-test('healthy: mark, label, state word + token, ONE continuous meter, 5h figure, reset expectation', () => {
-  const html = render([HEALTHY()], 0);
-  const text = visibleText(html);
-  assert.ok(text.includes('|Codex|'));
-  assert.ok(text.includes('Available'));
+test('healthy: mark, label, green dot, ONE continuous meter, the 5h figure — and no reset hint above the threshold', () => {
+  const html = render([HEALTHY()]);
+  const nodes = visibleNodes(html);
+  assert.ok(nodes.includes('Codex'));
+  assert.ok(nodes.includes('●'));
   assert.ok(html.includes('data-cap-state-token="AVAILABLE"'));
   assert.equal(count(html, /role="meter"/g), 1);
   assert.match(html, /role="meter" aria-valuemin="0" aria-valuemax="100" aria-valuenow="80.6" aria-valuetext="5h · 80% remaining"/);
-  assert.ok(text.includes('|5h · 80% remaining|'));
-  assert.ok(text.includes('|reset expected ~@3600000|'));
-  assert.ok(!text.includes('Weekly'), 'weekly is hidden and therefore absent');
+  assert.ok(nodes.includes('5h · 80% remaining'));
+  assert.ok(!/data-cap-reset/.test(html), 'reset hint only below the threshold');
   assert.ok(html.includes('<svg'), 'the provider mark is drawn');
 });
 
-test('C2.10 collapse order: meters first, then reset hints, then compact figures — 5h never dropped', () => {
-  const p = HEALTHY();
-  const at = (level) => render([p], level);
-  assert.ok(/role="meter"/.test(at(0)) && /data-cap-reset/.test(at(0)));
-  assert.ok(!/role="meter"/.test(at(1)) && /data-cap-reset/.test(at(1)), 'level 1 drops meters only');
-  assert.ok(!/role="meter"/.test(at(2)) && !/data-cap-reset/.test(at(2)), 'level 2 also drops reset hints');
-  assert.ok(visibleText(at(2)).includes('|5h · 80% remaining|'));
-  assert.ok(visibleText(at(3)).includes('|5h 80%|'), 'level 3 compacts the labelled figure');
+test('reset hint: drawn for the 5h window when it is BELOW the threshold', () => {
+  const html = render([LOW_5H()]);
+  assert.ok(visibleNodes(html).includes('reset expected ~@3600000'));
+  assert.equal(count(html, /data-cap-reset="five-hour"/g), 1);
 });
 
-test('weekly revealed: its own continuous meter and main\'s text, compacting to main\'s compact text', () => {
+test('weekly revealed: its own meter and text, with its reset (below threshold) — the 5h beside it has none', () => {
   const p = REVEALED();
   assert.equal(p.weekly.reason, 'BELOW_DISPLAY_THRESHOLD');
-  const full = render([p], 0);
-  assert.equal(count(full, /role="meter"/g), 2);
-  assert.ok(visibleText(full).includes('|Weekly · 14% remaining|'));
-  assert.ok(visibleText(render([p], 3)).includes('|Weekly 14%|'));
-  assert.ok(visibleText(render([p], 3)).includes('|5h 80%|'), 'a revealed weekly never displaces the 5h value');
+  const html = render([p]);
+  assert.equal(count(html, /role="meter"/g), 2);
+  assert.ok(visibleNodes(html).includes('Weekly · 14% remaining'));
+  assert.equal(count(html, /data-cap-reset="weekly"/g), 1);
+  assert.equal(count(html, /data-cap-reset="five-hour"/g), 0);
 });
 
-test('crit 1: every fixture at every width shows a 5h value or status, and no bare percentage exists', () => {
-  for (const make of [HEALTHY, REVEALED, BLOCKED, STALE]) {
-    const p = make();
-    for (const level of COLLAPSE_LEVELS) {
-      const text = visibleText(render([p], level));
-      assert.match(text, /\|5h[ ·]/, `${p.presentation} level ${level}`);
-      for (const piece of text.split('|')) {
-        if (/\d+%/.test(piece)) assert.match(piece, /^(5h|Weekly)\b/, `a percentage must carry its window: "${piece}"`);
-      }
-    }
+test('crit 1: every fixture shows a 5h value or status, and no bare percentage exists', () => {
+  for (const make of ALL) {
+    const nodes = visibleNodes(render([make()]));
+    assert.ok(nodes.some((n) => /^5h[ ·]/.test(n)), JSON.stringify(nodes));
+    for (const n of nodes) if (/\d+%/.test(n)) assert.match(n, /^(5h|Weekly)\b/, `a percentage must carry its window: "${n}"`);
   }
 });
 
-// ─── The exhausted frame (C2.7, crit 14-15) ──────────────────────────────────
+// ─── The exhausted frames (C2.7, crit 14-15, A2) ────────────────────────────────
 
-test('crit 14: blocked frame — exactly ONE subordinate 5h token, no meter/progress semantics, no positive colour', () => {
-  const p = BLOCKED();
-  assert.equal(p.presentation, 'BLOCKED_SUBORDINATE');
-  for (const level of COLLAPSE_LEVELS) {
-    const html = render([p], level);
-    assert.equal(count(html, /data-cap-figure="five-hour"/g), 1, `level ${level}`);
+for (const [name, make, token] of [['attributed LIMITED', BLOCKED, 'LIMITED'], ['A2 RESERVE_ONLY held', HELD_A2, 'RESERVE_ONLY']]) {
+  test(`crit 14/15 (${name}): the shape, weekly primary, then ONE subordinate 5h token; no meter, no positive colour`, () => {
+    const p = make();
+    assert.equal(p.presentation, 'BLOCKED_SUBORDINATE');
+    const html = render([p]);
+    assert.equal(count(html, /data-cap-figure="five-hour"/g), 1);
     assert.equal(count(html, /data-cap-subordinate="true"/g), 1);
-    assert.equal(count(html, /63%/g), 1, `level ${level}: the 5h figure appears exactly once`);
-    assert.ok(!/role="(meter|progressbar)"|aria-value|data-cap-meter|data-cap-reset/.test(html), `level ${level}`);
-    assert.ok(!html.includes('--cth-status-success'), `level ${level}: no positive-capacity colour anywhere`);
-    assert.ok(!/animation|transition/.test(html), 'no animation channel');
+    assert.equal(count(visibleNodes(html).join('|'), /63%/g), 1, 'the 5h figure appears exactly once');
+    assert.ok(!/role="(meter|progressbar)"|aria-value|data-cap-meter|data-cap-reset/.test(html));
+    assert.ok(!html.includes('--cth-status-success'), 'no positive-capacity colour anywhere');
+    const iShape = html.indexOf(`data-cap-state-token="${token}"`);
+    const iWeekly = html.indexOf('data-cap-figure="weekly"');
+    const iFive = html.indexOf('data-cap-figure="five-hour"');
+    assert.ok(iShape >= 0 && iShape < iWeekly && iWeekly < iFive, 'state shape, weekly, then 5h');
     const five = html.match(/data-cap-figure="five-hour"[^>]*>([^<]*)</)[1];
-    assert.match(five, /63%.*(unavailable while Weekly is exhausted|blocked by Weekly)/, 'the blocker is in the SAME atomic string');
-  }
-  assert.ok(visibleText(render([p], 3)).includes('|5h 63% · blocked by Weekly|'), 'the compact invariant (C2.7)');
-});
+    assert.match(five, /63%.*(unavailable while Weekly is exhausted|ordinary work held while Weekly is at 0%)/,
+      'the blocker is in the SAME atomic string');
+  });
+}
 
-test('crit 15: overall LIMITED, weekly primary, then the subordinate 5h token — in DOM and reading order', () => {
-  for (const level of COLLAPSE_LEVELS) {
-    const html = render([BLOCKED()], level);
-    const iState = html.indexOf('Limited');
-    const iWeekly = html.indexOf('data-cap-figure="weekly"');
-    const iFive = html.indexOf('data-cap-figure="five-hour"');
-    assert.ok(iState >= 0 && iState < iWeekly && iWeekly < iFive, `level ${level}: LIMITED, weekly, then 5h`);
-  }
-});
+// ─── Full content + scroll-on-overflow (replaces C2.10's collapse) ─────────────
 
-test('A2: the RESERVE_ONLY held frame renders like crit 14/15 — one subordinate token, weekly first, no meter', () => {
-  const p = pool(std(63, 0));
-  assert.equal(p.state, 'RESERVE_ONLY');
-  assert.equal(p.presentation, 'BLOCKED_SUBORDINATE');
-  for (const level of COLLAPSE_LEVELS) {
-    const html = render([p], level);
-    assert.equal(count(html, /data-cap-subordinate="true"/g), 1, `level ${level}`);
-    assert.equal(count(html, /63%/g), 1, `level ${level}: the 5h figure appears exactly once`);
-    assert.ok(!/role="(meter|progressbar)"|aria-value|data-cap-meter|data-cap-reset/.test(html), `level ${level}`);
-    assert.ok(!html.includes('--cth-status-success'), `level ${level}: no positive-capacity colour`);
-    const iState = html.indexOf('Reserve only');
-    const iWeekly = html.indexOf('data-cap-figure="weekly"');
-    const iFive = html.indexOf('data-cap-figure="five-hour"');
-    assert.ok(iState >= 0 && iState < iWeekly && iWeekly < iFive, `level ${level}: state, weekly, then 5h`);
-  }
-  assert.ok(visibleText(render([p], 3)).includes('|5h 63% · held by Weekly 0%|'));
-  assert.ok(visibleText(render([p], 0)).includes('|5h · 63% remaining · ordinary work held while Weekly is at 0%|'));
-});
-
-// ─── Layout (C2.10) ───────────────────────────────────────────────────────────
-
-test('chooseCollapseLevel picks the LEAST collapsed level that fits, and never goes past 3', () => {
-  const measure = (s) => s.length * 6;
-  const pools = [REVEALED(), HEALTHY()];
-  const widths = COLLAPSE_LEVELS.map((l) => pools.reduce((s, p, i) => s + poolWidth(p, l, measure) + (i ? 16 : 0), 0));
-  for (let i = 1; i < widths.length; i++) assert.ok(widths[i] < widths[i - 1], `level ${i} must be narrower than ${i - 1}`);
-  assert.equal(chooseCollapseLevel(pools, widths[0], measure), 0);
-  assert.equal(chooseCollapseLevel(pools, widths[0] - 1, measure), 1);
-  assert.equal(chooseCollapseLevel(pools, widths[1] - 1, measure), 2);
-  assert.equal(chooseCollapseLevel(pools, widths[2] - 1, measure), 3);
-  assert.equal(chooseCollapseLevel(pools, 10, measure), 3, 'below the compact form the layout is unsupported, not smaller');
-  assert.equal(chooseCollapseLevel(pools, 0, measure), 0, 'unmeasured renders full until measured');
-});
-
-test('the layout copies main\'s strings — it composes no wording of its own', () => {
-  for (const make of [HEALTHY, REVEALED, BLOCKED, STALE]) {
+test('the layout draws main\'s FULL strings only — no collapse, no compact form, no composed wording', () => {
+  assert.equal(layout.chooseCollapseLevel, undefined, 'the C2.10 collapse ladder is gone (human override)');
+  assert.equal(layout.COLLAPSE_LEVELS, undefined);
+  for (const make of ALL) {
     const p = make();
-    const allowed = new Set([p.fiveHour.text, p.fiveHour.compactText, p.fiveHour.resetText,
-      p.weekly?.text, p.weekly?.compactText, p.weekly?.resetText].filter(Boolean));
-    for (const level of COLLAPSE_LEVELS) {
-      for (const t of poolTokens(p, level)) {
-        const s = t.kind === 'meter' ? t.valueText : t.text;
-        assert.ok(allowed.has(s), `"${s}" is not a string main supplied`);
-      }
+    const allowed = new Set([p.fiveHour.text, p.fiveHour.resetText, p.weekly?.text, p.weekly?.resetText].filter(Boolean));
+    for (const t of poolTokens(p)) {
+      const s = t.kind === 'meter' ? t.valueText : t.text;
+      assert.ok(allowed.has(s), `"${s}" is not one of main's full strings`);
     }
   }
 });
 
-test('nothing renders before main answers (NONE is not drawn as a healthy empty strip)', () => {
-  assert.equal(render([], 0), '');
+test('scroll: travel is exactly the overflow (zero when it fits), at a gentle speed', () => {
+  assert.equal(scrollDistance(300, 200), 100);
+  assert.equal(scrollDistance(199.2, 200), 0, 'fits: no travel');
+  assert.equal(scrollDistance(200.4, 200), 1, 'a sub-pixel overflow still reaches the last pixel');
+  assert.equal(sweepSeconds(0), 6, 'a floor on one sweep');
+  assert.ok(sweepSeconds(600) >= 600 / 30, 'no faster than 30px/s');
+});
+
+test('scroll CSS: runs only when overflowing, holds at both ends, pauses on hover/focus, OFF under reduced motion', () => {
+  const css = STRIP_CSS.replace(/\s+/g, ' ');
+  assert.match(css, /\.cap-strip-host\[data-overflow="true"\] \.cap-strip-track \{ animation: cap-strip-scroll /);
+  assert.ok(!/^\s*\.cap-strip-track \{[^}]*animation/.test(css), 'the track does not animate unless the host overflows');
+  assert.match(css, /0%, 12% \{ transform: translateX\(0\); \} 88%, 100% \{ transform: translateX\(var\(--cap-scroll, 0px\)\); \}/);
+  assert.match(css, /infinite alternate/);
+  assert.match(css, /\.cap-strip-host:hover \.cap-strip-track, \.cap-strip-host:focus-within \.cap-strip-track \{ animation-play-state: paused; \}/);
+  assert.match(css, /@media \(prefers-reduced-motion: reduce\) \{ \.cap-strip-host\[data-overflow="true"\] \.cap-strip-track \{ animation: none; \} \.cap-strip-host \{ overflow-x: auto;/);
+  assert.match(css, /\.cap-strip-host \{[^}]*height: 36px; overflow: hidden;/, 'one fixed 36px line: overflow never grows the bar');
+  assert.match(css, /\.cap-strip-track \{[^}]*white-space: nowrap;/);
+  assert.ok(render([HEALTHY()]).includes('<style>'), 'the CSS ships with the strip');
+});
+
+test('the connected strip measures its own overflow and hands the travel to the CSS', () => {
+  const src = codeOnly(readSource('src/renderer/src/components/CapacityStrip.tsx'), 'CapacityStrip.tsx');
+  assert.match(src, /const d = scrollDistance\(track\.scrollWidth, el\.clientWidth\);/);
+  assert.match(src, /el\.dataset\.overflow = d > 0 \? 'true' : 'false';/);
+  assert.match(src, /el\.style\.setProperty\('--cap-scroll', `\$\{-d\}px`\);/);
+  assert.match(src, /new ResizeObserver\(measure\)/);
+  assert.match(src, /className="cap-strip-host cth-titlebar-nodrag"/, 'no-drag, so hover can pause it');
 });
 
 // ─── Structure ────────────────────────────────────────────────────────────────
 
-test('geometry (§9): the strip draws ONE continuous fill per meter and no segments', () => {
+test('geometry (§9): one continuous fill per meter, no segments; the mask applied; no IPC in the component', () => {
   const src = codeOnly(readSource('src/renderer/src/components/CapacityStrip.tsx'), 'CapacityStrip.tsx');
-  assert.ok(!/segment|repeat\(|\.map\(\(_?, ?i\)|Array\.from\(\{ ?length/i.test(src), 'no segmented gauge in the capacity strip');
+  assert.ok(!/segment|repeat\(|Array\.from\(\{ ?length/i.test(src), 'no segmented gauge in the capacity strip');
   assert.ok(src.includes('presentPool('), 'the connected strip applies the one-way mask');
-  assert.ok(!/window\.cth/.test(src), 'no IPC in the component: it reads the one mirror via the hook');
+  assert.ok(!/window\.cth/.test(src), 'it reads the one mirror via the hook');
 });
 
-test('C2.10: mounted in the 36px title bar, fixed height, clipped — a capacity change cannot reflow the chrome', () => {
-  const app = readSource('src/renderer/src/App.tsx');
-  const bar = app.indexOf('{/* Title bar */}');
+test('title bar: the strip is mounted where the display-only "auto mode" label was; the setting itself remains', () => {
+  const app = codeOnly(readSource('src/renderer/src/App.tsx'), 'App.tsx');
+  const bar = app.indexOf('className="cth-titlebar-drag"');
   const mount = app.indexOf('<CapacityStrip />');
   const settings = app.indexOf('aria-label="Settings"');
   assert.ok(bar > 0 && mount > bar && mount < settings, 'the strip sits in the title bar, before its right-hand controls');
-  const src = codeOnly(readSource('src/renderer/src/components/CapacityStrip.tsx'), 'CapacityStrip.tsx');
-  const host = src.slice(src.indexOf('data-cap-strip'));
-  assert.match(host, /height: 36/);
-  assert.match(host, /overflow: 'hidden'/);
-  assert.match(host, /flexWrap: 'wrap'/);
+  assert.ok(!/auto mode on|auto mode off/.test(app), 'the title-bar auto-mode label is gone');
+  assert.match(readSource('src/renderer/src/components/SettingsModal.tsx'), /autoMode/, 'the autoMode setting is untouched');
 });

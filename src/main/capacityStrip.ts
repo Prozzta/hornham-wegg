@@ -32,7 +32,7 @@ import type {
   CapacityFreshnessView, CapacityNotice, CapacityStripCollection, CapacityStripPool, DisplayReadyMeter, FiveHourStrip,
   NoticeDelivery, ProvenanceClass, StripPresentation, VisibleWeeklyStrip, WeeklyRevealReason
 } from '../shared/capacityStrip';
-import { validateCapacityStrip } from '../shared/capacityStrip';
+import { CAPACITY_EMPTY_TEXT, validateCapacityStrip } from '../shared/capacityStrip';
 import type { CapacityNotifyIntent } from './capacityNotify';
 
 /**
@@ -169,12 +169,16 @@ export class CapacityStripPresenter {
   private readonly idKey: Buffer;
   /** poolId → last revision and the body it was issued for. Never pruned: no rollback. */
   private readonly revisions = new Map<string, { revision: number; body: string }>();
+  /**
+   * C2.5 fixed-band latches, one per (pool, purpose): the weekly REVEAL (`<poolKey>`) and
+   * the reset-text gate of each window (`<poolKey>|reset|five`, `<poolKey>|reset|weekly`).
+   * One band implementation for all of them (`band`), so they cannot drift apart.
+   */
   private readonly latches = new Map<string, WeeklyLatch>();
-  /** Per-provider ordinal in first-seen order, so a label never moves under a person. */
-  private readonly ordinals = new Map<string, number>();
-  private readonly nextOrdinal = new Map<ProviderId, number>();
   private readonly notices = new Map<string, StoredNotice>();
-  private collection: CapacityStripCollection = { collectionRevision: 0, domainRevision: 0, complete: true, pools: [] };
+  private collection: CapacityStripCollection = {
+    collectionRevision: 0, domainRevision: 0, complete: true, emptyText: CAPACITY_EMPTY_TEXT, pools: []
+  };
   private collectionBody = JSON.stringify({ complete: true, pools: [] });
 
   constructor(opts: CapacityStripPresenterOptions = {}) {
@@ -232,7 +236,7 @@ export class CapacityStripPresenter {
     }
     // A pool that left the complete-replace snapshot is gone: its latch and notice go
     // with it. Its revision counter stays, so a return continues upward.
-    for (const k of [...this.latches.keys()]) if (!live.has(k)) this.latches.delete(k);
+    for (const k of [...this.latches.keys()]) if (!live.has(k.split('|')[0])) this.latches.delete(k);
     for (const k of [...this.notices.keys()]) if (!live.has(k)) this.notices.delete(k);
 
     const complete = inputs.snapshot.overflow === null;
@@ -242,6 +246,7 @@ export class CapacityStripPresenter {
         collectionRevision: this.collection.collectionRevision + 1,
         domainRevision: inputs.snapshot.collectionRevision,
         complete,
+        emptyText: CAPACITY_EMPTY_TEXT,
         pools
       };
       const errors = validateCapacityStrip(next);
@@ -361,7 +366,8 @@ export class CapacityStripPresenter {
       fiveHour.text = `5h · ${m.displayPercent}% remaining`;
       fiveHour.compactText = `5h ${m.displayPercent}%`;
       fiveHour.meter = m;
-      if (five.resetsAt !== null && five.resetsAt > now) {
+      if (five.resetsAt !== null && five.resetsAt > now
+        && this.band(`${pool.poolKey}|reset|five`, fiveRemaining, five.resetsAt, T) !== null) {
         fiveHour.resetText = `reset expected ~${this.formatTime(five.resetsAt, now)}`;
         fiveHour.resetExpectedAt = five.resetsAt;
       }
@@ -382,7 +388,9 @@ export class CapacityStripPresenter {
       if (presentation === 'NORMAL' && numeric && remaining !== null) {
         visibleWeekly.meter = meterOf(remaining);
         const r = weekly.window?.resetsAt ?? null;
-        if (r !== null && r > now) visibleWeekly.resetText = `reset expected ~${this.formatTime(r, now)}`;
+        if (r !== null && r > now && this.band(`${pool.poolKey}|reset|weekly`, remaining, r, T) !== null) {
+          visibleWeekly.resetText = `reset expected ~${this.formatTime(r, now)}`;
+        }
       }
     }
     const out: ReturnType<CapacityStripPresenter['rows']> = {
@@ -406,15 +414,9 @@ export class CapacityStripPresenter {
     // The band is evaluated on every FRESH value, whichever reason ends up winning, so
     // a stronger reason ending does not leave the latch describing an older sample.
     // No fresh value: the latch is left exactly as it was (C2.5, UNKNOWN clause).
-    let banded: WeeklyRevealReason | null = null;
-    if (wk && value !== null) {
-      let latch = this.latches.get(pool.poolKey) ?? { shown: false, anchor: wk.resetsAt };
-      if (latch.anchor !== wk.resetsAt) latch = { shown: false, anchor: wk.resetsAt };
-      if (value < T) { latch.shown = true; banded = 'BELOW_DISPLAY_THRESHOLD'; }
-      else if (latch.shown && value < Math.min(100, T + HYSTERESIS_BAND)) banded = 'HYSTERESIS_HOLD';
-      else latch.shown = false;
-      this.latches.set(pool.poolKey, latch);
-    }
+    const band = wk && value !== null ? this.band(pool.poolKey, value, wk.resetsAt, T) : null;
+    const banded: WeeklyRevealReason | null =
+      band === 'BELOW' ? 'BELOW_DISPLAY_THRESHOLD' : band === 'HOLD' ? 'HYSTERESIS_HOLD' : null;
 
     if (wk && pool.providerAttributedLimitingWindowId === wk.windowId) return { reason: 'PROVIDER_ATTRIBUTED_LIMITING', window: wk };
     if (wk && fresh && pool.numericallyExhaustedWindowIds.includes(wk.windowId)) return { reason: 'NUMERICALLY_EXHAUSTED', window: wk };
@@ -434,20 +436,37 @@ export class CapacityStripPresenter {
 
   /**
    * The pool's user-safe label, the SAME one the strip shows (unit #5: an agent card names
-   * its pool exactly as the strip does, "Codex 2" included). A label, never pool data.
+   * its pool exactly as the strip does). A label, never pool data.
    */
   labelOf(pool: PoolCapacitySnapshot): string {
     return this.label(pool);
   }
 
+  /**
+   * The provider's name. There is only ever ONE pool per provider (human ruling at the
+   * strip review, 2026-09-21): at most two pools, Claude and Codex, so the name is the
+   * whole label and no second-account ordinal exists.
+   */
   private label(pool: PoolCapacitySnapshot): string {
-    let ordinal = this.ordinals.get(pool.poolKey);
-    if (ordinal === undefined) {
-      ordinal = (this.nextOrdinal.get(pool.provider) ?? 0) + 1;
-      this.nextOrdinal.set(pool.provider, ordinal);
-      this.ordinals.set(pool.poolKey, ordinal);
-    }
-    return ordinal === 1 ? PROVIDER_LABEL[pool.provider] : `${PROVIDER_LABEL[pool.provider]} ${ordinal}`;
+    return PROVIDER_LABEL[pool.provider];
+  }
+
+  /**
+   * THE C2.5 fixed band, for every threshold-driven disclosure the strip makes: weekly
+   * reveal, and (strip-polish, human ruling) the reset hint of each window. Evaluated on a
+   * FRESH full-precision value only. Enter at `< T`; hold until `>= min(100, T + band)`;
+   * a re-anchored window (its reset moved) re-evaluates from hidden.
+   * Returns BELOW (under T), HOLD (inside the band after entering), or null (hidden).
+   */
+  private band(key: string, value: number, anchor: number | null, T: number): 'BELOW' | 'HOLD' | null {
+    let latch = this.latches.get(key) ?? { shown: false, anchor };
+    if (latch.anchor !== anchor) latch = { shown: false, anchor };
+    let out: 'BELOW' | 'HOLD' | null = null;
+    if (value < T) { latch.shown = true; out = 'BELOW'; }
+    else if (latch.shown && value < Math.min(100, T + HYSTERESIS_BAND)) out = 'HOLD';
+    else latch.shown = false;
+    this.latches.set(key, latch);
+    return out;
   }
 
   /** Keyed hash: stable in this process, not reversible to an account scope. */

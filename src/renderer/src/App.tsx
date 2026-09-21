@@ -289,15 +289,10 @@ export function App() {
         {/* v0.3.7: the version is no longer inert text — it doubles as the
             update control (check / download / restart to update). */}
         <UpdateBadge />
-        <span style={{
-          fontFamily: 'var(--cth-font-ui)',
-          fontSize: 13,
-          color: 'var(--cth-ink-500)'
-        }}>
-          {config.autoMode ? 'auto mode on' : 'auto mode off'}
-        </span>
         {/* v1.1.45: provider capacity, one inline group per pool (design of record C2).
-            It fills the middle run and never grows the bar (C2.10). */}
+            One fixed line that scrolls when it overflows, so it never grows the bar. It
+            took the place of the old display-only "auto mode on/off" label (removed at the
+            strip review; the autoMode setting itself is untouched, in Settings > General). */}
         <CapacityStrip />
         {/* v0.3.4: theme + fullscreen live HERE (top right), not buried in the
             terminal header — and the theme darkens the whole app, terminals

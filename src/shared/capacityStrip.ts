@@ -186,6 +186,15 @@ export interface CapacityStripPool {
   notice?: CapacityNotice;
 }
 
+/**
+ * What the strip says when there is nothing to show: no collection yet (cold start, a
+ * reload before main answered, a disconnect) or a collection with no pools (design §10's
+ * cold-start / disconnected case, F3). Main sends it on every collection; the renderer
+ * falls back to this same constant only while it holds NO collection at all, which is the
+ * one moment main has not spoken yet. One string, one owner, no renderer wording.
+ */
+export const CAPACITY_EMPTY_TEXT = 'Capacity unknown';
+
 export interface CapacityStripCollection {
   /** Complete-replace ordering: a strictly higher value replaces the whole set. */
   collectionRevision: number;
@@ -193,6 +202,8 @@ export interface CapacityStripCollection {
   domainRevision: number;
   /** False when the tracker's pool-count cap was breached: pools may be missing. */
   complete: boolean;
+  /** Drawn when `pools` is empty (F3). Always `CAPACITY_EMPTY_TEXT`. */
+  emptyText: string;
   pools: CapacityStripPool[];
 }
 
@@ -337,7 +348,7 @@ function poolInvariants(v: Record<string, unknown>, at: string, errors: string[]
 /** Validate a collection. An empty list means valid; anything else is refused whole. */
 export function validateCapacityStrip(value: unknown): string[] {
   const errors: string[] = [];
-  object({ collectionRevision: revision, domainRevision: revision, complete: bool, pools: () => {} })(value, '$', errors);
+  object({ collectionRevision: revision, domainRevision: revision, complete: bool, emptyText: text, pools: () => {} })(value, '$', errors);
   if (!isObj(value)) return errors;
   if (!Array.isArray(value.pools)) { errors.push('$.pools: not an array'); return errors; }
   const seen = new Set<unknown>();

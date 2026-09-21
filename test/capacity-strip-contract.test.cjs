@@ -96,7 +96,8 @@ test('a healthy pool projects to ONE display-ready object with main-issued field
   assert.equal(p.presentation, 'NORMAL');
   assert.deepEqual(p.fiveHour.meter, { remainingPercent: 80.6, displayPercent: 80 }, 'rounded DOWN: never overstate');
   assert.equal(p.fiveHour.text, '5h · 80% remaining');
-  assert.equal(p.fiveHour.resetText, `reset expected ~@${RESET_5H - T0}`);
+  assert.ok(!('resetText' in p.fiveHour) && !('resetExpectedAt' in p.fiveHour),
+    'strip-polish: 80% is above the threshold, so no reset hint');
   assert.equal(p.freshness.verdict, 'FRESH');
   assert.equal(p.freshness.expiresAt, p.freshness.observedAt + L0_SEM_POLICY.liveTtlMs,
     'the mask deadline is the tracker\'s OWN freshness deadline');
@@ -237,6 +238,71 @@ test('C2.6: whole-pool UNKNOWN is text only, and the pool-level row suffices (no
   assert.ok(!('weekly' in p), 'an unknown pool does not repeat UNKNOWN per window');
   assert.ok(!JSON.stringify(p).includes('"meter"'), 'an empty bar is a drawn claim of zero');
   assert.ok(!/\d+% remaining/.test(JSON.stringify(p)), 'stale removes the number');
+});
+
+// ─── Reset-text gating (strip-polish, human ruling): only below the threshold ───
+
+test('reset hint: shown for a window only BELOW the threshold, held through the C2.5 band, then hidden', () => {
+  const r = rig();
+  assert.ok(!('resetText' in only(r.read(15.0, 60)).fiveHour), '15.0 is not below T=15');
+  const below = only(r.read(14.9, 60)).fiveHour;
+  assert.equal(below.resetText, `reset expected ~@${RESET_5H - T0}`);
+  assert.equal(below.resetExpectedAt, RESET_5H);
+  assert.equal(only(r.read(19.9, 60)).fiveHour.resetText, `reset expected ~@${RESET_5H - T0}`, 'inside the band it holds (no flicker)');
+  assert.ok(!('resetText' in only(r.read(20.0, 60)).fiveHour), 'at min(100, T+5) it hides');
+});
+
+test('reset hint: weekly uses the SAME threshold and band as the 5h window', () => {
+  const r = rig();
+  const w = only(r.read(80, 14.9)).weekly;
+  assert.equal(w.resetText, `reset expected ~@${RESET_7D - T0}`, 'a weekly shown below T carries its reset');
+  assert.ok(!('resetText' in only(r.read(80, 14.9)).fiveHour), 'the healthy 5h beside it does not');
+  const held = only(r.read(80, 19.9)).weekly;
+  assert.equal(held.reason, 'HYSTERESIS_HOLD');
+  assert.equal(held.resetText, `reset expected ~@${RESET_7D - T0}`);
+});
+
+test('reset hint: a weekly revealed by EVIDENCE but above the threshold carries NO reset (the gate is the own figure of the window)', () => {
+  const r = rig();
+  const p = only(r.read(0, 50, { providerReachedType: 'usage', providerAttributedLimitingWindowId: 'seven_day' }));
+  assert.equal(p.presentation, 'NORMAL', 'a 5h at 0 has nothing to subordinate');
+  assert.equal(p.weekly.reason, 'PROVIDER_ATTRIBUTED_LIMITING');
+  assert.ok(p.weekly.meter, 'a fresh figure is drawn');
+  assert.ok(!('resetText' in p.weekly), '50% is above T=15: no reset hint, whatever revealed the row');
+  assert.equal(p.fiveHour.resetText, `reset expected ~@${RESET_5H - T0}`, 'the 5h at 0 is below T and carries its reset');
+});
+
+test('reset hint: a re-anchored window re-evaluates from hidden, and a threshold change moves it (presentation only)', () => {
+  const r = rig();
+  r.read(10, 60);
+  const moved = obs(0, 18, 60);
+  moved.windows[0].resetsAt = RESET_5H + 5 * 3_600_000;
+  assert.ok(!('resetText' in only(r.read(18, 60, { windows: moved.windows })).fiveHour), 'a new window does not inherit the old latch');
+  const r2 = rig();
+  const before = only(r2.read(40, 60));
+  assert.ok(!('resetText' in before.fiveHour));
+  r2.setThreshold(50);
+  const after = only(r2.present());
+  assert.ok('resetText' in after.fiveHour);
+  assert.equal(after.domainRevision, before.domainRevision, 'threshold is presentation only');
+});
+
+test('F3: every collection carries the main-owned emptyText, including an empty one', () => {
+  const r = rig();
+  const empty = r.present();
+  assert.equal(empty.pools.length, 0);
+  assert.equal(empty.emptyText, shared.CAPACITY_EMPTY_TEXT);
+  assert.equal(shared.CAPACITY_EMPTY_TEXT, 'Capacity unknown');
+  valid(empty);
+  const c = JSON.parse(JSON.stringify(r.read(80, 60)));
+  delete c.emptyText;
+  assert.notDeepEqual(validateCapacityStrip(c), [], 'emptyText is required');
+});
+
+test('one pool per provider: the label is the provider name, whatever the account', () => {
+  const r = rig();
+  assert.equal(only(r.read(80, 60)).poolLabel, 'Codex');
+  assert.equal(r.presenter.labelOf(r.tracker.pool(POOL)), 'Codex');
 });
 
 // ─── Schema: additionalProperties:false and the hidden-weekly rejections ─────
