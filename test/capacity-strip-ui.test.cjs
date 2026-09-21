@@ -192,6 +192,25 @@ test('crit 15: overall LIMITED, weekly primary, then the subordinate 5h token �
   }
 });
 
+test('A2: the RESERVE_ONLY held frame renders like crit 14/15 — one subordinate token, weekly first, no meter', () => {
+  const p = pool(std(63, 0));
+  assert.equal(p.state, 'RESERVE_ONLY');
+  assert.equal(p.presentation, 'BLOCKED_SUBORDINATE');
+  for (const level of COLLAPSE_LEVELS) {
+    const html = render([p], level);
+    assert.equal(count(html, /data-cap-subordinate="true"/g), 1, `level ${level}`);
+    assert.equal(count(html, /63%/g), 1, `level ${level}: the 5h figure appears exactly once`);
+    assert.ok(!/role="(meter|progressbar)"|aria-value|data-cap-meter|data-cap-reset/.test(html), `level ${level}`);
+    assert.ok(!html.includes('--cth-status-success'), `level ${level}: no positive-capacity colour`);
+    const iState = html.indexOf('Reserve only');
+    const iWeekly = html.indexOf('data-cap-figure="weekly"');
+    const iFive = html.indexOf('data-cap-figure="five-hour"');
+    assert.ok(iState >= 0 && iState < iWeekly && iWeekly < iFive, `level ${level}: state, weekly, then 5h`);
+  }
+  assert.ok(visibleText(render([p], 3)).includes('|5h 63% · held by Weekly 0%|'));
+  assert.ok(visibleText(render([p], 0)).includes('|5h · 63% remaining · ordinary work held while Weekly is at 0%|'));
+});
+
 // ─── Layout (C2.10) ───────────────────────────────────────────────────────────
 
 test('chooseCollapseLevel picks the LEAST collapsed level that fits, and never goes past 3', () => {

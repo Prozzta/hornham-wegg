@@ -121,10 +121,28 @@ const MUTANTS = [
     "flex: '1 1 auto', minWidth: 0, height: 36, overflow: 'hidden',", "flex: '1 1 auto', minWidth: 0,"],
   ['u2 empty collection drawn', VIEW,
     '  if (!pools.length) return null;', "  if (!pools.length) return <span>Capacity unknown</span>;"],
+  // ── A2 (human ruling): the RESERVE_ONLY held frame ───────────────────────────
+  ['a2 RESERVE_ONLY frame removed', STRIP,
+    "  RESERVE_ONLY: {\n    text: (n) => `5h · ${n}% remaining · ordinary work held while Weekly is at 0%`,\n    compactText: (n) => `5h ${n}% · held by Weekly 0%`\n  }\n",
+    ''],
+  ['a2 RESERVE_ONLY frame uses the causal LIMITED copy', STRIP,
+    "text: (n) => `5h · ${n}% remaining · ordinary work held while Weekly is at 0%`,",
+    "text: (n) => `5h · ${n}% remaining · unavailable while Weekly is exhausted`,"],
+  ['a2 frame ignores the 5h-above-zero precondition', STRIP,
+    'const frame = known && fiveRemaining !== null && fiveRemaining > 0',
+    'const frame = known && fiveRemaining !== null'],
   // ── unit #2: presenter copy used by the strip ─────────────────────────────────
   ['u2 weekly compact text drops its label', STRIP,
     "case 'HYSTERESIS_HOLD': return `Weekly ${display}%`;", "case 'HYSTERESIS_HOLD': return `${display}%`;"]
 ];
+
+// THE BASELINE MUST BE GREEN. Against already-failing tests every mutant "dies", and a
+// kill that the unmutated code would also have scored is not evidence of anything.
+const baseline = spawnSync(process.execPath, ['--test', ...TESTS], { cwd: ROOT, encoding: 'utf8' });
+if (baseline.status !== 0) {
+  console.log('BASELINE RED: the unmutated capacity tests fail, so no mutant result would mean anything.');
+  process.exit(2);
+}
 
 const only = process.argv[2];
 const selected = MUTANTS.filter(([name]) => !only || name.startsWith(only));

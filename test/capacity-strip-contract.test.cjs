@@ -191,6 +191,35 @@ test('C2.7: provider-attributed weekly limit — BLOCKED_SUBORDINATE, one atomic
   }
 });
 
+test('A2 (human ruling): RESERVE_ONLY with weekly freshly at 0 takes the blocked frame, with OBSERVATIONAL copy', () => {
+  for (const T of [1, 15, 99]) {
+    const r = rig({ threshold: T });
+    const c = r.read(63, 0);
+    valid(c);
+    const p = only(c);
+    assert.equal(p.state, 'RESERVE_ONLY', 'unattributed numeric exhaustion is RESERVE_ONLY (ruling 2)');
+    assert.equal(p.presentation, 'BLOCKED_SUBORDINATE');
+    assert.equal(p.weekly.reason, 'NUMERICALLY_EXHAUSTED');
+    assert.equal(p.fiveHour.text, '5h · 63% remaining · ordinary work held while Weekly is at 0%');
+    assert.equal(p.fiveHour.compactText, '5h 63% · held by Weekly 0%');
+    const json = JSON.stringify(p);
+    assert.ok(!json.includes('"meter"'), 'no meter on either window in the blocked frame');
+    // Human-facing strings only: enum identifiers such as BLOCKED_SUBORDINATE are not copy.
+    const copy = [];
+    JSON.stringify(p, (k, v) => { if (/^(text|compactText|stateText|resetText)$/.test(k)) copy.push(v); return v; });
+    assert.ok(copy.length >= 4);
+    for (const s of copy) assert.ok(!/exhausted|blocked|limit reached/i.test(s), `crit 16: no causal wording without provider attribution: "${s}"`);
+  }
+});
+
+test('A2 boundary: BOTH windows at 0 keeps the NORMAL frame — a 5h at 0 has no headroom to subordinate', () => {
+  const p = only(rig().read(0, 0));
+  assert.equal(p.state, 'RESERVE_ONLY');
+  assert.equal(p.weekly.reason, 'NUMERICALLY_EXHAUSTED', 'weekly is exhausted, so only the 5h precondition keeps this NORMAL');
+  assert.equal(p.presentation, 'NORMAL');
+  assert.equal(p.fiveHour.text, '5h · 0% remaining');
+});
+
 test('C2.6: whole-pool UNKNOWN is text only, and the pool-level row suffices (no weekly property)', () => {
   const r = rig();
   r.read(80, 10);

@@ -75,17 +75,19 @@ function weeklyText(reason: WeeklyRevealReason, display: number | null): string 
  * gets. The frame's other preconditions (a fresh 5h figure above zero, and weekly
  * provider-attributed or freshly at zero) live at the single call site.
  *
- * A2 IS PENDING THE HUMAN: whether a RESERVE_ONLY pool with weekly freshly at 0 (no
- * provider attribution, so no causal wording - crit 16) also takes this frame. If he
- * says yes, the change is this one entry, with Jim's proposed observational copy:
- *   RESERVE_ONLY: { text: (n) => `5h · ${n}% remaining · ordinary work held while Weekly is at 0%`,
- *                   compactText: (n) => `5h ${n}% · held by Weekly 0%` },
- * Until then RESERVE_ONLY renders the NORMAL frame, which is the current ruling.
+ * A2, RULED BY THE HUMAN (2026-09-21): a RESERVE_ONLY pool whose weekly is freshly at
+ * 0 also takes this frame. The provider did NOT attribute that limit, so its copy is
+ * OBSERVATIONAL - "held while Weekly is at 0%" - never the causal "exhausted" or
+ * "blocked" wording reserved for a LIMITED pool (crit 16). Copy is Jim's, as ruled.
  */
 const BLOCKED_FRAME: Partial<Record<CapacityState, { text: (n: number) => string; compactText: (n: number) => string }>> = {
   LIMITED: {
     text: (n) => `5h · ${n}% remaining · unavailable while Weekly is exhausted`,
     compactText: (n) => `5h ${n}% · blocked by Weekly`
+  },
+  RESERVE_ONLY: {
+    text: (n) => `5h · ${n}% remaining · ordinary work held while Weekly is at 0%`,
+    compactText: (n) => `5h ${n}% · held by Weekly 0%`
   }
 };
 
