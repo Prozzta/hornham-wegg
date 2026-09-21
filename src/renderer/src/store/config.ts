@@ -112,6 +112,10 @@ export interface HarnessConfig {
   /** Per-agent total-token ceiling, keyed by agent id. Overrides the floor budget
    *  for that agent's meter and trips the breaker for it alone. */
   agentTokenCaps?: Record<string, number>;
+  /** v1.1.45 CAPUI-MONITOR: what each agent's first Monitor line shows. Absent = 'budget'.
+   *  'fiveHour' / 'weekly' show that provider window's usage AND exempt the agent from the
+   *  budget limits (see src/shared/agentUsage.ts). Claude/Codex agents only. */
+  agentUsageDisplay?: Record<string, 'budget' | 'fiveHour' | 'weekly'>;
   autoDeliveryPausedAgents?: string[];
   maxTurns?: number;
   circuitBreaker?: CircuitBreakerConfig;

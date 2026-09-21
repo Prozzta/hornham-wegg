@@ -24,6 +24,7 @@
  */
 import type { CircuitBreakerConfig } from './config';
 import type { AgentUsageSample } from './usage';
+import { isBudgetExempt } from '../shared/agentUsage';
 
 export type BreakerLevel = 'healthy' | 'steering' | 'constrained' | 'stopped';
 
@@ -111,7 +112,11 @@ interface AgentBreakerState {
 export class CircuitBreaker {
   private agents = new Map<string, AgentBreakerState>();
 
-  constructor(private getConfig: () => CircuitBreakerConfig & { costCapUsd?: number; costCapTokens?: number; agentTokenCaps?: Record<string, number> }) {}
+  constructor(private getConfig: () => CircuitBreakerConfig & {
+    costCapUsd?: number; costCapTokens?: number; agentTokenCaps?: Record<string, number>;
+    /** v1.1.45 CAPUI-MONITOR: 5H / Weekly on an agent's Monitor line exempts it from the budget. */
+    agentUsageDisplay?: Record<string, string>;
+  }) {}
 
   private cfg() {
     const c = this.getConfig() ?? {};
@@ -123,7 +128,8 @@ export class CircuitBreaker {
       tokenVelocityPerMin: c.tokenVelocityPerMin ?? DEFAULTS.tokenVelocityPerMin,
       costCapUsd: c.costCapUsd,
       costCapTokens: c.costCapTokens,
-      agentTokenCaps: c.agentTokenCaps
+      agentTokenCaps: c.agentTokenCaps,
+      agentUsageDisplay: c.agentUsageDisplay
     };
   }
 
@@ -224,12 +230,20 @@ export class CircuitBreaker {
       return decisions;
     }
 
+    // v1.1.45 CAPUI-MONITOR: an agent whose Monitor line shows 5H or Weekly is FULLY
+    // outside the budget (god's floor-blame ruling). It is left out of both floor totals
+    // below, so it can neither be blamed nor push the floor over a cap, and its own
+    // budget arms are skipped in evaluate(). Read live each beat, so a choice applies on
+    // the next beat with no restart. The behaviour-safety arms still see every agent.
+    const exempt = (agentId: string): boolean => isBudgetExempt(cfg.agentUsageDisplay?.[agentId]);
+    const budgeted = inputs.filter((i) => !exempt(i.agentId));
+
     // Cost cap is floor-wide: sum cumulative usd, blame the single biggest spender
     // so one runaway doesn't trip the whole floor.
     let topSpender: string | null = null;
     if (typeof cfg.costCapUsd === 'number' && cfg.costCapUsd > 0) {
       let total = 0; let max = -1;
-      for (const i of inputs) {
+      for (const i of budgeted) {
         const usd = i.sample?.usd ?? 0;
         total += usd;
         if (usd > max) { max = usd; topSpender = i.agentId; }
@@ -241,7 +255,7 @@ export class CircuitBreaker {
     let topTokenSpender: string | null = null;
     if (typeof cfg.costCapTokens === 'number' && cfg.costCapTokens > 0) {
       let total = 0; let max = -1;
-      for (const i of inputs) {
+      for (const i of budgeted) {
         const tok = tokensOf(i.sample);
         total += tok;
         if (tok > max) { max = tok; topTokenSpender = i.agentId; }
@@ -254,7 +268,8 @@ export class CircuitBreaker {
       const trip = this.evaluate(
         input, s, cfg, nowMs,
         input.agentId === topSpender, cfg.costCapUsd,
-        input.agentId === topTokenSpender, cfg.costCapTokens
+        input.agentId === topTokenSpender, cfg.costCapTokens,
+        exempt(input.agentId)
       );
       // remember the cumulative baseline for next beat's velocity diff
       if (input.sample) s.lastSample = input.sample;
@@ -289,7 +304,8 @@ export class CircuitBreaker {
     isTopSpender: boolean,
     costCapUsd: number | undefined,
     isTopTokenSpender: boolean,
-    costCapTokens: number | undefined
+    costCapTokens: number | undefined,
+    budgetExempt = false
   ): { tripping: boolean; reason: string } {
     // (b) repeated identical tool calls
     if (s.repeatCount >= cfg.repeatedToolLimit) {
@@ -299,17 +315,19 @@ export class CircuitBreaker {
     if (s.errorCount >= cfg.errorStormLimit) {
       return { tripping: true, reason: `error storm: ${s.errorCount} consecutive api errors/retries` };
     }
-    // (a) per-agent token limit — this agent's own total over its configured cap
-    const perAgentCap = cfg.agentTokenCaps?.[input.agentId];
+    // (a) per-agent token limit — this agent's own total over its configured cap. The
+    // three BUDGET arms (this one and the two floor caps below) are skipped for an agent
+    // exempted on its Monitor line; the floor arms also never select it (see tick()).
+    const perAgentCap = budgetExempt ? undefined : cfg.agentTokenCaps?.[input.agentId];
     if (typeof perAgentCap === 'number' && perAgentCap > 0 && tokensOf(input.sample) > perAgentCap) {
       return { tripping: true, reason: `token limit: ${tokensOf(input.sample).toLocaleString()} over the agent cap of ${perAgentCap.toLocaleString()}` };
     }
     // (a) cost cap — floor total over cap, this agent is the biggest spender
-    if (isTopSpender && typeof costCapUsd === 'number') {
+    if (!budgetExempt && isTopSpender && typeof costCapUsd === 'number') {
       return { tripping: true, reason: `cost cap: floor total over $${costCapUsd} (top spender $${(input.sample?.usd ?? 0).toFixed(2)})` };
     }
     // (a) token cap — floor total tokens over cap, this agent is the biggest spender
-    if (isTopTokenSpender && typeof costCapTokens === 'number') {
+    if (!budgetExempt && isTopTokenSpender && typeof costCapTokens === 'number') {
       return { tripping: true, reason: `token cap: floor total over ${costCapTokens.toLocaleString()} tokens (top spender ${tokensOf(input.sample).toLocaleString()})` };
     }
     // (a) token-velocity spike — diff cumulative output across consecutive beats.

@@ -1,7 +1,7 @@
 'use strict';
 
 /**
- * Mutant runner for the capacity display milestone (v1.1.45 units #1, #2, #5 and the strip polish).
+ * Mutant runner for the capacity display milestone (v1.1.45 units #1, #2, #5, the strip polish and CAPUI-MONITOR).
  *
  * WHY IT IS COMMITTED (Jim's audit, F2). A mutant count that lives in someone's
  * scratchpad cannot be reproduced, and a count nobody can reproduce is not evidence.
@@ -29,7 +29,7 @@ const { spawnSync } = require('node:child_process');
 
 const ROOT = path.resolve(__dirname, '..', '..');
 const TESTS = ['test/capacity-strip-contract.test.cjs', 'test/capacity-strip-ui.test.cjs',
-  'test/capacity-agent-impact.test.cjs', 'test/delivery-hold.test.cjs'];
+  'test/capacity-agent-impact.test.cjs', 'test/delivery-hold.test.cjs', 'test/capacity-monitor.test.cjs'];
 
 const STRIP = 'src/main/capacityStrip.ts';
 const SHARED = 'src/shared/capacityStrip.ts';
@@ -43,6 +43,12 @@ const IMPACT_VIEW = 'src/renderer/src/components/agentImpactView.ts';
 const CARD = 'src/renderer/src/components/AgentCard.tsx';
 const HOLD = 'src/shared/deliveryHold.ts';
 const APP = 'src/renderer/src/App.tsx';
+const BREAKER = 'src/main/breaker.ts';
+const USAGE = 'src/shared/agentUsage.ts';
+const USAGE_MAIN = 'src/main/capacityAgentUsage.ts';
+const USAGE_LINE = 'src/renderer/src/components/AgentUsageLine.tsx';
+const PANEL = 'src/renderer/src/components/CommandCenterPanel.tsx';
+const CONFIG = 'src/main/config.ts';
 
 /** [name, file, from, to] */
 const MUTANTS = [
@@ -178,6 +184,39 @@ const MUTANTS = [
     '<PixelBadge status={held.status} label={held.label}', "<PixelBadge status={typing ? 'typing' : status} label={undefined}"],
   ['u5 unknown-capacity hold reads idle', HOLD,
     "  return impact('CAPACITY_UNKNOWN', 'waiting', `${pool} capacity unknown`);", '  return null;'],
+  // ── CAPUI-MONITOR: the budget exemption (the risky part) ──────────────────────
+  ['mon floor total counts exempt agents', BREAKER,
+    'const budgeted = inputs.filter((i) => !exempt(i.agentId));', 'const budgeted = inputs;'],
+  ['mon per-agent cap applies to an exempt agent', BREAKER,
+    'const perAgentCap = budgetExempt ? undefined : cfg.agentTokenCaps?.[input.agentId];',
+    'const perAgentCap = cfg.agentTokenCaps?.[input.agentId];'],
+  ['mon exemption never reaches evaluate()', BREAKER,
+    '        exempt(input.agentId)\n      );', '        false\n      );'],
+  ['mon any non-budget value exempts (malformed switches a limit off)', USAGE,
+    "  return display === 'fiveHour' || display === 'weekly';", "  return display !== 'budget' && display !== undefined;"],
+  ['mon the breaker never sees the choice', INDEX,
+    '    agentUsageDisplay: c.agentUsageDisplay\n  };', '  };'],
+  ['mon Budget stored explicitly instead of as absent', CONFIG,
+    '  if (display === \'budget\') delete agentUsageDisplay[agentId];\n  else agentUsageDisplay[agentId] = display;',
+    '  agentUsageDisplay[agentId] = display;'],
+  // ── CAPUI-MONITOR: the usage projection and its channel ──────────────────────
+  ['mon used rounded down (usage understated)', USAGE_MAIN,
+    'const displayPercent = 100 - Math.floor(r);', 'const displayPercent = Math.round(100 - r);'],
+  ['mon a stale reading drawn as a figure', USAGE_MAIN,
+    "  if (pool.freshness !== 'FRESH') {", "  if (false) {"],
+  ['mon the usage schema allows extra properties', USAGE,
+    '  const errors = Object.keys(o).filter((k) => !allowed.includes(k)).map((k) => `${at}.${k}: property not allowed`);',
+    '  const errors: string[] = [];'],
+  ['mon usage rides on control:snapshot', INDEX,
+    'capacityEvidence: gate.evidence, interfered, impact };', 'capacityEvidence: gate.evidence, interfered, impact, agentUsage: null };'],
+  // ── CAPUI-MONITOR: the Monitor line ─────────────────────────────────────────
+  ['mon the select offered to every provider', PANEL,
+    "const usageCapable = agentProvider === 'claude' || agentProvider === 'codex';", 'const usageCapable = true;'],
+  ['mon the usage bar is not the strip meter', USAGE_LINE,
+    '<CapacityMeter percent={view.usedPercent} valueText={view.text} color={STATE_COLOR[view.state]} dataRole="usage" />',
+    '<span style={{ width: 96, height: 8 }} />'],
+  ['mon text-only usage draws a bar', USAGE_LINE,
+    "  if (view.kind === 'TEXT') {", "  if (view.kind === 'TEXT' && false) {"]
 ];
 
 // THE BASELINE MUST BE GREEN. Against already-failing tests every mutant "dies", and a

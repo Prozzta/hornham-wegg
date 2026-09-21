@@ -12,6 +12,7 @@ import {
 } from '../shared/agentProvider';
 import { defaultMcpDefaults } from '../shared/mcpCatalog';
 import { MAX_AGENT_TOKEN_CAP } from '../shared/tokenCaps';
+import { isAgentUsageDisplay } from '../shared/agentUsage';
 import { expandTilde, normalizeHiveHome } from './fs';
 import type { IntegrationRecord } from '../shared/integrations';
 import {
@@ -273,6 +274,10 @@ export interface HarnessConfig {
    *  tokens exceed its cap the breaker trips that agent alone (independent of the
    *  floor budget). Set from each agent's card in the Command Center. */
   agentTokenCaps?: Record<string, number>;
+  /** v1.1.45 CAPUI-MONITOR: what each agent's first Monitor line shows. Absent = 'budget'.
+   *  'fiveHour' / 'weekly' show that provider window's usage AND exempt the agent from the
+   *  budget limits (see src/shared/agentUsage.ts). Claude/Codex agents only. */
+  agentUsageDisplay?: Record<string, 'budget' | 'fiveHour' | 'weekly'>;
   /** Agent ids whose automatic inbox/queue delivery is paused. Pending messages
    *  stay durable until the operator explicitly resumes delivery. */
   autoDeliveryPausedAgents?: string[];
@@ -736,6 +741,24 @@ export function setAgentTokenCap(agentId: unknown, tokenCap: unknown): HarnessCo
     ...current,
     agentTokenCaps
   });
+}
+
+/** Set one agent's Monitor line (Budget / 5H / Weekly) against the latest config on disk.
+ *
+ * The same read-modify-write in main as `setAgentTokenCap`, for the same reason: the
+ * renderer holds snapshots. 'budget' is the default, so it is stored as ABSENT; only an
+ * explicit 5H or Weekly choice is written, and only that exempts the agent from the
+ * budget. An unknown value is refused rather than stored, so it can never be read later
+ * as an exemption. */
+export function setAgentUsageDisplay(agentId: unknown, display: unknown): HarnessConfig {
+  if (typeof agentId !== 'string' || agentId.trim().length === 0 || !isAgentUsageDisplay(display)) {
+    throw new Error('invalid agent usage display');
+  }
+  const current = readConfig();
+  const agentUsageDisplay = { ...(current.agentUsageDisplay ?? {}) };
+  if (display === 'budget') delete agentUsageDisplay[agentId];
+  else agentUsageDisplay[agentId] = display;
+  return persistConfig({ ...current, agentUsageDisplay });
 }
 
 /** Wipe the persisted config back to first-run defaults so the app boots into

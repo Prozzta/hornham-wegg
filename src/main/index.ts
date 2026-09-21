@@ -18,7 +18,7 @@ import { resolveCommand as resolveCliCommand, isSafeCommandName } from './shellE
 import { initAutoUpdater, abortPendingRestart } from './updater';
 import { RealtimeFloorWatcher } from './realtimeFloorWatcher';
 import {
-  readConfig, writeConfig, setAgentTokenCap, resetConfig, ensureHarnessHome, ensureClaudePermissionsAccepted,
+  readConfig, writeConfig, setAgentTokenCap, setAgentUsageDisplay, resetConfig, ensureHarnessHome, ensureClaudePermissionsAccepted,
   modelForRole, OPS_STANDUP_MISSION, HEARTBEAT_MISSION, COMPACT_MAINTENANCE_MISSION, type HarnessConfig, type ScheduledMission
 } from './config';
 import {
@@ -44,6 +44,8 @@ import { CapacityStore, capacityStorePath } from './capacityPersistence';
 import type { CapacityNotifyIntent } from './capacityNotify';
 import { CapacityStripPresenter } from './capacityStrip';
 import { agentImpactOf, type AgentImpact } from '../shared/deliveryHold';
+import { agentUsageView } from './capacityAgentUsage';
+import { CAPACITY_AGENT_USAGE, validateAgentUsageView } from '../shared/agentUsage';
 import {
   CAPACITY_STRIP_CHANNEL, CAPACITY_STRIP_CURRENT, CAPACITY_NOTICE_DISMISS,
   type CapacityStripCollection, type NoticeDelivery
@@ -337,7 +339,10 @@ const usageProvider: UsageProvider = telemetry;
 // enforces its decisions. Config read live so a settings change applies next beat.
 const breaker = new CircuitBreaker(() => {
   const c = readConfig();
-  return { ...(c.circuitBreaker ?? {}), costCapUsd: c.costCapUsd, costCapTokens: c.costCapTokens, agentTokenCaps: c.agentTokenCaps };
+  return {
+    ...(c.circuitBreaker ?? {}), costCapUsd: c.costCapUsd, costCapTokens: c.costCapTokens, agentTokenCaps: c.agentTokenCaps,
+    agentUsageDisplay: c.agentUsageDisplay
+  };
 });
 // Always-on beats (decoupled from the optional heartbeat): the live fleet snapshot
 // Michael reads + the breaker beat, so guardrails + monitoring work even when the
@@ -3495,6 +3500,11 @@ ipcMain.handle('config:update', (_evt, patch: Partial<HarnessConfig>) => {
 ipcMain.handle('config:setAgentTokenCap', (_evt, agentId: unknown, tokenCap: unknown) =>
   setAgentTokenCap(agentId, tokenCap)
 );
+// v1.1.45 CAPUI-MONITOR: persist an agent's Monitor line. The breaker reads config live,
+// so a 5H / Weekly choice exempts the agent from the budget on the very next beat.
+ipcMain.handle('config:setAgentUsageDisplay', (_evt, agentId: unknown, display: unknown) =>
+  setAgentUsageDisplay(agentId, display)
+);
 ipcMain.handle('config:ensureHome', (_evt, path: unknown) => {
   if (typeof path !== 'string' || path.length === 0) return { ok: false, error: 'invalid path' };
   return ensureHarnessHome(path);
@@ -4249,6 +4259,17 @@ ipcMain.handle('control:halt', (_evt, agentId: unknown) => {
 ipcMain.handle(CAPACITY_STRIP_CURRENT, () => {
   try { return presentCapacityStrip(); }
   catch (e) { console.warn('[capacity-strip]', e instanceof Error ? e.message : e); return null; }
+});
+// v1.1.45 CAPUI-MONITOR - one agent's 5h + weekly USAGE for its Monitor line, on its OWN
+// channel (never control:snapshot, which carries no pool data). The pool is the one the
+// agent's own readings landed in; no reading means text, never a guessed figure.
+ipcMain.handle(CAPACITY_AGENT_USAGE, (_evt, agentId: unknown) => {
+  if (typeof agentId !== 'string') return null;
+  const poolKey = providerCapacity.poolKeyOf(agentId);
+  const view = agentUsageView(poolKey ? providerCapacity.tracker.pool(poolKey) : null, Date.now());
+  const errors = validateAgentUsageView(view);
+  if (errors.length) { console.warn('[capacity-usage] refused:', errors.slice(0, 3).join('; ')); return null; }
+  return view;
 });
 // A person dismissed a capacity notice. Recorded in MAIN, so a reload cannot reopen it.
 ipcMain.handle(CAPACITY_NOTICE_DISMISS, (_evt, noticeId: unknown) => {

@@ -10,6 +10,8 @@ export type { IntegrationRecord, IntegrationTemplate } from '../shared/integrati
 import type { UpdateStatus } from '../shared/updateState';
 import type { CapacityStripCollection } from '../shared/capacityStrip';
 import type { AgentImpact } from '../shared/deliveryHold';
+import type { AgentUsageView } from '../shared/agentUsage';
+export type { AgentUsageView } from '../shared/agentUsage';
 export type { CapacityStripCollection } from '../shared/capacityStrip';
 export type { UpdateStatus } from '../shared/updateState';
 import type { ToolStatus } from '../shared/toolCatalog';
@@ -316,6 +318,10 @@ export interface HarnessConfig {
   costCapUsd?: number;
   costCapTokens?: number;
   agentTokenCaps?: Record<string, number>;
+  /** v1.1.45 CAPUI-MONITOR: what each agent's first Monitor line shows. Absent = 'budget'.
+   *  'fiveHour' / 'weekly' show that provider window's usage AND exempt the agent from the
+   *  budget limits (see src/shared/agentUsage.ts). Claude/Codex agents only. */
+  agentUsageDisplay?: Record<string, 'budget' | 'fiveHour' | 'weekly'>;
   autoDeliveryPausedAgents?: string[];
   maxTurns?: number;
   circuitBreaker?: CircuitBreakerConfig;
@@ -727,6 +733,13 @@ const api = {
   /** Set or clear one per-agent token ceiling against main's latest config. */
   setAgentTokenCap: (agentId: string, tokenCap?: number): Promise<HarnessConfig> =>
     ipcRenderer.invoke('config:setAgentTokenCap', agentId, tokenCap),
+  /** v1.1.45 CAPUI-MONITOR: persist an agent's Monitor line; 5H/Weekly also exempt it from the budget. */
+  setAgentUsageDisplay: (agentId: string, display: 'budget' | 'fiveHour' | 'weekly'): Promise<HarnessConfig> =>
+    ipcRenderer.invoke('config:setAgentUsageDisplay', agentId, display),
+  /** v1.1.45 CAPUI-MONITOR: one agent's 5h + weekly usage, on its OWN channel (not control:snapshot).
+   *  Literal channel name: a test pins it to CAPACITY_AGENT_USAGE in src/shared/agentUsage.ts. */
+  capacityAgentUsage: (agentId: string): Promise<AgentUsageView | null> =>
+    ipcRenderer.invoke('capacity:agentUsage', agentId),
   ensureHarnessHome: (path: string): Promise<{ ok: boolean; error?: string }> =>
     ipcRenderer.invoke('config:ensureHome', path),
   /** Change the harness home folder. 'move' copies the existing hive + palace

@@ -97,16 +97,23 @@ export const STRIP_CSS = `
 }
 `;
 
-/** A continuous capacity meter. Drawn only for a figure main sent a meter with. */
-function Meter({ token, state }: { token: Extract<StripToken, { kind: 'meter' }>; state: CapacityState }) {
+/**
+ * THE capacity meter primitive: one continuous fill (§9: continuous = provider capacity),
+ * 40x6, so it can never be mistaken for the segmented context gauge or the 96x8 budget and
+ * context bars. Exported so every capacity surface draws the same shape (the Monitor
+ * line's usage bar, v1.1.45 CAPUI-MONITOR). Drawn only for a figure main supplied.
+ */
+export function CapacityMeter({ percent, valueText, color, dataRole }: {
+  percent: number; valueText: string; color: string; dataRole: string;
+}) {
   return (
     <span
       role="meter"
       aria-valuemin={0}
       aria-valuemax={100}
-      aria-valuenow={token.meter.remainingPercent}
-      aria-valuetext={token.valueText}
-      data-cap-meter={token.role}
+      aria-valuenow={percent}
+      aria-valuetext={valueText}
+      data-cap-meter={dataRole}
       style={{
         display: 'inline-block', position: 'relative', flexShrink: 0,
         width: STRIP_GEOMETRY.meter, height: 6, borderRadius: 3,
@@ -115,10 +122,15 @@ function Meter({ token, state }: { token: Extract<StripToken, { kind: 'meter' }>
     >
       <span style={{
         position: 'absolute', left: 0, top: 0, bottom: 0,
-        width: `${token.meter.remainingPercent}%`, background: STATE_COLOR[state]
+        width: `${percent}%`, background: color
       }} />
     </span>
   );
+}
+
+/** A strip meter: the remaining figure main sent, in its pool's state colour. */
+function Meter({ token, state }: { token: Extract<StripToken, { kind: 'meter' }>; state: CapacityState }) {
+  return <CapacityMeter percent={token.meter.remainingPercent} valueText={token.valueText} color={STATE_COLOR[state]} dataRole={token.role} />;
 }
 
 function Token({ token, state }: { token: StripToken; state: CapacityState }) {

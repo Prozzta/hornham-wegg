@@ -148,6 +148,11 @@ export class CapacityRuntime {
     return out;
   }
 
+  /** The pool this agent's own accepted readings landed in, or null. */
+  poolKeyOf(agentId: string): string | null {
+    return this.poolForAgent.get(agentId) ?? null;
+  }
+
   /** Whether this agent has produced any accepted reading, i.e. has a known pool. */
   hasPool(agentId: string): boolean {
     return this.poolForAgent.has(agentId);

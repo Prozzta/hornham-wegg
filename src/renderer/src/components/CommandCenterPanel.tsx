@@ -1,6 +1,8 @@
 import { useEffect, useRef, useState } from 'react';
 import { PixelPanel } from './PixelPanel';
 import { AgentImpactBadge } from './AgentImpactBadge';
+import { AgentUsageSelect, AgentUsageWindow } from './AgentUsageLine';
+import type { AgentUsageDisplay } from '@shared/agentUsage';
 import { PixelButton } from './PixelButton';
 import { SpritePortrait } from './SpritePortrait';
 import { PtyTerminalView } from './PtyTerminalView';
@@ -351,6 +353,8 @@ function FloorTab({ seed }: { seed: { text: string; seq: number } }) {
   const [tokenCap, setTokenCap] = useState<number | undefined>(undefined);
   // Per-agent token limit (overrides the floor budget for that agent), keyed by id.
   const [agentTokenCaps, setAgentTokenCaps] = useState<Record<string, number>>({});
+  // v1.1.45 CAPUI-MONITOR: each Claude/Codex agent's first Monitor line (Budget / 5H / Weekly).
+  const [agentUsageDisplay, setAgentUsageDisplayMap] = useState<Record<string, AgentUsageDisplay>>({});
   const [restarting, setRestarting] = useState<string | null>(null);
   const [engineProvider, setEngineProvider] = useState<AgentProvider>('claude');
   const [engineModel, setEngineModel] = useState<string | undefined>(undefined);
@@ -373,6 +377,7 @@ function FloorTab({ seed }: { seed: { text: string; seq: number } }) {
       setRepos(c.registeredRepos ?? []);
       setTokenCap(c.costCapTokens);
       setAgentTokenCaps(c.agentTokenCaps ?? {});
+      setAgentUsageDisplayMap(c.agentUsageDisplay ?? {});
       setEngineProvider(c.godProvider ?? 'claude');
       setEngineModel(c.godModel);
       setDefaultModel(c.defaultModel);
@@ -608,6 +613,25 @@ function FloorTab({ seed }: { seed: { text: string; seq: number } }) {
     });
   };
 
+  // v1.1.45 CAPUI-MONITOR: persist one agent's Monitor line in main (the same atomic
+  // read-modify-write as the token cap). 5H / Weekly exempt the agent from the budget; main's
+  // breaker reads it live, so the exemption applies on the next beat.
+  const setUsageDisplay = (id: string, display: AgentUsageDisplay) => {
+    setAgentUsageDisplayMap((current) => {
+      const optimistic = { ...current };
+      if (display === 'budget') delete optimistic[id];
+      else optimistic[id] = display;
+      return optimistic;
+    });
+    void window.cth.setAgentUsageDisplay(id, display).then((updated) => {
+      setAgentUsageDisplayMap(updated.agentUsageDisplay ?? {});
+    }).catch(() => {
+      void window.cth.getConfig().then((current) => {
+        setAgentUsageDisplayMap(current.agentUsageDisplay ?? {});
+      }).catch(() => { /* noop */ });
+    });
+  };
+
   // The token meter is scaled to the agent's own limit when set, else the floor
   // token budget — so each bar reads as "tokens used vs budget" with the remaining
   // headroom visible, never pinned to a useless 100%.
@@ -663,6 +687,9 @@ function FloorTab({ seed }: { seed: { text: string; seq: number } }) {
           const armed = !!breaker && (breaker.level === 'constrained' || breaker.level === 'stopped');
           const tokens = sample ? sample.input + sample.output + sample.cacheRead + sample.cacheCreation : 0;
           const agentCap = agentTokenCaps[a.id]; // per-agent limit, if set
+          // 5H / Weekly exist only for providers that report those windows.
+          const usageCapable = agentProvider === 'claude' || agentProvider === 'codex';
+          const usageDisplay: AgentUsageDisplay = usageCapable ? (agentUsageDisplay[a.id] ?? 'budget') : 'budget';
           const denom = agentCap && agentCap > 0 ? agentCap : floorCap;
           const pct = Math.min(100, Math.round((tokens / denom) * 100));
           const meterColor = armed || pct >= 90 ? 'var(--cth-coral)' : pct >= 60 ? 'var(--cth-lemon)' : 'var(--cth-mint)';
@@ -719,15 +746,24 @@ function FloorTab({ seed }: { seed: { text: string; seq: number } }) {
                   background: 'var(--cth-paper-200)', boxShadow: 'inset 0 0 0 1px var(--cth-ink-300)', color: 'var(--cth-ink-700)'
                 }}>{lastTool[a.id]}</span>
               )}
-              <span style={{ fontFamily: 'var(--cth-font-mono)', fontSize: 10, color: 'var(--cth-ink-300)', flexShrink: 0 }}>budget</span>
-              <span style={{ fontFamily: 'var(--cth-font-mono)', fontSize: 11, color: 'var(--cth-ink-900)', width: 56, textAlign: 'right' }}>{fmtTokens(tokens)}</span>
-              <div
-                title={`CUMULATIVE session usage: ${tokens.toLocaleString()} of ${denom.toLocaleString()} tokens${agentCap ? ' (agent limit)' : ' (floor budget)'} — not the context window`}
-                style={{ width: 96, height: 8, background: 'var(--cth-cream-200)', boxShadow: 'inset 0 0 0 1px var(--cth-ink-300)', flexShrink: 0 }}
-              >
-                <div style={{ width: `${pct}%`, height: '100%', background: meterColor }} />
-              </div>
-              <span style={{ fontFamily: 'var(--cth-font-mono)', fontSize: 11, color: 'var(--cth-ink-500)', width: 30, textAlign: 'right' }}>{pct}%</span>
+              {/* v1.1.45 CAPUI-MONITOR: Claude/Codex choose what this first line shows. */}
+              {usageCapable
+                ? <AgentUsageSelect value={usageDisplay} onChange={(v) => setUsageDisplay(a.id, v)} />
+                : <span style={{ fontFamily: 'var(--cth-font-mono)', fontSize: 10, color: 'var(--cth-ink-300)', flexShrink: 0 }}>budget</span>}
+              {usageDisplay === 'budget' ? (
+                <>
+                  <span style={{ fontFamily: 'var(--cth-font-mono)', fontSize: 11, color: 'var(--cth-ink-900)', width: 56, textAlign: 'right' }}>{fmtTokens(tokens)}</span>
+                  <div
+                    title={`CUMULATIVE session usage: ${tokens.toLocaleString()} of ${denom.toLocaleString()} tokens${agentCap ? ' (agent limit)' : ' (floor budget)'} — not the context window`}
+                    style={{ width: 96, height: 8, background: 'var(--cth-cream-200)', boxShadow: 'inset 0 0 0 1px var(--cth-ink-300)', flexShrink: 0 }}
+                  >
+                    <div style={{ width: `${pct}%`, height: '100%', background: meterColor }} />
+                  </div>
+                  <span style={{ fontFamily: 'var(--cth-font-mono)', fontSize: 11, color: 'var(--cth-ink-500)', width: 30, textAlign: 'right' }}>{pct}%</span>
+                </>
+              ) : (
+                <AgentUsageWindow agentId={a.id} display={usageDisplay} />
+              )}
             </div>
             {/* Context window — the SAME exact statusLine-fed numbers as the
                 avatar-card gauge (tokens currently in the window vs the real

@@ -1185,7 +1185,9 @@ export function SettingsModal({ config, onClose, initialSection }: SettingsModal
                             </PixelButton>
                           </div>
                           <div style={{ display: 'flex', gap: 20, flexWrap: 'wrap' }}>
-                            <label style={{ display: 'flex', flexDirection: 'column', gap: 4, ...slackLabelStyle }}>
+                            <label
+                              title="Counts every agent whose Monitor line shows budget. Agents set to 5H or Weekly on the Monitor tab are OUTSIDE the budget: they are not counted in this total, never blamed for it, and their own token limit does not apply."
+                              style={{ display: 'flex', flexDirection: 'column', gap: 4, ...slackLabelStyle }}>
                               floor token budget
                               <input
                                 type="number" min="0" step="100000" value={agentBudget}
