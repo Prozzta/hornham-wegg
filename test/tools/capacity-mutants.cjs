@@ -1,7 +1,7 @@
 'use strict';
 
 /**
- * Mutant runner for the capacity display milestone (v1.1.45 units #1, #2, #5, #8, the strip polish and CAPUI-MONITOR).
+ * Mutant runner for the capacity display milestone (v1.1.45 units #1, #2, #4, #5, #8, the strip polish and CAPUI-MONITOR).
  *
  * WHY IT IS COMMITTED (Jim's audit, F2). A mutant count that lives in someone's
  * scratchpad cannot be reproduced, and a count nobody can reproduce is not evidence.
@@ -30,7 +30,7 @@ const { spawnSync } = require('node:child_process');
 const ROOT = path.resolve(__dirname, '..', '..');
 const TESTS = ['test/capacity-strip-contract.test.cjs', 'test/capacity-strip-ui.test.cjs',
   'test/capacity-agent-impact.test.cjs', 'test/delivery-hold.test.cjs', 'test/capacity-monitor.test.cjs',
-  'test/capacity-threshold.test.cjs'];
+  'test/capacity-threshold.test.cjs', 'test/capacity-detail.test.cjs'];
 
 const STRIP = 'src/main/capacityStrip.ts';
 const SHARED = 'src/shared/capacityStrip.ts';
@@ -52,6 +52,10 @@ const PANEL = 'src/renderer/src/components/CommandCenterPanel.tsx';
 const CONFIG = 'src/main/config.ts';
 const THRESHOLD = 'src/shared/capacityThreshold.ts';
 const THRESHOLD_UI = 'src/renderer/src/components/CapacityDisplaySetting.tsx';
+const DETAIL = 'src/main/capacityDetail.ts';
+const DETAIL_SCHEMA = 'src/shared/capacityDetail.ts';
+const DETAIL_PANEL = 'src/renderer/src/components/CapacityDetailPanel.tsx';
+const SETTINGS = 'src/renderer/src/components/SettingsModal.tsx';
 
 /** [name, file, from, to] */
 const MUTANTS = [
@@ -72,7 +76,7 @@ const MUTANTS = [
     'fiveHour.compactText = frame.compactText(shown);',
     'fiveHour.compactText = frame.compactText(shown); fiveHour.meter = meterOf(fiveRemaining);'],
   ['u1 pool id not opaque', STRIP,
-    'poolId: `pool-${this.opaque(pool.poolKey)}`', 'poolId: `pool-${pool.poolKey}`'],
+    'return `pool-${this.opaque(poolKey)}`;', 'return `pool-${poolKey}`;'],
   ['u1 revision never moves', STRIP, ': prev.revision + 1;', ': prev.revision;'],
   ['u1 notice never retires', STRIP,
     'if (n.to !== pool.state) { this.notices.delete(pool.poolKey); return undefined; }', ''],
@@ -165,7 +169,7 @@ const MUTANTS = [
     '        emptyText: CAPACITY_EMPTY_TEXT,\n        pools\n', '        pools\n'],
   // ── A2 (human ruling): the RESERVE_ONLY held frame ───────────────────────────
   ['a2 RESERVE_ONLY frame removed', STRIP,
-    "  RESERVE_ONLY: {\n    text: (n) => `5h · ${n}% remaining · ordinary work held while Weekly is at 0%`,\n    compactText: (n) => `5h ${n}% · held by Weekly 0%`\n  }\n",
+    "  RESERVE_ONLY: {\n    text: (n) => `5h · ${n}% remaining · ordinary work held while Weekly is at 0%`,\n    compactText: (n) => `5h ${n}% · held by Weekly 0%`,\n    note: 'ordinary work held while Weekly is at 0%'\n  }\n",
     ''],
   ['a2 RESERVE_ONLY frame uses the causal LIMITED copy', STRIP,
     "text: (n) => `5h · ${n}% remaining · ordinary work held while Weekly is at 0%`,",
@@ -243,7 +247,35 @@ const MUTANTS = [
     "  if (t === null) return { kind: 'invalid', message: CAPACITY_DISPLAY_COPY.invalid(stored) };",
     "  if (t === null) return { kind: 'save', value: stored };"],
   ['u8 a forbidden label', THRESHOLD_UI,
-    "  title: 'Provider capacity display',", "  title: 'Weekly limit threshold',"]
+    "  title: 'Provider capacity display',", "  title: 'Weekly limit threshold',"],
+  // ── unit #4: the provider details panel ─────────────────────────────────────
+  ['u4 a stale figure is offered to a meter', DETAIL,
+    "const current = pool.freshness === 'FRESH' && !restored;", 'const current = !restored;'],
+  ['u4 a known-inapplicable window is listed', DETAIL,
+    "    .filter((w) => applicabilityOf(w) !== 'INAPPLICABLE')\n", ''],
+  ['u4 the blocked relationship is dropped', DETAIL,
+    "const blocked = i.presentation === 'BLOCKED_SUBORDINATE' ? blockedFrameNote(pool.state) : null;", 'const blocked = null as string | null;'],
+  ['u4 unknown membership reads as known', DETAIL,
+    "    ? 'Membership unknown'", "    ? 'Shared by 0 agents'"],
+  ['u4 a passed reset still reads as expected', DETAIL,
+    'out.resetText = w.resetsAt > now ?', 'out.resetText = true ?'],
+  ['u4 the detail schema allows extra properties', DETAIL_SCHEMA,
+    'return Object.keys(o).filter((k) => !allowed.includes(k)).map(', 'return Object.keys(o).filter(() => false).map('],
+  ['u4 the schema lets a stale pool offer a figure', DETAIL_SCHEMA,
+    "    errors.push('$.windows: a stale pool offers no current figure');\n", ''],
+  ['u4 the detail is built from the strip object', INDEX,
+    'const pool = providerCapacity.snapshot().pools.find((p) => capacityStrip.poolIdOf(p.poolKey) === poolId);',
+    'const pool = providerCapacity.snapshot().pools.find((p) => capacityStrip.current().pools.some((q) => q.poolId === poolId) && !!p);'],
+  ['u4 the status note bypasses the composer wording', INDEX,
+    '  return capacityStateNote(gate.evidence);', '  return gate.evidence;'],
+  ['u4 a switch shows the previous pool', DETAIL_PANEL,
+    '    setView(null);                                  // a switch never shows the previous pool\n', ''],
+  ['u4 a removed pool keeps the panel open', DETAIL_PANEL,
+    '  useEffect(() => { if (gone) closeCapacityDetail(); }, [gone]);\n', ''],
+  ['u4 a strip pool is not clickable', VIEW,
+    '      onClick={() => openCapacityDetail(pool.poolId)}\n', ''],
+  ['u4 the Settings link is missing', SETTINGS,
+    '<CapacityDisplaySetting onOpenDetails={() => { if (openFirstCapacityDetail()) onClose(); }} />', '<CapacityDisplaySetting />'],
 ];
 
 // THE BASELINE MUST BE GREEN. Against already-failing tests every mutant "dies", and a

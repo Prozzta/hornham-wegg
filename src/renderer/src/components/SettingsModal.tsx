@@ -13,6 +13,7 @@ import {
 import { PixelPanel } from './PixelPanel';
 import { PixelButton } from './PixelButton';
 import { CapacityDisplaySetting } from './CapacityDisplaySetting';
+import { openFirstCapacityDetail } from '../capacity/detailSelection';
 import { UpdatesSection } from './UpdatesSection';
 import { SettingsHeroCard } from './SettingsHeroCard';
 import { SetupPanel } from './SetupPanel';
@@ -982,7 +983,7 @@ export function SettingsModal({ config, onClose, initialSection }: SettingsModal
 
                       {/* v1.1.45 unit #8 (C2.8): Capacity display, directly after Notifications,
                           in its own section with its own save lifecycle. */}
-                      <CapacityDisplaySetting />
+                      <CapacityDisplaySetting onOpenDetails={() => { if (openFirstCapacityDetail()) onClose(); }} />
 
                       <div style={{ height: 1, background: 'var(--cth-ink-300)' }} />
 

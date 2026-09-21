@@ -45,7 +45,7 @@ export const DEFAULT_WEEKLY_DISPLAY_THRESHOLD = DEFAULT_CAPACITY_DISPLAY_THRESHO
 /** C2.5: shown → hidden only at `>= min(100, T + band)`. */
 export const HYSTERESIS_BAND = 5;
 
-const STATE_TEXT: Record<CapacityState, string> = {
+export const STATE_TEXT: Record<CapacityState, string> = {
   UNKNOWN: 'Capacity unknown',
   AVAILABLE: 'Available',
   APPROACHING: 'Approaching limit',
@@ -81,16 +81,27 @@ function weeklyText(reason: WeeklyRevealReason, display: number | null): string 
  * OBSERVATIONAL - "held while Weekly is at 0%" - never the causal "exhausted" or
  * "blocked" wording reserved for a LIMITED pool (crit 16). Copy is Jim's, as ruled.
  */
-const BLOCKED_FRAME: Partial<Record<CapacityState, { text: (n: number) => string; compactText: (n: number) => string }>> = {
+const BLOCKED_FRAME: Partial<Record<CapacityState, { text: (n: number) => string; compactText: (n: number) => string; note: string }>> = {
   LIMITED: {
     text: (n) => `5h · ${n}% remaining · unavailable while Weekly is exhausted`,
-    compactText: (n) => `5h ${n}% · blocked by Weekly`
+    compactText: (n) => `5h ${n}% · blocked by Weekly`,
+    note: 'unavailable while Weekly is exhausted'
   },
   RESERVE_ONLY: {
     text: (n) => `5h · ${n}% remaining · ordinary work held while Weekly is at 0%`,
-    compactText: (n) => `5h ${n}% · held by Weekly 0%`
+    compactText: (n) => `5h ${n}% · held by Weekly 0%`,
+    note: 'ordinary work held while Weekly is at 0%'
   }
 };
+
+/**
+ * The blocked relationship for the provider details panel (unit #4). C2.7: details may show
+ * the raw five-hour observation but must PRESERVE the blocked relationship, so it reads the
+ * SAME table the strip's blocked token comes from. Null when the state has no blocked frame.
+ */
+export function blockedFrameNote(state: CapacityState): string | null {
+  return BLOCKED_FRAME[state]?.note ?? null;
+}
 
 /** The compact form of each, for C2.10's last collapse step. Same one-copy-per-reason rule. */
 function weeklyCompactText(reason: WeeklyRevealReason, display: number | null): string {
@@ -307,7 +318,7 @@ export class CapacityStripPresenter {
 
     const notice = this.noticeFor(pool);
     const body: PoolBody = {
-      poolId: `pool-${this.opaque(pool.poolKey)}`,
+      poolId: this.poolIdOf(pool.poolKey),
       poolLabel: this.label(pool),
       provider: pool.provider,
       domainRevision: pool.revision,
@@ -441,6 +452,11 @@ export class CapacityStripPresenter {
    */
   labelOf(pool: PoolCapacitySnapshot): string {
     return this.label(pool);
+  }
+
+  /** The strip's opaque id for a pool key (unit #4 resolves a clicked poolId back to its pool). */
+  poolIdOf(poolKey: string): string {
+    return `pool-${this.opaque(poolKey)}`;
   }
 
   /**

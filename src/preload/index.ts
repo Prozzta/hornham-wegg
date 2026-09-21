@@ -11,6 +11,8 @@ import type { UpdateStatus } from '../shared/updateState';
 import type { CapacityStripCollection } from '../shared/capacityStrip';
 import type { AgentImpact } from '../shared/deliveryHold';
 import type { AgentUsageView } from '../shared/agentUsage';
+import type { ProviderCapacityDetailView } from '../shared/capacityDetail';
+export type { ProviderCapacityDetailView } from '../shared/capacityDetail';
 export type { AgentUsageView } from '../shared/agentUsage';
 export type { CapacityStripCollection } from '../shared/capacityStrip';
 export type { UpdateStatus } from '../shared/updateState';
@@ -972,6 +974,9 @@ const api = {
   /** Record, in main, that a person dismissed a capacity notice. */
   capacityDismissNotice: (noticeId: string): Promise<boolean> =>
     ipcRenderer.invoke('capacity:dismissNotice', noticeId),
+  /** v1.1.45 unit #4: one pool's provider DETAIL view, on its OWN channel, only while the panel is open. */
+  capacityDetail: (poolId: string): Promise<ProviderCapacityDetailView | null> =>
+    ipcRenderer.invoke('capacity:detail', poolId),
   onHiveMessage: (cb: (e: HiveRouteEvent) => void): (() => void) => {
     const listener = (_e: IpcRendererEvent, payload: HiveRouteEvent) => cb(payload);
     ipcRenderer.on('hive:message', listener);

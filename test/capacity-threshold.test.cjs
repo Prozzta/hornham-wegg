@@ -166,7 +166,7 @@ test('the copy: C2.8-derived, no forbidden label or claim, no off switch', () =>
 test('placement (C2.8): Settings -> General, directly after Notifications, not beside the breaker or budget', () => {
   const settings = codeOnly(readSource('src/renderer/src/components/SettingsModal.tsx'), 'SettingsModal.tsx');
   const notif = settings.indexOf('Desktop notifications');
-  const cap = settings.indexOf('<CapacityDisplaySetting />');
+  const cap = settings.indexOf('<CapacityDisplaySetting');
   const next = settings.indexOf('Scheduled auto-compact') >= 0 ? settings.indexOf('Scheduled auto-compact') : Infinity;
   const budget = settings.indexOf('floor token budget');
   assert.ok(notif > 0 && cap > notif, 'after Notifications');

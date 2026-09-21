@@ -29,7 +29,9 @@ export const CAPACITY_DISPLAY_COPY = {
   help: 'Shows the Weekly window, and the expected reset time of the 5h and Weekly windows, in the capacity strip '
     + 'when their remaining capacity falls below this value. Display only: it does not change provider limits, '
     + 'scheduling, routing, circuit breakers, or determine which window is limiting. Weekly is also shown when it '
-    + 'is numerically exhausted, when the provider identifies it as limiting, or when its status is unknown.',
+    + 'is numerically exhausted, when the provider identifies it as limiting, or when its status is unknown. '
+    + 'All windows remain available in Provider Details.',
+  detailsLink: 'open Provider Details',
   invalid: (current: number) => `Enter a whole number from 1 to 99. The current value (${current}) is unchanged.`
 };
 
@@ -44,7 +46,8 @@ export function decideThresholdCommit(draft: string, stored: number):
   return t === stored ? { kind: 'unchanged' } : { kind: 'save', value: t };
 }
 
-export function CapacityDisplaySetting() {
+/** `onOpenDetails`: the C2.8 link from this setting to the Provider Details panel. */
+export function CapacityDisplaySetting({ onOpenDetails }: { onOpenDetails?: () => void } = {}) {
   const [stored, setStored] = useState<number>(DEFAULT_CAPACITY_DISPLAY_THRESHOLD);
   const [draft, setDraft] = useState<string>(String(DEFAULT_CAPACITY_DISPLAY_THRESHOLD));
   const [error, setError] = useState<string | null>(null);
@@ -100,6 +103,17 @@ export function CapacityDisplaySetting() {
         </label>
         {error && <span role="alert" style={{ fontSize: 12, color: 'var(--cth-status-blocked)' }}>{error}</span>}
         <span style={{ fontSize: 12, lineHeight: '16px', color: 'var(--cth-ink-500)' }}>{CAPACITY_DISPLAY_COPY.help}</span>
+        {onOpenDetails && (
+          <button
+            type="button"
+            data-capacity-details-link=""
+            onClick={onOpenDetails}
+            style={{
+              alignSelf: 'flex-start', padding: 0, border: 'none', background: 'transparent', cursor: 'pointer',
+              fontSize: 12, color: 'var(--cth-ink-900)', textDecoration: 'underline'
+            }}
+          >{CAPACITY_DISPLAY_COPY.detailsLink}</button>
+        )}
       </div>
     </div>
   );

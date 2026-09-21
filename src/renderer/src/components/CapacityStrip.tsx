@@ -30,6 +30,7 @@ import { ProviderLogo } from './ProviderLogo';
 import { presentPool, selectPools, type PresentedPool } from '../capacity/capacityStrip';
 import { useCapacityStrip } from '../capacity/useCapacityStrip';
 import { poolTokens, STRIP_GEOMETRY, type StripToken } from '../capacity/stripLayout';
+import { openCapacityDetail } from '../capacity/detailSelection';
 
 /** The non-colour channel (§9): a SHAPE per state, so the state survives greyscale. */
 export const STATE_TOKEN: Record<CapacityState, string> = {
@@ -156,7 +157,7 @@ function Token({ token, state }: { token: StripToken; state: CapacityState }) {
 }
 
 /** The coloured shape. Its accessible name is main's state word, never visible text. */
-function StateShape({ state, name }: { state: CapacityState; name: string }) {
+export function StateShape({ state, name }: { state: CapacityState; name: string }) {
   return (
     <span
       role="img"
@@ -174,12 +175,17 @@ function StateShape({ state, name }: { state: CapacityState; name: string }) {
 
 function PoolGroup({ pool }: { pool: PresentedPool }) {
   return (
+    // Clicking a pool opens its provider details (unit #4, §12): the one canonical panel.
     <span
-      role="group"
+      role="button"
+      tabIndex={0}
       aria-label={pool.poolLabel}
+      title="Provider details"
       data-cap-pool={pool.poolId}
       data-cap-presentation={pool.presentation}
-      style={{ display: 'inline-flex', alignItems: 'center', columnGap: STRIP_GEOMETRY.gap, flexShrink: 0 }}
+      onClick={() => openCapacityDetail(pool.poolId)}
+      onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); openCapacityDetail(pool.poolId); } }}
+      style={{ display: 'inline-flex', alignItems: 'center', columnGap: STRIP_GEOMETRY.gap, flexShrink: 0, cursor: 'pointer' }}
     >
       <ProviderLogo provider={pool.provider} size={STRIP_GEOMETRY.mark} />
       <span style={{ color: 'var(--cth-ink-700)', whiteSpace: 'nowrap' }}>{pool.poolLabel}</span>

@@ -43,7 +43,9 @@ import { CapacityRuntime } from './capacityRuntime';
 import { CapacityStore, capacityStorePath } from './capacityPersistence';
 import type { CapacityNotifyIntent } from './capacityNotify';
 import { CapacityStripPresenter } from './capacityStrip';
-import { agentImpactOf, type AgentImpact } from '../shared/deliveryHold';
+import { agentImpactOf, capacityStateNote, type AgentImpact } from '../shared/deliveryHold';
+import { capacityDetailView } from './capacityDetail';
+import { CAPACITY_DETAIL_CHANNEL, validateCapacityDetail } from '../shared/capacityDetail';
 import { agentUsageView } from './capacityAgentUsage';
 import { CAPACITY_AGENT_USAGE, validateAgentUsageView } from '../shared/agentUsage';
 import { capacityDisplayThresholdOf } from '../shared/capacityThreshold';
@@ -4279,6 +4281,44 @@ ipcMain.handle(CAPACITY_STRIP_CURRENT, () => {
 // v1.1.45 CAPUI-MONITOR - one agent's 5h + weekly USAGE for its Monitor line, on its OWN
 // channel (never control:snapshot, which carries no pool data). The pool is the one the
 // agent's own readings landed in; no reading means text, never a guessed figure.
+// v1.1.45 unit #4 - the provider DETAIL view for one pool, asked for only while the panel is
+// open. Its OWN scoped channel: not control:snapshot, and not the strip object (C2.9). Built
+// from the same tracker snapshot, at the same revision, as the strip it was opened from.
+ipcMain.handle(CAPACITY_DETAIL_CHANNEL, (_evt, poolId: unknown) => {
+  if (typeof poolId !== 'string') return null;
+  const pool = providerCapacity.snapshot().pools.find((p) => capacityStrip.poolIdOf(p.poolKey) === poolId);
+  if (!pool) return null;
+  let presentation: CapacityStripCollection['pools'][number]['presentation'] | null = null;
+  try { presentation = presentCapacityStrip().pools.find((p) => p.poolId === poolId)?.presentation ?? null; }
+  catch { presentation = null; }
+  const members = providerCapacity.membersOf(pool.poolKey);
+  const view = capacityDetailView({
+    pool, poolId, poolLabel: capacityStrip.labelOf(pool), presentation,
+    members, membershipKnown: capacityMembershipKnown(pool.provider),
+    statusNote: capacityStatusNote(members), now: Date.now()
+  });
+  const errors = validateCapacityDetail(view);
+  if (errors.length) { console.warn('[capacity-detail] refused:', errors.slice(0, 3).join('; ')); return null; }
+  return view;
+});
+
+/**
+ * The composer's OWN words for what admission is doing on a pool (Jim's obsolete-item #1:
+ * the post-reset probe and probe-spent states must read the same in the details panel as in
+ * the composer). Asked through a member agent with the same non-spending probe and the same
+ * gate the per-agent snapshot uses; null when the pool has no member or nothing to say.
+ */
+function capacityStatusNote(members: readonly string[]): string | null {
+  const agentId = members[0];
+  if (!agentId) return null;
+  const probed = providerCapacity.admission.probe(agentId, 'ORDINARY_TURN');
+  const gate = capacityGateOf(probed,
+    probed.poolKey ? providerCapacity.tracker.pool(probed.poolKey)?.freshness ?? null : null,
+    undefined,
+    probed.poolKey ? providerCapacity.tracker.resetOutlook(probed.poolKey) : null);
+  return capacityStateNote(gate.evidence);
+}
+
 ipcMain.handle(CAPACITY_AGENT_USAGE, (_evt, agentId: unknown) => {
   if (typeof agentId !== 'string') return null;
   const poolKey = providerCapacity.poolKeyOf(agentId);
