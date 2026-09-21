@@ -24,6 +24,8 @@
  *  drop from the front (FIFO) so a busy agent still hears the most recent note. */
 const MAX_PENDING_STEERS = 20;
 
+import type { AgentImpact } from '../shared/deliveryHold';
+
 export interface AgentControlSnapshot {
   /**
    * Provider capacity refuses an ORDINARY automatic turn for this agent's pool.
@@ -53,6 +55,12 @@ export interface AgentControlSnapshot {
    * the rest are held. See `CapacityEvidence` in automaticSubmit.ts.
    */
   capacityEvidence?: 'NO_POOL' | 'FRESH_HEALTHY' | 'STALE_AFTER_HEALTHY' | 'FRESH_NOT_HEALTHY' | 'STALE_AFTER_LIMITED' | 'STALE_AFTER_UNHEALTHY' | 'RECOVERING' | 'NO_STATE' | 'INDETERMINATE' | 'UNCLASSIFIED' | 'POST_RESET_PROBE' | 'POST_RESET_PROBE_SPENT' | 'LIMITED_NO_KNOWN_RESET';
+  /**
+   * v1.1.45 unit #5 - what this agent's card says while a hold is real, or null when
+   * nothing is held. MAIN-produced from the fields above (`agentImpactOf`); AGENT-scoped,
+   * so it belongs here - it carries a pool LABEL, never pool data (that is capacity:strip).
+   */
+  impact?: AgentImpact | null;
   paused: boolean;
   halted: boolean;
   autoDeliveryPaused: boolean;

@@ -1,7 +1,7 @@
 'use strict';
 
 /**
- * Mutant runner for the capacity display milestone (v1.1.45 units #1 and #2).
+ * Mutant runner for the capacity display milestone (v1.1.45 units #1, #2 and #5).
  *
  * WHY IT IS COMMITTED (Jim's audit, F2). A mutant count that lives in someone's
  * scratchpad cannot be reproduced, and a count nobody can reproduce is not evidence.
@@ -28,7 +28,8 @@ const path = require('node:path');
 const { spawnSync } = require('node:child_process');
 
 const ROOT = path.resolve(__dirname, '..', '..');
-const TESTS = ['test/capacity-strip-contract.test.cjs', 'test/capacity-strip-ui.test.cjs'];
+const TESTS = ['test/capacity-strip-contract.test.cjs', 'test/capacity-strip-ui.test.cjs',
+  'test/capacity-agent-impact.test.cjs', 'test/delivery-hold.test.cjs'];
 
 const STRIP = 'src/main/capacityStrip.ts';
 const SHARED = 'src/shared/capacityStrip.ts';
@@ -38,6 +39,9 @@ const VIEW = 'src/renderer/src/components/CapacityStrip.tsx';
 const RUNTIME = 'src/main/capacityRuntime.ts';
 const TRACKER = 'src/main/providerCapacityTracker.ts';
 const INDEX = 'src/main/index.ts';
+const IMPACT_VIEW = 'src/renderer/src/components/agentImpactView.ts';
+const CARD = 'src/renderer/src/components/AgentCard.tsx';
+const HOLD = 'src/shared/deliveryHold.ts';
 
 /** [name, file, from, to] */
 const MUTANTS = [
@@ -89,8 +93,8 @@ const MUTANTS = [
   ['u1 freshUntil ignores the monotonic deadline', TRACKER,
     'return now + (rec.staleAt - monoNow);', 'return now + 1;'],
   ['u1 control:snapshot carries pool data', INDEX,
-    'return { ...control.snapshot(agentId), capacityHold: gate.holds,',
-    'return { ...control.snapshot(agentId), pools: capacityStrip.current(), capacityHold: gate.holds,'],
+    'return { ...snap, capacityHold: gate.holds,',
+    'return { ...snap, pools: capacityStrip.current(), capacityHold: gate.holds,'],
   // ── unit #2: layout ───────────────────────────────────────────────────────────
   ['u2 collapse drops resets before meters', LAYOUT,
     "const meters = level < 1 && pool.presentation === 'NORMAL';\n  const resets = level < 2 && pool.presentation === 'NORMAL';",
@@ -131,6 +135,20 @@ const MUTANTS = [
   ['a2 frame ignores the 5h-above-zero precondition', STRIP,
     'const frame = known && fiveRemaining !== null && fiveRemaining > 0',
     'const frame = known && fiveRemaining !== null'],
+  // ── unit #5: agent-card impact ────────────────────────────────────────────────
+  ['u5 wrong pool label (provider name instead of the strip label)', INDEX,
+    'poolLabel: pool ? capacityStrip.labelOf(pool) : null', 'poolLabel: pool ? pool.provider : null'],
+  ['u5 impact not sent on the snapshot', INDEX,
+    'capacityEvidence: gate.evidence, interfered, impact };', 'capacityEvidence: gate.evidence, interfered };'],
+  ['u5 "idle" leaks while held', IMPACT_VIEW,
+    "export const RESTING_STATUSES: readonly StatusKind[] = ['idle', 'success'];",
+    "export const RESTING_STATUSES: readonly StatusKind[] = ['success'];"],
+  ['u5 impact shown over a working agent', IMPACT_VIEW,
+    'if (!impact || !RESTING_STATUSES.includes(status)) return', 'if (!impact) return'],
+  ['u5 card badge ignores the impact', CARD,
+    '<PixelBadge status={held.status} label={held.label}', "<PixelBadge status={typing ? 'typing' : status} label={undefined}"],
+  ['u5 unknown-capacity hold reads idle', HOLD,
+    "  return impact('CAPACITY_UNKNOWN', 'waiting', `${pool} capacity unknown`);", '  return null;'],
   // ── unit #2: presenter copy used by the strip ─────────────────────────────────
   ['u2 weekly compact text drops its label', STRIP,
     "case 'HYSTERESIS_HOLD': return `Weekly ${display}%`;", "case 'HYSTERESIS_HOLD': return `${display}%`;"]

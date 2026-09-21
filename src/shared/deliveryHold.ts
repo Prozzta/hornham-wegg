@@ -206,3 +206,84 @@ export function capacityStateNote(evidence: CapacityEvidenceName | null | undefi
 export function isHeldQueueItem(interfered: InterferedView | null, messageId: string): boolean {
   return !!interfered && interfered.requestId.startsWith('queue:') && interfered.requestId.endsWith(`:${messageId}`);
 }
+
+// ─── Agent impact (v1.1.45 unit #5) ───────────────────────────────────────────────────────
+
+/**
+ * WHAT AN AGENT'S CARD SAYS WHILE A HOLD IS REAL (design of record §5, §6, C2.11 crit 13).
+ *
+ * An agent whose automatic delivery is held must never just read "idle": it is not idle,
+ * it is waiting on something, and "idle" tells a person there is nothing to do. So main
+ * produces ONE string per hold kind, from the same settled facts `deliveryHoldView`
+ * words. The renderer shows the string as given and composes nothing.
+ *
+ * The copy is Jim's, blessed for unit #5. `<pool>` is the capacity strip's own pool label,
+ * so the card and the strip name a pool the same way ("Codex 2" included). No figure ever
+ * appears here: the number lives once, on the strip (§6; crit 14's duplicate-text arm).
+ *
+ * The precedence is `deliveryHoldView`'s: INTERFERED, then the auto-delivery pause, then
+ * capacity. The first real hold names the impact. No hold at all means NO string: absence
+ * is how "nothing is held" is said, including a manual send with no hold behind it.
+ */
+export type AgentImpactKind =
+  | 'INTERFERED'
+  | 'DELIVERY_PAUSED'
+  | 'CAPACITY_LIMITED'
+  | 'CAPACITY_RESERVE_ONLY'
+  | 'CAPACITY_RECOVERING'
+  | 'CAPACITY_PROBE_USED'
+  | 'CAPACITY_UNKNOWN';
+
+/** The leading word of the string, for a badge. The same word, never a second one. */
+export type AgentImpactVerb = 'held' | 'paused' | 'waiting';
+
+export interface AgentImpact {
+  kind: AgentImpactKind;
+  verb: AgentImpactVerb;
+  text: string;
+}
+
+/** The capacity-pool state the hold is about, as the tracker publishes it. */
+export type ImpactPoolState = 'UNKNOWN' | 'AVAILABLE' | 'APPROACHING' | 'RESERVE_ONLY' | 'LIMITED' | 'RECOVERING';
+
+export interface AgentImpactInput {
+  interfered: boolean;
+  /** Auto-delivery paused for this agent (the Command Center's floor switch sets it for all). */
+  autoDeliveryPaused: boolean;
+  capacityHold: boolean;
+  capacityEvidence: CapacityEvidenceName | null;
+  /** The held pool's tracker state, or null when the hold has no resolvable pool. */
+  poolState: ImpactPoolState | null;
+  /** The strip's label for that pool, or null when there is none to name. */
+  poolLabel: string | null;
+}
+
+const impact = (kind: AgentImpactKind, verb: AgentImpactVerb, rest: string): AgentImpact =>
+  ({ kind, verb, text: `${verb} · ${rest}` });
+
+/** A pool with no label (a binding the pool-count cap left unresolved) is named generically. */
+const poolName = (label: string | null): string => label ?? 'capacity';
+
+/** The impact string for one agent, or null when nothing is held. */
+export function agentImpactOf(i: AgentImpactInput): AgentImpact | null {
+  if (i.interfered) return impact('INTERFERED', 'held', 'a typed-over message needs you');
+  if (i.autoDeliveryPaused) return impact('DELIVERY_PAUSED', 'paused', 'auto-delivery off (floor)');
+  if (!i.capacityHold) return null;
+  const pool = poolName(i.poolLabel);
+  if (i.capacityEvidence === 'POST_RESET_PROBE_SPENT') {
+    return impact('CAPACITY_PROBE_USED', 'waiting', `${pool} probe used, awaiting reading`);
+  }
+  if (i.capacityEvidence === 'RECOVERING' || i.poolState === 'RECOVERING') {
+    return impact('CAPACITY_RECOVERING', 'waiting', `${pool} recovering`);
+  }
+  if (i.poolState === 'RESERVE_ONLY') return impact('CAPACITY_RESERVE_ONLY', 'paused', `${pool} reserve only`);
+  if (i.poolState === 'LIMITED' || i.capacityEvidence === 'FRESH_NOT_HEALTHY'
+    || i.capacityEvidence === 'STALE_AFTER_LIMITED' || i.capacityEvidence === 'LIMITED_NO_KNOWN_RESET') {
+    return impact('CAPACITY_LIMITED', 'paused', `${pool} limited`);
+  }
+  // Held for want of evidence (the L0-UNKNOWN ruling holds NO_STATE, STALE_AFTER_UNHEALTHY,
+  // INDETERMINATE and anything unclassified). The blessed copy has no line for this, and a
+  // held agent must still not read idle, so it gets the one string that claims nothing.
+  // PROPOSED, NOT BLESSED - flagged for the wording pass.
+  return impact('CAPACITY_UNKNOWN', 'waiting', `${pool} capacity unknown`);
+}

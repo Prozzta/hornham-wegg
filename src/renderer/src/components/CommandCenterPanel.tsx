@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import { PixelPanel } from './PixelPanel';
-import { PixelBadge } from './PixelBadge';
+import { AgentImpactBadge } from './AgentImpactBadge';
 import { PixelButton } from './PixelButton';
 import { SpritePortrait } from './SpritePortrait';
 import { PtyTerminalView } from './PtyTerminalView';
@@ -173,7 +173,7 @@ export function CommandCenterPanel({ agent, fullscreen = false }: { agent: Agent
             whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis'
           }}>COMMAND CENTER</div>
           <div style={{ display: 'flex', gap: 6, alignItems: 'center', marginTop: 1, minWidth: 0 }}>
-            <PixelBadge status={agent.status} />
+            <AgentImpactBadge agentId={agent.id} status={agent.status} />
             <span style={{
               fontSize: 12, color: 'var(--cth-ink-500)',
               whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis'
@@ -695,7 +695,7 @@ function FloorTab({ seed }: { seed: { text: string; seq: number } }) {
                   fontFamily: 'var(--cth-font-ui)', fontSize: 12, color: 'var(--cth-ink-900)'
                 }}
               >{a.name}{a.isGod ? ' (god)' : ''}</button>
-              <PixelBadge status={armed ? 'looping' : a.status} />
+              <AgentImpactBadge agentId={a.id} status={armed ? 'looping' : a.status} showText />
               {armed && <span title={breaker?.reason} style={{ color: 'var(--cth-coral)', fontSize: 12 }}>⚠</span>}
               <span style={{ marginLeft: 'auto', fontSize: 11, color: 'var(--cth-ink-500)' }}>
                 {(toolCounts[a.id] ?? 0)} tool calls

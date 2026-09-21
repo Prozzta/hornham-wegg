@@ -30,7 +30,7 @@ import { normalizeWeekly, weeklyDelayMs } from '../shared/weeklySchedule';
 import { isInputOrigin } from '../shared/inputOrigin';
 import { automaticDeliveryEligibility, isTerminalInputState } from '../shared/inputProvenance';
 import { isTerminalPromptState } from '../shared/promptState';
-import { AutomaticSubmitOwner, ADMISSION_CLASSES, INTERFERENCE_RESOLUTIONS, capacityGateOf, type AdmissionClass, type InterferenceResolution } from './automaticSubmit';
+import { AutomaticSubmitOwner, ADMISSION_CLASSES, INTERFERENCE_RESOLUTIONS, capacityGateOf, type AdmissionClass, type CapacityGate, type InterferenceResolution } from './automaticSubmit';
 import { buildOwnerDeps, ScreenReadingBroker } from './automaticSubmitWiring';
 import {
   getBranch, getStatus, getLog, getBranches, getAheadBehind, isRepo, getDiff, mainRepoRoot,
@@ -43,6 +43,7 @@ import { CapacityRuntime } from './capacityRuntime';
 import { CapacityStore, capacityStorePath } from './capacityPersistence';
 import type { CapacityNotifyIntent } from './capacityNotify';
 import { CapacityStripPresenter } from './capacityStrip';
+import { agentImpactOf, type AgentImpact } from '../shared/deliveryHold';
 import {
   CAPACITY_STRIP_CHANNEL, CAPACITY_STRIP_CURRENT, CAPACITY_NOTICE_DISMISS,
   type CapacityStripCollection, type NoticeDelivery
@@ -4282,8 +4283,32 @@ ipcMain.handle('control:snapshot', (_evt, agentId: unknown) => {
   const heldPty = ptyForAgent(agentId);
   const held = heldPty ? automaticSubmit.inhibition(heldPty) : null;
   const interfered = held ? { requestId: held.requestId, reason: held.reason, at: held.at } : null;
-  return { ...control.snapshot(agentId), capacityHold: gate.holds, capacityEvidence: gate.evidence, interfered };
+  const snap = control.snapshot(agentId);
+  const impact = agentImpactFor(snap.autoDeliveryPaused, gate, interfered !== null, probed.poolKey);
+  return { ...snap, capacityHold: gate.holds, capacityEvidence: gate.evidence, interfered, impact };
 });
+
+/**
+ * v1.1.45 unit #5 - the agent-card impact, from the SAME settled facts the snapshot above
+ * reports. The pool is named with the strip's own label and nothing else is taken from
+ * the pool: a label and the tracker state word, never a figure, a window or a reset.
+ */
+function agentImpactFor(
+  autoDeliveryPaused: boolean,
+  gate: CapacityGate,
+  interfered: boolean,
+  poolKey: string | null
+): AgentImpact | null {
+  const pool = poolKey ? providerCapacity.tracker.pool(poolKey) : null;
+  return agentImpactOf({
+    interfered,
+    autoDeliveryPaused,
+    capacityHold: gate.holds,
+    capacityEvidence: gate.evidence,
+    poolState: pool?.state ?? null,
+    poolLabel: pool ? capacityStrip.labelOf(pool) : null
+  });
+}
 
 /**
  * L0-FUSION stage 5.3 - THE ONE DOOR for programmatic text+Enter from a renderer.

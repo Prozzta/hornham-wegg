@@ -160,6 +160,56 @@ K.aHeldWakeIsNotWordedAsAQueuedMessage = async (mod) => {
   assert.equal(mod.heldIsQueueItem(null), false);
 };
 
+// ─── v1.1.45 unit #5: agent-card impact (agentImpactOf) ─────────────────────────────────
+// Jim's blessed copy, verbatim; <pool> is the strip's label. Held by the same banned words.
+const imp = (over = {}) => ({
+  interfered: false, autoDeliveryPaused: false, capacityHold: false,
+  capacityEvidence: null, poolState: null, poolLabel: 'Codex 2', ...over
+});
+const HELD_EVIDENCE = ['FRESH_NOT_HEALTHY', 'STALE_AFTER_LIMITED', 'STALE_AFTER_UNHEALTHY', 'RECOVERING',
+  'NO_STATE', 'INDETERMINATE', 'UNCLASSIFIED', 'POST_RESET_PROBE_SPENT', 'LIMITED_NO_KNOWN_RESET'];
+const POOL_STATES = [null, 'UNKNOWN', 'AVAILABLE', 'APPROACHING', 'RESERVE_ONLY', 'LIMITED', 'RECOVERING'];
+
+K.impactHasOneBlessedStringPerHoldKind = async (mod) => {
+  const text = (over) => mod.agentImpactOf(imp(over))?.text;
+  assert.equal(text({ capacityHold: true, capacityEvidence: 'FRESH_NOT_HEALTHY', poolState: 'LIMITED' }), 'paused · Codex 2 limited', 'LIMITED reads "paused · <pool> limited"');
+  assert.equal(text({ capacityHold: true, capacityEvidence: 'STALE_AFTER_LIMITED', poolState: 'LIMITED' }), 'paused · Codex 2 limited', 'stale-with-epoch LIMITED is still limited');
+  assert.equal(text({ capacityHold: true, capacityEvidence: 'FRESH_NOT_HEALTHY', poolState: 'RESERVE_ONLY' }), 'paused · Codex 2 reserve only', 'RESERVE_ONLY reads "paused · <pool> reserve only"');
+  assert.equal(text({ capacityHold: true, capacityEvidence: 'RECOVERING', poolState: 'RECOVERING' }), 'waiting · Codex 2 recovering', 'RECOVERING reads "waiting · <pool> recovering"');
+  assert.equal(text({ capacityHold: true, capacityEvidence: 'POST_RESET_PROBE_SPENT', poolState: 'UNKNOWN' }), 'waiting · Codex 2 probe used, awaiting reading', 'a spent probe reads "waiting · <pool> probe used, awaiting reading"');
+  assert.equal(text({ autoDeliveryPaused: true }), 'paused · auto-delivery off (floor)', 'the floor pause reads "paused · auto-delivery off (floor)"');
+  assert.equal(text({ interfered: true }), 'held · a typed-over message needs you', 'INTERFERED reads "held · a typed-over message needs you"');
+  for (const over of [{ interfered: true }, { autoDeliveryPaused: true }, { capacityHold: true, capacityEvidence: 'NO_STATE' }]) {
+    const v = mod.agentImpactOf(imp(over));
+    assert.ok(v.text.startsWith(`${v.verb} · `), 'the badge word is the string\'s own leading word');
+  }
+};
+
+K.aHeldAgentNeverReadsIdleAndCarriesNoFigure = async (mod) => {
+  for (const e of HELD_EVIDENCE) {
+    for (const poolState of POOL_STATES) {
+      const v = mod.agentImpactOf(imp({ capacityHold: true, capacityEvidence: e, poolState }));
+      assert.ok(v, `every REAL hold names an impact (${e}/${poolState}) - a held agent must never fall back to idle`);
+      assert.ok(!/\bidle\b/i.test(v.text), `never "idle" while held: "${v.text}"`);
+      assert.ok(!/\d|%/.test(v.text.replace('Codex 2', 'Codex')), `no figure in an impact string: "${v.text}"`);
+      assert.ok(!CLAIMS_HEALTH.test(v.text), `the banned words stay out of the impact too: "${v.text}"`);
+    }
+  }
+};
+
+K.nothingHeldMeansNoImpact = async (mod) => {
+  for (const e of [null, ...EVIDENCE]) {
+    assert.equal(mod.agentImpactOf(imp({ capacityHold: false, capacityEvidence: e, poolState: 'LIMITED' })), null,
+      `no hold, no impact (${e}) - absence is how nothing-held is said, evidence alone never makes one`);
+  }
+};
+
+K.impactPrecedenceIsTheHoldPrecedence = async (mod) => {
+  const all = imp({ interfered: true, autoDeliveryPaused: true, capacityHold: true, capacityEvidence: 'FRESH_NOT_HEALTHY', poolState: 'LIMITED' });
+  assert.equal(mod.agentImpactOf(all).kind, 'INTERFERED', 'INTERFERED outranks every other impact');
+  assert.equal(mod.agentImpactOf({ ...all, interfered: false }).kind, 'DELIVERY_PAUSED', 'the pause outranks capacity');
+};
+
 const MUTANTS = [
   { name: 'the duplicate warning taken off the button',
     edits: [["          + 'DO NOT use this if you already pressed Enter on it yourself - it would be sent TWICE. Nothing is typed by pressing this.' },", "          + 'Nothing is typed by pressing this.' },"]],
@@ -214,7 +264,23 @@ const MUTANTS = [
     killer: 'sendNowBypassesPauseAndCapacityOnly', dies: /EVIDENCE alone never makes a hold/ },
   { name: 'a worker wake flags a queue row',
     edits: [["interfered.requestId.startsWith('queue:') && ", '']],
-    killer: 'onlyTheHeldQueueRowIsFlagged', dies: /flags NO queue row/ }
+    killer: 'onlyTheHeldQueueRowIsFlagged', dies: /flags NO queue row/ },
+  { name: 'unit #5: a hold on unknown capacity falls back to no impact (reads idle)',
+    edits: [["  return impact('CAPACITY_UNKNOWN', 'waiting', `${pool} capacity unknown`);", '  return null;']],
+    killer: 'aHeldAgentNeverReadsIdleAndCarriesNoFigure', dies: /must never fall back to idle/ },
+  { name: 'unit #5: reserve only worded as limited',
+    edits: [["  if (i.poolState === 'RESERVE_ONLY') return impact('CAPACITY_RESERVE_ONLY', 'paused', `${pool} reserve only`);\n", '']],
+    killer: 'impactHasOneBlessedStringPerHoldKind', dies: /RESERVE_ONLY reads/ },
+  { name: 'unit #5: evidence alone makes an impact',
+    edits: [['  if (!i.capacityHold) return null;', '  if (!i.capacityHold && !i.capacityEvidence) return null;']],
+    killer: 'nothingHeldMeansNoImpact', dies: /no hold, no impact/ },
+  { name: 'unit #5: the pause outranks INTERFERED',
+    edits: [["  if (i.interfered) return impact('INTERFERED', 'held', 'a typed-over message needs you');\n  if (i.autoDeliveryPaused) return impact('DELIVERY_PAUSED', 'paused', 'auto-delivery off (floor)');",
+      "  if (i.autoDeliveryPaused) return impact('DELIVERY_PAUSED', 'paused', 'auto-delivery off (floor)');\n  if (i.interfered) return impact('INTERFERED', 'held', 'a typed-over message needs you');"]],
+    killer: 'impactPrecedenceIsTheHoldPrecedence', dies: /INTERFERED outranks/ },
+  { name: 'unit #5: a figure leaks into the impact',
+    edits: [["    return impact('CAPACITY_PROBE_USED', 'waiting', `${pool} probe used, awaiting reading`);", "    return impact('CAPACITY_PROBE_USED', 'waiting', `${pool} probe used (1 of 1), awaiting reading`);"]],
+    killer: 'aHeldAgentNeverReadsIdleAndCarriesNoFigure', dies: /no figure in an impact string/ }
 ];
 
 for (const [name, killer] of Object.entries(K)) test(`killer on the real module: ${name}`, () => killer(REAL));

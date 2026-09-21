@@ -432,6 +432,14 @@ export class CapacityStripPresenter {
     return { ...visible };
   }
 
+  /**
+   * The pool's user-safe label, the SAME one the strip shows (unit #5: an agent card names
+   * its pool exactly as the strip does, "Codex 2" included). A label, never pool data.
+   */
+  labelOf(pool: PoolCapacitySnapshot): string {
+    return this.label(pool);
+  }
+
   private label(pool: PoolCapacitySnapshot): string {
     let ordinal = this.ordinals.get(pool.poolKey);
     if (ordinal === undefined) {

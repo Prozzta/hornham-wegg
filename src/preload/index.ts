@@ -9,6 +9,7 @@ import type { IntegrationRecord, IntegrationTemplate } from '../shared/integrati
 export type { IntegrationRecord, IntegrationTemplate } from '../shared/integrations';
 import type { UpdateStatus } from '../shared/updateState';
 import type { CapacityStripCollection } from '../shared/capacityStrip';
+import type { AgentImpact } from '../shared/deliveryHold';
 export type { CapacityStripCollection } from '../shared/capacityStrip';
 export type { UpdateStatus } from '../shared/updateState';
 import type { ToolStatus } from '../shared/toolCatalog';
@@ -533,6 +534,8 @@ export interface AgentControlSnapshot {
   capacityEvidence?: 'NO_POOL' | 'FRESH_HEALTHY' | 'STALE_AFTER_HEALTHY' | 'FRESH_NOT_HEALTHY' | 'STALE_AFTER_LIMITED' | 'STALE_AFTER_UNHEALTHY' | 'RECOVERING' | 'NO_STATE' | 'INDETERMINATE' | 'UNCLASSIFIED' | 'POST_RESET_PROBE' | 'POST_RESET_PROBE_SPENT' | 'LIMITED_NO_KNOWN_RESET';
   paused: boolean;
   halted: boolean;
+  /** v1.1.45 unit #5: main's agent-card impact string while a hold is real, else null. */
+  impact?: AgentImpact | null;
   autoDeliveryPaused: boolean;
   gatedTools: string[];
   pendingSteers: number;
