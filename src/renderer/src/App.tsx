@@ -17,6 +17,7 @@ import { CompletionToast } from '@/realtime/CompletionToast';
 import { UpdateToast } from '@/components/UpdateToast';
 import { CapacityStrip } from '@/components/CapacityStrip';
 import { CapacityDetailPanel } from '@/components/CapacityDetailPanel';
+import { CapacityLimitBanner } from '@/components/CapacityLimitBanner';
 import { UpdateBadge } from '@/components/UpdateBadge';
 import { useAppTheme, toggleAppTheme } from '@/design/theme';
 import { SettingsModal, type Section as SettingsSection } from '@/components/SettingsModal';
@@ -387,6 +388,7 @@ export function App() {
           <OfficeFloor />
           <MemoryPanel />
           <CapacityDetailPanel />
+          <CapacityLimitBanner />
           {agentCount === 0 && godStatus === 'booting' && <MichaelBooting />}
           {agentCount === 0 && godStatus !== 'booting' && (
             <div style={{

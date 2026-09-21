@@ -111,6 +111,21 @@ export function selectOpenNotices(c: CapacityStripCollection | null): { poolId: 
 }
 
 /**
+ * v1.1.45 unit #6 — the LIMITED entry banners to show: an OPEN notice that carries main's
+ * banner words (only an entry to LIMITED does). Dismissed ones are main-recorded, so they
+ * never come back on a reload; a notice retires when the pool leaves the state it announced.
+ */
+export function selectLimitBanners(c: CapacityStripCollection | null):
+  { poolId: string; noticeId: string; banner: NonNullable<CapacityNotice['banner']> }[] {
+  const out: { poolId: string; noticeId: string; banner: NonNullable<CapacityNotice['banner']> }[] = [];
+  for (const p of selectPools(c)) {
+    const n = p.notice;
+    if (n && n.lifecycle === 'OPEN' && n.kind === 'LIMIT_REACHED' && n.banner) out.push({ poolId: p.poolId, noticeId: n.noticeId, banner: n.banner });
+  }
+  return out;
+}
+
+/**
  * A pool as a surface should draw it at `now`.
  *
  * THE ONE-WAY EXPIRY MASK (§17, C2.11 crit 10). Past main's `expiresAt` — which means

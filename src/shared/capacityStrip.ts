@@ -163,6 +163,19 @@ export interface CapacityNotice {
   issuedAt: number;
   delivery: NoticeDelivery;
   lifecycle: NoticeLifecycle;
+  /**
+   * v1.1.45 unit #6: the LIMITED entry banner's words (§11, C2.12 rule 3), present ONLY on
+   * a LIMIT_REACHED notice. State, cause and consequence, and NO figure: the number
+   * belongs to the strip row, which is on screen at the same time (crit 14's duplicate-text
+   * arm). Causal wording only when the provider attributed the limit (crit 16).
+   */
+  banner?: CapacityBanner;
+}
+
+export interface CapacityBanner {
+  title: string;
+  cause: string;
+  consequence: string;
 }
 
 export interface CapacityStripPool {
@@ -279,6 +292,8 @@ const notice = object({
   issuedAt: instant,
   delivery: oneOf(NOTICE_DELIVERIES),
   lifecycle: oneOf(NOTICE_LIFECYCLES)
+}, {
+  banner: object({ title: text, cause: text, consequence: text })
 });
 
 const pool = object(
@@ -324,6 +339,14 @@ function poolInvariants(v: Record<string, unknown>, at: string, errors: string[]
     if (wk && 'meter' in wk) errors.push(`${at}.weekly.meter: no meter outside NORMAL`);
   }
   if (v.presentation === 'BLOCKED_SUBORDINATE' && !wk) errors.push(`${at}.weekly: a blocked frame names its blocker`);
+  const nt = v.notice as Record<string, unknown> | undefined;
+  if (isObj(nt) && isObj(nt.banner)) {
+    if (nt.kind !== 'LIMIT_REACHED') errors.push(`${at}.notice.banner: only an entry to LIMITED has a banner`);
+    // C2.12 rule 3: the banner carries NO figure.
+    if (Object.values(nt.banner).some((s) => typeof s === 'string' && /\d/.test(s))) {
+      errors.push(`${at}.notice.banner: carries no figure`);
+    }
+  }
   if (wk && (wk.reason === 'UNKNOWN_CAPACITY' || wk.reason === 'UNKNOWN_APPLICABILITY') && 'meter' in wk) {
     errors.push(`${at}.weekly.meter: UNKNOWN is text only`);
   }

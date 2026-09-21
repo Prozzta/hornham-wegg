@@ -1,7 +1,7 @@
 'use strict';
 
 /**
- * Mutant runner for the capacity display milestone (v1.1.45 units #1, #2, #4, #5, #8, the strip polish and CAPUI-MONITOR).
+ * Mutant runner for the capacity display milestone (v1.1.45 units #1, #2, #4, #5, #6, #8, the strip polish and CAPUI-MONITOR).
  *
  * WHY IT IS COMMITTED (Jim's audit, F2). A mutant count that lives in someone's
  * scratchpad cannot be reproduced, and a count nobody can reproduce is not evidence.
@@ -30,7 +30,8 @@ const { spawnSync } = require('node:child_process');
 const ROOT = path.resolve(__dirname, '..', '..');
 const TESTS = ['test/capacity-strip-contract.test.cjs', 'test/capacity-strip-ui.test.cjs',
   'test/capacity-agent-impact.test.cjs', 'test/delivery-hold.test.cjs', 'test/capacity-monitor.test.cjs',
-  'test/capacity-threshold.test.cjs', 'test/capacity-detail.test.cjs'];
+  'test/capacity-threshold.test.cjs', 'test/capacity-detail.test.cjs',
+  'test/capacity-banner.test.cjs'];
 
 const STRIP = 'src/main/capacityStrip.ts';
 const SHARED = 'src/shared/capacityStrip.ts';
@@ -56,6 +57,7 @@ const DETAIL = 'src/main/capacityDetail.ts';
 const DETAIL_SCHEMA = 'src/shared/capacityDetail.ts';
 const DETAIL_PANEL = 'src/renderer/src/components/CapacityDetailPanel.tsx';
 const SETTINGS = 'src/renderer/src/components/SettingsModal.tsx';
+const BANNER = 'src/renderer/src/components/CapacityLimitBanner.tsx';
 
 /** [name, file, from, to] */
 const MUTANTS = [
@@ -276,6 +278,21 @@ const MUTANTS = [
     '      onClick={() => openCapacityDetail(pool.poolId)}\n', ''],
   ['u4 the Settings link is missing', SETTINGS,
     '<CapacityDisplaySetting onOpenDetails={() => { if (openFirstCapacityDetail()) onClose(); }} />', '<CapacityDisplaySetting />'],
+  // ── unit #6: the LIMITED entry banner ────────────────────────────────────────
+  ['u6 every notice kind gets a banner', STRIP,
+    "    if (n.kind === 'LIMIT_REACHED') out.banner = this.banner(pool);", '    out.banner = this.banner(pool);'],
+  ['u6 causal wording without attribution', STRIP,
+    '? `${name} reported a usage limit without naming which window.`', '? `${name} reports a usage limit reached.`'],
+  ['u6 a figure in the banner', STRIP,
+    'is paused until capacity returns.', 'is paused until capacity returns (0% left).'],
+  ['u6 a dismissed banner still shows', MIRROR,
+    "if (n && n.lifecycle === 'OPEN' && n.kind === 'LIMIT_REACHED' && n.banner)", "if (n && n.kind === 'LIMIT_REACHED' && n.banner)"],
+  ['u6 a banner for a non-LIMITED notice', MIRROR,
+    "if (n && n.lifecycle === 'OPEN' && n.kind === 'LIMIT_REACHED' && n.banner)", "if (n && n.lifecycle === 'OPEN' && (n.banner || n.kind))"],
+  ['u6 dismissal kept locally, not in main', BANNER,
+    'onDismiss={(id) => { void dismissCapacityNotice(id); }}', 'onDismiss={() => {}}'],
+  ['u6 the schema allows a banner on any kind', SHARED,
+    "    if (nt.kind !== 'LIMIT_REACHED') errors.push(`${at}.notice.banner: only an entry to LIMITED has a banner`);\n", ''],
 ];
 
 // THE BASELINE MUST BE GREEN. Against already-failing tests every mutant "dies", and a

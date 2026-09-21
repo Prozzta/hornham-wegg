@@ -29,7 +29,7 @@ import { createHmac, randomBytes } from 'node:crypto';
 import { applicabilityOf, type CapacityCollectionSnapshot, type CapacityState, type CapacityWindow,
   type PoolCapacitySnapshot, type ProviderId } from '../shared/providerCapacity';
 import type {
-  CapacityFreshnessView, CapacityNotice, CapacityStripCollection, CapacityStripPool, DisplayReadyMeter, FiveHourStrip,
+  CapacityBanner, CapacityFreshnessView, CapacityNotice, CapacityStripCollection, CapacityStripPool, DisplayReadyMeter, FiveHourStrip,
   NoticeDelivery, ProvenanceClass, StripPresentation, VisibleWeeklyStrip, WeeklyRevealReason
 } from '../shared/capacityStrip';
 import { CAPACITY_EMPTY_TEXT, validateCapacityStrip } from '../shared/capacityStrip';
@@ -443,7 +443,33 @@ export class CapacityStripPresenter {
     if (!n) return undefined;
     if (n.to !== pool.state) { this.notices.delete(pool.poolKey); return undefined; }
     const { identity: _identity, ...visible } = n;
-    return { ...visible };
+    const out: CapacityNotice = { ...visible };
+    if (n.kind === 'LIMIT_REACHED') out.banner = this.banner(pool);
+    return out;
+  }
+
+  /**
+   * The LIMITED entry banner's words (unit #6; §11, C2.12 rule 3): state, cause and
+   * consequence, NO figure. The cause is causal ("limit reached") ONLY when the provider
+   * attributed the window (crit 16); an unattributed refusal is reported as what it is.
+   */
+  private banner(pool: PoolCapacitySnapshot): CapacityBanner {
+    const name = this.label(pool);
+    const attributed = pool.providerAttributedLimitingWindowId
+      ? pool.windows.find((w) => w.windowId === pool.providerAttributedLimitingWindowId)?.label ?? null
+      : null;
+    const cause = pool.stateReason === 'PROVIDER_ATTRIBUTED_LIMITING' && attributed
+      ? `${name} reports the ${attributed} limit reached.`
+      : pool.stateReason === 'ORDINARY_USE_DENIED'
+        ? `${name} is refusing ordinary use.`
+        : pool.stateReason === 'PROVIDER_REACHED_UNATTRIBUTED'
+          ? `${name} reported a usage limit without naming which window.`
+          : `A limit on ${name} is in effect and has not cleared yet.`;
+    return {
+      title: `${name} limited`,
+      cause,
+      consequence: `Automatic delivery to ${name} agents is paused until capacity returns. Queued messages wait; nothing is lost.`
+    };
   }
 
   /**
