@@ -7,7 +7,8 @@
  *   amber ~50 -> dark red 0); LIMITED = stop sign; never read = spotted; STALE = dimmed and
  *   wedge-less with no figure (S1 = a, and A1's no-figure-on-stale re-pinned); the A2 frame
  *   = an empty pie with a dark-red rim, no stop sign (S3); one lead dot per pool (S2);
- *   PIE_DOT_SIZE 20; contrast in BOTH themes (S4).
+ *   PIE_DOT_SIZE 20; contrast in BOTH themes (S4), judged against the bar colours READ from
+ *   tokens.css (so a tokens.css change to a low-contrast bar colour fails here).
  */
 const test = require('node:test');
 const assert = require('node:assert/strict');
@@ -175,8 +176,31 @@ const rgbOf = (c) => {
 };
 const lum = (c) => { const [r, g, b] = rgbOf(c).map((v) => (v <= 0.03928 ? v / 12.92 : ((v + 0.055) / 1.055) ** 2.4)); return 0.2126 * r + 0.7152 * g + 0.0722 * b; };
 const contrast = (a, b) => { const [x, y] = [lum(a), lum(b)].sort((m, n) => n - m); return (x + 0.05) / (y + 0.05); };
-/** The title bar's backgrounds, from src/renderer/src/design/tokens.css (light, then dark). */
-const BARS = { lightCream100: '#FFF8E7', lightCream200: '#F4E9C7', darkCream100: '#1D1D22', darkCream200: '#26262C' };
+/**
+ * The title bar's backgrounds, READ from src/renderer/src/design/tokens.css at test time (light
+ * `:root`, then dark `:root[data-cth-theme='dark']`), so a future change to a bar colour is
+ * judged here rather than against a stale copy. A missing block or token fails loudly.
+ */
+const barsFromTokens = () => {
+  const css = readSource('src/renderer/src/design/tokens.css').replace(/\/\*[\s\S]*?\*\//g, '');
+  const block = (selector) => {
+    const at = css.indexOf(`${selector} {`);
+    assert.ok(at >= 0, `tokens.css has a ${selector} block`);
+    return css.slice(at, css.indexOf('}', at));
+  };
+  const token = (body, name) => {
+    const m = new RegExp(`--${name}:\\s*(#[0-9a-f]{6})\\s*;`, 'i').exec(body);
+    assert.ok(m, `tokens.css defines --${name} as a 6-digit hex colour`);
+    return m[1];
+  };
+  const light = block(':root');
+  const dark = block(":root[data-cth-theme='dark']");
+  return {
+    lightCream100: token(light, 'cth-cream-100'), lightCream200: token(light, 'cth-cream-200'),
+    darkCream100: token(dark, 'cth-cream-100'), darkCream200: token(dark, 'cth-cream-200')
+  };
+};
+const BARS = barsFromTokens();
 
 test('S4: every ramp colour keeps >= 3:1 on its disc, and the disc, the rim, the stop sign and the spotted dot hold on both themes', () => {
   for (let p = 0; p <= 100; p += 5) {

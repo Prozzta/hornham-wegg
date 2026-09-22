@@ -66,6 +66,7 @@ const COMPOSER_STATUS = 'src/renderer/src/components/composerStatus.ts';
 const COMPOSER = 'src/renderer/src/components/MessageQueueComposer.tsx';
 const PANEL_CC = 'src/renderer/src/components/CommandCenterPanel.tsx';
 const PIE = 'src/renderer/src/capacity/pieDot.ts';
+const TOKENS = 'src/renderer/src/design/tokens.css';
 
 /** [name, file, from, to] */
 const MUTANTS = [
@@ -446,6 +447,10 @@ const MUTANTS = [
   ["u14 the 5h pie drawn twice (lead dot + token)", LAYOUT,
     "if (normal && meter && role !== 'five-hour')",
     "if (normal && meter)"],
+  // ── S4 reads tokens.css: a bar colour changed there is judged by the contrast test ──
+  ["u14 a tokens.css dark bar colour loses contrast with the pie-dot", TOKENS,
+    "  --cth-cream-100: #1D1D22;",
+    "  --cth-cream-100: #E8E4DA;"],
 ];
 
 // THE BASELINE MUST BE GREEN. Against already-failing tests every mutant "dies", and a
