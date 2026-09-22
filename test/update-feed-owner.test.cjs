@@ -97,7 +97,7 @@ test('package.json repository and version, and the lockfile agrees on the versio
   const pkg = JSON.parse(read('package.json'));
   assert.equal(pkg.repository.url, `https://github.com/${OWN}.git`,
     'electron-builder falls back to `repository` for a github publish, so it must not point upstream');
-  assert.equal(pkg.version, '1.0.45');
+  assert.equal(pkg.version, '1.1.45');
   const lock = JSON.parse(read('package-lock.json'));
   assert.equal(lock.version, pkg.version, 'package-lock root version agrees');
   assert.equal(lock.packages[''].version, pkg.version, 'package-lock packages[""] version agrees');
@@ -105,7 +105,7 @@ test('package.json repository and version, and the lockfile agrees on the versio
 
 test('every installer download URL resolves under the human\'s repository', () => {
   for (const platform of ['win32', 'darwin', 'linux']) {
-    const url = installerUrl('1.0.45', platform);
+    const url = installerUrl('1.1.45', platform);
     if (url === null || url === undefined) continue;
     assert.ok(url.startsWith(`https://github.com/${OWN}/releases/download/`), `${platform}: ${url}`);
   }
