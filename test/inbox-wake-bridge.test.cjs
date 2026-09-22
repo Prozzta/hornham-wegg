@@ -222,6 +222,21 @@ test('C7 a worker and god go through the SAME code path; no god branch, no heart
   assert.ok(!/godId|isGod|heartbeat/i.test(bridgeSrc), 'no god branch and no heartbeat in the bridge');
 });
 
+test('D3 through the bridge: god mid-tool with an old last output gets NO reconcile wake until Stop', async (t) => {
+  const f = await floor(t);
+  f.coordinator.noteHook('god-1', 'PreToolUse', '', NOW);
+  f.hive.setDeliveryObserver(null);
+  f.post('jim-1', 'mid-1');
+  await f.flush();
+  f.now.t += 30 * 60_000;                                    // the PTY has been silent for 30 minutes
+  f.bridge.reconcileAll(['god-1']);
+  await f.flush();
+  assert.equal(f.owner.calls.length, 0, 'an active god is not typed into on silence');
+  f.bridge.onHook('god-1', 'Stop', '');
+  await f.flush();
+  assert.equal(f.owner.calls.length, 1, 'the Stop edge wakes it once');
+});
+
 test('a missed delivery event is found by reconciliation (one wake, then never again)', async (t) => {
   const f = await floor(t);
   f.hive.setDeliveryObserver(null);                           // the callback is lost

@@ -190,7 +190,8 @@ export class WorkerWakeWatchdog {
    * At most ONE immutable batch, or null. Both modes fail closed on: no PTY, pause, halt,
    * auto-delivery pause, an owner inhibition, a recent HITL prompt, boot grace, an existing
    * in-flight or held claim. `event` mode needs recorded lifecycle-idle evidence;
-   * `reconcile` may also accept PTY quiescence, rate-limited per agent.
+   * `reconcile` may also accept PTY quiescence, but ONLY for an agent whose lifecycle is
+   * unknown (never one known to be active), rate-limited per agent.
    */
   claim(f: WorkerWakeFacts, cause: WakeCause, mode: WakeMode, now = Date.now()): WakeClaim | null {
     const r = this.rec(f.agentId);
@@ -203,7 +204,11 @@ export class WorkerWakeWatchdog {
       if (r.lifecycle !== 'idle') return null;
     } else {
       const quiescent = f.lastOutputAt > 0 && now - f.lastOutputAt >= WORKER_WAKE_IDLE_MS;
-      if (r.lifecycle !== 'idle' && !quiescent) return null;
+      // D3 (god ruling, Dwight's tightening): PTY silence stands in ONLY when the lifecycle is
+      // UNKNOWN (start-up, lost history, a lost Stop). A positively ACTIVE agent is never claimed
+      // on quiescence: a silent tool, build or network wait can outlast 12s, and the owner
+      // proves the prompt and the human, not that the model's turn ended.
+      if (!(r.lifecycle === 'idle' || (r.lifecycle === 'unknown' && quiescent))) return null;
       if (r.lastReconcileAttemptAt > 0 && now - r.lastReconcileAttemptAt < WORKER_WAKE_COOLDOWN_MS) return null;
       r.lastReconcileAttemptAt = now;
     }

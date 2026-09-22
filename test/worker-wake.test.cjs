@@ -190,6 +190,25 @@ test('B8b reconciliation: PTY quiescence may stand in for a missed Stop, never t
   assert.ok(c.claim(quiet, 'reconcile', 'reconcile', NOW + WORKER_WAKE_COOLDOWN_MS));
 });
 
+test('D3 reconcile: an ACTIVE agent is never claimed on PTY silence alone; UNKNOWN + quiescent still recovers', () => {
+  const quiet = fact({ lastOutputAt: NOW - 25 * 60_000 });     // e.g. a 25-minute silent tool run
+  for (const event of ['UserPromptSubmit', 'PreToolUse']) {
+    const c = new WorkerWakeWatchdog();
+    c.noteHook('alice', event, '', NOW - 26 * 60_000);
+    c.noteDelivery('alice', 'm1');
+    assert.equal(c.state('alice').lifecycle, 'active');
+    assert.equal(c.claim(quiet, 'reconcile', 'reconcile', NOW), null, `${event}: active + quiescent is NOT idle`);
+    assert.equal(c.claim(quiet, 'reconcile', 'reconcile', NOW + 10 * WORKER_WAKE_COOLDOWN_MS), null, 'not later either');
+    assert.deepEqual(c.state('alice').pending, ['m1'], 'the mail is kept');
+    c.noteHook('alice', 'Stop', '', NOW);                     // the real idle edge
+    assert.ok(c.claim(quiet, 'reconcile', 'reconcile', NOW), 'claims once the turn really ended');
+  }
+  const recovery = new WorkerWakeWatchdog();                   // start-up / lost history: unknown
+  recovery.reconcile('alice', ['m1']);
+  assert.equal(recovery.state('alice').lifecycle, 'unknown');
+  assert.deepEqual([...recovery.claim(quiet, 'reconcile', 'reconcile', NOW).ids], ['m1'], 'unknown + quiescent still recovers');
+});
+
 test('B9 god is not special: there is no isGod, and god passes the same guards and claims', () => {
   const c = idleWith(['m1'], 'god-1');
   const claim = c.claim({ ...fact({ agentId: 'god-1', ptyId: 'pty-god' }), isGod: true }, 'delivery', 'event', NOW);
