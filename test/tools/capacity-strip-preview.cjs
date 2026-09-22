@@ -76,7 +76,7 @@ function panel(title, note, view, windowWidth) {
   <h2>${title}</h2>
   <p class="note">${note} <span class="meta">window ${windowWidth}px</span></p>
   <div class="bar" style="width:${windowWidth}px">
-    <span class="logo">Munder Difflin</span><span class="badge">v1.1.45</span>
+    <span class="logo">Munder Difflin</span><span class="badge">v1.1.46</span>
     <div class="cap-strip-host" data-cap-strip="" data-overflow="false" tabindex="0">${strip}</div>
     <span class="drag"></span>
     <span class="btn">☾</span><span class="btn">⚙</span><span class="btn">⛶</span>
