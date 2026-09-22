@@ -17,7 +17,8 @@ const { spawnSync } = require('node:child_process');
 
 const ROOT = path.resolve(__dirname, '..', '..');
 const TESTS = ['test/hive-event-router.test.cjs', 'test/worker-wake.test.cjs', 'test/inbox-wake-bridge.test.cjs',
-  'test/inbox-wake-pins.test.cjs', 'test/control.test.cjs', 'test/automatic-submit-wiring.test.cjs'];
+  'test/inbox-wake-pins.test.cjs', 'test/control.test.cjs', 'test/automatic-submit-wiring.test.cjs',
+  'test/wake-cold-boot.test.cjs'];
 
 const INDEX = 'src/main/index.ts';
 const WAKE = 'src/main/workerWake.ts';
@@ -105,7 +106,16 @@ const MUTANTS = [
     'onChange: () => { pushCapacityStrip(); pushAgentUsage(); pushAgentImpact(); }'],
   ['w the delivery observer is never registered', INDEX,
     '  inboxWake?.onDelivery(agentId, messageId);',
-    '  void 0;']
+    '  void 0;'],
+  // GATE-2: the cold-boot deadlock that stalled the packaged 1.1.46 floor. Counting a
+  // CLI's boot SessionStart as an active turn makes a never-prompted agent permanently
+  // unclaimable, because only a Stop it can never emit clears the label.
+  ['w SessionStart is an active turn again (the 1.1.46 cold-boot deadlock)', WAKE,
+    "const ACTIVE_EVENTS = new Set(['UserPromptSubmit'",
+    "const ACTIVE_EVENTS = new Set(['SessionStart', 'UserPromptSubmit'"],
+  ['w a session boundary no longer clears a stale active label', WAKE,
+    "    if (event === 'SessionStart' || event === 'SessionEnd') { r.lifecycle = 'unknown'; return false; }",
+    "    if (event === 'SessionEnd') { r.lifecycle = 'unknown'; return false; }"]
 ];
 
 // THE BASELINE MUST BE GREEN.

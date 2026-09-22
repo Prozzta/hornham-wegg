@@ -64,8 +64,25 @@ export function classifyHook(event: string | undefined, message: string | undefi
   return null;
 }
 
-/** Hook events that prove the main agent is working (a stale idle assertion is cleared). */
-const ACTIVE_EVENTS = new Set(['SessionStart', 'UserPromptSubmit', 'PreToolUse', 'PostToolUse', 'PreCompact', 'PostCompact']);
+/**
+ * Hook events that prove the main agent is working (a stale idle assertion is cleared).
+ *
+ * `SessionStart` is deliberately NOT one of them, and this is the 1.1.46 floor-stall in one
+ * line. Every CLI fires it while it BOOTS, before anything has been submitted to it, so
+ * counting it as an active turn labelled every freshly spawned agent active while it sat
+ * parked at its prompt. The only way back to `idle` is a `Stop`, which a turn that never
+ * started cannot emit, so event wakes (which need recorded idle) and the reconciliation
+ * beat (which under D3 lets PTY silence stand in only for an UNKNOWN lifecycle) both
+ * refused every wake for the life of the process. In 1.1.45 the renderer's 4s inbox poll
+ * had covered it regardless of lifecycle; C3 deleted that, and no producer was left.
+ *
+ * A session boundary means the PREVIOUS turn is moot, not that a new one is running, so it
+ * is handled as `unknown` below — which routes it into the already-ratified
+ * `unknown && quiescent` recovery, behind boot grace. D3 is untouched: a turn that really
+ * starts supplies `UserPromptSubmit` (and then `PreToolUse`) immediately, and stays
+ * unclaimable through any length of silent tool until it says `Stop`.
+ */
+const ACTIVE_EVENTS = new Set(['UserPromptSubmit', 'PreToolUse', 'PostToolUse', 'PreCompact', 'PostCompact']);
 
 export type WakeLifecycle = 'active' | 'idle' | 'unknown';
 /** Why a wake was attempted (breadcrumbs only; never a decision input). */
@@ -175,7 +192,12 @@ export class WorkerWakeWatchdog {
       return true;
     }
     if (ACTIVE_EVENTS.has(event)) { r.lifecycle = 'active'; return false; }
-    if (event === 'SessionEnd') { r.lifecycle = 'unknown'; return false; }
+    // A session boundary moots whatever the previous session was doing, in both directions:
+    // it never asserts a turn is running (the cold-boot deadlock above), and it must not
+    // let a stale `active` from the old session survive into the new one either — a
+    // --resume'd agent would inherit exactly the same deadlock. Not a retry edge: nothing
+    // is known to be idle yet, so the reconciliation beat decides, behind boot grace.
+    if (event === 'SessionStart' || event === 'SessionEnd') { r.lifecycle = 'unknown'; return false; }
     return false;
   }
 
