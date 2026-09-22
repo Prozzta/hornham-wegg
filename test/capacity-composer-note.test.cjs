@@ -21,7 +21,7 @@ const status = (over = {}) => {
   const evidence = over.evidence ?? null;
   return composerStatus({ agentName: 'Alice', queueLength: 0, idle: true, block: null,
     hold: over.hold !== undefined ? over.hold : view({ capacityEvidence: evidence }),
-    capacityNote: capacityStateNote(evidence), ...over.i });
+    capacityNote: capacityStateNote(evidence), capacityEvidence: evidence, ...over.i });
 };
 
 test('empty queue + a limited, recovering or stale pool: the note is in the header', () => {
@@ -48,6 +48,13 @@ test('healthy stays silent on an empty queue', () => {
   assert.equal(status({ evidence: null, hold: view({ paused: true }) }), null, 'a pause is about queued messages; none are queued');
 });
 
+test('outside capacity gating (NO_POOL) is silent on an EMPTY queue, and still said on a moving one', () => {
+  assert.ok(capacityStateNote('NO_POOL'), 'main still words it');
+  assert.equal(status({ evidence: 'NO_POOL' }), null, 'the ordinary case for an ungated agent: no clutter');
+  assert.equal(status({ evidence: 'NO_POOL', i: { queueLength: 1 } }).text,
+    `sending to Alice one-by-one… (${capacityStateNote('NO_POOL')})`, 'the moving-queue suffix is unchanged');
+});
+
 test('INTERFERED still escapes the empty queue, and still wins over the note', () => {
   const hold = view({ interfered: INTERFERED, capacityEvidence: 'FRESH_NOT_HEALTHY' });
   const s = status({ evidence: 'FRESH_NOT_HEALTHY', hold });
@@ -72,7 +79,7 @@ test('a non-empty queue reads exactly as before: busy, hold, blocks, sending (+ 
 
 test('the composer renders composerStatus; send-now and the hold stay queue-driven', () => {
   const src = codeOnly(readSource('src/renderer/src/components/MessageQueueComposer.tsx'), 'MessageQueueComposer.tsx');
-  assert.match(src, /const status = composerStatus\(\{ agentName: agent\.name, queueLength: queue\.length, idle, hold, block, capacityNote \}\);/);
+  assert.match(src, /const status = composerStatus\(\{ agentName: agent\.name, queueLength: queue\.length, idle, hold, block, capacityNote,\s+capacityEvidence: delivery\.capacityEvidence \}\);/);
   assert.match(src, /title=\{status\.title\}/);
   assert.match(src, />\{status\.text\}<\/span>/);
   assert.ok(!/statusHint/.test(src), 'the old inline gate is gone');

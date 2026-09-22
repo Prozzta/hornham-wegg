@@ -11,9 +11,12 @@
  * needs a queued message, exactly as before. INTERFERED still shows with nothing queued.
  *
  * The words are MAIN's (`capacityStateNote`, shared/deliveryHold.ts); a fresh healthy
- * reading has no note, so a healthy empty composer stays silent.
+ * reading has no note, so a healthy empty composer stays silent. So does an agent outside
+ * capacity gating (NO_POOL): that is its ordinary case, not an attention state, and saying
+ * so on every ungated agent's empty composer is clutter. Only on an EMPTY queue — a moving
+ * queue still says "(outside capacity gating)", so no pool is never read as an all-clear.
  */
-import type { DeliveryHoldView } from '@shared/deliveryHold';
+import type { CapacityEvidenceName, DeliveryHoldView } from '@shared/deliveryHold';
 import type { TerminalAutomationBlock } from './terminalAutomation';
 
 export interface ComposerStatusInput {
@@ -23,6 +26,7 @@ export interface ComposerStatusInput {
   hold: DeliveryHoldView | null;
   block: TerminalAutomationBlock;
   capacityNote: string | null;
+  capacityEvidence: CapacityEvidenceName | null | undefined;
 }
 
 export interface ComposerStatus {
@@ -35,7 +39,7 @@ export interface ComposerStatus {
 export function composerStatus(i: ComposerStatusInput): ComposerStatus | null {
   const own = (text: string): ComposerStatus => ({ text, title: text });
   if (i.hold?.kind === 'INTERFERED') return { text: i.hold.hint, title: i.hold.title };
-  if (i.queueLength === 0) return i.capacityNote ? own(i.capacityNote) : null;
+  if (i.queueLength === 0) return i.capacityNote && i.capacityEvidence !== 'NO_POOL' ? own(i.capacityNote) : null;
   if (!i.idle) {
     const text = `${i.agentName} is busy — ${i.queueLength} queued`;
     return { text, title: i.hold ? i.hold.title : text };

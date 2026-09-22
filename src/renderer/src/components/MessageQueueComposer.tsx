@@ -190,7 +190,8 @@ export function MessageQueueComposer({ agent }: MessageQueueComposerProps) {
   // INTERFERED is shown even with nothing queued: a worker wake can be the held request,
   // and the terminal stays refused until a person resolves it. So is the capacity note
   // (unit #11): a limited, recovering or stale pool must not be invisible on an empty queue.
-  const status = composerStatus({ agentName: agent.name, queueLength: queue.length, idle, hold, block, capacityNote });
+  const status = composerStatus({ agentName: agent.name, queueLength: queue.length, idle, hold, block, capacityNote,
+    capacityEvidence: delivery.capacityEvidence });
 
   return (
     <div

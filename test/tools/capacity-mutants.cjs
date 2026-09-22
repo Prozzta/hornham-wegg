@@ -314,21 +314,23 @@ const MUTANTS = [
     'agents has resumed.`', 'agents has resumed (100%).`'],
   // ── unit #11: composer capacity note (unconditional) ──────────────────────────
   ['u11 the empty queue hides the note again', COMPOSER_STATUS,
-    '  if (i.queueLength === 0) return i.capacityNote ? own(i.capacityNote) : null;',
+    "  if (i.queueLength === 0) return i.capacityNote && i.capacityEvidence !== 'NO_POOL' ? own(i.capacityNote) : null;",
     '  if (i.queueLength === 0) return null;'],
   ['u11 healthy is no longer silent', COMPOSER_STATUS,
-    '  if (i.queueLength === 0) return i.capacityNote ? own(i.capacityNote) : null;',
+    "  if (i.queueLength === 0) return i.capacityNote && i.capacityEvidence !== 'NO_POOL' ? own(i.capacityNote) : null;",
     "  if (i.queueLength === 0) return own(i.capacityNote ?? 'provider capacity healthy');"],
+  ['u11 the empty-queue note is shown for NO_POOL again', COMPOSER_STATUS,
+    " && i.capacityEvidence !== 'NO_POOL'", ''],
   ['u11 INTERFERED no longer escapes the empty queue', COMPOSER_STATUS,
     "  if (i.hold?.kind === 'INTERFERED') return { text: i.hold.hint, title: i.hold.title };\n", ''],
   ['u11 the empty queue shows the hold hint instead of the note', COMPOSER_STATUS,
-    '  if (i.queueLength === 0) return i.capacityNote ? own(i.capacityNote) : null;',
+    "  if (i.queueLength === 0) return i.capacityNote && i.capacityEvidence !== 'NO_POOL' ? own(i.capacityNote) : null;",
     '  if (i.queueLength === 0) return i.hold ? { text: i.hold.hint, title: i.hold.title } : i.capacityNote ? own(i.capacityNote) : null;'],
   ['u11 the moving queue loses its note', COMPOSER_STATUS,
     "one-by-one…${i.capacityNote ? ` (${i.capacityNote})` : ''}`", 'one-by-one…`'],
   ['u11 the composer bypasses composerStatus', COMPOSER,
-    '  const status = composerStatus({ agentName: agent.name, queueLength: queue.length, idle, hold, block, capacityNote });',
-    '  const status = queue.length === 0 ? null : composerStatus({ agentName: agent.name, queueLength: queue.length, idle, hold, block, capacityNote });'],
+    '  const status = composerStatus({ agentName: agent.name, queueLength: queue.length, idle, hold, block, capacityNote,',
+    '  const status = queue.length === 0 ? null : composerStatus({ agentName: agent.name, queueLength: queue.length, idle, hold, block, capacityNote,'],
 ];
 
 // THE BASELINE MUST BE GREEN. Against already-failing tests every mutant "dies", and a
