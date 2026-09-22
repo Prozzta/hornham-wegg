@@ -53,6 +53,10 @@ const LIVE_HIVE = 'C:\\Dunder\\hive';
 const BOOT_BUDGET_MS = 180_000;
 const EVENT_BUDGET_MS = 90_000;
 const DUP_WATCH_MS = 40_000;      // longer than two 15s beats
+/** How long the worker stub stays mid-turn after a prompt — a long silent tool. */
+const MID_TURN_MS = 45_000;
+/** How long to watch, mid-turn, for a wake that must NOT happen (> two beats + quiescence). */
+const D3_WATCH_MS = 30_000;
 const POLL_MS = 1_000;
 /** DevTools port, so the canary can get past the config chooser the way a human does. */
 const CDP_PORT = 9333;
@@ -77,7 +81,7 @@ function pipeFor(hiveRoot, dev) {
  * The pipe path and agent id are baked in at generation time, so the stub never depends on
  * the app's env plumbing to know who it is.
  */
-function stubSource(agentId, pipe, typedLog) {
+function stubSource(agentId, pipe, typedLog, stopDelayMs) {
   return `'use strict';
 const net = require('net');
 const fs = require('fs');
@@ -85,6 +89,7 @@ const AGENT_ID = ${JSON.stringify(agentId)};
 const PIPE = ${JSON.stringify(pipe)};
 const TYPED = ${JSON.stringify(typedLog)};
 const SESSION = 'canary-' + AGENT_ID;
+const STOP_DELAY_MS = ${Number(stopDelayMs) || 600};
 
 function emit(payload) {
   try {
@@ -111,10 +116,10 @@ process.stdin.on('data', function (chunk) {
     if (!line.trim()) continue;
     try { fs.appendFileSync(TYPED, line + '\\n'); } catch (e) {}
     process.stdout.write('\\r\\n[received ' + line.length + ' chars]\\r\\n> ');
-    // A real turn just ran: report the prompt, then the end of the turn, which is what
-    // releases the next wake.
+    // A real turn just ran: report the prompt, then — after STOP_DELAY_MS, which stands in
+    // for a long silent tool — the end of the turn, which is what releases the next wake.
     emit({ hook_event_name: 'UserPromptSubmit' });
-    setTimeout(function () { emit({ hook_event_name: 'Stop' }); }, 600);
+    setTimeout(function () { emit({ hook_event_name: 'Stop' }); }, STOP_DELAY_MS);
   }
 });
 process.stdin.resume();
@@ -159,7 +164,8 @@ function seed(stubsDir) {
     typed[id] = join(stubsDir, `typed-${id}.log`);
     writeFileSync(typed[id], '');
     const stub = join(stubsDir, `${id}.cjs`);
-    writeFileSync(stub, stubSource(id, pipe, typed[id]));
+    // The worker holds its Stop, so the canary gets a REAL mid-turn window to prove D3 in.
+    writeFileSync(stub, stubSource(id, pipe, typed[id], id === WORKER ? MID_TURN_MS : 600));
     agents[id] = {
       id,
       name: id === GOD ? 'Michael' : 'Worker',
@@ -371,18 +377,35 @@ async function main() {
     const committed = wake.find((r) => r.stage === 'settle' && r.outcome === 'COMMITTED');
     check(!!committed, 'the owner COMMITTED the wake', committed ? committed.requestId : 'no COMMITTED settle');
 
-    // ── SCENARIO B: the event edge — a durable delivery wakes it again ────────
-    log('scenario B: delivering god -> worker through the real router…');
+    // ── SCENARIO B + D3 BOTH WAYS, in the packaged app ───────────────────────
+    // Scenario A's nudge started a turn, and the worker stub holds its Stop for
+    // MID_TURN_MS. So this delivery lands while a turn is genuinely running — the exact
+    // situation D3 exists for. It must be OBSERVED and CLAIMED BY NOBODY until Stop, and
+    // then delivered. Nothing is mocked: real router, real hooks, real owner, real Enter.
+    log('scenario B + D3: delivering god -> worker MID-TURN through the real router…');
     const beforeB = nudges(typed[WORKER]).length;
-    deliverFromGod('canary-b', 'scenario B: event edge');
+    deliverFromGod('canary-b', 'scenario B: event edge, delivered mid-turn');
     await waitFor('the message is routed and delivered', 60_000,
       () => rows().some((r) => r.kind === 'message' && r.id === 'canary-b'));
     check(rows().some((r) => r.kind === 'wake' && r.stage === 'observer' && r.messageId === 'canary-b'),
       'the delivery observer fired for the durable write');
-    await waitFor('scenario B nudge typed into the worker', EVENT_BUDGET_MS,
+
+    // D3, the safety direction: no typing into a live turn, through two beats.
+    log(`D3: watching ${D3_WATCH_MS}ms for a wake that must NOT happen…`);
+    await sleep(D3_WATCH_MS);
+    const midTurn = nudges(typed[WORKER]).length;
+    check(midTurn === beforeB, 'D3: a live turn is NEVER typed into, however long it is silent',
+      `${beforeB} -> ${midTurn}`);
+    const refusals = rows().filter((r) => r.kind === 'wake' && r.stage === 'no-claim'
+      && r.agentId === WORKER && String(r.why).startsWith('lifecycle-active'));
+    check(refusals.length > 0, 'D3: and the refusal names the live turn as the reason',
+      refusals.length ? String(refusals[refusals.length - 1].why) : 'no lifecycle-active refusal');
+
+    // D3, the liveness direction: Stop releases it, and the mail is delivered after all.
+    await waitFor('scenario B nudge typed once the turn ends', EVENT_BUDGET_MS,
       () => nudges(typed[WORKER]).length > beforeB);
-    check(true, 'SCENARIO B: a durable delivery wakes the agent by itself');
-    log('scenario B: woken');
+    check(true, 'SCENARIO B: a durable delivery wakes the agent once its turn ENDS');
+    log('scenario B + D3: held mid-turn, delivered after Stop');
 
     // ── NO DUPLICATES: two more beat cycles must add nothing ─────────────────
     const settled = nudges(typed[WORKER]).length;
