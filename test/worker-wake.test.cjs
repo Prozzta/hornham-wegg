@@ -52,6 +52,9 @@ test('B2 two ids before a claim = one sorted immutable batch; a third in flight 
   assert.match(claim.requestId, /^inbox-wake:alice:[0-9a-f]{64}$/);
   c.noteDelivery('alice', 'm3');
   assert.deepEqual([...claim.ids], ['m1', 'm2'], 'the claim is never enlarged');
+  c.noteHook('alice', 'Stop', '', NOW);      // even with fresh idle evidence and new mail...
+  assert.equal(c.claim(fact(), 'hook', 'event', NOW), null, '...no second claim while one is in flight');
+  assert.equal(c.claim(fact({ lastOutputAt: NOW - WORKER_WAKE_IDLE_MS - 1 }), 'reconcile', 'reconcile', NOW), null);
   c.settle(claim, 'COMMITTED');
   assert.equal(c.state('alice').lifecycle, 'active', 'a committed wake means a turn started');
   assert.equal(c.claim(fact(), 'delivery', 'event', NOW), null, 'm3 waits for the Stop of that turn');

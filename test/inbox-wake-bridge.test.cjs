@@ -135,6 +135,23 @@ test('C3 delivery, Stop, a duplicate watch hint, a capacity change, a control re
   assert.deepEqual(f.owner.enters, ['god-1'], 'one Enter');
 });
 
+test('events for one agent in one turn coalesce into ONE scheduled attempt', () => {
+  const queued = [];
+  const bridge = new InboxWakeBridge({
+    coordinator: new WorkerWakeWatchdog(), inboxIds: () => [], facts: () => null,
+    submit: () => Promise.resolve({ kind: 'COMMITTED' }), text: () => '', setImmediate: (fn) => queued.push(fn), now: () => NOW
+  });
+  bridge.onDelivery('god-1', 'a');
+  bridge.onHook('god-1', 'Stop', '');
+  bridge.onControlRelease('god-1');
+  bridge.scheduleWake('god-1', 'capacity');
+  bridge.scheduleWake('jim-1', 'delivery');
+  assert.equal(queued.length, 2, 'one per agent, not one per event');
+  queued.shift()();
+  bridge.scheduleWake('god-1', 'hook');
+  assert.equal(queued.length, 2, 'after it runs, the next turn can schedule again');
+});
+
 test('C4 a REFUSED wake keeps its ids; the release edge retries at once, with no interval', async (t) => {
   let refuse = true;
   const f = await floor(t, { decide: () => (refuse ? 'REFUSED' : 'COMMITTED') });

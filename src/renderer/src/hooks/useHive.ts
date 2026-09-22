@@ -17,7 +17,6 @@ import { DEFAULT_CONTEXT_TRIGGER, type ContextRule } from '../../../shared/trigg
 import type { AgentProvider } from '../../../shared/agentProvider';
 import { bridgeOf, providerPreset } from '../../../shared/agentProvider';
 import { isDurableRole, preferredAgentRole, roleForHiveSpawn } from '../../../shared/agentRole';
-import { inboxNudgeText } from '../../../shared/hiveNudge';
 import { acquireTerminal, resetTerminal, isTerminalAutomationSafe } from '@/components/terminalPool';
 import { canDeliverToAgent, deliverWithAcknowledgement, checkPrecondition } from './queueDelivery';
 import type { AutoSubmitOutcome } from '../../../preload';
@@ -248,27 +247,6 @@ function passesContextPressure(a: Agent, rule: ContextRule): boolean {
  *      doesn't stall while an agent sits at its prompt.
  */
 export function useHive(config: HarnessConfig | null): void {
-  // Per-agent dedup for the inbox-wake nudge: every inbox message id we have
-  // already nudged this agent about. A SET, not a high-water mark.
-  //
-  // This used to hold one string — the lexicographically largest id in the inbox,
-  // read as "the newest". Message ids are usually `<timestamp>-<rand>`, so that
-  // held, but an agent may set its own `id` in the outbox JSON and the hive keeps
-  // it verbatim (hive.ts normalize: `partial.id ?? ...`). One such id in god's
-  // inbox — `dev15-progress-canvas-v4` — sorts above EVERY `2026-*` timestamp and
-  // never drains, so the "newest" id was frozen on it: Michael was nudged once per
-  // app launch and then never again, however much real mail piled up behind it.
-  // Tracking the ids we have seen has no such ordering assumption, and it keeps
-  // the property the high-water mark was there for: draining removes ids from the
-  // INBOX without adding anything new, so a drain still produces no nudge.
-  //
-  // Note what this set does NOT do: it never shrinks. Ids accumulate for the life
-  // of the window (a restart clears it), because forgetting an id we have already
-  // nudged for would re-nudge the moment that message reappeared in a listing. The
-  // cost is a few tens of bytes per message, which for a 24/7 floor is real but
-  // negligible next to a stalled agent. Evicting ids that have left the inbox would
-  // bound it exactly; deliberately not done here to keep this fix minimal.
-  const nudged = useRef<Record<string, Set<string>>>({});
   // Per-agent context size at the last auto-/compact queued. See the latch note
   // in the context-trigger effect: an idle agent's token count is frozen, so
   // without this the pressure gate re-fires on the identical number every cycle.
@@ -630,59 +608,13 @@ export function useHive(config: HarnessConfig | null): void {
     return () => clearInterval(iv);
   }, [config?.onboardingComplete]);
 
-  // 3) Wake agents holding unread inbox messages. The assistant is send-only
-  //    (it never receives inbox mail), so it's excluded.
-  //
-  //    QUEUES the nudge rather than typing it. This loop used to write straight
-  //    into the terminal, which made it the one automatic writer that could land
-  //    on top of whatever the user was typing — its text fused onto the user's
-  //    half-written line and the pair got submitted as one garbled prompt. Going
-  //    through the queue means effect #4 owns every decision about when a
-  //    terminal may be typed into: idle, off cooldown, past boot grace, delivery
-  //    not paused, and no user draft in the way. One gate, one place, and this
-  //    loop stops needing prompt logic of its own. /compact (effect #6) has
-  //    always worked this way.
-  useEffect(() => {
-    if (!config?.onboardingComplete) return;
-    const iv = setInterval(async () => {
-      const agents = useStore.getState().agents.filter((a) => a.ptyId);
-      for (const a of agents) {
-        try {
-          const inbox = await window.cth.hiveInbox(a.id);
-          // Nudge on any id we have not nudged for yet (#130's per-id Set).
-          // Draining shrinks the set and introduces nothing new, so this POLL
-          // stays quiet; a genuinely new message fires regardless of how its id
-          // happens to sort.
-          //
-          // That reasoning covers the poll only — it does NOT survive the gap
-          // between enqueue and delivery, which is why the nudge carries an
-          // 'inbox-nonempty' precondition that the drain re-checks before typing.
-          // Without it: mail lands and queues a nudge, the already-awake agent
-          // drains the whole inbox in that same turn, and the nudge is typed into
-          // an empty inbox afterwards — a wasted turn, and the most expensive one
-          // on the floor when the agent is god.
-          const seen = nudged.current[a.id] ?? (nudged.current[a.id] = new Set());
-          const fresh = inbox.filter((m) => m.id && !seen.has(m.id));
-          if (fresh.length) {
-            // Name the ids: the nudge is queued now and typed whenever the agent
-            // next goes idle, so it can arrive long after the agent drained and
-            // filed this very mail. Carrying the ids is what lets it tell
-            // "already handled" from "woken for nothing". The queue keeps only
-            // one nudge pending per agent (see enqueueMessage), so a suppressed
-            // copy's ids stay unnamed — hence the text points at the pending
-            // inbox as the authority rather than at the list.
-            useStore.getState().enqueueMessage(
-              a.id,
-              inboxNudgeText(fresh.map((m) => m.id)),
-              { precondition: 'inbox-nonempty' }
-            );
-            for (const m of fresh) seen.add(m.id);
-          }
-        } catch { /* ignore */ }
-      }
-    }, 4000);
-    return () => clearInterval(iv);
-  }, [config?.onboardingComplete]);
+  // 3) REMOVED (pre-M1 event-wake bridge). The renderer no longer produces inbox-wake
+  //    prompts: main is the ONLY producer. A durable delivery, a Stop / idle edge, a
+  //    control release or main's reconciliation beat asks main's inbox-wake bridge,
+  //    which submits one CAPACITY_GATED wake through the submit owner under a stable
+  //    request id. A renderer copy would enqueue a second wake for the same inbox edge
+  //    under a different id, which the owner can serialize but cannot recognise as a
+  //    duplicate. Ordinary queued messages still drain through effect #4.
 
   // 3b) Seed a fresh "type-into-tui" worker (Crush) with the hive protocol. Its
   //     bare TUI rejects a positional seed (Cobra reads it as a subcommand →
