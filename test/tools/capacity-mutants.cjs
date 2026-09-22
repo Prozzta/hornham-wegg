@@ -1,7 +1,7 @@
 'use strict';
 
 /**
- * Mutant runner for the capacity display milestone (v1.1.45 units #1, #2, #4, #5, #6, #7, #8, #11, the strip polish and CAPUI-MONITOR).
+ * Mutant runner for the capacity display milestone (v1.1.45 units #1, #2, #4, #5, #6, #7, #8, #11, #12, the strip polish and CAPUI-MONITOR).
  *
  * WHY IT IS COMMITTED (Jim's audit, F2). A mutant count that lives in someone's
  * scratchpad cannot be reproduced, and a count nobody can reproduce is not evidence.
@@ -32,7 +32,7 @@ const TESTS = ['test/capacity-strip-contract.test.cjs', 'test/capacity-strip-ui.
   'test/capacity-agent-impact.test.cjs', 'test/delivery-hold.test.cjs', 'test/capacity-monitor.test.cjs',
   'test/capacity-threshold.test.cjs', 'test/capacity-detail.test.cjs',
   'test/capacity-banner.test.cjs', 'test/capacity-toast.test.cjs',
-  'test/capacity-composer-note.test.cjs'];
+  'test/capacity-composer-note.test.cjs', 'test/capacity-copy-guards.test.cjs'];
 
 const STRIP = 'src/main/capacityStrip.ts';
 const SHARED = 'src/shared/capacityStrip.ts';
@@ -331,6 +331,30 @@ const MUTANTS = [
   ['u11 the composer bypasses composerStatus', COMPOSER,
     '  const status = composerStatus({ agentName: agent.name, queueLength: queue.length, idle, hold, block, capacityNote,',
     '  const status = queue.length === 0 ? null : composerStatus({ agentName: agent.name, queueLength: queue.length, idle, hold, block, capacityNote,'],
+  // ── unit #12: vocabulary + geometry guards ─────────────────────────────────────
+  ['u12 a cross-family word in the strip copy', STRIP,
+    'unavailable while Weekly is exhausted`,', 'unavailable while Weekly is exhausted (the binding window)`,'],
+  ['u12 a cross-family word in renderer-only copy', VIEW,
+    'title="Provider details"', 'title="Provider details (tighter window first)"'],
+  ['u12 a cross-family word in the hold wording', HOLD,
+    "FRESH_NOT_HEALTHY: { state: 'provider capacity is limited',", "FRESH_NOT_HEALTHY: { state: 'provider capacity is limited (no headroom)',"],
+  ['u12 a bare percentage in the detail panel', DETAIL,
+    'out.text = `${w.label} · ${Math.floor(r)}% remaining`;', 'out.text = `${w.label} · remaining ${Math.floor(r)}%`;'],
+  ['u12 a bare percentage in the Monitor usage line', USAGE_MAIN,
+    'text: `${label} · ${displayPercent}% used`', 'text: `${displayPercent}% used · ${label}`'],
+  ['u12 a figure in the banner', STRIP,
+    'is paused until capacity returns. Queued messages wait; nothing is lost.`',
+    'is paused until capacity returns (0% left). Queued messages wait; nothing is lost.`'],
+  ['u12 a figure in the agent impact', HOLD,
+    "impact('CAPACITY_LIMITED', 'paused', `${pool} limited`)", "impact('CAPACITY_LIMITED', 'paused', `${pool} limited (0%)`)"],
+  ['u12 the shape shows its state word as text', VIEW,
+    '      {STATE_TOKEN[state]}\n    </span>', '      {name}\n    </span>'],
+  ['u12 a segmented usage gauge', USAGE_LINE,
+    '      <CapacityMeter percent={view.usedPercent}',
+    '      {Array.from({ length: 8 }, (_, i) => <span key={i} />)}\n      <CapacityMeter percent={view.usedPercent}'],
+  ['u12 a second fill inside a capacity meter', VIEW,
+    '        width: `${percent}%`, background: color\n      }} />',
+    '        width: `${percent}%`, background: color\n      }} /><span />'],
 ];
 
 // THE BASELINE MUST BE GREEN. Against already-failing tests every mutant "dies", and a
