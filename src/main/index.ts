@@ -47,8 +47,8 @@ import { deliverCapacityToast, type CapacityToast } from './capacityToast';
 import { agentImpactOf, capacityStateNote, type AgentImpact } from '../shared/deliveryHold';
 import { capacityDetailView } from './capacityDetail';
 import { CAPACITY_DETAIL_CHANNEL, validateCapacityDetail } from '../shared/capacityDetail';
-import { agentUsageView } from './capacityAgentUsage';
-import { CAPACITY_AGENT_USAGE, validateAgentUsageView } from '../shared/agentUsage';
+import { AgentUsagePushGate, agentUsagePushOf, agentUsageView } from './capacityAgentUsage';
+import { CAPACITY_AGENT_USAGE, CAPACITY_AGENT_USAGE_PUSH, validateAgentUsageView } from '../shared/agentUsage';
 import { capacityDisplayThresholdOf } from '../shared/capacityThreshold';
 import {
   CAPACITY_STRIP_CHANNEL, CAPACITY_STRIP_CURRENT, CAPACITY_NOTICE_DISMISS,
@@ -405,7 +405,7 @@ const providerCapacity = new CapacityRuntime({
       capacityStrip.noteIntent(intent, capacityToast(capacityStrip.toastFor(intent, providerCapacity.tracker.pool(intent.poolKey))));
     }
   },
-  onChange: () => pushCapacityStrip()
+  onChange: () => { pushCapacityStrip(); pushAgentUsage(); }
 });
 // L0-FUSION stage 5 - THE ONE OWNER of programmatic stage -> final revalidation -> Enter.
 // Main resolves the PTY, main holds it against other programmatic writers, and main's
@@ -595,6 +595,7 @@ function teardownPty(id: string): void {
     ptyProvider.delete(id);
     // Pool membership completeness can change when an agent leaves.
     pushCapacityStrip();
+    pushAgentUsage();
     // Drop watchdog state so a dead agent can't get nudged or leak its grace.
     try { workerWake.forget(agentId, id); } catch { /* best-effort */ }
     // Drop breaker state so a dead agent can't leak/zombie a tripped level.
@@ -1448,6 +1449,28 @@ function pushCapacityStrip(): void {
   for (const w of allWindows) {
     if (w.isDestroyed() || w.webContents.isDestroyed()) continue;
     try { w.webContents.send(CAPACITY_STRIP_CHANNEL, collection); } catch { /* window tearing down */ }
+  }
+}
+
+const agentUsagePushGate = new AgentUsagePushGate();
+/**
+ * v1.1.45 unit #13 (crit 15): the Monitor 5H / Weekly lines are PUSHED, never polled. The
+ * rows for every agent whose persisted display is 5H or Weekly go to every window on their
+ * OWN channel (not control:snapshot, no pool identity), only when the rows changed. The
+ * owner's onChange carries time-driven FRESH -> STALE decay, so that pushes too.
+ */
+function pushAgentUsage(): void {
+  let push;
+  try {
+    push = agentUsagePushGate.next(agentUsagePushOf(readConfig().agentUsageDisplay, (agentId) => {
+      const poolKey = providerCapacity.poolKeyOf(agentId);
+      return poolKey ? providerCapacity.tracker.pool(poolKey) : null;
+    }, Date.now()));
+  } catch (e) { console.warn('[capacity-usage]', e instanceof Error ? e.message : e); return; }
+  if (!push) return;
+  for (const w of allWindows) {
+    if (w.isDestroyed() || w.webContents.isDestroyed()) continue;
+    try { w.webContents.send(CAPACITY_AGENT_USAGE_PUSH, push); } catch { /* window tearing down */ }
   }
 }
 
@@ -3196,6 +3219,7 @@ async function spawnAgentCore(opts: AgentSpawnOptions, owner: Electron.WebConten
     ptyProvider.set(opts.id, provider);
     // A new agent with no reading yet makes its provider's membership unknown.
     pushCapacityStrip();
+    pushAgentUsage();
     // Worker inbox-wake watchdog (#151): boot grace starts at spawn so the
     // initial orientation prompt is never mistaken for an idle agent.
     workerWake.noteSpawn(opts.id);
@@ -3517,9 +3541,11 @@ ipcMain.handle('config:setCapacityDisplayThreshold', (_evt, value: unknown) => {
 });
 // v1.1.45 CAPUI-MONITOR: persist an agent's Monitor line. The breaker reads config live,
 // so a 5H / Weekly choice exempts the agent from the budget on the very next beat.
-ipcMain.handle('config:setAgentUsageDisplay', (_evt, agentId: unknown, display: unknown) =>
-  setAgentUsageDisplay(agentId, display)
-);
+ipcMain.handle('config:setAgentUsageDisplay', (_evt, agentId: unknown, display: unknown) => {
+  const next = setAgentUsageDisplay(agentId, display);
+  pushAgentUsage();
+  return next;
+});
 ipcMain.handle('config:ensureHome', (_evt, path: unknown) => {
   if (typeof path !== 'string' || path.length === 0) return { ok: false, error: 'invalid path' };
   return ensureHarnessHome(path);

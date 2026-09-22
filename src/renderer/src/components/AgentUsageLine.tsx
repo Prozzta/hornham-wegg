@@ -9,7 +9,7 @@
  * strip's own meter so it cannot be confused with the 96x8 budget or context bars.
  */
 import { useEffect, useState } from 'react';
-import type { AgentUsageDisplay, UsageWindowView } from '@shared/agentUsage';
+import type { AgentUsageDisplay, AgentUsageView, UsageWindowView } from '@shared/agentUsage';
 import { CapacityMeter, STATE_COLOR } from './CapacityStrip';
 
 /** The three choices (UI chrome, not capacity wording); the tooltip states the budget consequence. */
@@ -59,25 +59,29 @@ export function UsageWindowFigure({ view }: { view: UsageWindowView | null }) {
   );
 }
 
-const USAGE_POLL_MS = 5000;
-
 /**
- * Main's usage answer for one agent's chosen window, read on the capacity:agentUsage
- * channel while the line shows 5H or Weekly (and not at all under Budget).
+ * Main's usage for one agent's chosen window while the line shows 5H or Weekly (and
+ * nothing at all under Budget). v1.1.45 unit #13 (crit 15): NO renderer polling. One
+ * invoke on mount for the initial state, then main's pushes on capacity:agentUsagePush.
  */
 export function useAgentUsageWindow(agentId: string, display: AgentUsageDisplay): UsageWindowView | null {
   const [view, setView] = useState<UsageWindowView | null>(null);
   useEffect(() => {
     if (display === 'budget') { setView(null); return; }
     let alive = true;
-    const read = () => {
-      window.cth.capacityAgentUsage(agentId)
-        .then((u) => { if (alive) setView(u ? (display === 'fiveHour' ? u.fiveHour : u.weekly) : null); })
-        .catch(() => { if (alive) setView(null); });
-    };
-    read();
-    const iv = setInterval(read, USAGE_POLL_MS);
-    return () => { alive = false; clearInterval(iv); };
+    let pushed = false;
+    const pick = (u: AgentUsageView | null) => (u ? (display === 'fiveHour' ? u.fiveHour : u.weekly) : null);
+    const off = window.cth.onAgentUsage((push) => {
+      const row = push.rows.find((r) => r.agentId === agentId);
+      if (!alive || !row) return;
+      pushed = true;
+      setView(pick(row.view));
+    });
+    // Mount-time initial state. A push that already arrived is newer, so it wins.
+    window.cth.capacityAgentUsage(agentId)
+      .then((u) => { if (alive && !pushed) setView(pick(u)); })
+      .catch(() => { if (alive && !pushed) setView(null); });
+    return () => { alive = false; off(); };
   }, [agentId, display]);
   return view;
 }

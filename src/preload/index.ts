@@ -10,10 +10,10 @@ export type { IntegrationRecord, IntegrationTemplate } from '../shared/integrati
 import type { UpdateStatus } from '../shared/updateState';
 import type { CapacityStripCollection } from '../shared/capacityStrip';
 import type { AgentImpact } from '../shared/deliveryHold';
-import type { AgentUsageView } from '../shared/agentUsage';
+import type { AgentUsagePush, AgentUsageView } from '../shared/agentUsage';
 import type { ProviderCapacityDetailView } from '../shared/capacityDetail';
 export type { ProviderCapacityDetailView } from '../shared/capacityDetail';
-export type { AgentUsageView } from '../shared/agentUsage';
+export type { AgentUsagePush, AgentUsageView } from '../shared/agentUsage';
 export type { CapacityStripCollection } from '../shared/capacityStrip';
 export type { UpdateStatus } from '../shared/updateState';
 import type { ToolStatus } from '../shared/toolCatalog';
@@ -748,6 +748,13 @@ const api = {
    *  Literal channel name: a test pins it to CAPACITY_AGENT_USAGE in src/shared/agentUsage.ts. */
   capacityAgentUsage: (agentId: string): Promise<AgentUsageView | null> =>
     ipcRenderer.invoke('capacity:agentUsage', agentId),
+  /** Push (unit #13): every 5H / Weekly agent's usage rows, on their OWN channel. The
+   *  invoke above stays for the mount-time initial state. */
+  onAgentUsage: (cb: (push: AgentUsagePush) => void): (() => void) => {
+    const listener = (_e: IpcRendererEvent, payload: AgentUsagePush) => cb(payload);
+    ipcRenderer.on('capacity:agentUsagePush', listener);
+    return () => ipcRenderer.removeListener('capacity:agentUsagePush', listener);
+  },
   ensureHarnessHome: (path: string): Promise<{ ok: boolean; error?: string }> =>
     ipcRenderer.invoke('config:ensureHome', path),
   /** Change the harness home folder. 'move' copies the existing hive + palace

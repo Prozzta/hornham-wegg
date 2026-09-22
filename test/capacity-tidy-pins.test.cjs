@@ -6,7 +6,7 @@
  *
  *  F6  a pool that LEAVES the complete-replace snapshot loses its weekly latch: back at the
  *      same anchor inside the hysteresis band, weekly is HIDDEN, not held.
- *  F7  a Budget line never asks main for 5H/Weekly usage (poll only while it shows them).
+ *  F7  a Budget line never asks main for 5H/Weekly usage, nor subscribes (unit #13: pushed, not polled).
  *  F8  a restored, unconfirmed pool offers NO current figure in the detail, EVEN IF its
  *      freshness verdict were FRESH (the validator could not catch that; only the gate does).
  *  F9  crit 16: an attributed window id that matches NO window never becomes a causal
@@ -61,33 +61,39 @@ test('F6: a pool that left the snapshot comes back same-anchor at ~17% with week
 
 // ─── F7 ─────────────────────────────────────────────────────────────────────────────
 
-test('F7: a Budget line never calls capacityAgentUsage; 5H / Weekly poll it, and stop on cleanup', () => {
+test('F7 (unit #13 reshape): a Budget line subscribes to nothing and reads nothing; 5H / Weekly read once + listen, and let go on cleanup', () => {
   const { useAgentUsageWindow } = loadTs('src/renderer/src/components/AgentUsageLine.tsx');
   const calls = [];
   const cleanups = [];
+  const listeners = new Set();
   const timers = [];
   const saved = { useEffect: React.useEffect, useState: React.useState, window: global.window,
-    setInterval: global.setInterval, clearInterval: global.clearInterval };
+    setInterval: global.setInterval, setTimeout: global.setTimeout };
   React.useEffect = (fn) => { const c = fn(); if (typeof c === 'function') cleanups.push(c); };
   React.useState = (init) => [init, () => {}];
-  global.window = { cth: { capacityAgentUsage: (id) => { calls.push(id); return new Promise(() => {}); } } };
-  global.setInterval = (fn) => { timers.push(fn); return timers.length; };
-  global.clearInterval = () => { timers.length = 0; };
+  global.window = { cth: {
+    capacityAgentUsage: (id) => { calls.push(id); return new Promise(() => {}); },
+    onAgentUsage: (cb) => { listeners.add(cb); return () => listeners.delete(cb); }
+  } };
+  // Recorded, never started: a timer must FAIL this pin, not hang the test process.
+  global.setInterval = () => { timers.push('setInterval'); return 0; };
+  global.setTimeout = () => { timers.push('setTimeout'); return 0; };
   try {
     useAgentUsageWindow('a1', 'budget');
     assert.deepEqual(calls, [], 'Budget: no usage read at all');
-    assert.equal(timers.length, 0, 'Budget: no poll scheduled');
+    assert.equal(listeners.size, 0, 'Budget: no subscription');
     for (const display of ['fiveHour', 'weekly']) {
       calls.length = 0;
       useAgentUsageWindow('a1', display);
-      assert.deepEqual(calls, ['a1'], `${display}: reads once now`);
-      assert.equal(timers.length, 1, `${display}: and polls`);
+      assert.deepEqual(calls, ['a1'], `${display}: one mount-time read`);
+      assert.equal(listeners.size, 1, `${display}: and it listens to main`);
       cleanups.pop()();
-      assert.equal(timers.length, 0, `${display}: the poll stops on cleanup`);
+      assert.equal(listeners.size, 0, `${display}: unsubscribed on cleanup`);
     }
+    assert.deepEqual(timers, [], 'no timer in any mode');
   } finally {
     React.useEffect = saved.useEffect; React.useState = saved.useState; global.window = saved.window;
-    global.setInterval = saved.setInterval; global.clearInterval = saved.clearInterval;
+    global.setInterval = saved.setInterval; global.setTimeout = saved.setTimeout;
   }
 });
 

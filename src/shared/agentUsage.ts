@@ -93,3 +93,34 @@ export function validateAgentUsageView(v: unknown): string[] {
   const errors = Object.keys(o).filter((k) => k !== 'fiveHour' && k !== 'weekly').map((k) => `$.${k}: property not allowed`);
   return [...errors, ...windowErrors(o.fiveHour, '$.fiveHour'), ...windowErrors(o.weekly, '$.weekly')];
 }
+
+// ─── v1.1.45 unit #13: the usage line is PUSHED by main (crit 15: no renderer polling) ───
+
+/** Push channel: every 5H / Weekly agent's usage, on its OWN channel (never control:snapshot). */
+export const CAPACITY_AGENT_USAGE_PUSH = 'capacity:agentUsagePush';
+
+/** One agent's row. The agent id is the only key; no pool identity crosses the bridge. */
+export interface AgentUsageRow { agentId: string; view: AgentUsageView }
+
+/** The complete set of rows for every agent whose persisted display is 5H or Weekly. */
+export interface AgentUsagePush { rows: AgentUsageRow[] }
+
+/** Validate a push. Empty = valid. Anything else is refused whole. */
+export function validateAgentUsagePush(v: unknown): string[] {
+  if (typeof v !== 'object' || v === null || Array.isArray(v)) return ['$: not an object'];
+  const o = v as Record<string, unknown>;
+  const errors = Object.keys(o).filter((k) => k !== 'rows').map((k) => `$.${k}: property not allowed`);
+  if (!Array.isArray(o.rows)) return [...errors, '$.rows: not an array'];
+  const seen = new Set<string>();
+  o.rows.forEach((r, i) => {
+    const at = `$.rows[${i}]`;
+    if (typeof r !== 'object' || r === null || Array.isArray(r)) { errors.push(`${at}: not an object`); return; }
+    const row = r as Record<string, unknown>;
+    for (const k of Object.keys(row)) if (k !== 'agentId' && k !== 'view') errors.push(`${at}.${k}: property not allowed`);
+    if (typeof row.agentId !== 'string' || row.agentId.length === 0) errors.push(`${at}.agentId: not a non-empty string`);
+    else if (seen.has(row.agentId)) errors.push(`${at}.agentId: duplicate`);
+    else seen.add(row.agentId);
+    errors.push(...validateAgentUsageView(row.view).map((e) => e.replace(/^\$/, `${at}.view`)));
+  });
+  return errors;
+}

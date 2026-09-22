@@ -129,7 +129,7 @@ test('persist: an invalid agent or value never reaches the config', () => {
 test('main wiring: the breaker gets agentUsageDisplay live, and the setter has its own IPC', () => {
   const main = codeOnly(readSource('src/main/index.ts'), 'index.ts');
   assert.match(main, /agentTokenCaps: c\.agentTokenCaps,\s*agentUsageDisplay: c\.agentUsageDisplay/);
-  assert.match(main, /ipcMain\.handle\('config:setAgentUsageDisplay', \(_evt, agentId: unknown, display: unknown\) =>\s*setAgentUsageDisplay\(agentId, display\)/);
+  assert.match(main, /ipcMain\.handle\('config:setAgentUsageDisplay', \(_evt, agentId: unknown, display: unknown\) => \{\s*const next = setAgentUsageDisplay\(agentId, display\);/);
   assert.match(readSource('src/preload/index.ts'), /ipcRenderer\.invoke\('config:setAgentUsageDisplay', agentId, display\)/);
 });
 

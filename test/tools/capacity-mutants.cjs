@@ -1,7 +1,7 @@
 'use strict';
 
 /**
- * Mutant runner for the capacity display milestone (v1.1.45 units #1, #2, #4, #5, #6, #7, #8, #11, #12, CAPUI-TIDY, the strip polish and CAPUI-MONITOR).
+ * Mutant runner for the capacity display milestone (v1.1.45 units #1, #2, #4, #5, #6, #7, #8, #11, #12, #13, CAPUI-TIDY, the strip polish and CAPUI-MONITOR).
  *
  * WHY IT IS COMMITTED (Jim's audit, F2). A mutant count that lives in someone's
  * scratchpad cannot be reproduced, and a count nobody can reproduce is not evidence.
@@ -33,7 +33,7 @@ const TESTS = ['test/capacity-strip-contract.test.cjs', 'test/capacity-strip-ui.
   'test/capacity-threshold.test.cjs', 'test/capacity-detail.test.cjs',
   'test/capacity-banner.test.cjs', 'test/capacity-toast.test.cjs',
   'test/capacity-composer-note.test.cjs', 'test/capacity-copy-guards.test.cjs',
-  'test/capacity-tidy-pins.test.cjs'];
+  'test/capacity-tidy-pins.test.cjs', 'test/capacity-usage-push.test.cjs'];
 
 const STRIP = 'src/main/capacityStrip.ts';
 const SHARED = 'src/shared/capacityStrip.ts';
@@ -372,6 +372,28 @@ const MUTANTS = [
     "  try {\n    if (!deps.supported()) return 'UNSUPPORTED';\n    if (!deps.notificationsOn()) return 'SUPPRESSED';"],
   ['tidy M2 the not-applied clause dropped from the tooltip', PANEL_CC,
     " — not applied while this line shows 5H or Weekly'", "'"],
+  // ── unit #13: the usage line is pushed, not polled (crit 15) ─────────────────────
+  ['u13 the usage line polls again', USAGE_LINE,
+    '    let pushed = false;\n', '    let pushed = false;\n    const iv = setInterval(() => {}, 5000); void iv;\n'],
+  ['u13 dedupe keyed on something other than the rows (drops a real usage change)', USAGE_MAIN,
+    '    const key = JSON.stringify(push.rows);', '    const key = JSON.stringify(push.rows.map((r) => r.agentId));'],
+  ['u13 the usage push gated on the strip collectionRevision', INDEX,
+    'onChange: () => { pushCapacityStrip(); pushAgentUsage(); }',
+    'onChange: () => { const was = lastPushedCapacityStrip; pushCapacityStrip(); if (lastPushedCapacityStrip !== was) pushAgentUsage(); }'],
+  ['u13 the display setter does not push', INDEX,
+    '  const next = setAgentUsageDisplay(agentId, display);\n  pushAgentUsage();\n', '  const next = setAgentUsageDisplay(agentId, display);\n'],
+  ['u13 an agent spawn does not push', INDEX,
+    '    ptyProvider.set(opts.id, provider);\n    // A new agent with no reading yet makes its provider\'s membership unknown.\n    pushCapacityStrip();\n    pushAgentUsage();\n',
+    '    ptyProvider.set(opts.id, provider);\n    // A new agent with no reading yet makes its provider\'s membership unknown.\n    pushCapacityStrip();\n'],
+  ['u13 an agent leave does not push', INDEX,
+    '    // Pool membership completeness can change when an agent leaves.\n    pushCapacityStrip();\n    pushAgentUsage();\n',
+    '    // Pool membership completeness can change when an agent leaves.\n    pushCapacityStrip();\n'],
+  ['u13 usage pushed on control:snapshot', INDEX,
+    'w.webContents.send(CAPACITY_AGENT_USAGE_PUSH, push)', "w.webContents.send('control:snapshot', push)"],
+  ['u13 a late mount answer overwrites a newer push', USAGE_LINE,
+    'if (alive && !pushed) setView(pick(u));', 'if (alive) setView(pick(u));'],
+  ['u13 Budget agents get pushed rows', USAGE_MAIN,
+    '.filter((id) => isBudgetExempt(displays?.[id]))', ''],
 ];
 
 // THE BASELINE MUST BE GREEN. Against already-failing tests every mutant "dies", and a
