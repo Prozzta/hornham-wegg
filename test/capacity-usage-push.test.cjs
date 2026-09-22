@@ -159,3 +159,31 @@ test('the hook: invoke once on mount, then pushes for THIS agent only; a push be
   h.cleanup();
   assert.equal(listeners.size, 0, 'unsubscribed on cleanup');
 });
+
+// ─── Jim's #13 audit: F11 + F12 (tests only; the code is correct in both spots) ─────
+
+test('F11: a push WITHOUT this agent\'s row does not count as "pushed" - the mount answer still lands', async () => {
+  let resolveInvoke;
+  const listeners = new Set();
+  const bridge = {
+    capacityAgentUsage: () => new Promise((res) => { resolveInvoke = res; }),
+    onAgentUsage: (cb) => { listeners.add(cb); return () => listeners.delete(cb); }
+  };
+  const h = runHook('amy', 'fiveHour', bridge);
+  const view = (w) => ({ fiveHour: { kind: 'TEXT', text: w }, weekly: { kind: 'TEXT', text: 'Weekly' } });
+  for (const cb of listeners) cb({ rows: [{ agentId: 'bob', view: view('bob') }] });   // row-less for amy
+  for (const cb of listeners) cb({ rows: [] });
+  resolveInvoke(view('mount answer'));
+  await new Promise((res) => setImmediate(res));
+  assert.deepEqual(h.views, [{ kind: 'TEXT', text: 'mount answer' }], 'the initial state is not lost to an unrelated push');
+  h.cleanup();
+});
+
+test('F12: the dedupe key includes the agent id - the SAME view under a DIFFERENT agent is sent again', () => {
+  const gate = new AgentUsagePushGate();
+  const v = { fiveHour: { kind: 'TEXT', text: '5h · capacity unknown' }, weekly: { kind: 'TEXT', text: 'Weekly · capacity unknown' } };
+  assert.ok(gate.next({ rows: [{ agentId: 'amy', view: v }] }));
+  const moved = gate.next({ rows: [{ agentId: 'bob', view: v }] });
+  assert.ok(moved, 'amy switched to Budget and bob to 5H with an identical view: the rows changed, so it is sent');
+  assert.deepEqual(moved.rows.map((r) => r.agentId), ['bob']);
+});
