@@ -13,7 +13,7 @@
  */
 import { useCapacityStrip, dismissCapacityNotice } from '../capacity/useCapacityStrip';
 import { selectLimitBanners } from '../capacity/capacityStrip';
-import { StateShape } from './CapacityStrip';
+import { StateDot } from './CapacityStrip';
 import type { CapacityBanner } from '@shared/capacityStrip';
 
 export interface BannerItem { poolId: string; noticeId: string; banner: CapacityBanner }
@@ -37,7 +37,7 @@ export function CapacityLimitBannerView({ items, onDismiss }: { items: readonly 
             fontFamily: 'var(--cth-font-ui)', color: 'var(--cth-ink-900)'
           }}
         >
-          <span style={{ paddingTop: 1 }}><StateShape state="LIMITED" name={it.banner.title} /></span>
+          <span style={{ paddingTop: 1 }}><StateDot look={{ kind: 'STOP' }} state="LIMITED" name={it.banner.title} /></span>
           <span style={{ display: 'flex', flexDirection: 'column', gap: 2, flex: 1, minWidth: 0 }}>
             <span style={{ fontSize: 13, fontWeight: 600 }}>{it.banner.title}</span>
             <span style={{ fontSize: 12, color: 'var(--cth-ink-700)' }}>{it.banner.cause}</span>

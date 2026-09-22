@@ -24,7 +24,7 @@ const S = require('./capacity-surface.cjs');
 
 const { STATE_TEXT } = loadTs('src/main/capacityStrip.ts');
 const { CAPACITY_EMPTY_TEXT } = loadTs('src/shared/capacityStrip.ts');
-const { CapacityStripView, STATE_TOKEN } = loadTs('src/renderer/src/components/CapacityStrip.tsx');
+const { CapacityStripView } = loadTs('src/renderer/src/components/CapacityStrip.tsx');
 
 const FIX = S.FIXTURES();
 const SOURCE = S.sourceCorpus();

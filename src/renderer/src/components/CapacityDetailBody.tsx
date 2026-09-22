@@ -3,7 +3,8 @@
  * store, no IPC), so it can be render-tested; the connected overlay is CapacityDetailPanel.
  */
 import type { ProviderCapacityDetailView } from '@shared/capacityDetail';
-import { CapacityMeter, STATE_COLOR, StateShape } from './CapacityStrip';
+import { CapacityMeter, STATE_COLOR, StateDot } from './CapacityStrip';
+import { detailDotOf } from '../capacity/pieDot';
 
 /** The panel body for one detail view. Pure: rendered by the connected panel and by tests. */
 export function CapacityDetailBody({ view, agentName }: {
@@ -14,7 +15,7 @@ export function CapacityDetailBody({ view, agentName }: {
   return (
     <div data-cap-detail={view.poolId} style={{ display: 'flex', flexDirection: 'column', gap: 10, padding: 14 }}>
       <div style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 13, color: 'var(--cth-ink-900)' }}>
-        <StateShape state={view.state} name={view.stateText} />
+        <StateDot look={detailDotOf(view)} state={view.state} name={view.stateText} />
         <span data-cap-detail-state="">{view.stateText}</span>
       </div>
       {view.statusNote && <div data-cap-detail-status="" style={muted}>{view.statusNote}</div>}

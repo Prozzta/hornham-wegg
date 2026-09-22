@@ -1,56 +1,71 @@
 /**
- * v1.1.45 unit #14 (human visual feedback) — the PIE-DOT that replaces the strip's bar.
- * Pure: which look a pool's dot takes, the colour for a remaining figure, and the wedge
- * geometry. The component (CapacityStrip.tsx) only draws what this decides.
+ * v1.1.45 unit #14 (human-approved look) — the PIE-DOT, THE capacity mark of the strip.
+ * Pure: which look a dot takes, the colour for a remaining figure, and the wedge geometry.
+ * The components (CapacityStrip.tsx) only draw what this decides.
  *
  *   - A live figure: a PIE whose filled wedge IS the remaining fraction (100% = full disc),
  *     coloured on ONE smooth scale from full green at 100% to dark red at 0%. The colour
- *     follows the figure, not the state (the human superseded the per-state tokens).
+ *     follows the figure, not the state (the human superseded the per-state glyph tokens).
  *   - LIMITED: a STOP SIGN (red octagon), never a pie.
- *   - UNKNOWN (no reading, cold start): a black-and-white SPOTTED dot, never a colour.
- *   - STALE (an aged, last-known reading): the DIMMED look by default. The human may pick
- *     the spotted look instead; that is one constant, STALE_LOOK.
+ *   - Never read / no usable reading: a black-and-white SPOTTED dot, never a colour.
+ *   - STALE (human ruling S1 = a): a DIMMED dot with NO wedge. A stale reading carries no
+ *     figure on the strip (A1), so the dimmed dot has none either; it says "we had a
+ *     reading and it aged", which the spotted "never read" dot does not.
+ *
+ * Stale needs NO new contract field: main already sends `freshness.verdict`, and the
+ * renderer's one-way expiry mask marks the pool `masked`. Either one means stale.
  *
  * Still ONE continuous fill per figure (§9: continuous = provider capacity); never segments.
  */
+import type { ProviderCapacityDetailView } from '@shared/capacityDetail';
 import type { PresentedPool } from './capacityStrip';
 
-/** Pixel diameter of every pie-dot (the old state token was 14px text). */
+/** Pixel diameter of every pie-dot (the old state glyph was 14px text). */
 export const PIE_DOT_SIZE = 20;
 
-/** How a STALE pool's dot looks. DIMMED is the default the human will confirm. */
-export const STALE_LOOK: 'DIMMED' | 'SPOTTED' = 'DIMMED';
+/**
+ * The disc behind a wedge: ONE fixed light colour in both themes, so every colour on the
+ * ramp keeps >= 3:1 against it, and the disc itself stands out on the dark title bar.
+ */
+export const PIE_TRACK = '#F6F3E8';
+
+/** The disc's rim (fixed; the light disc carries the contrast against either theme). */
+export const PIE_RIM = '#736A80';
+
+/** The stop sign's red (fixed in both themes; a white edge keeps it clear on dark). */
+export const STOP_RED = '#B3121C';
 
 export type DotLook =
   | { kind: 'STOP' }
   | { kind: 'SPOTTED' }
   /** A live figure: `percent` remaining, 0..100. */
   | { kind: 'PIE'; percent: number }
-  /** Stale. `percent` is the last-known figure when one is available, else null (a ring). */
-  | { kind: 'DIMMED'; percent: number | null }
-  /** A known state with no figure to draw (e.g. a live 5h that is not reported). */
+  /** Stale: dimmed, and wedge-less BY TYPE - there is no figure to carry (A1). */
+  | { kind: 'DIMMED' }
+  /** A known, fresh state with no figure to draw (e.g. a live 5h that is not reported). */
   | { kind: 'RING' };
 
 /**
  * Colour stops for the remaining scale: green at 100, amber/orange around 50, dark red at 0.
  * Interpolated in HSL between neighbours, so the ramp is smooth with no visible bands.
+ * Lightness is capped so every point keeps >= 3:1 against PIE_TRACK (a test pins it).
  */
-const STOPS: readonly (readonly [number, number, number, number])[] = [
+export const PIE_STOPS: readonly (readonly [number, number, number, number])[] = [
   // [remaining%, hue, saturation%, lightness%]
   [0, 0, 75, 28],
-  [25, 14, 80, 42],
-  [50, 36, 90, 47],
-  [75, 80, 60, 40],
-  [100, 128, 55, 36]
+  [25, 14, 80, 38],
+  [50, 34, 92, 36],
+  [75, 78, 62, 30],
+  [100, 128, 55, 32]
 ];
 
 /** The colour for `percent` remaining (clamped to 0..100). */
 export function remainingColor(percent: number): string {
   const p = Math.min(100, Math.max(0, Number.isFinite(percent) ? percent : 0));
   let i = 0;
-  while (i < STOPS.length - 2 && p > STOPS[i + 1][0]) i++;
-  const [p0, h0, s0, l0] = STOPS[i];
-  const [p1, h1, s1, l1] = STOPS[i + 1];
+  while (i < PIE_STOPS.length - 2 && p > PIE_STOPS[i + 1][0]) i++;
+  const [p0, h0, s0, l0] = PIE_STOPS[i];
+  const [p1, h1, s1, l1] = PIE_STOPS[i + 1];
   const t = (p - p0) / (p1 - p0);
   const mix = (a: number, b: number) => Math.round((a + (b - a) * t) * 10) / 10;
   return `hsl(${mix(h0, h1)}, ${mix(s0, s1)}%, ${mix(l0, l1)}%)`;
@@ -74,17 +89,26 @@ export function wedgePath(percent: number, r: number, c: number): string | 'FULL
 }
 
 /**
- * The look of a pool's LEAD dot (the state position). The 5h figure is the live pie; a
- * revealed weekly figure gets its own pie beside its text (see poolTokens).
+ * The look of a pool's LEAD dot on the strip (the state position). The live 5h figure is
+ * that pie; a revealed weekly figure gets its own pie beside its text (see poolTokens).
  */
 export function leadDotOf(pool: PresentedPool): DotLook {
+  // An open limit stays a stop sign even once its reading ages (A1: the state is kept).
   if (pool.state === 'LIMITED') return { kind: 'STOP' };
-  if (pool.state === 'UNKNOWN') return { kind: 'SPOTTED' };
-  // A known state whose figures were removed: the reading aged out, or the one-way
-  // expiry mask fired (A1: the state is kept, the figures are not).
-  if (pool.presentation === 'UNKNOWN') return STALE_LOOK === 'SPOTTED' ? { kind: 'SPOTTED' } : { kind: 'DIMMED', percent: null };
-  // The A2 held frame (RESERVE_ONLY, weekly freshly at 0): the weekly figure is primary.
+  if (pool.masked || pool.freshness.verdict === 'STALE') return { kind: 'DIMMED' };
+  if (pool.state === 'UNKNOWN' || pool.presentation === 'UNKNOWN') return { kind: 'SPOTTED' };
+  // The A2 held frame (RESERVE_ONLY, weekly freshly at 0; S3): an EMPTY pie, no stop sign -
+  // the provider did not attribute a limit.
   if (pool.presentation === 'BLOCKED_SUBORDINATE') return { kind: 'PIE', percent: 0 };
   const five = pool.fiveHour.meter?.remainingPercent;
+  return typeof five === 'number' ? { kind: 'PIE', percent: five } : { kind: 'RING' };
+}
+
+/** The same rules for the provider-details header (one mark for a pool everywhere). */
+export function detailDotOf(view: ProviderCapacityDetailView): DotLook {
+  if (view.state === 'LIMITED') return { kind: 'STOP' };
+  if (view.freshness.verdict === 'STALE') return { kind: 'DIMMED' };
+  if (view.state === 'UNKNOWN') return { kind: 'SPOTTED' };
+  const five = view.windows.find((w) => w.kind === 'FIVE_HOUR')?.remainingPercent;
   return typeof five === 'number' ? { kind: 'PIE', percent: five } : { kind: 'RING' };
 }

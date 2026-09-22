@@ -30,7 +30,6 @@ export type StripToken =
 /** Fixed pixel geometry shared with the component. */
 export const STRIP_GEOMETRY = {
   mark: 14,
-  stateToken: 14,
   meter: 40,
   gap: 6,
   poolGap: 18

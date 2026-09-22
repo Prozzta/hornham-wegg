@@ -98,9 +98,7 @@ const spectrum = [100, 90, 80, 70, 60, 50, 40, 30, 20, 10, 5, 0].map((p) =>
 const specials = [
   cell(dot(React.createElement(StateDot, { look: { kind: 'STOP' }, state: 'LIMITED', name: 'Limited' })), 'LIMIT reached', 'stop sign, not a pie'),
   cell(dot(React.createElement(StateDot, { look: { kind: 'SPOTTED' }, state: 'UNKNOWN', name: 'Unknown' })), 'UNKNOWN / no reading', 'black-and-white spotted'),
-  cell(dot(React.createElement(StateDot, { look: { kind: 'DIMMED', percent: null }, state: 'AVAILABLE', name: 'Available' })), 'STALE (default, today)', 'dimmed, dashed rim, no wedge'),
-  cell(dot(React.createElement(StateDot, { look: { kind: 'DIMMED', percent: 72 }, state: 'AVAILABLE', name: 'Available' })), 'STALE with last-known 72%', 'dimmed pie: needs a contract change (see note)'),
-  cell(dot(React.createElement(StateDot, { look: { kind: 'SPOTTED' }, state: 'AVAILABLE', name: 'Available' })), 'STALE, alternative', 'the spotted look instead'),
+  cell(dot(React.createElement(StateDot, { look: { kind: 'DIMMED' }, state: 'AVAILABLE', name: 'Available' })), 'STALE (approved)', 'dimmed, dashed rim, no wedge, no figure'),
   cell(dot(React.createElement(StateDot, { look: { kind: 'RING' }, state: 'AVAILABLE', name: 'Available' })), 'known state, no figure', 'empty ring (rare)')
 ].join('');
 const LEGEND = `
@@ -126,12 +124,12 @@ const panels = [
     scenario([codex(std(63, 0))]), MIN),
   panel('UNKNOWN (fresh reading, no usable numbers)', 'The spotted dot; no pie at all; the status is stated.',
     scenario([codex([win('five_hour', 'FIVE_HOUR', null, null), win('seven_day', 'SEVEN_DAY', 60, null)])]), MIN),
-  panel('Stale', 'The reading aged out. TODAY this draws the SPOTTED dot: a stale reading is forced to UNKNOWN, and the strip is told nothing that separates it from "no reading" (the same text as the panel above). The DIMMED look in the legend needs main to say "stale" - see the note to god.',
+  panel('Stale', 'The reading aged out: the DIMMED dot (dashed rim, no wedge, no figure), distinct from the never-read spotted dot above; absolute last-update time.',
     scenario([codex(std(80, 60))], { stale: true }), MIN),
   panel('Stale + open limit epoch (A1)', 'The stop sign stays (the tracker\'s state is kept); the figures are removed.',
     // 5h reset beyond the staleness gap: a PASSED reset would (correctly) move the epoch to RECOVERING.
     scenario([codex(std(80, 60, T0 + 3 * H), { providerReachedType: 'usage' })], { stale: true }), MIN),
-  panel('Restored after restart', 'Evidence survived a restart but no live reading has confirmed it yet.',
+  panel('Restored after restart', 'Evidence survived a restart but no live reading has confirmed it yet: the dimmed dot, like any aged reading.',
     scenario([codex(std(80, 60), undefined, { restore: true, ageMin: 5 })]), MIN),
   panel('Busy — two pools, everything showing, full-screen window', 'Both weekly rows revealed and every reset hint showing, on a 1920px window. This much text may overflow even here; if it does, it scrolls.',
     scenario([codex(std(12, 9.5)), claude(std(8, 13))]), FULL),
@@ -187,7 +185,7 @@ const html = `<!doctype html>
   .sub { font-size: 10px; color: var(--cth-ink-500); line-height: 1.3; }
 </style></head>
 <body>
-<h1>Title-bar capacity strip — visual preview (unit #14: the pie-dot)</h1>
+<h1>Title-bar capacity strip — visual preview (unit #14: the pie-dot, approved)</h1>
 <p class="lead">Every panel is a real pool object from the real tracker and presenter, rendered by the real strip component
 inside a replica of the 36px title bar at the stated window width (the app's minimum is 1280px). The bar is gone: each figure
 is a PIE-DOT whose wedge and colour are the remaining share (green at 100% to dark red at 0%). A provider limit is a stop sign;

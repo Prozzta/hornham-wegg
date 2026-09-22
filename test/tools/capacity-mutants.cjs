@@ -1,7 +1,7 @@
 'use strict';
 
 /**
- * Mutant runner for the capacity display milestone (v1.1.45 units #1, #2, #4, #5, #6, #7, #8, #11, #12, #13, CAPUI-TIDY, the strip polish and CAPUI-MONITOR).
+ * Mutant runner for the capacity display milestone (v1.1.45 units #1, #2, #4, #5, #6, #7, #8, #11, #12, #13, #14, CAPUI-TIDY, the strip polish and CAPUI-MONITOR).
  *
  * WHY IT IS COMMITTED (Jim's audit, F2). A mutant count that lives in someone's
  * scratchpad cannot be reproduced, and a count nobody can reproduce is not evidence.
@@ -33,7 +33,8 @@ const TESTS = ['test/capacity-strip-contract.test.cjs', 'test/capacity-strip-ui.
   'test/capacity-threshold.test.cjs', 'test/capacity-detail.test.cjs',
   'test/capacity-banner.test.cjs', 'test/capacity-toast.test.cjs',
   'test/capacity-composer-note.test.cjs', 'test/capacity-copy-guards.test.cjs',
-  'test/capacity-tidy-pins.test.cjs', 'test/capacity-usage-push.test.cjs'];
+  'test/capacity-tidy-pins.test.cjs', 'test/capacity-usage-push.test.cjs',
+  'test/capacity-piedot.test.cjs'];
 
 const STRIP = 'src/main/capacityStrip.ts';
 const SHARED = 'src/shared/capacityStrip.ts';
@@ -64,6 +65,7 @@ const TOAST = 'src/main/capacityToast.ts';
 const COMPOSER_STATUS = 'src/renderer/src/components/composerStatus.ts';
 const COMPOSER = 'src/renderer/src/components/MessageQueueComposer.tsx';
 const PANEL_CC = 'src/renderer/src/components/CommandCenterPanel.tsx';
+const PIE = 'src/renderer/src/capacity/pieDot.ts';
 
 /** [name, file, from, to] */
 const MUTANTS = [
@@ -131,7 +133,9 @@ const MUTANTS = [
     "color: token.subordinate ? 'var(--cth-ink-500)' : 'var(--cth-ink-900)',",
     "color: token.subordinate ? 'var(--cth-status-success)' : 'var(--cth-ink-900)',"],
   ['u2 meter drawn as a progressbar', VIEW, "    <span role=\"meter\" aria-valuemin={0}", "    <span role=\"progressbar\" aria-valuemin={0}"],
-  ['u2 UNKNOWN shares the healthy token', VIEW, "UNKNOWN: '◌'", "UNKNOWN: '●'"],
+  ['u2 UNKNOWN shares the healthy look (cold start drawn as a full green pie)', VIEW,
+    "              <StateDot look={{ kind: 'SPOTTED' }} state=\"UNKNOWN\" name={emptyText} />",
+    "              <StateDot look={{ kind: 'PIE', percent: 100 }} state=\"UNKNOWN\" name={emptyText} />"],
   ['polish UNKNOWN back to the pale ghost ink', VIEW,
     "UNKNOWN: 'var(--cth-ink-500)'", "UNKNOWN: 'var(--cth-status-ghost)'"],
   ['polish a state word is visible again', VIEW,
@@ -393,6 +397,55 @@ const MUTANTS = [
     '      if (!alive || !row) return;\n      pushed = true;\n', '      pushed = true;\n      if (!alive || !row) return;\n'],
   ['u13 F12 dedupe keyed on views alone (agent ids dropped)', USAGE_MAIN,
     '    const key = JSON.stringify(push.rows);', '    const key = JSON.stringify(push.rows.map((r) => r.view));'],
+  // ── unit #14: the pie-dot (human-approved look) ────────────────────────────────
+  ["u14 the strip draws a bar again", VIEW,
+    "  return <PieMeter percent={token.meter.remainingPercent} valueText={token.valueText} role={token.role} />;",
+    "  return <CapacityMeter percent={token.meter.remainingPercent} valueText={token.valueText} color=\"red\" dataRole={token.role} />;"],
+  ["u14 the wedge sweeps the USED share", PIE,
+    "  const a = (p / 100) * 2 * Math.PI;",
+    "  const a = (1 - p / 100) * 2 * Math.PI;"],
+  ["u14 the colour ramp is inverted", PIE,
+    "  const p = Math.min(100, Math.max(0, Number.isFinite(percent) ? percent : 0));",
+    "  const p = 100 - Math.min(100, Math.max(0, Number.isFinite(percent) ? percent : 0));"],
+  ["u14 one colour for every figure", PIE,
+    "  return `hsl(${mix(h0, h1)}, ${mix(s0, s1)}%, ${mix(l0, l1)}%)`;",
+    "  return 'hsl(128, 55%, 32%)';"],
+  ["u14 LIMITED drawn as a pie", PIE,
+    "  if (pool.state === 'LIMITED') return { kind: 'STOP' };\n",
+    ""],
+  ["u14 never-read drawn as a plain ring", PIE,
+    "  if (pool.state === 'UNKNOWN' || pool.presentation === 'UNKNOWN') return { kind: 'SPOTTED' };",
+    "  if (pool.state === 'UNKNOWN' || pool.presentation === 'UNKNOWN') return { kind: 'RING' };"],
+  ["u14 stale drawn as a live pie", PIE,
+    "  if (pool.masked || pool.freshness.verdict === 'STALE') return { kind: 'DIMMED' };",
+    "  if (pool.masked || pool.freshness.verdict === 'STALE') return { kind: 'PIE', percent: 50 };"],
+  ["u14 stale no longer told apart from never-read", PIE,
+    "  if (pool.masked || pool.freshness.verdict === 'STALE') return { kind: 'DIMMED' };\n",
+    ""],
+  ["u14 the dimmed dot carries a figure", VIEW,
+    "      <circle cx={c} cy={c} r={c - 1.5} fill=\"#D6D1C8\"",
+    "      <path data-cap-fill=\"\" d=\"M 10 10 L 10 1.5 A 8.5 8.5 0 0 1 18.5 10 Z\" fill=\"green\" />\n      <circle cx={c} cy={c} r={c - 1.5} fill=\"#D6D1C8\""],
+  ["u14 the dot shrinks back to the glyph size", PIE,
+    "export const PIE_DOT_SIZE = 20;",
+    "export const PIE_DOT_SIZE = 14;"],
+  ["u14 the A2 frame drawn as a stop sign", PIE,
+    "  if (pool.presentation === 'BLOCKED_SUBORDINATE') return { kind: 'PIE', percent: 0 };",
+    "  if (pool.presentation === 'BLOCKED_SUBORDINATE') return { kind: 'STOP' };"],
+  ["u14 the empty pie loses its dark-red rim", VIEW,
+    "stroke={percent === 0 ? remainingColor(0) : PIE_RIM}",
+    "stroke={PIE_RIM}"],
+  ["u14 the disc follows the dark theme (contrast lost)", PIE,
+    "export const PIE_TRACK = '#F6F3E8';",
+    "export const PIE_TRACK = '#1A1A1F';"],
+  ["u14 the stop sign loses its white edge", VIEW,
+    "fill={STOP_RED} stroke=\"#FFFFFF\" strokeWidth={0.8}",
+    "fill={STOP_RED}"],
+  ["u14 the banner goes back to a non-stop mark", BANNER,
+    "<StateDot look={{ kind: 'STOP' }} state=\"LIMITED\" name={it.banner.title} />",
+    "<StateDot look={{ kind: 'SPOTTED' }} state=\"LIMITED\" name={it.banner.title} />"],
+  ["u14 the 5h pie drawn twice (lead dot + token)", LAYOUT,
+    "if (normal && meter && role !== 'five-hour')",
+    "if (normal && meter)"],
 ];
 
 // THE BASELINE MUST BE GREEN. Against already-failing tests every mutant "dies", and a

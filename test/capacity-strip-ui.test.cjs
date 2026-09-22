@@ -24,7 +24,7 @@ const { CAPACITY_EMPTY_TEXT } = loadTs('src/shared/capacityStrip.ts');
 const { presentPool } = loadTs('src/renderer/src/capacity/capacityStrip.ts');
 const layout = loadTs('src/renderer/src/capacity/stripLayout.ts');
 const { poolTokens } = layout;
-const { CapacityStripView, STATE_TOKEN, STATE_COLOR, STRIP_CSS, scrollDistance, sweepSeconds } =
+const { CapacityStripView, STATE_COLOR, STRIP_CSS, scrollDistance, sweepSeconds } =
   loadTs('src/renderer/src/components/CapacityStrip.tsx');
 
 const T0 = 1_800_000_000_000;
@@ -139,8 +139,7 @@ test('NO state word is visible in any state — the shape carries it, named for 
   }
 });
 
-test('colours: six DISTINCT theme tokens; UNKNOWN is strong neutral ink, never ghost and never healthy', () => {
-  assert.equal(new Set(Object.values(STATE_TOKEN)).size, 6, 'every state has its own shape');
+test('colours (the Monitor usage bar and detail rows): six DISTINCT theme tokens; UNKNOWN is strong neutral ink, never ghost and never healthy', () => {
   assert.equal(new Set(Object.values(STATE_COLOR)).size, 6, 'every state has its own colour');
   assert.notEqual(STATE_COLOR.UNKNOWN, STATE_COLOR.AVAILABLE);
   assert.ok(!Object.values(STATE_COLOR).some((c) => /ghost|idle/.test(c)), 'no pale ghost/idle ink carries a state (V3)');

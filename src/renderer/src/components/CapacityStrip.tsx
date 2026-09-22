@@ -3,10 +3,11 @@
  * C2.6, C2.7, C2.11 crit 1 and 14-15), as amended by the human at the strip review
  * (2026-09-21):
  *
- *   - STATE IS A COLOURED SHAPE, NEVER A WORD. Every pool carries its shape token in
- *     every state, healthy included; the shape is the non-colour channel (§9 kept, the
- *     word dropped). The state word survives only as the token's ACCESSIBLE NAME, so a
- *     screen reader still hears it; nothing visible says "Available".
+ *   - STATE IS A DOT, NEVER A WORD (unit #14, human-approved): every pool leads with ONE
+ *     pie-dot - the live 5h pie (wedge and colour = remaining), a stop sign when limited,
+ *     spotted when never read, dimmed when the reading aged. The dot's form is the
+ *     non-colour channel. The state word survives only as the dot's ACCESSIBLE NAME, so a
+ *     screen reader still hears it; nothing visible says "Available". There is no bar.
  *   - FULL CONTENT, SCROLLED WHEN IT OVERFLOWS, replacing the C2.10 collapse ladder: a
  *     gentle back-and-forth marquee, paused on hover or focus, and no motion at all
  *     under prefers-reduced-motion (the row can then be scrolled by hand).
@@ -31,17 +32,7 @@ import { presentPool, selectPools, type PresentedPool } from '../capacity/capaci
 import { useCapacityStrip } from '../capacity/useCapacityStrip';
 import { poolTokens, STRIP_GEOMETRY, type StripToken } from '../capacity/stripLayout';
 import { openCapacityDetail } from '../capacity/detailSelection';
-import { leadDotOf, PIE_DOT_SIZE, remainingColor, wedgePath, type DotLook } from '../capacity/pieDot';
-
-/** The non-colour channel (§9): a SHAPE per state, so the state survives greyscale. */
-export const STATE_TOKEN: Record<CapacityState, string> = {
-  AVAILABLE: '●',
-  APPROACHING: '▲',
-  RESERVE_ONLY: '◐',
-  LIMITED: '■',
-  RECOVERING: '↻',
-  UNKNOWN: '◌'
-};
+import { leadDotOf, PIE_DOT_SIZE, PIE_RIM, PIE_TRACK, remainingColor, STOP_RED, wedgePath, type DotLook } from '../capacity/pieDot';
 
 /**
  * State colour, strengthened at the review now that colour carries more of the meaning.
@@ -159,46 +150,58 @@ function Token({ token }: { token: StripToken }) {
 
 
 /**
- * v1.1.45 unit #14 — THE PIE-DOT (replaces the strip bar). One disc per figure: the filled
- * wedge IS the remaining fraction, coloured on the one green-to-dark-red scale. A faint rim
- * is always drawn so 0% still reads as a (empty) dot, never as nothing. Still ONE fill.
+ * v1.1.45 unit #14 — THE PIE-DOT (the strip's capacity mark; the bar is gone). One disc per
+ * figure: the filled wedge IS the remaining fraction, coloured on the one green-to-dark-red
+ * scale, on a fixed light disc so it reads in both themes. At 0% the rim takes the dark
+ * red, so an empty pie still reads as spent, never as nothing. Still ONE fill.
  */
-function PieSvg({ percent, dimmed = false }: { percent: number | null; dimmed?: boolean }) {
+function PieSvg({ percent }: { percent: number | null }) {
   const d = PIE_DOT_SIZE;
   const c = d / 2;
   const r = c - 1.5;
   const wedge = percent === null ? null : wedgePath(percent, r, c);
   const fill = percent === null ? 'none' : remainingColor(percent);
   return (
-    <svg width={d} height={d} viewBox={`0 0 ${d} ${d}`} aria-hidden="true"
-      style={{ display: 'block', opacity: dimmed ? 0.45 : 1, filter: dimmed ? 'saturate(0.35)' : undefined }}>
-      {/* At 0% the rim itself takes the dark red, so an empty pie still reads as spent. */}
-      <circle cx={c} cy={c} r={r} fill="var(--cth-paper-100)"
-        stroke={percent === 0 ? remainingColor(0) : dimmed ? 'var(--cth-ink-500)' : 'var(--cth-ink-300)'}
-        strokeWidth={percent === 0 ? 1.6 : 1} strokeDasharray={dimmed ? '2 2' : undefined} />
+    <svg width={d} height={d} viewBox={`0 0 ${d} ${d}`} aria-hidden="true" style={{ display: 'block' }}>
+      <circle cx={c} cy={c} r={r} fill={PIE_TRACK}
+        stroke={percent === 0 ? remainingColor(0) : PIE_RIM} strokeWidth={percent === 0 ? 1.6 : 1} />
       {wedge === 'FULL' ? <circle data-cap-fill="" cx={c} cy={c} r={r} fill={fill} />
         : wedge ? <path data-cap-fill="" d={wedge} fill={fill} /> : null}
     </svg>
   );
 }
 
-/** LIMITED: a stop sign. A red octagon with a white inner rim; no text on it. */
+/**
+ * STALE (S1 = a): a dimmed, WEDGE-LESS disc with a dashed rim. It takes no figure at all -
+ * a stale reading has none on the strip (A1) - so it can never be drawn as a live pie.
+ */
+function DimmedSvg() {
+  const d = PIE_DOT_SIZE;
+  const c = d / 2;
+  return (
+    <svg width={d} height={d} viewBox={`0 0 ${d} ${d}`} aria-hidden="true" style={{ display: 'block' }}>
+      <circle cx={c} cy={c} r={c - 1.5} fill="#D6D1C8" stroke="var(--cth-ink-500)" strokeWidth={1.2} strokeDasharray="2 2" />
+    </svg>
+  );
+}
+
+/** LIMITED: a stop sign. A red octagon, a white inner rim, and a white edge for dark bars. */
 function StopSvg() {
   const d = PIE_DOT_SIZE;
-  const pts = (inset: number) => Array.from([0, 1, 2, 3, 4, 5, 6, 7], (i) => {
+  const pts = (inset: number) => [0, 1, 2, 3, 4, 5, 6, 7].map((i) => {
     const a = (Math.PI / 4) * i + Math.PI / 8;
     const rr = d / 2 - inset;
     return `${(d / 2 + rr * Math.cos(a)).toFixed(2)},${(d / 2 + rr * Math.sin(a)).toFixed(2)}`;
   }).join(' ');
   return (
     <svg width={d} height={d} viewBox={`0 0 ${d} ${d}`} aria-hidden="true" style={{ display: 'block' }}>
-      <polygon points={pts(0.5)} fill="#B3121C" />
-      <polygon points={pts(2.5)} fill="none" stroke="#FFFFFF" strokeWidth={1.2} />
+      <polygon data-cap-stop="" points={pts(0.6)} fill={STOP_RED} stroke="#FFFFFF" strokeWidth={0.8} />
+      <polygon points={pts(2.6)} fill="none" stroke="#FFFFFF" strokeWidth={1.2} />
     </svg>
   );
 }
 
-/** UNKNOWN: black-and-white spotted (a dalmatian dot). No colour, no figure. */
+/** Never read: black-and-white spotted (a dalmatian dot). No colour, no figure. */
 const SPOTS: readonly (readonly [number, number, number])[] = [
   [6.5, 6.5, 2.1], [12.8, 5.6, 1.4], [14.2, 11.2, 2.3], [8.3, 12.6, 1.6], [5.4, 10.4, 1], [11.2, 15.6, 1.2], [10.5, 9.4, 0.9]
 ];
@@ -207,7 +210,7 @@ function SpottedSvg() {
   const k = d / 20;
   return (
     <svg width={d} height={d} viewBox={`0 0 ${d} ${d}`} aria-hidden="true" style={{ display: 'block' }}>
-      <circle cx={d / 2} cy={d / 2} r={d / 2 - 1} fill="#FFFFFF" stroke="#111111" strokeWidth={1.2} />
+      <circle data-cap-spotted="" cx={d / 2} cy={d / 2} r={d / 2 - 1} fill="#FFFFFF" stroke="#111111" strokeWidth={1.2} />
       {SPOTS.map(([x, y, s], i) => <circle key={i} cx={x * k} cy={y * k} r={s * k} fill="#111111" />)}
     </svg>
   );
@@ -225,8 +228,9 @@ export function PieMeter({ percent, valueText, role }: { percent: number; valueT
 }
 
 /**
- * The pool's LEAD dot, in the state position. Its accessible name is main's state word,
- * never visible text. When the look is the live 5h pie, the 5h meter semantics sit on it.
+ * THE capacity mark of a pool, wherever the pool is named (strip, provider details, the
+ * limit banner). Its accessible name is main's state word, never visible text. When the
+ * look is a live 5h pie, the 5h meter semantics sit on it.
  */
 export function StateDot({ look, state, name, meter }: {
   look: DotLook; state: CapacityState; name: string; meter?: { percent: number; valueText: string };
@@ -236,27 +240,10 @@ export function StateDot({ look, state, name, meter }: {
       style={{ display: 'inline-flex', width: PIE_DOT_SIZE, height: PIE_DOT_SIZE, flexShrink: 0 }}>
       {look.kind === 'STOP' ? <StopSvg />
         : look.kind === 'SPOTTED' ? <SpottedSvg />
-        : look.kind === 'DIMMED' ? <PieSvg percent={look.percent} dimmed />
+        : look.kind === 'DIMMED' ? <DimmedSvg />
         : look.kind === 'RING' ? <PieSvg percent={null} />
         : meter ? <PieMeter percent={meter.percent} valueText={meter.valueText} role="five-hour" />
         : <PieSvg percent={look.percent} />}
-    </span>
-  );
-}
-
-/** The pre-#14 glyph shape. Kept for reference only; the strip draws StateDot. */
-export function StateShape({ state, name }: { state: CapacityState; name: string }) {
-  return (
-    <span
-      role="img"
-      aria-label={name}
-      data-cap-state-token={state}
-      style={{
-        color: STATE_COLOR[state], fontSize: 14, fontWeight: 700, lineHeight: 1,
-        display: 'inline-block', width: STRIP_GEOMETRY.stateToken, textAlign: 'center', flexShrink: 0
-      }}
-    >
-      {STATE_TOKEN[state]}
     </span>
   );
 }
