@@ -185,10 +185,10 @@ test('C2.7: provider-attributed weekly limit — BLOCKED_SUBORDINATE, one atomic
     assert.equal(p.weekly.reason, 'PROVIDER_ATTRIBUTED_LIMITING');
     assert.equal(p.weekly.attribution, 'provider');
     assert.equal(p.fiveHour.text, '5h · 63% remaining · unavailable while Weekly is exhausted');
-    assert.equal(p.fiveHour.compactText, '5h 63% · blocked by Weekly');
+    assert.ok(!('compactText' in p.fiveHour) && !('compactText' in p.weekly), 'P3: no compact form is sent');
     const json = JSON.stringify(p);
     assert.ok(!json.includes('"meter"'), 'C2.12 rule 1: no meter on either window in the blocked state');
-    assert.equal((json.match(/63%/g) || []).length, 2, 'the 5h figure appears only inside its full and compact token');
+    assert.equal((json.match(/63%/g) || []).length, 1, 'the 5h figure appears only inside its one atomic token');
   }
 });
 
@@ -202,13 +202,12 @@ test('A2 (human ruling): RESERVE_ONLY with weekly freshly at 0 takes the blocked
     assert.equal(p.presentation, 'BLOCKED_SUBORDINATE');
     assert.equal(p.weekly.reason, 'NUMERICALLY_EXHAUSTED');
     assert.equal(p.fiveHour.text, '5h · 63% remaining · ordinary work held while Weekly is at 0%');
-    assert.equal(p.fiveHour.compactText, '5h 63% · held by Weekly 0%');
     const json = JSON.stringify(p);
     assert.ok(!json.includes('"meter"'), 'no meter on either window in the blocked frame');
     // Human-facing strings only: enum identifiers such as BLOCKED_SUBORDINATE are not copy.
     const copy = [];
-    JSON.stringify(p, (k, v) => { if (/^(text|compactText|stateText|resetText)$/.test(k)) copy.push(v); return v; });
-    assert.ok(copy.length >= 4);
+    JSON.stringify(p, (k, v) => { if (/^(text|stateText|resetText)$/.test(k)) copy.push(v); return v; });
+    assert.ok(copy.length >= 3);
     for (const s of copy) assert.ok(!/exhausted|blocked|limit reached/i.test(s), `crit 16: no causal wording without provider attribution: "${s}"`);
   }
 });

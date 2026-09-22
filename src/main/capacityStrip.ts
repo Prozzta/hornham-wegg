@@ -84,15 +84,13 @@ function weeklyText(reason: WeeklyRevealReason, display: number | null): string 
  * OBSERVATIONAL - "held while Weekly is at 0%" - never the causal "exhausted" or
  * "blocked" wording reserved for a LIMITED pool (crit 16). Copy is Jim's, as ruled.
  */
-const BLOCKED_FRAME: Partial<Record<CapacityState, { text: (n: number) => string; compactText: (n: number) => string; note: string }>> = {
+const BLOCKED_FRAME: Partial<Record<CapacityState, { text: (n: number) => string; note: string }>> = {
   LIMITED: {
     text: (n) => `5h · ${n}% remaining · unavailable while Weekly is exhausted`,
-    compactText: (n) => `5h ${n}% · blocked by Weekly`,
     note: 'unavailable while Weekly is exhausted'
   },
   RESERVE_ONLY: {
     text: (n) => `5h · ${n}% remaining · ordinary work held while Weekly is at 0%`,
-    compactText: (n) => `5h ${n}% · held by Weekly 0%`,
     note: 'ordinary work held while Weekly is at 0%'
   }
 };
@@ -104,18 +102,6 @@ const BLOCKED_FRAME: Partial<Record<CapacityState, { text: (n: number) => string
  */
 export function blockedFrameNote(state: CapacityState): string | null {
   return BLOCKED_FRAME[state]?.note ?? null;
-}
-
-/** The compact form of each, for C2.10's last collapse step. Same one-copy-per-reason rule. */
-function weeklyCompactText(reason: WeeklyRevealReason, display: number | null): string {
-  switch (reason) {
-    case 'PROVIDER_ATTRIBUTED_LIMITING': return 'Weekly limit reached (provider)';
-    case 'NUMERICALLY_EXHAUSTED': return 'Weekly 0%';
-    case 'UNKNOWN_CAPACITY': return 'Weekly capacity unknown';
-    case 'UNKNOWN_APPLICABILITY': return 'Additional limit status unknown';
-    case 'BELOW_DISPLAY_THRESHOLD':
-    case 'HYSTERESIS_HOLD': return `Weekly ${display}%`;
-  }
 }
 
 const WEEKLY_ATTRIBUTION = {
@@ -385,17 +371,14 @@ export class CapacityStripPresenter {
       label: '5h',
       text: pool.stateReason === 'RESTORED_UNCONFIRMED'
         ? '5h · Capacity unknown · no live reading since restart'
-        : `5h · Capacity unknown · last update ${this.formatTime(pool.observedAt, now)}`,
-      compactText: '5h · Capacity unknown'
+        : `5h · Capacity unknown · last update ${this.formatTime(pool.observedAt, now)}`
     };
     if (frame && fiveRemaining !== null) {
       const shown = Math.floor(fiveRemaining);
       fiveHour.text = frame.text(shown);
-      fiveHour.compactText = frame.compactText(shown);
     } else if (presentation === 'NORMAL' && fiveRemaining !== null && five) {
       const m = meterOf(fiveRemaining);
       fiveHour.text = `5h · ${m.displayPercent}% remaining`;
-      fiveHour.compactText = `5h ${m.displayPercent}%`;
       fiveHour.meter = m;
       if (five.resetsAt !== null && five.resetsAt > now
         && this.band(`${pool.poolKey}|reset|five`, fiveRemaining, five.resetsAt, T) !== null) {
@@ -412,7 +395,6 @@ export class CapacityStripPresenter {
       visibleWeekly = {
         reason: weekly.reason,
         text: weeklyText(weekly.reason, remaining === null ? null : Math.floor(remaining)),
-        compactText: weeklyCompactText(weekly.reason, remaining === null ? null : Math.floor(remaining)),
         attribution: WEEKLY_ATTRIBUTION[weekly.reason]
       };
       const numeric = weekly.reason !== 'UNKNOWN_CAPACITY' && weekly.reason !== 'UNKNOWN_APPLICABILITY';

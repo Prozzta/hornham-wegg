@@ -727,7 +727,7 @@ function FloorTab({ seed }: { seed: { text: string; seq: number } }) {
               <span style={{ marginLeft: 'auto', fontSize: 11, color: 'var(--cth-ink-500)' }}>
                 {(toolCounts[a.id] ?? 0)} tool calls
               </span>
-              <TokenLimitEditor value={agentCap} onSet={(t) => setAgentCap(a.id, t)} />
+              <TokenLimitEditor value={agentCap} onSet={(t) => setAgentCap(a.id, t)} usageCapable={usageCapable} />
             </div>
             <div style={{ fontSize: 11, color: 'var(--cth-ink-500)', wordBreak: 'break-all' }}>{a.cwd}</div>
             {/* Live telemetry (folded in from the old Fleet tab) */}
@@ -1193,8 +1193,12 @@ function fmtTokens(n: number): string {
 
 /** Per-agent token-limit control (top-right of each agent card). Shows the
  *  current limit as a lemon chip, or "set limit"; click to edit a token number.
- *  Enter / ✓ / blur commit; Escape cancels. */
-function TokenLimitEditor({ value, onSet }: { value?: number; onSet: (tokens: number | undefined) => void }) {
+ *  Enter / ✓ / blur commit; Escape cancels.
+ *  An agent whose line can show 5H / Weekly is budget-EXEMPT while it does (CAPUI-MONITOR):
+ *  the limit is kept but not enforced, and the tooltip says so (M2). */
+function TokenLimitEditor({ value, onSet, usageCapable }: {
+  value?: number; onSet: (tokens: number | undefined) => void; usageCapable: boolean;
+}) {
   const [editing, setEditing] = useState(false);
   const [text, setText] = useState(value != null ? String(value) : '');
   const skipBlur = useRef(false);
@@ -1208,7 +1212,7 @@ function TokenLimitEditor({ value, onSet }: { value?: number; onSet: (tokens: nu
     return (
       <button
         onClick={() => { setText(value != null ? String(value) : ''); setEditing(true); }}
-        title="Set this agent's total token limit"
+        title={`Set this agent's total token limit${usageCapable ? ' — not applied while this line shows 5H or Weekly' : ''}`}
         style={{
           flexShrink: 0, padding: '1px 6px', border: 'none', cursor: 'pointer',
           background: value && value > 0 ? 'var(--cth-lemon)' : 'var(--cth-cream-200)',

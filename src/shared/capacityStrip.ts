@@ -92,8 +92,6 @@ export interface FiveHourStrip {
   label: '5h';
   /** Full form. Label, value or status, and any blocker are inseparable in one string. */
   text: string;
-  /** The last reducible form (C2.7): never drops the value, never drops the blocker. */
-  compactText: string;
   meter?: DisplayReadyMeter;
   /** `reset expected ~14:30` — an expectation, never a recovery claim (§11). */
   resetText?: string;
@@ -101,16 +99,13 @@ export interface FiveHourStrip {
 }
 
 /**
- * C2.9, plus ONE field: `compactText`. C2.10's last collapse step compacts BOTH labelled
- * figures, and a renderer that shortened `text` itself would be composing wording
- * (C2.11 crit 18), so main supplies the compact form too. The property is ABSENT when
- * weekly is normally hidden.
+ * C2.9. The property is ABSENT when weekly is normally hidden. (The C2.10 `compactText`
+ * form is gone: scroll-on-overflow replaced the collapse ladder by the human's override,
+ * so the strip always draws the full `text`, and nothing else is sent.)
  */
 export interface VisibleWeeklyStrip {
   reason: WeeklyRevealReason;
   text: string;
-  /** The last reducible form. C2.6 UNKNOWN text is already minimal and is repeated verbatim. */
-  compactText: string;
   meter?: DisplayReadyMeter;
   resetText?: string;
   attribution: WeeklyAttribution;
@@ -282,12 +277,12 @@ const meter: Check = (v, at, errors) => {
 };
 
 const fiveHour = object(
-  { label: exactly('5h'), text, compactText: text },
+  { label: exactly('5h'), text },
   { meter, resetText: text, resetExpectedAt: instant }
 );
 
 const weekly = object(
-  { reason: oneOf(WEEKLY_REVEAL_REASONS), text, compactText: text, attribution: oneOf(WEEKLY_ATTRIBUTIONS) },
+  { reason: oneOf(WEEKLY_REVEAL_REASONS), text, attribution: oneOf(WEEKLY_ATTRIBUTIONS) },
   { meter, resetText: text }
 );
 

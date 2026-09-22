@@ -1,7 +1,7 @@
 'use strict';
 
 /**
- * Mutant runner for the capacity display milestone (v1.1.45 units #1, #2, #4, #5, #6, #7, #8, #11, #12, the strip polish and CAPUI-MONITOR).
+ * Mutant runner for the capacity display milestone (v1.1.45 units #1, #2, #4, #5, #6, #7, #8, #11, #12, CAPUI-TIDY, the strip polish and CAPUI-MONITOR).
  *
  * WHY IT IS COMMITTED (Jim's audit, F2). A mutant count that lives in someone's
  * scratchpad cannot be reproduced, and a count nobody can reproduce is not evidence.
@@ -32,7 +32,8 @@ const TESTS = ['test/capacity-strip-contract.test.cjs', 'test/capacity-strip-ui.
   'test/capacity-agent-impact.test.cjs', 'test/delivery-hold.test.cjs', 'test/capacity-monitor.test.cjs',
   'test/capacity-threshold.test.cjs', 'test/capacity-detail.test.cjs',
   'test/capacity-banner.test.cjs', 'test/capacity-toast.test.cjs',
-  'test/capacity-composer-note.test.cjs', 'test/capacity-copy-guards.test.cjs'];
+  'test/capacity-composer-note.test.cjs', 'test/capacity-copy-guards.test.cjs',
+  'test/capacity-tidy-pins.test.cjs'];
 
 const STRIP = 'src/main/capacityStrip.ts';
 const SHARED = 'src/shared/capacityStrip.ts';
@@ -62,6 +63,7 @@ const BANNER = 'src/renderer/src/components/CapacityLimitBanner.tsx';
 const TOAST = 'src/main/capacityToast.ts';
 const COMPOSER_STATUS = 'src/renderer/src/components/composerStatus.ts';
 const COMPOSER = 'src/renderer/src/components/MessageQueueComposer.tsx';
+const PANEL_CC = 'src/renderer/src/components/CommandCenterPanel.tsx';
 
 /** [name, file, from, to] */
 const MUTANTS = [
@@ -79,8 +81,8 @@ const MUTANTS = [
   ['u1 display rounds to nearest', STRIP,
     'displayPercent: Math.floor(remaining)', 'displayPercent: Math.round(remaining)'],
   ['u1 meter in the blocked frame', STRIP,
-    'fiveHour.compactText = frame.compactText(shown);',
-    'fiveHour.compactText = frame.compactText(shown); fiveHour.meter = meterOf(fiveRemaining);'],
+    '      fiveHour.text = frame.text(shown);',
+    '      fiveHour.text = frame.text(shown); fiveHour.meter = meterOf(fiveRemaining);'],
   ['u1 pool id not opaque', STRIP,
     'return `pool-${this.opaque(poolKey)}`;', 'return `pool-${poolKey}`;'],
   ['u1 revision never moves', STRIP, ': prev.revision + 1;', ': prev.revision;'],
@@ -121,10 +123,9 @@ const MUTANTS = [
     "    out.push({ kind: 'figure', key: 'five-hour', role: 'five-hour', text: pool.fiveHour.text, subordinate: true });\n    if (pool.weekly) out.push({ kind: 'figure', key: 'weekly', role: 'weekly', text: pool.weekly.text, subordinate: false });"],
   ['u2 blocked 5h shown twice', LAYOUT,
     "    out.push({ kind: 'figure', key: 'five-hour', role: 'five-hour', text: pool.fiveHour.text, subordinate: true });\n    return out;",
-    "    out.push({ kind: 'figure', key: 'five-hour', role: 'five-hour', text: pool.fiveHour.text, subordinate: true });\n    out.push({ kind: 'figure', key: 'five-hour-2', role: 'five-hour', text: pool.fiveHour.compactText, subordinate: false });\n    return out;"],
-  ['polish strip draws the compact form', LAYOUT,
-    "  window('five-hour', pool.fiveHour.text, pool.fiveHour.meter, pool.fiveHour.resetText);",
-    "  window('five-hour', pool.fiveHour.compactText, pool.fiveHour.meter, pool.fiveHour.resetText);"],
+    "    out.push({ kind: 'figure', key: 'five-hour', role: 'five-hour', text: pool.fiveHour.text, subordinate: true });\n    out.push({ kind: 'figure', key: 'five-hour-2', role: 'five-hour', text: pool.fiveHour.text, subordinate: false });\n    return out;"],
+  ['tidy P3 the dead compact form comes back into the contract', SHARED,
+    "  { label: exactly('5h'), text },", "  { label: exactly('5h'), text, compactText: text },"],
   // ── unit #2 + strip-polish: view ─────────────────────────────────────────────
   ['u2 subordinate token in a positive colour', VIEW,
     "color: token.subordinate ? 'var(--cth-ink-500)' : 'var(--cth-ink-900)',",
@@ -175,7 +176,7 @@ const MUTANTS = [
     '        emptyText: CAPACITY_EMPTY_TEXT,\n        pools\n', '        pools\n'],
   // ── A2 (human ruling): the RESERVE_ONLY held frame ───────────────────────────
   ['a2 RESERVE_ONLY frame removed', STRIP,
-    "  RESERVE_ONLY: {\n    text: (n) => `5h · ${n}% remaining · ordinary work held while Weekly is at 0%`,\n    compactText: (n) => `5h ${n}% · held by Weekly 0%`,\n    note: 'ordinary work held while Weekly is at 0%'\n  }\n",
+    "  RESERVE_ONLY: {\n    text: (n) => `5h · ${n}% remaining · ordinary work held while Weekly is at 0%`,\n    note: 'ordinary work held while Weekly is at 0%'\n  }\n",
     ''],
   ['a2 RESERVE_ONLY frame uses the causal LIMITED copy', STRIP,
     "text: (n) => `5h · ${n}% remaining · ordinary work held while Weekly is at 0%`,",
@@ -355,6 +356,22 @@ const MUTANTS = [
   ['u12 a second fill inside a capacity meter', VIEW,
     '        width: `${percent}%`, background: color\n      }} />',
     '        width: `${percent}%`, background: color\n      }} /><span />'],
+  // ── CAPUI-TIDY: the deferred audit pins ───────────────────────────────────────
+  ['tidy F6 a departed pool keeps its latch', STRIP,
+    "    for (const k of [...this.latches.keys()]) if (!live.has(k.split('|')[0])) this.latches.delete(k);\n", ''],
+  ['tidy F7 a Budget line polls usage anyway', USAGE_LINE,
+    "    if (display === 'budget') { setView(null); return; }\n", ''],
+  ['tidy F8 the restored gate dropped from the detail', DETAIL,
+    "const current = pool.freshness === 'FRESH' && !restored;", "const current = pool.freshness === 'FRESH';"],
+  ['tidy F9 an unmatched attributed id invents the Weekly cause', STRIP,
+    '?.label ?? null\n      : null;', "?.label ?? 'Weekly'\n      : null;"],
+  ['tidy F10 the x dismisses by pool id', BANNER,
+    'onClick={() => onDismiss(it.noticeId)}', 'onClick={() => onDismiss(it.poolId)}'],
+  ['tidy T7 the platform is checked before the setting', TOAST,
+    "  if (!deps.notificationsOn()) return 'SUPPRESSED';\n  try {\n    if (!deps.supported()) return 'UNSUPPORTED';",
+    "  try {\n    if (!deps.supported()) return 'UNSUPPORTED';\n    if (!deps.notificationsOn()) return 'SUPPRESSED';"],
+  ['tidy M2 the not-applied clause dropped from the tooltip', PANEL_CC,
+    " — not applied while this line shows 5H or Weekly'", "'"],
 ];
 
 // THE BASELINE MUST BE GREEN. Against already-failing tests every mutant "dies", and a
