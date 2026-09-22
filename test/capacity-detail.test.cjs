@@ -147,8 +147,12 @@ test('its OWN channel: capacity:detail, resolved by opaque poolId, validated; no
   assert.equal(CAPACITY_DETAIL_CHANNEL, 'capacity:detail');
   assert.match(readSource('src/preload/index.ts'), /ipcRenderer\.invoke\('capacity:detail', poolId\)/);
   const main = codeOnly(readSource('src/main/index.ts'), 'index.ts');
-  const start = main.indexOf('ipcMain.handle(CAPACITY_DETAIL_CHANNEL');
-  const handler = main.slice(start, main.indexOf('\n});', start));
+  // v1.1.46 A2: the projection moved into capacityDetailViewOf, shared by the ask and the re-push.
+  const door = main.indexOf('ipcMain.handle(CAPACITY_DETAIL_CHANNEL');
+  assert.ok(door > 0);
+  assert.match(main.slice(door, main.indexOf('\n});', door)), /const view = capacityDetailViewOf\(poolId\);/);
+  const start = main.indexOf('function capacityDetailViewOf(');
+  const handler = main.slice(start, main.indexOf('\n}', start));
   assert.ok(start > 0);
   assert.match(handler, /providerCapacity\.snapshot\(\)\.pools\.find\(\(p\) => capacityStrip\.poolIdOf\(p\.poolKey\) === poolId\)/,
     'built from the tracker snapshot, not from the strip object');

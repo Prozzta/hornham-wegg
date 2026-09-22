@@ -984,6 +984,15 @@ const api = {
   /** v1.1.45 unit #4: one pool's provider DETAIL view, on its OWN channel, only while the panel is open. */
   capacityDetail: (poolId: string): Promise<ProviderCapacityDetailView | null> =>
     ipcRenderer.invoke('capacity:detail', poolId),
+  /** v1.1.46 A2: main re-pushes the open STALE pool's detail once a minute (a main-side time
+   *  edge, never a renderer clock). Literal channel names: a test pins them to
+   *  CAPACITY_DETAIL_PUSH / CAPACITY_DETAIL_CLOSED in src/shared/capacityDetail.ts. */
+  onCapacityDetailPush: (cb: (view: ProviderCapacityDetailView) => void): (() => void) => {
+    const listener = (_e: IpcRendererEvent, payload: ProviderCapacityDetailView) => cb(payload);
+    ipcRenderer.on('capacity:detailPush', listener);
+    return () => ipcRenderer.removeListener('capacity:detailPush', listener);
+  },
+  capacityDetailClosed: (poolId: string): void => ipcRenderer.send('capacity:detailClosed', poolId),
   onHiveMessage: (cb: (e: HiveRouteEvent) => void): (() => void) => {
     const listener = (_e: IpcRendererEvent, payload: HiveRouteEvent) => cb(payload);
     ipcRenderer.on('hive:message', listener);

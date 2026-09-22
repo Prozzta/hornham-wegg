@@ -34,7 +34,8 @@ const TESTS = ['test/capacity-strip-contract.test.cjs', 'test/capacity-strip-ui.
   'test/capacity-banner.test.cjs', 'test/capacity-toast.test.cjs',
   'test/capacity-composer-note.test.cjs', 'test/capacity-copy-guards.test.cjs',
   'test/capacity-tidy-pins.test.cjs', 'test/capacity-usage-push.test.cjs',
-  'test/capacity-piedot.test.cjs', 'test/capacity-impact-push.test.cjs', 'test/capacity-stale-retain.test.cjs'];
+  'test/capacity-piedot.test.cjs', 'test/capacity-impact-push.test.cjs', 'test/capacity-stale-retain.test.cjs',
+  'test/capacity-detail-tick.test.cjs'];
 
 const STRIP = 'src/main/capacityStrip.ts';
 const SHARED = 'src/shared/capacityStrip.ts';
@@ -70,6 +71,8 @@ const TOKENS = 'src/renderer/src/design/tokens.css';
 const IMPACT_HOOK = 'src/renderer/src/hooks/useAgentImpact.ts';
 const IMPACT_PUSH = 'src/main/agentImpactPush.ts';
 const DETAIL_BODY = 'src/renderer/src/components/CapacityDetailBody.tsx';
+const DETAIL_TICK = 'src/main/capacityDetailTick.ts';
+const PRELOAD = 'src/preload/index.ts';
 
 /** [name, file, from, to] */
 const MUTANTS = [
@@ -276,8 +279,8 @@ const MUTANTS = [
   ['u4 the schema lets a stale pool offer a figure', DETAIL_SCHEMA,
     "    errors.push('$.windows: a stale pool offers no current figure');\n", ''],
   ['u4 the detail is built from the strip object', INDEX,
-    'const pool = providerCapacity.snapshot().pools.find((p) => capacityStrip.poolIdOf(p.poolKey) === poolId);',
-    'const pool = providerCapacity.snapshot().pools.find((p) => capacityStrip.current().pools.some((q) => q.poolId === poolId) && !!p);'],
+    'ProviderCapacityDetailView | null {\n  const pool = providerCapacity.snapshot().pools.find((p) => capacityStrip.poolIdOf(p.poolKey) === poolId);',
+    'ProviderCapacityDetailView | null {\n  const pool = providerCapacity.snapshot().pools.find((p) => capacityStrip.current().pools.some((q) => q.poolId === poolId) && !!p);'],
   ['u4 the status note bypasses the composer wording', INDEX,
     '  return capacityStateNote(gate.evidence);', '  return gate.evidence;'],
   ['u4 a switch shows the previous pool', DETAIL_PANEL,
@@ -522,6 +525,49 @@ const MUTANTS = [
   ["sr the schema accepts a stale view with no age", DETAIL_SCHEMA,
     "    if ((v.freshness.verdict === 'STALE') !== ('ageText' in v.freshness)) errors.push('$.freshness.ageText: present exactly when STALE');\n",
     ""],
+  // ── v1.1.46 A2: the age note ticks by a MAIN-side edge while the panel is open on a stale pool ──
+  ["a2 the once-a-minute re-push is deleted", DETAIL_TICK,
+    "    this.deps.push(windowId, entry.poolId);\n",
+    ""],
+  ["a2 the edge is not re-armed after a push", DETAIL_TICK,
+    "    this.deps.push(windowId, entry.poolId);\n    this.arm(windowId, entry);",
+    "    this.deps.push(windowId, entry.poolId);"],
+  ["a2 a close does not stop the edge", DETAIL_TICK,
+    "    if (cur.timer !== null) this.deps.clearTimer(cur.timer);\n    this.open.delete(windowId);\n",
+    ""],
+  ["a2 a pool that went fresh is still re-pushed", DETAIL_TICK,
+    "    if (this.deps.staleSince(entry.poolId) === null) return;          // no longer stale: stop\n",
+    ""],
+  ["a2 an open arms nothing", DETAIL_TICK,
+    "    this.open.set(windowId, entry);\n    this.arm(windowId, entry);",
+    "    this.open.set(windowId, entry);"],
+  ["a2 a close for another pool stops the open one", DETAIL_TICK,
+    "    if (!cur || (poolId !== undefined && cur.poolId !== poolId)) return;",
+    "    if (!cur) return;"],
+  ["a2 the edge is a fixed minute from the open, not the age boundary", DETAIL_TICK,
+    "    const ms = DETAIL_TICK_MS - (age % DETAIL_TICK_MS) + BOUNDARY_MARGIN_MS;",
+    "    const ms = DETAIL_TICK_MS;"],
+  ["a2 the panel ticks with a renderer clock", DETAIL_PANEL,
+    "  }, [poolId, revision]);\n",
+    "  }, [poolId, revision]);\n  useEffect(() => { const iv = setInterval(() => setView((v) => v), 60_000); return () => clearInterval(iv); }, []);\n"],
+  ["a2 the panel takes a push for another pool", DETAIL_PANEL,
+    "{ if (v && v.poolId === poolId) setView(v); }",
+    "{ if (v) setView(v); }"],
+  ["a2 the panel does not tell main it closed", DETAIL_PANEL,
+    "return () => { off(); window.cth.capacityDetailClosed(poolId); };",
+    "return () => { off(); };"],
+  ["a2 the ask does not arm the ticker", INDEX,
+    "  if (view) capacityDetailTicker.opened(evt.sender.id, poolId);\n",
+    ""],
+  ["a2 the close channel is not handled", INDEX,
+    "  if (typeof poolId === 'string') capacityDetailTicker.closed(evt.sender.id, poolId);",
+    "  void poolId;"],
+  ["a2 any pool counts as stale", INDEX,
+    "    return pool && pool.freshness === 'STALE' ? pool.observedAt : null;",
+    "    return pool ? pool.observedAt : null;"],
+  ["a2 the push channel renamed in the preload", PRELOAD,
+    "    ipcRenderer.on('capacity:detailPush', listener);",
+    "    ipcRenderer.on('capacity:detail-push', listener);"],
 ];
 
 // THE BASELINE MUST BE GREEN. Against already-failing tests every mutant "dies", and a

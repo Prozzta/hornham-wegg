@@ -47,7 +47,8 @@ import { deliverCapacityToast, type CapacityToast } from './capacityToast';
 import { AGENT_IMPACT_PUSH, agentImpactOf, capacityStateNote, type AgentImpact } from '../shared/deliveryHold';
 import { AgentImpactPushGate, agentImpactPushOf } from './agentImpactPush';
 import { capacityDetailView } from './capacityDetail';
-import { CAPACITY_DETAIL_CHANNEL, validateCapacityDetail } from '../shared/capacityDetail';
+import { CapacityDetailTicker } from './capacityDetailTick';
+import { CAPACITY_DETAIL_CHANNEL, CAPACITY_DETAIL_CLOSED, CAPACITY_DETAIL_PUSH, validateCapacityDetail, type ProviderCapacityDetailView } from '../shared/capacityDetail';
 import { AgentUsagePushGate, agentUsagePushOf, agentUsageView } from './capacityAgentUsage';
 import { CAPACITY_AGENT_USAGE, CAPACITY_AGENT_USAGE_PUSH, validateAgentUsageView } from '../shared/agentUsage';
 import { capacityDisplayThresholdOf } from '../shared/capacityThreshold';
@@ -4345,8 +4346,7 @@ ipcMain.handle(CAPACITY_STRIP_CURRENT, () => {
 // v1.1.45 unit #4 - the provider DETAIL view for one pool, asked for only while the panel is
 // open. Its OWN scoped channel: not control:snapshot, and not the strip object (C2.9). Built
 // from the same tracker snapshot, at the same revision, as the strip it was opened from.
-ipcMain.handle(CAPACITY_DETAIL_CHANNEL, (_evt, poolId: unknown) => {
-  if (typeof poolId !== 'string') return null;
+function capacityDetailViewOf(poolId: string): ProviderCapacityDetailView | null {
   const pool = providerCapacity.snapshot().pools.find((p) => capacityStrip.poolIdOf(p.poolKey) === poolId);
   if (!pool) return null;
   let presentation: CapacityStripCollection['pools'][number]['presentation'] | null = null;
@@ -4361,6 +4361,36 @@ ipcMain.handle(CAPACITY_DETAIL_CHANNEL, (_evt, poolId: unknown) => {
   const errors = validateCapacityDetail(view);
   if (errors.length) { console.warn('[capacity-detail] refused:', errors.slice(0, 3).join('; ')); return null; }
   return view;
+}
+// v1.1.46 A2 - the age note ticks while the panel stays open on a STALE pool: a main-side
+// time edge re-pushes the SAME projection once a minute (capacityDetailTick.ts). Armed by the
+// panel's own ask (open and every crit-17 re-ask), stopped by its close, by the window going,
+// and by the pool no longer being stale. No renderer clock (crit 15).
+const capacityDetailTicker = new CapacityDetailTicker({
+  staleSince: (poolId) => {
+    const pool = providerCapacity.snapshot().pools.find((p) => capacityStrip.poolIdOf(p.poolKey) === poolId);
+    return pool && pool.freshness === 'STALE' ? pool.observedAt : null;
+  },
+  push: (windowId, poolId) => {
+    const wc = BrowserWindow.getAllWindows().map((w) => w.webContents).find((c) => c.id === windowId);
+    if (!wc || wc.isDestroyed()) { capacityDetailTicker.closed(windowId); return; }
+    const view = capacityDetailViewOf(poolId);
+    if (!view) { capacityDetailTicker.closed(windowId); return; }
+    try { wc.send(CAPACITY_DETAIL_PUSH, view); } catch { capacityDetailTicker.closed(windowId); }
+  },
+  now: () => Date.now(),
+  setTimer: (fn, ms) => setTimeout(fn, ms),
+  clearTimer: (h) => clearTimeout(h as ReturnType<typeof setTimeout>)
+});
+ipcMain.handle(CAPACITY_DETAIL_CHANNEL, (evt, poolId: unknown) => {
+  if (typeof poolId !== 'string') return null;
+  const view = capacityDetailViewOf(poolId);
+  if (view) capacityDetailTicker.opened(evt.sender.id, poolId);
+  else capacityDetailTicker.closed(evt.sender.id, poolId);
+  return view;
+});
+ipcMain.on(CAPACITY_DETAIL_CLOSED, (evt, poolId: unknown) => {
+  if (typeof poolId === 'string') capacityDetailTicker.closed(evt.sender.id, poolId);
 });
 
 /**
@@ -5927,7 +5957,7 @@ app.on('before-quit', (e) => {
 // The last chance to flush a coalesced capacity write. `before-quit` can be
 // preventDefault-ed by the running-terminals warning above, so the flush hangs off
 // `will-quit`, which only fires once the quit is actually going ahead.
-app.on('will-quit', () => { capacityStore.saveNow(); });
+app.on('will-quit', () => { capacityStore.saveNow(); capacityDetailTicker.stopAll(); });
 
 app.on('window-all-closed', () => {
   if (process.platform !== 'darwin') {

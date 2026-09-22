@@ -19,6 +19,10 @@ import { CAPACITY_STATES, PROVIDER_IDS, type CapacityState, type ProviderId } fr
 
 /** Invoke: the detail view for one poolId, or null when that pool is not in the collection. */
 export const CAPACITY_DETAIL_CHANNEL = 'capacity:detail';
+/** v1.1.46 A2 - push: main's re-push of the open STALE pool's detail view, once a minute. */
+export const CAPACITY_DETAIL_PUSH = 'capacity:detailPush';
+/** v1.1.46 A2 - send: the panel on this poolId closed or switched; main stops re-pushing it. */
+export const CAPACITY_DETAIL_CLOSED = 'capacity:detailClosed';
 
 export interface DetailWindow {
   /** Main's label: `5h`, `Weekly`, or a model-specific / other window's own label. */

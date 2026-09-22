@@ -13,6 +13,11 @@
  * whenever the strip's collection revision moves (so it stays at the same domain truth),
  * and DROPPED on close, on a switch to another pool, and when the pool leaves the
  * collection. Nothing is cached across a reload: the component starts empty.
+ *
+ * v1.1.46 A2: on a STALE pool main also RE-PUSHES the view once a minute, so the
+ * "Not refreshed in X min" note keeps counting. The time edge is main's; this component has
+ * no clock (crit 15). It takes a pushed view only for the pool on show, and tells main when
+ * the panel closes or switches so the re-push stops.
  */
 import { useEffect, useState } from 'react';
 import type { ProviderCapacityDetailView } from '@shared/capacityDetail';
@@ -45,6 +50,12 @@ export function CapacityDetailPanel() {
       .catch(() => { if (alive) setView(null); });
     return () => { alive = false; };
   }, [poolId, revision]);
+
+  useEffect(() => {
+    if (poolId === null) return;
+    const off = window.cth.onCapacityDetailPush((v) => { if (v && v.poolId === poolId) setView(v); });
+    return () => { off(); window.cth.capacityDetailClosed(poolId); };
+  }, [poolId]);
 
   if (poolId === null || gone) return null;
   const nameOf = (id: string): string => agents.find((a) => a.id === id)?.name ?? id;
