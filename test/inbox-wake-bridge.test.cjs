@@ -259,7 +259,13 @@ test('index.ts wires every edge to the ONE bridge, registered before the router 
   const index = codeOnly(readSource('src/main/index.ts'), 'index.ts');
   const at = (s) => { const i = index.indexOf(s); assert.ok(i >= 0, s); return i; };
   assert.ok(at('hive.setDeliveryObserver(') < at('hive.startRouter()'), 'the delivery observer exists before any routing');
-  assert.match(index, /hive\.setDeliveryObserver\(\(\{ agentId, messageId \}\) => inboxWake\?\.onDelivery\(agentId, messageId\)\)/);
+  // DIAGNOSIS BRANCH: the observer may carry a breadcrumb alongside the hand-off, so the
+  // pin asserts the INVARIANT (the one registration routes the delivery to the one bridge)
+  // rather than the exact one-liner it used to be.
+  const obs = index.slice(at('hive.setDeliveryObserver('), at('control.setTransitionObserver('));
+  assert.match(obs, /\(\{ agentId, messageId \}\)/, 'the observer takes the delivery');
+  assert.match(obs, /inboxWake\?\.onDelivery\(agentId, messageId\)/, 'and hands it to the one bridge');
+  assert.ok(!/automaticSubmit|ptyManager/.test(obs), 'the observer never submits or types by itself');
   assert.match(index, /\(agentId, event, message\) => inboxWake\?\.onHook\(agentId, event, message\)/, 'the hook stream');
   assert.match(index, /transition === 'UNPAUSED' \|\| transition === 'RESUMED' \|\| transition === 'AUTO_DELIVERY_RELEASED'/, 'only releases retry');
   assert.match(index, /onChange: \(\) => \{ pushCapacityStrip\(\); pushAgentUsage\(\); pushAgentImpact\(\); inboxWake\?\.onCapacityChange\(\); \}/);

@@ -119,6 +119,13 @@ export class WorkerWakeWatchdog {
   /** ptyId → spawn timestamp (boot grace). */
   private spawnedAt = new Map<string, number>();
   private agents = new Map<string, AgentWake>();
+  /** DIAGNOSIS ONLY (diag-1.1.46-wake): the guard that refused this agent's last claim. */
+  private lastWhy = new Map<string, string>();
+
+  /** DIAGNOSIS ONLY: why `claim()` last returned null for this agent ('' = it claimed). */
+  whyNoClaim(agentId: string): string {
+    return this.lastWhy.get(agentId) ?? '';
+  }
 
   private rec(agentId: string): AgentWake {
     let r = this.agents.get(agentId);
@@ -195,23 +202,36 @@ export class WorkerWakeWatchdog {
    */
   claim(f: WorkerWakeFacts, cause: WakeCause, mode: WakeMode, now = Date.now()): WakeClaim | null {
     const r = this.rec(f.agentId);
-    if (r.inFlight || r.held || r.pending.size === 0) return null;
-    if (!f.ptyId || f.paused || f.halted || f.autoDeliveryPaused || f.inhibited) return null;
-    if (r.lastHumanNeedsAt > 0 && now - r.lastHumanNeedsAt < WORKER_WAKE_HITL_REARM_MS) return null;
+    // DIAGNOSIS ONLY (diag-1.1.46-wake): every `return null` below names itself, so a
+    // packaged run can say WHICH guard is holding instead of just "no wake". `no()` is
+    // pure bookkeeping — it returns null and changes nothing the guards decide.
+    const no = (why: string): null => { this.lastWhy.set(f.agentId, why); return null; };
+    if (r.inFlight) return no('in-flight');
+    if (r.held) return no('held-interfered');
+    if (r.pending.size === 0) return no('no-pending-ids');
+    if (!f.ptyId) return no('no-pty');
+    if (f.paused) return no('paused');
+    if (f.halted) return no('halted');
+    if (f.autoDeliveryPaused) return no('auto-delivery-paused');
+    if (f.inhibited) return no('owner-inhibited');
+    if (r.lastHumanNeedsAt > 0 && now - r.lastHumanNeedsAt < WORKER_WAKE_HITL_REARM_MS) return no('hitl-hold');
     const spawned = this.spawnedAt.get(f.ptyId) ?? 0;
-    if (spawned > 0 && now - spawned < WORKER_WAKE_BOOT_GRACE_MS) return null;
+    if (spawned > 0 && now - spawned < WORKER_WAKE_BOOT_GRACE_MS) return no('boot-grace');
     if (mode === 'event') {
-      if (r.lifecycle !== 'idle') return null;
+      if (r.lifecycle !== 'idle') return no(`lifecycle-${r.lifecycle}`);
     } else {
       const quiescent = f.lastOutputAt > 0 && now - f.lastOutputAt >= WORKER_WAKE_IDLE_MS;
       // D3 (god ruling, Dwight's tightening): PTY silence stands in ONLY when the lifecycle is
       // UNKNOWN (start-up, lost history, a lost Stop). A positively ACTIVE agent is never claimed
       // on quiescence: a silent tool, build or network wait can outlast 12s, and the owner
       // proves the prompt and the human, not that the model's turn ended.
-      if (!(r.lifecycle === 'idle' || (r.lifecycle === 'unknown' && quiescent))) return null;
-      if (r.lastReconcileAttemptAt > 0 && now - r.lastReconcileAttemptAt < WORKER_WAKE_COOLDOWN_MS) return null;
+      if (!(r.lifecycle === 'idle' || (r.lifecycle === 'unknown' && quiescent))) {
+        return no(`lifecycle-${r.lifecycle}${quiescent ? '' : '-not-quiescent'}`);
+      }
+      if (r.lastReconcileAttemptAt > 0 && now - r.lastReconcileAttemptAt < WORKER_WAKE_COOLDOWN_MS) return no('reconcile-cooldown');
       r.lastReconcileAttemptAt = now;
     }
+    this.lastWhy.delete(f.agentId);
     const ids = [...r.pending].sort();
     r.pending.clear();
     const claim: WakeClaim = Object.freeze({ agentId: f.agentId, requestId: inboxWakeRequestId(f.agentId, ids), ids: Object.freeze(ids), cause });

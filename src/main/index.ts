@@ -379,6 +379,28 @@ function standingGoalFromRoster(agentId: string): string | null {
 // claims one batch here and submits it through the one owner (CAPACITY_GATED). HookServer
 // feeds it the hook stream, so a permission/HITL prompt blocks wakes.
 const workerWake = new WorkerWakeWatchdog();
+// ─── DIAGNOSIS ONLY (branch diag-1.1.46-wake) ───────────────────────────────
+// The 1.1.46 packaged canary produced no wakes and could not say why, because every
+// breadcrumb on the wake path is console.log and a packaged Windows Electron app has
+// no console attached and no file sink: the output is discarded. These write to the
+// hive event log instead, which agents and the human already read, so ONE canary run
+// says which stage is inert. Remove with this branch.
+const wakeDiagSeen = new Map<string, string>();
+function wakeDiag(stage: string, fields: Record<string, unknown>): void {
+  try {
+    // The 15s reconciliation beat repeats every stage for every agent. Log one line per
+    // CHANGE there (ignoring the always-moving idle age), so a 15-minute canary stays
+    // readable while every real transition is still captured. Event-path lines always log.
+    if (fields.mode === 'reconcile') {
+      const key = `${stage}:${String(fields.agentId)}`;
+      const sig = JSON.stringify({ ...fields, idleMs: undefined });
+      if (wakeDiagSeen.get(key) === sig) return;
+      wakeDiagSeen.set(key, sig);
+    }
+    hive.appendLog({ kind: 'wake', stage, ...fields });
+  } catch { /* the diagnosis must never break the path it is watching */ }
+}
+
 /** Built once the submit owner exists (below); null only during module start-up. */
 let inboxWake: InboxWakeBridge | null = null;
 // HookServer needs BOTH: Oscar's control registry (HITL pause/gate/steer/halt via
@@ -475,9 +497,16 @@ inboxWake = new InboxWakeBridge({
   text: (ids) => inboxNudgeText([...ids]),
   setImmediate: (fn) => { setImmediate(fn); },
   now: () => Date.now(),
-  log: (line) => console.log(line)
+  log: (line) => console.log(line),
+  diag: wakeDiag
 });
-hive.setDeliveryObserver(({ agentId, messageId }) => inboxWake?.onDelivery(agentId, messageId));
+wakeDiag('bridge-built', { ok: !!inboxWake });
+hive.setDeliveryObserver(({ agentId, messageId }) => {
+  // Proves the observer is registered AND that deliver() reached it, independently of
+  // anything the bridge then decides.
+  wakeDiag('observer', { agentId, messageId, bridge: !!inboxWake });
+  inboxWake?.onDelivery(agentId, messageId);
+});
 // Only a RELEASE of a blocking state is a retry edge; applying pause/halt is not.
 control.setTransitionObserver((agentId, transition) => {
   if (transition === 'UNPAUSED' || transition === 'RESUMED' || transition === 'AUTO_DELIVERY_RELEASED') {
@@ -1701,6 +1730,9 @@ function armHeartbeat(m: ScheduledMission): void {
       // waiting in god's inbox — the latter is independent of floor-quiet so a
       // worker's reply doesn't sit unread while other agents keep the floor busy.
       const actionable = godActionableInboxCount();
+      // Separates "the heartbeat timer is dead" from "it ran and its own conditions said
+      // nothing to send" — the 1.1.46 post-mortem could not tell those apart.
+      wakeDiag('heartbeat', { quiet: isFloorQuiet(quiet), actionable, baseMs: base });
       if (isFloorQuiet(quiet) || actionable > 0) {
         reengageGod(buildHeartbeatDigest(quiet, actionable));
         next = Math.round(base * 2.5);            // back off after re-engaging
@@ -5730,6 +5762,9 @@ function runWorkerWakeBeat(): void {
   const live = Object.entries(reg.agents)
     .filter(([agentId, a]) => !a?.archived && ptyForAgent(agentId))
     .map(([agentId]) => agentId);
+  // Proves the 15s beat is ARMED and running at all, and over how many agents. This alone
+  // separates "armAlwaysOnBeats never ran" from "it ran and every claim was refused".
+  wakeDiag('beat', { live: live.length, agents: live.join(',') });
   inboxWake.reconcileAll(live);
 }
 
@@ -5746,6 +5781,7 @@ function armAlwaysOnBeats(): void {
   breakerBeatTimer = setInterval(() => { try { runBreakerBeat(300_000); } catch (e) { console.error('[breaker beat]', e); } }, 30_000);
   if (workerWakeTimer) clearInterval(workerWakeTimer);
   workerWakeTimer = setInterval(() => { try { runWorkerWakeBeat(); } catch (e) { console.error('[worker-wake beat]', e); } }, WORKER_WAKE_POLL_MS);
+  wakeDiag('beats-armed', { cadenceMs: WORKER_WAKE_POLL_MS });
   runWorkerWakeBeat(); // catch-up on arm — power-resume re-arms and drains the backlog
 }
 

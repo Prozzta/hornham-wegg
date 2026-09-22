@@ -1468,7 +1468,14 @@ export class HiveManager {
     this.atomicWriteJson(join(inbox, `${msg.id}.json`), msg);
     // THE successful-delivery edge (pre-M1 event-wake bridge): only after the durable write.
     // An observer failure can never turn a written delivery into a routing failure.
-    try { this.deliveryObserver?.({ agentId: toId, messageId: msg.id }); } catch { /* observer error */ }
+    // DIAGNOSIS ONLY (diag-1.1.46-wake): a durable write with NO observer registered is the
+    // one failure the message log cannot show - it looks identical to a delivered message.
+    if (!this.deliveryObserver) {
+      try { this.appendLog({ kind: 'wake', stage: 'observer-missing', agentId: toId, messageId: msg.id }); } catch { /* noop */ }
+    }
+    try { this.deliveryObserver?.({ agentId: toId, messageId: msg.id }); } catch (e) {
+      try { this.appendLog({ kind: 'wake', stage: 'observer-threw', agentId: toId, error: String(e) }); } catch { /* noop */ }
+    }
     return true;
   }
 
