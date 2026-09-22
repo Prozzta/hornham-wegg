@@ -258,6 +258,19 @@ export interface AgentImpactInput {
   poolLabel: string | null;
 }
 
+/** v1.1.45 CRIT-15-PRE: main PUSHES each watched agent's impact on this channel (not control:snapshot). */
+export const AGENT_IMPACT_PUSH = 'control:agentImpactPush';
+
+export interface AgentImpactRow {
+  agentId: string;
+  /** The same value control:snapshot answers as `impact`: null when nothing is held. */
+  impact: AgentImpact | null;
+}
+
+export interface AgentImpactPush {
+  rows: AgentImpactRow[];
+}
+
 const impact = (kind: AgentImpactKind, verb: AgentImpactVerb, rest: string): AgentImpact =>
   ({ kind, verb, text: `${verb} · ${rest}` });
 

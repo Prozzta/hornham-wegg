@@ -28,7 +28,7 @@
  * owner supplies, so the decision to notify is testable without a display and a
  * renderer can never become the thing that dedupes.
  */
-import { CapacityAdmission, ADMISSION_REASON, type AdmissionDecision, type WorkClass } from './capacityAdmission';
+import { CapacityAdmission, ADMISSION_REASON, RECOVERY_RESERVATION_TTL_MS, type AdmissionDecision, type WorkClass } from './capacityAdmission';
 import { CapacityNotifier, type CapacityNotifyIntent } from './capacityNotify';
 import { ProviderCapacityTracker, staleLastKnown } from './providerCapacityTracker';
 import type { CapacityCollectionSnapshot, CapacityObservation } from '../shared/providerCapacity';
@@ -70,6 +70,13 @@ export interface CapacityRuntimeDeps {
    * feeds nothing back: display is downstream of every decision made here.
    */
   onChange?: () => void;
+  /**
+   * v1.1.45 CRIT-15-PRE: the admission ledger moved (a grant reserved, confirmed, held for
+   * a person or returned), or a reservation nobody resolved has just lapsed on its TTL. An
+   * agent's impact string reads that ledger, so main re-pushes impacts on this instead of
+   * a renderer polling for it. Optional, and it feeds nothing back.
+   */
+  onAdmission?: () => void;
 }
 
 /**
@@ -98,6 +105,7 @@ export class CapacityRuntime {
   private readonly setTimer: (fn: () => void, ms: number) => unknown;
   private readonly clearTimer: (handle: unknown) => void;
   private timer: unknown = null;
+  private readonly lapseTimers = new Set<unknown>();
   private stopped = false;
 
   constructor(private readonly deps: CapacityRuntimeDeps, tracker = new ProviderCapacityTracker()) {
@@ -160,22 +168,42 @@ export class CapacityRuntime {
 
   /** May this agent start this unit of work? See `CapacityAdmission`. */
   admit(agentId: string, workClass: WorkClass = 'ORDINARY_TURN'): AdmissionDecision {
-    return this.admission.admit(agentId, workClass);
+    const decision = this.admission.admit(agentId, workClass);
+    if (decision.grantId) this.armReservationLapse();
+    this.admissionMoved();
+    return decision;
   }
 
   /** The work really started — commit any recovery grant the decision reserved. */
   confirmLaunch(decision: AdmissionDecision): void {
     this.admission.confirmLaunch(decision);
+    this.admissionMoved();
   }
 
   /** The work MAY have started and only a person can say — see `holdGrantForHuman`. */
   holdGrant(decision: AdmissionDecision): void {
     this.admission.holdGrantForHuman(decision);
+    this.admissionMoved();
   }
 
   /** The work did not start after all — return any reservation it held. */
   cancelGrant(decision: AdmissionDecision): void {
     this.admission.cancelGrant(decision);
+    this.admissionMoved();
+  }
+
+  private admissionMoved(): void {
+    try { this.deps.onAdmission?.(); } catch { /* display never decides */ }
+  }
+
+  /** An unresolved reservation lapses on its TTL with no event; one one-shot marks the lapse. */
+  private armReservationLapse(): void {
+    if (!this.deps.onAdmission || this.stopped) return;
+    const handle = this.setTimer(() => {
+      this.lapseTimers.delete(handle);
+      if (!this.stopped) this.admissionMoved();
+    }, RECOVERY_RESERVATION_TTL_MS + 1);
+    this.lapseTimers.add(handle);
   }
 
   /**
@@ -257,6 +285,8 @@ export class CapacityRuntime {
   stop(): void {
     this.stopped = true;
     this.disarm();
+    for (const handle of this.lapseTimers) this.clearTimer(handle);
+    this.lapseTimers.clear();
   }
 
   /**

@@ -61,9 +61,14 @@ test('main: control:snapshot carries the impact, built from its OWN settled fact
   const main = codeOnly(readSource('src/main/index.ts'), 'index.ts');
   const start = main.indexOf("ipcMain.handle('control:snapshot'");
   const handler = main.slice(start, main.indexOf('});', start));
-  assert.match(handler, /agentImpactFor\(snap\.autoDeliveryPaused, gate, interfered !== null, probed\.poolKey\)/,
+  // CRIT-15-PRE: the facts live in ONE function, shared by the snapshot and the impact push.
+  const factsStart = main.indexOf('function controlFactsOf(');
+  const facts = main.slice(factsStart, main.indexOf('\n}\n', factsStart));
+  assert.ok(factsStart > 0);
+  assert.match(facts, /agentImpactFor\(snap\.autoDeliveryPaused, gate, interfered !== null, probed\.poolKey\)/,
     'the impact is derived from the same gate, pause and INTERFERED the snapshot reports');
-  assert.match(handler, /return \{ \.\.\.snap, capacityHold: gate\.holds, capacityEvidence: gate\.evidence, interfered, impact \}/);
+  assert.match(facts, /return \{ snap, gate, interfered, impact \}/);
+  assert.match(handler, /return \{ \.\.\.f\.snap, capacityHold: f\.gate\.holds, capacityEvidence: f\.gate\.evidence, interfered: f\.interfered, impact: f\.impact \}/);
   const fnStart = main.indexOf('function agentImpactFor(');
   const fn = main.slice(fnStart, main.indexOf('\n}\n', fnStart));
   assert.ok(fnStart > 0);

@@ -1,45 +1,63 @@
 /**
- * v1.1.45 unit #5 — each agent's main-produced impact string, READ from control:snapshot.
+ * v1.1.45 unit #5 — each agent's main-produced impact string, from control:snapshot.
  *
- * ONE poller for every card and row: an agent shown both as a card and as a Command
- * Center row costs one snapshot read per tick, not two. It runs only while something is
- * subscribed, on the composer's 2s cadence (holds flip on human timescales). The string is
- * main's; nothing here decides or words a hold.
+ * CRIT-15-PRE: PUSHED, never polled. Each agent's snapshot is read ONCE when something
+ * first shows it (the mount-time initial state, which also tells main to serve it); after
+ * that main pushes every change on its own channel (`window.cth.onAgentImpact`). There is
+ * no timer. One subscription serves every card and row while anything is shown. A push
+ * row outranks a mount answer that lands after it. The string is main's; nothing here
+ * decides or words a hold.
  */
 import { useSyncExternalStore } from 'react';
-import type { AgentImpact } from '@shared/deliveryHold';
+import type { AgentImpact, AgentImpactPush } from '@shared/deliveryHold';
 
-const POLL_MS = 2000;
 const values = new Map<string, AgentImpact | null>();
 const listeners = new Map<string, Set<() => void>>();
-let timer: ReturnType<typeof setInterval> | null = null;
+/** Agents whose row a push has carried: a later mount answer is older than it. */
+const pushed = new Set<string>();
+let unsubscribePush: (() => void) | null = null;
 
 const sameImpact = (a: AgentImpact | null | undefined, b: AgentImpact | null): boolean =>
   (a ?? null) === b || (!!a && !!b && a.kind === b.kind && a.text === b.text && a.verb === b.verb);
+
+function store(agentId: string, next: AgentImpact | null): void {
+  if (sameImpact(values.get(agentId), next) && values.has(agentId)) return;
+  values.set(agentId, next);
+  for (const l of listeners.get(agentId) ?? []) l();
+}
 
 function read(agentId: string): void {
   if (typeof window === 'undefined' || !window.cth?.controlSnapshot) return;
   window.cth.controlSnapshot(agentId)
     .then((s) => {
-      const next = s?.impact ?? null;
-      if (sameImpact(values.get(agentId), next) && values.has(agentId)) return;
-      values.set(agentId, next);
-      for (const l of listeners.get(agentId) ?? []) l();
+      if (pushed.has(agentId) || !listeners.has(agentId)) return;
+      store(agentId, s?.impact ?? null);
     })
     // Main not ready: say nothing rather than guess. Absence is "no impact known".
     .catch(() => {});
 }
 
+function onPush(push: AgentImpactPush): void {
+  for (const row of push?.rows ?? []) {
+    if (!listeners.has(row.agentId)) continue;
+    pushed.add(row.agentId);
+    store(row.agentId, row.impact ?? null);
+  }
+}
+
 function subscribe(agentId: string, listener: () => void): () => void {
   let set = listeners.get(agentId);
+  const first = !set;
   if (!set) { set = new Set(); listeners.set(agentId, set); }
   set.add(listener);
-  read(agentId);
-  if (!timer) timer = setInterval(() => { for (const id of listeners.keys()) read(id); }, POLL_MS);
+  if (!unsubscribePush && typeof window !== 'undefined' && window.cth?.onAgentImpact) {
+    unsubscribePush = window.cth.onAgentImpact(onPush);
+  }
+  if (first) read(agentId);
   return () => {
     set!.delete(listener);
-    if (set!.size === 0) { listeners.delete(agentId); values.delete(agentId); }
-    if (listeners.size === 0 && timer) { clearInterval(timer); timer = null; }
+    if (set!.size === 0) { listeners.delete(agentId); values.delete(agentId); pushed.delete(agentId); }
+    if (listeners.size === 0 && unsubscribePush) { unsubscribePush(); unsubscribePush = null; }
   };
 }
 

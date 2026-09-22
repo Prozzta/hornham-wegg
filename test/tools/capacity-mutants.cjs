@@ -34,7 +34,7 @@ const TESTS = ['test/capacity-strip-contract.test.cjs', 'test/capacity-strip-ui.
   'test/capacity-banner.test.cjs', 'test/capacity-toast.test.cjs',
   'test/capacity-composer-note.test.cjs', 'test/capacity-copy-guards.test.cjs',
   'test/capacity-tidy-pins.test.cjs', 'test/capacity-usage-push.test.cjs',
-  'test/capacity-piedot.test.cjs'];
+  'test/capacity-piedot.test.cjs', 'test/capacity-impact-push.test.cjs'];
 
 const STRIP = 'src/main/capacityStrip.ts';
 const SHARED = 'src/shared/capacityStrip.ts';
@@ -67,6 +67,8 @@ const COMPOSER = 'src/renderer/src/components/MessageQueueComposer.tsx';
 const PANEL_CC = 'src/renderer/src/components/CommandCenterPanel.tsx';
 const PIE = 'src/renderer/src/capacity/pieDot.ts';
 const TOKENS = 'src/renderer/src/design/tokens.css';
+const IMPACT_HOOK = 'src/renderer/src/hooks/useAgentImpact.ts';
+const IMPACT_PUSH = 'src/main/agentImpactPush.ts';
 
 /** [name, file, from, to] */
 const MUTANTS = [
@@ -118,8 +120,8 @@ const MUTANTS = [
   ['u1 freshUntil ignores the monotonic deadline', TRACKER,
     'return now + (rec.staleAt - monoNow);', 'return now + 1;'],
   ['u1 control:snapshot carries pool data', INDEX,
-    'return { ...snap, capacityHold: gate.holds,',
-    'return { ...snap, pools: capacityStrip.current(), capacityHold: gate.holds,'],
+    'return { ...f.snap, capacityHold: f.gate.holds,',
+    'return { ...f.snap, pools: capacityStrip.current(), capacityHold: f.gate.holds,'],
   // ── unit #2 + strip-polish: layout ───────────────────────────────────────────
   ['u2 blocked frame puts 5h before weekly', LAYOUT,
     "    if (pool.weekly) out.push({ kind: 'figure', key: 'weekly', role: 'weekly', text: pool.weekly.text, subordinate: false });\n    out.push({ kind: 'figure', key: 'five-hour', role: 'five-hour', text: pool.fiveHour.text, subordinate: true });",
@@ -378,8 +380,8 @@ const MUTANTS = [
   ['u13 dedupe keyed on something other than the rows (drops a real usage change)', USAGE_MAIN,
     '    const key = JSON.stringify(push.rows);', '    const key = JSON.stringify(push.rows.map((r) => r.agentId));'],
   ['u13 the usage push gated on the strip collectionRevision', INDEX,
-    'onChange: () => { pushCapacityStrip(); pushAgentUsage(); }',
-    'onChange: () => { const was = lastPushedCapacityStrip; pushCapacityStrip(); if (lastPushedCapacityStrip !== was) pushAgentUsage(); }'],
+    'onChange: () => { pushCapacityStrip(); pushAgentUsage(); pushAgentImpact(); }',
+    'onChange: () => { const was = lastPushedCapacityStrip; pushCapacityStrip(); if (lastPushedCapacityStrip !== was) pushAgentUsage(); pushAgentImpact(); }'],
   ['u13 the display setter does not push', INDEX,
     '  const next = setAgentUsageDisplay(agentId, display);\n  pushAgentUsage();\n', '  const next = setAgentUsageDisplay(agentId, display);\n'],
   ['u13 an agent spawn does not push', INDEX,
@@ -451,6 +453,37 @@ const MUTANTS = [
   ["u14 a tokens.css dark bar colour loses contrast with the pie-dot", TOKENS,
     "  --cth-cream-100: #1D1D22;",
     "  --cth-cream-100: #E8E4DA;"],
+  // ── CRIT-15-PRE: the impact string is pushed by main, never polled ──
+  ["c15 the impact hook polls again", IMPACT_HOOK,
+    "  if (first) read(agentId);\n",
+    "  if (first) read(agentId);\n  setInterval(() => read(agentId), 2000);\n"],
+  ["c15 a capacity publication does not push impacts", INDEX,
+    "onChange: () => { pushCapacityStrip(); pushAgentUsage(); pushAgentImpact(); }",
+    "onChange: () => { pushCapacityStrip(); pushAgentUsage(); }"],
+  ["c15 an admission move does not push impacts", INDEX,
+    "  onAdmission: () => pushAgentImpact()", "  onAdmission: () => {}"],
+  ["c15 the runtime does not report a confirmed launch", RUNTIME,
+    "    this.admission.confirmLaunch(decision);\n    this.admissionMoved();\n", "    this.admission.confirmLaunch(decision);\n"],
+  ["c15 an unresolved reservation's lapse is never marked", RUNTIME,
+    "    if (decision.grantId) this.armReservationLapse();\n", ""],
+  ["c15 stop() leaves a lapse timer armed", RUNTIME,
+    "    for (const handle of this.lapseTimers) this.clearTimer(handle);\n", ""],
+  ["c15 impacts pushed on control:snapshot", INDEX,
+    "w.webContents.send(AGENT_IMPACT_PUSH, push)", "w.webContents.send('control:snapshot', push)"],
+  ["c15 impact dedupe drops a real change", IMPACT_PUSH,
+    "    const key = JSON.stringify(push.rows);", "    const key = JSON.stringify(push.rows.map((r) => r.agentId));"],
+  ["c15 a late mount answer overwrites a newer impact push", IMPACT_HOOK,
+    "if (pushed.has(agentId) || !listeners.has(agentId)) return;", "if (!listeners.has(agentId)) return;"],
+  ["c15 the snapshot does not register the agent for pushes", INDEX,
+    "  impactWatched.add(agentId);\n", ""],
+  ["c15 the floor switch does not push", INDEX,
+    "  writeConfig({ autoDeliveryPausedAgents: Array.from(current).sort() });\n  pushAgentImpact();\n",
+    "  writeConfig({ autoDeliveryPausedAgents: Array.from(current).sort() });\n"],
+  ["c15 a submit outcome does not push", INDEX,
+    "    pushAgentImpact();\n    if (r.outcome.kind === 'COMMITTED') return;", "    if (r.outcome.kind === 'COMMITTED') return;"],
+  ["c15 a resolved interference does not push", INDEX,
+    "  const resolved = ptyId ? automaticSubmit.resolveInterference(ptyId, how as InterferenceResolution) : false;\n  pushAgentImpact();\n",
+    "  const resolved = ptyId ? automaticSubmit.resolveInterference(ptyId, how as InterferenceResolution) : false;\n"],
 ];
 
 // THE BASELINE MUST BE GREEN. Against already-failing tests every mutant "dies", and a

@@ -349,8 +349,13 @@ const handlerBody = (text, channel) => {
 test('main: the snapshot REPORTS the owner’s inhibition, and only a dedicated handler resolves it', () => {
   const index = codeOnly(readSource('src/main/index.ts'));
   const snapshot = handlerBody(index, 'control:snapshot');
-  assert.match(snapshot, /automaticSubmit\.inhibition\(heldPty\)/, 'read from the ONE owner, not kept anywhere else');
-  assert.ok(!/resolveInterference/.test(snapshot), 'a read of the state never resolves it');
+  // CRIT-15-PRE: the handler's facts live in controlFactsOf, shared with the impact push.
+  assert.match(snapshot, /const f = controlFactsOf\(agentId\);/);
+  const factsAt = index.indexOf('function controlFactsOf(');
+  const facts = index.slice(factsAt, index.indexOf('\n}\n', factsAt));
+  assert.ok(factsAt > 0);
+  assert.match(facts, /automaticSubmit\.inhibition\(heldPty\)/, 'read from the ONE owner, not kept anywhere else');
+  assert.ok(!/resolveInterference/.test(snapshot + facts), 'a read of the state never resolves it');
   const resolve = handlerBody(index, 'autoSubmit:resolveInterference');
   assert.match(resolve, /automaticSubmit\.resolveInterference\(ptyId, how as InterferenceResolution\)/, 'the person\u2019s answer is passed through');
   assert.match(resolve, /if \(typeof how !== 'string' \|\| !\(INTERFERENCE_RESOLUTIONS as readonly string\[\]\)\.includes\(how\)\) return false;/,

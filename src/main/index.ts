@@ -44,7 +44,8 @@ import { CapacityStore, capacityStorePath } from './capacityPersistence';
 import type { CapacityNotifyIntent } from './capacityNotify';
 import { CapacityStripPresenter } from './capacityStrip';
 import { deliverCapacityToast, type CapacityToast } from './capacityToast';
-import { agentImpactOf, capacityStateNote, type AgentImpact } from '../shared/deliveryHold';
+import { AGENT_IMPACT_PUSH, agentImpactOf, capacityStateNote, type AgentImpact } from '../shared/deliveryHold';
+import { AgentImpactPushGate, agentImpactPushOf } from './agentImpactPush';
 import { capacityDetailView } from './capacityDetail';
 import { CAPACITY_DETAIL_CHANNEL, validateCapacityDetail } from '../shared/capacityDetail';
 import { AgentUsagePushGate, agentUsagePushOf, agentUsageView } from './capacityAgentUsage';
@@ -405,7 +406,8 @@ const providerCapacity = new CapacityRuntime({
       capacityStrip.noteIntent(intent, capacityToast(capacityStrip.toastFor(intent, providerCapacity.tracker.pool(intent.poolKey))));
     }
   },
-  onChange: () => { pushCapacityStrip(); pushAgentUsage(); }
+  onChange: () => { pushCapacityStrip(); pushAgentUsage(); pushAgentImpact(); },
+  onAdmission: () => pushAgentImpact()
 });
 // L0-FUSION stage 5 - THE ONE OWNER of programmatic stage -> final revalidation -> Enter.
 // Main resolves the PTY, main holds it against other programmatic writers, and main's
@@ -421,6 +423,8 @@ const automaticSubmit = new AutomaticSubmitOwner(buildOwnerDeps({
   providerForPty: (ptyId) => ptyProvider.get(ptyId),
   requestScreenReading: (ptyId, needle) => screenReadings.request(ptyId, needle),
   onOutcome: (r) => {
+    // An outcome can raise an INTERFERED hold or settle one: the impact string moves.
+    pushAgentImpact();
     if (r.outcome.kind === 'COMMITTED') return;
     const why = 'reason' in r.outcome ? r.outcome.reason : '';
     console.log(`[auto-submit] ${r.admissionClass} ${r.agentId} on ${r.ptyId ?? '-'}: ${r.outcome.kind} ${why}`);
@@ -596,6 +600,7 @@ function teardownPty(id: string): void {
     // Pool membership completeness can change when an agent leaves.
     pushCapacityStrip();
     pushAgentUsage();
+    pushAgentImpact();
     // Drop watchdog state so a dead agent can't get nudged or leak its grace.
     try { workerWake.forget(agentId, id); } catch { /* best-effort */ }
     // Drop breaker state so a dead agent can't leak/zombie a tripped level.
@@ -1472,6 +1477,37 @@ function pushAgentUsage(): void {
     if (w.isDestroyed() || w.webContents.isDestroyed()) continue;
     try { w.webContents.send(CAPACITY_AGENT_USAGE_PUSH, push); } catch { /* window tearing down */ }
   }
+}
+
+/** Agents a renderer has asked about via control:snapshot: the rows of the impact push. */
+const impactWatched = new Set<string>();
+const agentImpactPushGate = new AgentImpactPushGate();
+let impactPushing = false;
+let impactPushAgain = false;
+/**
+ * v1.1.45 CRIT-15-PRE: the agent-card impact is PUSHED, never polled (see agentImpactPush.ts
+ * for the events that call this). Re-entrant calls - reading an interference hold can retire
+ * one and settle its grant, which is itself an admission move - fold into one more pass.
+ */
+function pushAgentImpact(): void {
+  if (impactPushing) { impactPushAgain = true; return; }
+  impactPushing = true;
+  try {
+    for (let pass = 0; pass < 3; pass++) {
+      impactPushAgain = false;
+      let push;
+      try {
+        push = agentImpactPushGate.next(agentImpactPushOf(impactWatched, (agentId) => controlFactsOf(agentId).impact));
+      } catch (e) { console.warn('[agent-impact]', e instanceof Error ? e.message : e); return; }
+      if (push) {
+        for (const w of allWindows) {
+          if (w.isDestroyed() || w.webContents.isDestroyed()) continue;
+          try { w.webContents.send(AGENT_IMPACT_PUSH, push); } catch { /* window tearing down */ }
+        }
+      }
+      if (!impactPushAgain) return;
+    }
+  } finally { impactPushing = false; }
 }
 
 /** A native toast for breaker constrain/stop, gated on the notifications setting. */
@@ -3220,6 +3256,7 @@ async function spawnAgentCore(opts: AgentSpawnOptions, owner: Electron.WebConten
     // A new agent with no reading yet makes its provider's membership unknown.
     pushCapacityStrip();
     pushAgentUsage();
+    pushAgentImpact();
     // Worker inbox-wake watchdog (#151): boot grace starts at spawn so the
     // initial orientation prompt is never mistaken for an idle agent.
     workerWake.noteSpawn(opts.id);
@@ -4272,6 +4309,7 @@ ipcMain.handle('control:autoDelivery', (_evt, agentId: unknown, paused: unknown)
   const current = new Set(readConfig().autoDeliveryPausedAgents ?? []);
   if (on) current.add(agentId); else current.delete(agentId);
   writeConfig({ autoDeliveryPausedAgents: Array.from(current).sort() });
+  pushAgentImpact();
   return control.snapshot(agentId);
 });
 ipcMain.handle('control:resume', (_evt, agentId: unknown) => {
@@ -4358,6 +4396,15 @@ ipcMain.handle(CAPACITY_NOTICE_DISMISS, (_evt, noticeId: unknown) => {
 });
 ipcMain.handle('control:snapshot', (_evt, agentId: unknown) => {
   if (typeof agentId !== 'string') return null;
+  // Asked about once, pushed from then on (CRIT-15-PRE): the impact push serves this agent.
+  impactWatched.add(agentId);
+  const f = controlFactsOf(agentId);
+  return { ...f.snap, capacityHold: f.gate.holds, capacityEvidence: f.gate.evidence, interfered: f.interfered, impact: f.impact };
+});
+
+/** The snapshot's settled facts for one agent - the ONE computation behind both the
+ *  control:snapshot answer and the impact push, so the two can never disagree. */
+function controlFactsOf(agentId: string) {
   // L0-SEAM on the renderer's automatic queued dispatch. That path already consults
   // this snapshot and already has a no-penalty early return for a held agent, so the
   // gate costs no send attempt and drops no queued message - which the other
@@ -4385,8 +4432,8 @@ ipcMain.handle('control:snapshot', (_evt, agentId: unknown) => {
   const interfered = held ? { requestId: held.requestId, reason: held.reason, at: held.at } : null;
   const snap = control.snapshot(agentId);
   const impact = agentImpactFor(snap.autoDeliveryPaused, gate, interfered !== null, probed.poolKey);
-  return { ...snap, capacityHold: gate.holds, capacityEvidence: gate.evidence, interfered, impact };
-});
+  return { snap, gate, interfered, impact };
+}
 
 /**
  * v1.1.45 unit #5 - the agent-card impact, from the SAME settled facts the snapshot above
@@ -4455,7 +4502,9 @@ ipcMain.handle('autoSubmit:resolveInterference', (_evt, agentId: unknown, how: u
   if (typeof agentId !== 'string' || !agentId) return false;
   if (typeof how !== 'string' || !(INTERFERENCE_RESOLUTIONS as readonly string[]).includes(how)) return false;
   const ptyId = ptyForAgent(agentId);
-  return ptyId ? automaticSubmit.resolveInterference(ptyId, how as InterferenceResolution) : false;
+  const resolved = ptyId ? automaticSubmit.resolveInterference(ptyId, how as InterferenceResolution) : false;
+  pushAgentImpact();
+  return resolved;
 });
 
 // ─── IPC: scheduled missions (recurring auto-dispatch) ──────────────────────
@@ -4984,7 +5033,7 @@ registerRealtimeActionIpc({
   trackDispatch: (d) => { try { completionWatcher.track({ ...d, kind: 'dispatch' }); } catch { /* watcher unavailable */ } },
   // ── v0.3.4 full-control extensions ──
   controlResume: (id) => control.resume(id),
-  controlAutoDelivery: (id, paused) => control.pauseAutoDelivery(id, paused),
+  controlAutoDelivery: (id, paused) => { control.pauseAutoDelivery(id, paused); pushAgentImpact(); },
   controlGateTool: (id, toolName, on) => control.gateTool(id, toolName, on),
   setArchived: (id, archived) => {
     if (!hive.enabled()) return { ok: false, error: 'hive disabled' };

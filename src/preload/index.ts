@@ -9,7 +9,7 @@ import type { IntegrationRecord, IntegrationTemplate } from '../shared/integrati
 export type { IntegrationRecord, IntegrationTemplate } from '../shared/integrations';
 import type { UpdateStatus } from '../shared/updateState';
 import type { CapacityStripCollection } from '../shared/capacityStrip';
-import type { AgentImpact } from '../shared/deliveryHold';
+import type { AgentImpact, AgentImpactPush } from '../shared/deliveryHold';
 import type { AgentUsagePush, AgentUsageView } from '../shared/agentUsage';
 import type { ProviderCapacityDetailView } from '../shared/capacityDetail';
 export type { ProviderCapacityDetailView } from '../shared/capacityDetail';
@@ -1161,6 +1161,14 @@ const api = {
   /** Read an agent's current control snapshot. */
   controlSnapshot: (agentId: string): Promise<AgentControlSnapshot | null> =>
     ipcRenderer.invoke('control:snapshot', agentId),
+  /** CRIT-15-PRE: every watched agent's impact, PUSHED by main on its own channel. The
+   *  snapshot above stays for the mount-time initial state. Literal channel name: a test
+   *  pins it to AGENT_IMPACT_PUSH in src/shared/deliveryHold.ts. */
+  onAgentImpact: (cb: (push: AgentImpactPush) => void): (() => void) => {
+    const listener = (_e: IpcRendererEvent, payload: AgentImpactPush) => cb(payload);
+    ipcRenderer.on('control:agentImpactPush', listener);
+    return () => ipcRenderer.removeListener('control:agentImpactPush', listener);
+  },
   /**
    * L0-FUSION stage 5.3 - ask MAIN to type a message into an agent's terminal and submit
    * it. The one door for programmatic text+Enter: the renderer names the agent and the

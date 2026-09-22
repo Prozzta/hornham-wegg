@@ -998,13 +998,16 @@ test('UNNAMED CASE (e): with several windows, the ATTRIBUTED window governs, the
 test('L0-UNKNOWN: the control snapshot is computed through the ONE resolver, and carries the evidence', () => {
   const index = read('src/main/index.ts');
   const handler = index.slice(index.indexOf("ipcMain.handle('control:snapshot'"));
-  const body = handler.slice(0, handler.indexOf('\n});'));
+  // CRIT-15-PRE: the handler's facts live in controlFactsOf, shared with the impact push.
+  const facts = index.slice(index.indexOf('function controlFactsOf('));
+  const body = handler.slice(0, handler.indexOf('\n});')) + facts.slice(0, facts.indexOf('\n}\n'));
+  assert.match(body, /const f = controlFactsOf\(agentId\);/);
   assert.match(body, /const probed = providerCapacity\.admission\.probe\(agentId, 'ORDINARY_TURN'\);/);
   assert.match(body, /probed\.poolKey \? providerCapacity\.tracker\.pool\(probed\.poolKey\)\?\.freshness \?\? null : null,/,
     'the pool\u2019s own published freshness chooses between labels; it never changes `holds`');
   assert.match(body, /probed\.poolKey \? providerCapacity\.tracker\.resetOutlook\(probed\.poolKey\) : null\)/,
     'and the TRACKER answers whether a hold can end by itself - the handler does not re-derive it');
-  assert.match(body, /capacityHold: gate\.holds, capacityEvidence: gate\.evidence/);
+  assert.match(body, /capacityHold: f\.gate\.holds, capacityEvidence: f\.gate\.evidence/);
   assert.ok(!/providerCapacity\.holds\(/.test(index), 'index.ts no longer reads the boolean collapse at all');
 });
 
