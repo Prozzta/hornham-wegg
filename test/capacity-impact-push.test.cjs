@@ -60,7 +60,7 @@ test('its OWN channel, the one computation for both doors, and the snapshot regi
 
 test('main pushes on every event that can move the string', () => {
   const main = codeOnly(readSource('src/main/index.ts'), 'index.ts');
-  assert.match(main, /onChange: \(\) => \{ pushCapacityStrip\(\); pushAgentUsage\(\); pushAgentImpact\(\); \}/, 'capacity publication (carries decay)');
+  assert.match(main, /onChange: \(\) => \{ pushCapacityStrip\(\); pushAgentUsage\(\); pushAgentImpact\(\); inboxWake\?\.onCapacityChange\(\); \}/, 'capacity publication (carries decay)');
   assert.match(main, /onAdmission: \(\) => pushAgentImpact\(\)/, 'admission-ledger move');
   assert.match(main, /onOutcome: \(r\) => \{\s*pushAgentImpact\(\);\s*if \(r\.outcome\.kind === 'COMMITTED'\) return;/, 'every submit outcome, before the COMMITTED early return');
   assert.match(main, /ptyProvider\.delete\(id\);[\s\S]{0,120}?pushAgentUsage\(\);\s*pushAgentImpact\(\);/, 'agent leave');

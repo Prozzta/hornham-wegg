@@ -262,7 +262,7 @@ test('index.ts wires every edge to the ONE bridge, registered before the router 
   assert.match(index, /hive\.setDeliveryObserver\(\(\{ agentId, messageId \}\) => inboxWake\?\.onDelivery\(agentId, messageId\)\)/);
   assert.match(index, /\(agentId, event, message\) => inboxWake\?\.onHook\(agentId, event, message\)/, 'the hook stream');
   assert.match(index, /transition === 'UNPAUSED' \|\| transition === 'RESUMED' \|\| transition === 'AUTO_DELIVERY_RELEASED'/, 'only releases retry');
-  assert.match(index, /onChange: \(\) => \{ pushCapacityStrip\(\); pushAgentUsage\(\); inboxWake\?\.onCapacityChange\(\); \}/);
+  assert.match(index, /onChange: \(\) => \{ pushCapacityStrip\(\); pushAgentUsage\(\); pushAgentImpact\(\); inboxWake\?\.onCapacityChange\(\); \}/);
   assert.match(index, /if \(resolved\) inboxWake\?\.onInterferenceResolved\(agentId, how as InterferenceResolution\);/);
   assert.match(index, /workerWake\.noteSpawn\(opts\.id, Date\.now\(\), opts\.hive\.id\)/);
   const beat = index.slice(at('function runWorkerWakeBeat'), at('function armAlwaysOnBeats'));

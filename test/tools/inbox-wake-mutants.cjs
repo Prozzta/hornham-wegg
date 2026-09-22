@@ -100,6 +100,9 @@ const MUTANTS = [
     '      try { this.routeOnce(); } catch { /* keep the loop alive */ }'],
   ['w a same-value control setter emits a transition', CONTROL,
     '    if (c.paused === on) return;\n', ''],
+  ['w a capacity change is no longer a retry hint (the merged onChange drops it)', INDEX,
+    'onChange: () => { pushCapacityStrip(); pushAgentUsage(); pushAgentImpact(); inboxWake?.onCapacityChange(); }',
+    'onChange: () => { pushCapacityStrip(); pushAgentUsage(); pushAgentImpact(); }'],
   ['w the delivery observer is never registered', INDEX,
     'hive.setDeliveryObserver(({ agentId, messageId }) => inboxWake?.onDelivery(agentId, messageId));',
     'void 0;']
