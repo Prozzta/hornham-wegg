@@ -48,7 +48,9 @@ export function poolTokens(pool: PresentedPool): StripToken[] {
   }
 
   const window = (role: StripRole, text: string, meter: DisplayReadyMeter | undefined, resetText: string | undefined): void => {
-    if (normal && meter) out.push({ kind: 'meter', key: `${role}-meter`, role, meter, valueText: text });
+    // Unit #14: the 5h figure's pie IS the pool's lead dot (drawn with the state), so only a
+    // revealed weekly figure gets a pie token of its own here.
+    if (normal && meter && role !== 'five-hour') out.push({ kind: 'meter', key: `${role}-meter`, role, meter, valueText: text });
     out.push({ kind: 'figure', key: role, role, text, subordinate: false });
     if (normal && resetText) out.push({ kind: 'reset', key: `${role}-reset`, role, text: resetText });
   };

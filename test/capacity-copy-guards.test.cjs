@@ -110,7 +110,7 @@ test('the strip shows NO state word in any fixture; each state word survives onl
     const nodes = visibleNodes(html);
     for (const w of words) assert.ok(!nodes.includes(w), `${f.name}: "${w}" is visible text`);
     assert.ok(html.includes(`role="img" aria-label="${f.shown.stateText}"`), `${f.name}: the shape is named "${f.shown.stateText}"`);
-    assert.ok(nodes.includes(STATE_TOKEN[f.shown.state]), `${f.name}: the shape itself is drawn`);
+    assert.match(html, /data-cap-dot="[A-Z]+"[^>]*>(<span[^>]*>)?<svg/, `${f.name}: the dot itself is drawn (unit #14)`);
   }
 });
 
@@ -126,10 +126,11 @@ test('§9: nothing on the capacity surface draws a segmented gauge; each capacit
   for (const f of FIX) {
     const html = renderStrip([f.shown]);
     let meters = 0;
-    for (const m of html.matchAll(/data-cap-meter="[^"]*"[^>]*>(.*?)<\/span><\/span>/g)) {
+    // Unit #14: a meter is a pie-dot. Up to its own <svg> close it holds at most ONE fill
+    // (none at 0%), a single wedge or disc, never segments.
+    for (const m of html.matchAll(/data-cap-meter="[^"]*"[^>]*>([\s\S]*?)<\/svg>/g)) {
       meters++;
-      // The meter's content up to its own close: exactly one empty fill span, nothing else.
-      assert.match(m[1], /^<span [^>]*>$/, `${f.name}: a meter holds exactly ONE fill`);
+      assert.ok((m[1].match(/data-cap-fill=/g) || []).length <= 1, `${f.name}: a meter holds exactly ONE fill`);
     }
     assert.equal(meters, (html.match(/data-cap-meter=/g) || []).length, `${f.name}: every meter was checked`);
   }

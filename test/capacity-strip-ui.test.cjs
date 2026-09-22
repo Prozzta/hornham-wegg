@@ -105,7 +105,8 @@ test('F3 cold start: no pools draws the unknown shape and main\'s emptyText — 
   const html = render([]);
   assert.ok(html.includes('data-cap-empty'));
   assert.ok(html.includes('data-cap-state-token="UNKNOWN"'));
-  assert.deepEqual(visibleNodes(html), ['◌', 'Capacity unknown']);
+  assert.deepEqual(visibleNodes(html), ['Capacity unknown']);
+  assert.ok(html.includes('data-cap-dot="SPOTTED"'), 'unit #14: the spotted dot is drawn');
   assert.ok(!/role="meter"|\d/.test(visibleNodes(html).join(' ')), 'no figure, no meter');
   assert.ok(visibleNodes(render([], 'from main')).includes('from main'), 'the text is main\'s, not the renderer\'s');
   const src = codeOnly(readSource('src/renderer/src/components/CapacityStrip.tsx'), 'CapacityStrip.tsx');
@@ -134,7 +135,7 @@ test('NO state word is visible in any state — the shape carries it, named for 
     }
     assert.match(html, new RegExp(`role="img" aria-label="${p.stateText}" data-cap-state-token="${p.state}"`),
       'the shape carries the state word as its accessible name');
-    assert.ok(nodes.includes(STATE_TOKEN[p.state]), 'every state shows its shape, healthy included');
+    assert.match(html, /data-cap-dot="(PIE|STOP|SPOTTED|DIMMED|RING)"[^>]*>(<span[^>]*>)?<svg/, 'every state shows its dot, healthy included (unit #14)');
   }
 });
 
@@ -153,7 +154,7 @@ test('healthy: mark, label, green dot, ONE continuous meter, the 5h figure — a
   const html = render([HEALTHY()]);
   const nodes = visibleNodes(html);
   assert.ok(nodes.includes('Codex'));
-  assert.ok(nodes.includes('●'));
+  assert.ok(html.includes('data-cap-dot="PIE"'), 'unit #14: the 5h pie leads');
   assert.ok(html.includes('data-cap-state-token="AVAILABLE"'));
   assert.equal(count(html, /role="meter"/g), 1);
   assert.match(html, /role="meter" aria-valuemin="0" aria-valuemax="100" aria-valuenow="80.6" aria-valuetext="5h · 80% remaining"/);

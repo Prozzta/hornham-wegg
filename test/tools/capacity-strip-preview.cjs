@@ -26,7 +26,8 @@ const { ProviderCapacityTracker, L0_SEM_POLICY } = loadTs('src/main/providerCapa
 const { CapacityStripPresenter } = loadTs('src/main/capacityStrip.ts');
 const { CAPACITY_EMPTY_TEXT } = loadTs('src/shared/capacityStrip.ts');
 const { presentPool } = loadTs('src/renderer/src/capacity/capacityStrip.ts');
-const { CapacityStripView, SCROLL_PX_PER_S } = loadTs('src/renderer/src/components/CapacityStrip.tsx');
+const { CapacityStripView, SCROLL_PX_PER_S, StateDot, PieMeter } = loadTs('src/renderer/src/components/CapacityStrip.tsx');
+const { remainingColor } = loadTs('src/renderer/src/capacity/pieDot.ts');
 
 const T0 = new Date(2026, 8, 21, 14, 5, 0).getTime();
 const H = 3_600_000;
@@ -89,24 +90,45 @@ const ATTRIB = { providerReachedType: 'usage', providerAttributedLimitingWindowI
 const MIN = 1280;   // the app's minimum window width
 const FULL = 1920;
 
+/** Unit #14: the pie-dot on its own, larger than life, so the look can be judged. */
+const dot = (el) => renderToStaticMarkup(el);
+const cell = (svg, label, sub = '') => `<div class="cell"><div class="big">${svg}</div><div class="lab">${label}</div>${sub ? `<div class="sub">${sub}</div>` : ''}</div>`;
+const spectrum = [100, 90, 80, 70, 60, 50, 40, 30, 20, 10, 5, 0].map((p) =>
+  cell(dot(React.createElement(PieMeter, { percent: p, valueText: `${p}%`, role: 'demo' })), `${p}% remaining`, remainingColor(p))).join('');
+const specials = [
+  cell(dot(React.createElement(StateDot, { look: { kind: 'STOP' }, state: 'LIMITED', name: 'Limited' })), 'LIMIT reached', 'stop sign, not a pie'),
+  cell(dot(React.createElement(StateDot, { look: { kind: 'SPOTTED' }, state: 'UNKNOWN', name: 'Unknown' })), 'UNKNOWN / no reading', 'black-and-white spotted'),
+  cell(dot(React.createElement(StateDot, { look: { kind: 'DIMMED', percent: null }, state: 'AVAILABLE', name: 'Available' })), 'STALE (default, today)', 'dimmed, dashed rim, no wedge'),
+  cell(dot(React.createElement(StateDot, { look: { kind: 'DIMMED', percent: 72 }, state: 'AVAILABLE', name: 'Available' })), 'STALE with last-known 72%', 'dimmed pie: needs a contract change (see note)'),
+  cell(dot(React.createElement(StateDot, { look: { kind: 'SPOTTED' }, state: 'AVAILABLE', name: 'Available' })), 'STALE, alternative', 'the spotted look instead'),
+  cell(dot(React.createElement(StateDot, { look: { kind: 'RING' }, state: 'AVAILABLE', name: 'Available' })), 'known state, no figure', 'empty ring (rare)')
+].join('');
+const LEGEND = `
+<section class="legend">
+  <h2>The pie-dot (unit #14), drawn larger than life (shown at 2x)</h2>
+  <p class="note">The filled wedge IS the remaining share (a full disc = 100% left). Its colour follows the same figure, on one smooth scale from green at 100% to dark red at 0%. The number stays as text on the row. In the strip, each dot is 20px (the old glyph was 14px) and the bar is gone.</p>
+  <div class="row">${spectrum}</div>
+  <div class="row">${specials}</div>
+</section>`;
+
 const panels = [
   panel('Cold start — no reading yet (F3)', 'Before any provider has reported: the unknown shape and main\'s text, never an empty bar.',
     { pools: [], emptyText: CAPACITY_EMPTY_TEXT }, MIN),
-  panel('Healthy — two pools', 'Green dot + meter + figure. No state words. No reset hints: both are above the threshold (15%).',
+  panel('Healthy — two pools', 'Each pool leads with its 5h pie (green, nearly full) and the figure. No bar. No state words. No reset hints: both are above the threshold (15%).',
     scenario([codex(std(80.6, 60)), claude(std(91, 55))]), MIN),
-  panel('Reset hint below the threshold', 'Codex 5h at 10%: below 15%, so its reset expectation appears. Claude at 91%: none.',
+  panel('Reset hint below the threshold', 'Codex 5h at 10%: a thin dark-orange wedge, and its reset expectation appears. Claude at 91%: none.',
     scenario([codex(std(10, 60)), claude(std(91, 55))]), MIN),
-  panel('Weekly revealed', 'Weekly at 14.9% is below the threshold, so its row (and its reset hint) appears inline.',
+  panel('Weekly revealed', 'Weekly at 14.9% is below the threshold: it gets its own (red-orange) pie, figure and reset hint, inline.',
     scenario([codex(std(80, 14.9))]), MIN),
-  panel('Exhausted / blocked (provider-attributed)', 'Red square; weekly primary; ONE subordinate 5h token. No meters.',
+  panel('Exhausted / blocked (provider-attributed)', 'LIMIT: the stop sign; weekly primary; ONE subordinate 5h token. No pie for the unusable 5h figure.',
     scenario([codex(std(63, 0), ATTRIB)]), MIN),
-  panel('A2: reserve only, weekly at 0% (not attributed)', 'Orange half-circle; the held frame with observational copy.',
+  panel('A2: reserve only, weekly at 0% (not attributed)', 'Not a provider limit, so no stop sign: an EMPTY pie (weekly at 0%) with its dark-red rim, and the held frame with observational copy.',
     scenario([codex(std(63, 0))]), MIN),
-  panel('UNKNOWN (fresh reading, no usable numbers)', 'No meter primitive at all; the status is stated.',
+  panel('UNKNOWN (fresh reading, no usable numbers)', 'The spotted dot; no pie at all; the status is stated.',
     scenario([codex([win('five_hour', 'FIVE_HOUR', null, null), win('seven_day', 'SEVEN_DAY', 60, null)])]), MIN),
-  panel('Stale', 'The reading aged out: no number, no bar, absolute last-update time.',
+  panel('Stale', 'The reading aged out. TODAY this draws the SPOTTED dot: a stale reading is forced to UNKNOWN, and the strip is told nothing that separates it from "no reading" (the same text as the panel above). The DIMMED look in the legend needs main to say "stale" - see the note to god.',
     scenario([codex(std(80, 60))], { stale: true }), MIN),
-  panel('Stale + open limit epoch (A1)', 'The red square stays (the tracker\'s state); the figures are removed.',
+  panel('Stale + open limit epoch (A1)', 'The stop sign stays (the tracker\'s state is kept); the figures are removed.',
     // 5h reset beyond the staleness gap: a PASSED reset would (correctly) move the epoch to RECOVERING.
     scenario([codex(std(80, 60, T0 + 3 * H), { providerReachedType: 'usage' })], { stale: true }), MIN),
   panel('Restored after restart', 'Evidence survived a restart but no live reading has confirmed it yet.',
@@ -158,15 +180,21 @@ const html = `<!doctype html>
   .btn { width: 28px; height: 28px; flex-shrink: 0; display: inline-flex; align-items: center; justify-content: center;
     background: var(--cth-paper-100); box-shadow: inset 0 0 0 1px var(--cth-ink-300); border-radius: 2px; }
   .cap-strip-host { outline: 1px dashed rgba(107,88,120,.35); outline-offset: -1px; }
+  .legend .row { display: flex; flex-wrap: wrap; gap: 10px 14px; margin: 8px 0 10px; }
+  .cell { width: 92px; text-align: center; }
+  .big { display: inline-block; transform: scale(2); transform-origin: center; margin: 12px 0 14px; }
+  .lab { font-size: 11px; color: var(--cth-ink-900); }
+  .sub { font-size: 10px; color: var(--cth-ink-500); line-height: 1.3; }
 </style></head>
 <body>
-<h1>Title-bar capacity strip — visual preview (strip-polish pass)</h1>
+<h1>Title-bar capacity strip — visual preview (unit #14: the pie-dot)</h1>
 <p class="lead">Every panel is a real pool object from the real tracker and presenter, rendered by the real strip component
-inside a replica of the 36px title bar at the stated window width (the app's minimum is 1280px). State is a coloured shape
-only: <b style="color:#5CA97A">●</b> healthy, <b style="color:#DCAB3C">▲</b> approaching, <b style="color:#D6903F">◐</b> reserve only,
-<b style="color:#D96A62">■</b> limited, <b style="color:#4F9FAF">↻</b> recovering, <b style="color:#6B5878">◌</b> unknown. Reset hints appear only
+inside a replica of the 36px title bar at the stated window width (the app's minimum is 1280px). The bar is gone: each figure
+is a PIE-DOT whose wedge and colour are the remaining share (green at 100% to dark red at 0%). A provider limit is a stop sign;
+no reading is a spotted dot; an aged reading is a dimmed dot. There are still no state words (screen readers hear them). Reset hints appear only
 below the threshold (15% for now). A strip wider than its room scrolls; hover pauses it. The dashed outline is the strip's own
 box. Light theme, approximate fonts. Generated ${new Date().toISOString()} by test/tools/capacity-strip-preview.cjs.</p>
+${LEGEND}
 ${panels.map((p) => `<div class="frame">${p}</div>`).join('\n')}
 <script>${MEASURE}</script>
 </body></html>

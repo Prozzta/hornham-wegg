@@ -31,6 +31,7 @@ import { presentPool, selectPools, type PresentedPool } from '../capacity/capaci
 import { useCapacityStrip } from '../capacity/useCapacityStrip';
 import { poolTokens, STRIP_GEOMETRY, type StripToken } from '../capacity/stripLayout';
 import { openCapacityDetail } from '../capacity/detailSelection';
+import { leadDotOf, PIE_DOT_SIZE, remainingColor, wedgePath, type DotLook } from '../capacity/pieDot';
 
 /** The non-colour channel (§9): a SHAPE per state, so the state survives greyscale. */
 export const STATE_TOKEN: Record<CapacityState, string> = {
@@ -129,13 +130,13 @@ export function CapacityMeter({ percent, valueText, color, dataRole }: {
   );
 }
 
-/** A strip meter: the remaining figure main sent, in its pool's state colour. */
-function Meter({ token, state }: { token: Extract<StripToken, { kind: 'meter' }>; state: CapacityState }) {
-  return <CapacityMeter percent={token.meter.remainingPercent} valueText={token.valueText} color={STATE_COLOR[state]} dataRole={token.role} />;
+/** A strip meter (unit #14): a pie-dot of the remaining figure main sent, coloured by that figure. */
+function Meter({ token }: { token: Extract<StripToken, { kind: 'meter' }> }) {
+  return <PieMeter percent={token.meter.remainingPercent} valueText={token.valueText} role={token.role} />;
 }
 
-function Token({ token, state }: { token: StripToken; state: CapacityState }) {
-  if (token.kind === 'meter') return <Meter token={token} state={state} />;
+function Token({ token }: { token: StripToken }) {
+  if (token.kind === 'meter') return <Meter token={token} />;
   if (token.kind === 'reset') {
     return <span data-cap-reset={token.role} style={{ color: 'var(--cth-ink-500)', whiteSpace: 'nowrap' }}>{token.text}</span>;
   }
@@ -156,7 +157,94 @@ function Token({ token, state }: { token: StripToken; state: CapacityState }) {
   );
 }
 
-/** The coloured shape. Its accessible name is main's state word, never visible text. */
+
+/**
+ * v1.1.45 unit #14 — THE PIE-DOT (replaces the strip bar). One disc per figure: the filled
+ * wedge IS the remaining fraction, coloured on the one green-to-dark-red scale. A faint rim
+ * is always drawn so 0% still reads as a (empty) dot, never as nothing. Still ONE fill.
+ */
+function PieSvg({ percent, dimmed = false }: { percent: number | null; dimmed?: boolean }) {
+  const d = PIE_DOT_SIZE;
+  const c = d / 2;
+  const r = c - 1.5;
+  const wedge = percent === null ? null : wedgePath(percent, r, c);
+  const fill = percent === null ? 'none' : remainingColor(percent);
+  return (
+    <svg width={d} height={d} viewBox={`0 0 ${d} ${d}`} aria-hidden="true"
+      style={{ display: 'block', opacity: dimmed ? 0.45 : 1, filter: dimmed ? 'saturate(0.35)' : undefined }}>
+      {/* At 0% the rim itself takes the dark red, so an empty pie still reads as spent. */}
+      <circle cx={c} cy={c} r={r} fill="var(--cth-paper-100)"
+        stroke={percent === 0 ? remainingColor(0) : dimmed ? 'var(--cth-ink-500)' : 'var(--cth-ink-300)'}
+        strokeWidth={percent === 0 ? 1.6 : 1} strokeDasharray={dimmed ? '2 2' : undefined} />
+      {wedge === 'FULL' ? <circle data-cap-fill="" cx={c} cy={c} r={r} fill={fill} />
+        : wedge ? <path data-cap-fill="" d={wedge} fill={fill} /> : null}
+    </svg>
+  );
+}
+
+/** LIMITED: a stop sign. A red octagon with a white inner rim; no text on it. */
+function StopSvg() {
+  const d = PIE_DOT_SIZE;
+  const pts = (inset: number) => Array.from([0, 1, 2, 3, 4, 5, 6, 7], (i) => {
+    const a = (Math.PI / 4) * i + Math.PI / 8;
+    const rr = d / 2 - inset;
+    return `${(d / 2 + rr * Math.cos(a)).toFixed(2)},${(d / 2 + rr * Math.sin(a)).toFixed(2)}`;
+  }).join(' ');
+  return (
+    <svg width={d} height={d} viewBox={`0 0 ${d} ${d}`} aria-hidden="true" style={{ display: 'block' }}>
+      <polygon points={pts(0.5)} fill="#B3121C" />
+      <polygon points={pts(2.5)} fill="none" stroke="#FFFFFF" strokeWidth={1.2} />
+    </svg>
+  );
+}
+
+/** UNKNOWN: black-and-white spotted (a dalmatian dot). No colour, no figure. */
+const SPOTS: readonly (readonly [number, number, number])[] = [
+  [6.5, 6.5, 2.1], [12.8, 5.6, 1.4], [14.2, 11.2, 2.3], [8.3, 12.6, 1.6], [5.4, 10.4, 1], [11.2, 15.6, 1.2], [10.5, 9.4, 0.9]
+];
+function SpottedSvg() {
+  const d = PIE_DOT_SIZE;
+  const k = d / 20;
+  return (
+    <svg width={d} height={d} viewBox={`0 0 ${d} ${d}`} aria-hidden="true" style={{ display: 'block' }}>
+      <circle cx={d / 2} cy={d / 2} r={d / 2 - 1} fill="#FFFFFF" stroke="#111111" strokeWidth={1.2} />
+      {SPOTS.map(([x, y, s], i) => <circle key={i} cx={x * k} cy={y * k} r={s * k} fill="#111111" />)}
+    </svg>
+  );
+}
+
+/** A pie-dot that is a figure's meter: the meter semantics on the disc itself. */
+export function PieMeter({ percent, valueText, role }: { percent: number; valueText: string; role: string }) {
+  return (
+    <span role="meter" aria-valuemin={0} aria-valuemax={100} aria-valuenow={percent} aria-valuetext={valueText}
+      data-cap-meter={role} data-cap-pie=""
+      style={{ display: 'inline-block', width: PIE_DOT_SIZE, height: PIE_DOT_SIZE, flexShrink: 0 }}>
+      <PieSvg percent={percent} />
+    </span>
+  );
+}
+
+/**
+ * The pool's LEAD dot, in the state position. Its accessible name is main's state word,
+ * never visible text. When the look is the live 5h pie, the 5h meter semantics sit on it.
+ */
+export function StateDot({ look, state, name, meter }: {
+  look: DotLook; state: CapacityState; name: string; meter?: { percent: number; valueText: string };
+}) {
+  return (
+    <span role="img" aria-label={name} data-cap-state-token={state} data-cap-dot={look.kind}
+      style={{ display: 'inline-flex', width: PIE_DOT_SIZE, height: PIE_DOT_SIZE, flexShrink: 0 }}>
+      {look.kind === 'STOP' ? <StopSvg />
+        : look.kind === 'SPOTTED' ? <SpottedSvg />
+        : look.kind === 'DIMMED' ? <PieSvg percent={look.percent} dimmed />
+        : look.kind === 'RING' ? <PieSvg percent={null} />
+        : meter ? <PieMeter percent={meter.percent} valueText={meter.valueText} role="five-hour" />
+        : <PieSvg percent={look.percent} />}
+    </span>
+  );
+}
+
+/** The pre-#14 glyph shape. Kept for reference only; the strip draws StateDot. */
 export function StateShape({ state, name }: { state: CapacityState; name: string }) {
   return (
     <span
@@ -171,6 +259,14 @@ export function StateShape({ state, name }: { state: CapacityState; name: string
       {STATE_TOKEN[state]}
     </span>
   );
+}
+
+/** A pool's lead dot. A live 5h figure's meter is drawn here, as the pie itself. */
+function PoolDot({ pool }: { pool: PresentedPool }) {
+  const look = leadDotOf(pool);
+  const five = pool.presentation === 'NORMAL' ? pool.fiveHour.meter : undefined;
+  return <StateDot look={look} state={pool.state} name={pool.stateText}
+    meter={look.kind === 'PIE' && five ? { percent: five.remainingPercent, valueText: pool.fiveHour.text } : undefined} />;
 }
 
 function PoolGroup({ pool }: { pool: PresentedPool }) {
@@ -189,8 +285,8 @@ function PoolGroup({ pool }: { pool: PresentedPool }) {
     >
       <ProviderLogo provider={pool.provider} size={STRIP_GEOMETRY.mark} />
       <span style={{ color: 'var(--cth-ink-700)', whiteSpace: 'nowrap' }}>{pool.poolLabel}</span>
-      <StateShape state={pool.state} name={pool.stateText} />
-      {poolTokens(pool).map((t) => <Token key={t.key} token={t} state={pool.state} />)}
+      <PoolDot pool={pool} />
+      {poolTokens(pool).map((t) => <Token key={t.key} token={t} />)}
     </span>
   );
 }
@@ -209,7 +305,7 @@ export function CapacityStripView({ pools, emptyText }: { pools: readonly Presen
           ? pools.map((p) => <PoolGroup key={p.poolId} pool={p} />)
           : (
             <span data-cap-empty="" style={{ display: 'inline-flex', alignItems: 'center', columnGap: STRIP_GEOMETRY.gap }}>
-              <StateShape state="UNKNOWN" name={emptyText} />
+              <StateDot look={{ kind: 'SPOTTED' }} state="UNKNOWN" name={emptyText} />
               <span style={{ color: 'var(--cth-ink-700)', whiteSpace: 'nowrap' }}>{emptyText}</span>
             </span>
           )}
