@@ -54,14 +54,37 @@ test('ids are announced ONLY in settle(), and only for COMMITTED / HUMAN_HANDLED
   assert.deepEqual(c.state('a').announced, []);
 });
 
-test('the renderer produces NO inbox wake (useHive effect #3 is gone); ordinary queued messages still drain', () => {
+test('the renderer HINTS but never SUBMITS an inbox wake; ordinary queued messages still drain', () => {
   const hive = src('src/renderer/src/hooks/useHive.ts');
   assert.ok(!/inboxNudgeText/.test(hive), 'no nudge text is built in the renderer');
   assert.ok(!/precondition: 'inbox-nonempty'/.test(hive), 'no inbox-wake item is enqueued by the renderer');
   assert.ok(!/const nudged = useRef/.test(hive), 'its dedup ref is gone');
+  // god's ruling (A): the 4s loop is BACK as a trigger, and that is the line to hold.
+  // A hint carries no payload and no decision, so main keeps the one claim and the one
+  // stable request id; a second SUBMITTER would make a second request id for the same
+  // inbox edge, and the owner — idempotent on requestId only — would turn that into a
+  // second real turn. Pin the distinction, not the absence.
+  assert.match(hive, /window\.cth\.hiveRequestInboxWake\(a\.id\)/, 'the renderer hint calls main');
+  assert.ok(!/autoSubmit.*inbox|submitInboxWake|admissionClass: 'CAPACITY_GATED'[^}]*inbox/i.test(hive),
+    'the renderer never submits an inbox wake itself');
+  const hint = between(hive, 'INBOX_HINT_MS)', '}, [config?.onboardingComplete]);');
+  assert.ok(!/inboxNudgeText|enqueueMessage|autoSubmit/.test(hint),
+    'the hint loop builds no text, queues nothing and submits nothing');
   // Effect #4 - the ordinary queue drain - stays, including its inbox precondition check.
   assert.match(hive, /checkPrecondition\(next, \(\) => window\.cth\.hiveInbox\(srcId\)\)/);
   assert.match(hive, /enqueueMessage\(/, 'the renderer still queues its own sends (e.g. /compact)');
+});
+
+test('the renderer HINT reaches the terminal only through the one main-owned wake path', () => {
+  const index = src('src/main/index.ts');
+  const handler = between(index, "ipcMain.handle('hive:requestInboxWake'", '});');
+  // A hint must not submit, type, or build a payload — everything that decides what the
+  // agent is told stays on main's one path, under main's one stable request id.
+  assert.ok(!/automaticSubmit|ptyManager|inboxNudgeText/.test(handler),
+    'the hint handler never submits, types, or builds nudge text');
+  assert.match(handler, /inboxWake\?\.requestInboxWake\(id, 'renderer', 'reconcile'\)/,
+    'it asks the one path, in reconcile mode so a cold-booted agent is recoverable');
+  assert.match(handler, /typeof id !== 'string'/, 'and it validates what the renderer sent');
 });
 
 test('the reconciliation beat has no submit of its own', () => {

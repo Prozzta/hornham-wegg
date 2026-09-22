@@ -246,6 +246,10 @@ function passesContextPressure(a: Agent, rule: ContextRule): boolean {
  *   3. wakes idle agents that have unread inbox messages so collaboration
  *      doesn't stall while an agent sits at its prompt.
  */
+/** The renderer inbox-hint cadence: 1.1.45's 4s poll, kept as a TRIGGER only. Faster than
+ *  main's 15s reconciliation beat, so an idle agent picks its mail up promptly. */
+const INBOX_HINT_MS = 4_000;
+
 export function useHive(config: HarnessConfig | null): void {
   // Per-agent context size at the last auto-/compact queued. See the latch note
   // in the context-trigger effect: an idle agent's token count is frozen, so
@@ -608,13 +612,32 @@ export function useHive(config: HarnessConfig | null): void {
     return () => clearInterval(iv);
   }, [config?.onboardingComplete]);
 
-  // 3) REMOVED (pre-M1 event-wake bridge). The renderer no longer produces inbox-wake
-  //    prompts: main is the ONLY producer. A durable delivery, a Stop / idle edge, a
-  //    control release or main's reconciliation beat asks main's inbox-wake bridge,
-  //    which submits one CAPACITY_GATED wake through the submit owner under a stable
-  //    request id. A renderer copy would enqueue a second wake for the same inbox edge
-  //    under a different id, which the owner can serialize but cannot recognise as a
-  //    duplicate. Ordinary queued messages still drain through effect #4.
+  // 3) The renderer inbox HINT. Main is still the ONLY producer of inbox wakes: this
+  //    loop carries no payload and makes no decision, it just asks main to look, and
+  //    main re-reads the inbox, applies every guard, takes its ONE claim under its ONE
+  //    stable request id and submits through the ONE owner. A hint is not a submitter,
+  //    and that distinction is the whole design: two submitters would make two request
+  //    ids for the same inbox edge, and the owner — which is idempotent on requestId —
+  //    would serialize them into two real turns.
+  //
+  //    WHY IT IS BACK. 1.1.45's 4s poll was the only thing waking workers; C3 deleted it
+  //    in the same release that made main the producer, so when main's claim refused
+  //    (the SessionStart cold-boot deadlock) there was no producer left and the packaged
+  //    floor stalled silently. This restores the 4s CADENCE — an independent trigger,
+  //    faster than the 15s beat — without restoring the second submitter.
+  //
+  //    It cannot mask a main-side decision bug, by construction: if main refuses, poking
+  //    it more often changes nothing. That is what the stall watchdog in main is for.
+  useEffect(() => {
+    if (!config?.onboardingComplete) return;
+    const iv = setInterval(() => {
+      for (const a of useStore.getState().agents) {
+        if (!a.ptyId) continue;
+        void window.cth.hiveRequestInboxWake(a.id).catch(() => { /* main decides; a hint may be dropped */ });
+      }
+    }, INBOX_HINT_MS);
+    return () => clearInterval(iv);
+  }, [config?.onboardingComplete]);
 
   // 3b) Seed a fresh "type-into-tui" worker (Crush) with the hive protocol. Its
   //     bare TUI rejects a positional seed (Cobra reads it as a subcommand →

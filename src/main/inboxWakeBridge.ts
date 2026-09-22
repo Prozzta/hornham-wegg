@@ -93,7 +93,7 @@ export class InboxWakeBridge {
       f ? { agentId, ...f } : { agentId, lastOutputAt: 0, autoDeliveryPaused: false, paused: false, halted: false },
       cause, mode, now);
     if (!claim) {
-      this.deps.diag?.('no-claim', { agentId, cause, mode, why: coordinator.whyNoClaim(agentId) });
+      this.deps.diag?.('no-claim', { agentId, cause, mode, why: coordinator.whyNoClaim(agentId), inboxIds: ids.length });
       return null;
     }
     this.deps.diag?.('claim', { agentId, cause, mode, ids: claim.ids.length, requestId: claim.requestId });

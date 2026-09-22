@@ -18,13 +18,14 @@ const { spawnSync } = require('node:child_process');
 const ROOT = path.resolve(__dirname, '..', '..');
 const TESTS = ['test/hive-event-router.test.cjs', 'test/worker-wake.test.cjs', 'test/inbox-wake-bridge.test.cjs',
   'test/inbox-wake-pins.test.cjs', 'test/control.test.cjs', 'test/automatic-submit-wiring.test.cjs',
-  'test/wake-cold-boot.test.cjs'];
+  'test/wake-cold-boot.test.cjs', 'test/wake-stall.test.cjs'];
 
 const INDEX = 'src/main/index.ts';
 const WAKE = 'src/main/workerWake.ts';
 const BRIDGE = 'src/main/inboxWakeBridge.ts';
 const HIVE = 'src/main/hive.ts';
 const CONTROL = 'src/main/control.ts';
+const STALL = 'src/main/wakeStall.ts';
 const USE_HIVE = 'src/renderer/src/hooks/useHive.ts';
 
 const MUTANTS = [
@@ -40,8 +41,8 @@ const MUTANTS = [
     "  submit: (req) => { ptyManager.write(ptyForAgent(req.agentId) ?? '', `${req.text}\\r`, 'PROGRAMMATIC'); return Promise.resolve({ kind: 'COMMITTED' }); },"],
   ['w ids announced at claim time, before COMMITTED', WAKE,
     '    r.pending.clear();\n', '    r.pending.clear();\n    for (const id of ids) r.announced.add(id);\n'],
-  ['w the renderer inbox-wake producer (useHive effect #3) comes back', USE_HIVE,
-    '  // 3) REMOVED (pre-M1 event-wake bridge).',
+  ['w the renderer hint becomes a producer again (two ids for one inbox edge)', USE_HIVE,
+    '  // 3) The renderer inbox HINT.',
     "  useEffect(() => {\n    const iv = setInterval(async () => {\n      for (const a of useStore.getState().agents) {\n        const inbox = await window.cth.hiveInbox(a.id);\n        if (inbox.length) useStore.getState().enqueueMessage(a.id, 'wake', { precondition: 'inbox-nonempty' });\n      }\n    }, 4000);\n    return () => clearInterval(iv);\n  }, []);\n  // 3) REMOVED (pre-M1 event-wake bridge)."],
   ['w a second submit inside the reconciliation beat', INDEX,
     '  inboxWake.reconcileAll(live);\n',
@@ -113,6 +114,29 @@ const MUTANTS = [
   ['w SessionStart is an active turn again (the 1.1.46 cold-boot deadlock)', WAKE,
     "const ACTIVE_EVENTS = new Set(['UserPromptSubmit'",
     "const ACTIVE_EVENTS = new Set(['SessionStart', 'UserPromptSubmit'"],
+  // god's ruling (A): the renderer hint is a TRIGGER. If it ever becomes a submitter
+  // again, two request ids exist for one inbox edge and the owner makes two real turns.
+  ['w the renderer hint is deleted again (no producer left if main refuses)', USE_HIVE,
+    '        void window.cth.hiveRequestInboxWake(a.id)',
+    '        void 0; void (a.id)'],
+  ['w the renderer inbox hint submits by itself instead of hinting', INDEX,
+    "  return !!inboxWake?.requestInboxWake(id, 'renderer', 'reconcile');",
+    "  void automaticSubmit.submit({ requestId: `renderer-${id}-${Date.now()}`, agentId: id, admissionClass: 'CAPACITY_GATED', text: inboxNudgeText([]) }); return true;"],
+  ['w the renderer hint asks in EVENT mode (cold-boot recovery lost)', INDEX,
+    "  return !!inboxWake?.requestInboxWake(id, 'renderer', 'reconcile');",
+    "  return !!inboxWake?.requestInboxWake(id, 'renderer', 'event');"],
+  // The stall watchdog is the only thing that makes a permanent refusal audible.
+  ['w the stall watchdog never announces (silent deadlock returns)', STALL,
+    '    if (stalledMs < WAKE_STALL_AFTER_MS) return null;',
+    '    if (true) return null;'],
+  ['w the stall watchdog fires for an agent with no mail', STALL,
+    '    if (inboxIds <= 0 || DELIBERATE.has(why)) { this.watching.delete(agentId); return null; }',
+    '    if (DELIBERATE.has(why)) { this.watching.delete(agentId); return null; }'],
+  ['w the stall watchdog shouts on every beat once stalled', STALL,
+    '    if (cur.announced) return null;\n', ''],
+  ['w a deliberate human-set state is announced as a stall', STALL,
+    "  'no-pending-ids', 'paused', 'halted', 'auto-delivery-paused', 'held-interfered', 'hitl-hold'",
+    "  'no-pending-ids'"],
   ['w a session boundary no longer clears a stale active label', WAKE,
     "    if (event === 'SessionStart' || event === 'SessionEnd') { r.lifecycle = 'unknown'; return false; }",
     "    if (event === 'SessionEnd') { r.lifecycle = 'unknown'; return false; }"]

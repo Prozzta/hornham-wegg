@@ -94,6 +94,7 @@ import { buildWorkerLaunch } from './workerLaunch';
 import { ControlRegistry } from './control';
 import { WorkerWakeWatchdog } from './workerWake';
 import { InboxWakeBridge } from './inboxWakeBridge';
+import { WakeStallWatch } from './wakeStall';
 import { inboxNudgeText } from '../shared/hiveNudge';
 import { fetchHireManifest, readHireManifestFiles } from './hire';
 import { parseHireDeepLink, type HireManifest } from '../shared/hire';
@@ -386,6 +387,19 @@ const workerWake = new WorkerWakeWatchdog();
 // hive event log instead, which agents and the human already read, so ONE canary run
 // says which stage is inert. Remove with this branch.
 const wakeDiagSeen = new Map<string, string>();
+// THE STALL WATCHDOG (god's ruling A2). Decision in wakeStall.ts; this is the voice.
+const wakeStalls = new WakeStallWatch();
+
+/** Fold one refusal into the stall watch and say so, once, if it is a deadlock. */
+function noteWakeRefusal(agentId: string, why: string, inboxIds: number): void {
+  const stall = wakeStalls.note(agentId, why, inboxIds, Date.now());
+  if (!stall) return;
+  // Loud, durable, and it NAMES THE GUARD — the one thing the 1.1.46 post-mortem could
+  // not get out of the running app.
+  console.error(`[inbox-wake] STALL ${stall.agentId}: ${stall.inboxIds} message(s) undrained, refused as "${stall.why}" for ${Math.round(stall.stalledMs / 60000)}m`);
+  wakeDiag('stall', { agentId: stall.agentId, why: stall.why, inboxIds: stall.inboxIds, stalledMs: stall.stalledMs });
+}
+
 function wakeDiag(stage: string, fields: Record<string, unknown>): void {
   try {
     // The 15s reconciliation beat repeats every stage for every agent. Log one line per
@@ -498,7 +512,16 @@ inboxWake = new InboxWakeBridge({
   setImmediate: (fn) => { setImmediate(fn); },
   now: () => Date.now(),
   log: (line) => console.log(line),
-  diag: wakeDiag
+  diag: (stage, fields) => {
+    wakeDiag(stage, fields);
+    // The watchdog sees EVERY refusal, not only the ones the log keeps: the sink folds
+    // repeated reconcile rows together, and a stall is made of exactly those repeats.
+    if (stage === 'no-claim') {
+      noteWakeRefusal(String(fields.agentId ?? ''), String(fields.why ?? ''), Number(fields.inboxIds ?? 0));
+    } else if (stage === 'claim') {
+      wakeStalls.clear(String(fields.agentId ?? ''));   // it moved; nothing is stuck
+    }
+  }
 });
 wakeDiag('bridge-built', { ok: !!inboxWake });
 hive.setDeliveryObserver(({ agentId, messageId }) => {
@@ -3916,6 +3939,15 @@ ipcMain.handle('hive:tasks', () => hive.tasks());
 ipcMain.handle('hive:log', (_evt, n: unknown) => hive.logTail(typeof n === 'number' ? n : 200));
 ipcMain.handle('hive:memory', (_evt, id: unknown) => (typeof id === 'string' ? hive.memory(id) : ''));
 ipcMain.handle('hive:inbox', (_evt, id: unknown) => (typeof id === 'string' ? hive.inbox(id) : []));
+// The renderer's 4s inbox HINT (plan A, god's ruling). It is a TRIGGER, never a producer:
+// it carries no decision and no payload, and it reaches the terminal only through the one
+// main-owned path, with main's one claim and its one stable request id. That is the whole
+// point - the renderer poll that 1.1.45 relied on is back as a cadence, without the second
+// submitter that would make two request ids for one inbox edge and so two turns.
+ipcMain.handle('hive:requestInboxWake', (_evt, id: unknown) => {
+  if (typeof id !== 'string' || !id) return false;
+  return !!inboxWake?.requestInboxWake(id, 'renderer', 'reconcile');
+});
 // Voice read-layer: recent message CONTENT (inbox/outbox bodies), REDACTED
 // main-side by hive.voiceMessages(). The renderer/voice layer never sees a raw
 // body — secrets are stripped here, before the result crosses IPC.

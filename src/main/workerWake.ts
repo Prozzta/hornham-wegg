@@ -86,7 +86,7 @@ const ACTIVE_EVENTS = new Set(['UserPromptSubmit', 'PreToolUse', 'PostToolUse', 
 
 export type WakeLifecycle = 'active' | 'idle' | 'unknown';
 /** Why a wake was attempted (breadcrumbs only; never a decision input). */
-export type WakeCause = 'delivery' | 'hook' | 'control' | 'capacity' | 'interference' | 'reconcile';
+export type WakeCause = 'delivery' | 'hook' | 'control' | 'capacity' | 'interference' | 'reconcile' | 'renderer';
 /** `event`: needs recorded lifecycle-idle evidence. `reconcile`: may also use PTY quiescence. */
 export type WakeMode = 'event' | 'reconcile';
 
