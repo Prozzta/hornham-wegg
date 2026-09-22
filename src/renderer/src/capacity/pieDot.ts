@@ -8,12 +8,14 @@
  *     follows the figure, not the state (the human superseded the per-state glyph tokens).
  *   - LIMITED: a STOP SIGN (red octagon), never a pie.
  *   - Never read / no usable reading: a black-and-white SPOTTED dot, never a colour.
- *   - STALE (human ruling S1 = a): a DIMMED dot with NO wedge. A stale reading carries no
- *     figure on the strip (A1), so the dimmed dot has none either; it says "we had a
- *     reading and it aged", which the spotted "never read" dot does not.
+ *   - STALE with a figure (STALE-RETAIN, human ruling 2026-09-22, SUPERSEDES S1/A1): the
+ *     ORDINARY pie for its last-known figure. The age is said in the provider details.
+ *   - Aged with NO figure to keep (evidence restored across a restart, a held recovery, a
+ *     reading with no usable figure): a DIMMED dot with NO wedge; it says "we had a reading
+ *     and it aged", which the spotted "never read" dot does not.
  *
- * Stale needs NO new contract field: main already sends `freshness.verdict`, and the
- * renderer's one-way expiry mask marks the pool `masked`. Either one means stale.
+ * No new contract field: main already sends `freshness.verdict`, and the renderer's
+ * one-way expiry mask marks the pool `masked`. Either one means aged.
  *
  * Still ONE continuous fill per figure (§9: continuous = provider capacity); never segments.
  */
@@ -40,7 +42,7 @@ export type DotLook =
   | { kind: 'SPOTTED' }
   /** A live figure: `percent` remaining, 0..100. */
   | { kind: 'PIE'; percent: number }
-  /** Stale: dimmed, and wedge-less BY TYPE - there is no figure to carry (A1). */
+  /** Aged with nothing to keep: dimmed, and wedge-less BY TYPE - there is no figure to carry. */
   | { kind: 'DIMMED' }
   /** A known, fresh state with no figure to draw (e.g. a live 5h that is not reported). */
   | { kind: 'RING' };
@@ -95,18 +97,24 @@ export function wedgePath(percent: number, r: number, c: number): string | 'FULL
 export function leadDotOf(pool: PresentedPool): DotLook {
   // An open limit stays a stop sign even once its reading ages (A1: the state is kept).
   if (pool.state === 'LIMITED') return { kind: 'STOP' };
+  // A figure on the strip is drawn as the ordinary pie - live, or a stale reading's last-known
+  // figure (STALE-RETAIN, supersedes A1; the age is in the provider details).
+  const five = pool.fiveHour.meter?.remainingPercent;
+  if (pool.presentation === 'NORMAL' && typeof five === 'number') return { kind: 'PIE', percent: five };
+  // Aged with nothing to retain (restored across a restart, a held recovery, no usable figure).
   if (pool.masked || pool.freshness.verdict === 'STALE') return { kind: 'DIMMED' };
   if (pool.state === 'UNKNOWN' || pool.presentation === 'UNKNOWN') return { kind: 'SPOTTED' };
   // The A2 held frame (RESERVE_ONLY, weekly freshly at 0; S3): an EMPTY pie, no stop sign -
   // the provider did not attribute a limit.
   if (pool.presentation === 'BLOCKED_SUBORDINATE') return { kind: 'PIE', percent: 0 };
-  const five = pool.fiveHour.meter?.remainingPercent;
-  return typeof five === 'number' ? { kind: 'PIE', percent: five } : { kind: 'RING' };
+  return { kind: 'RING' };
 }
 
 /** The same rules for the provider-details header (one mark for a pool everywhere). */
 export function detailDotOf(view: ProviderCapacityDetailView): DotLook {
   if (view.state === 'LIMITED') return { kind: 'STOP' };
+  const kept = view.windows.find((w) => w.kind === 'FIVE_HOUR')?.lastKnownPercent;
+  if (typeof kept === 'number') return { kind: 'PIE', percent: kept };
   if (view.freshness.verdict === 'STALE') return { kind: 'DIMMED' };
   if (view.state === 'UNKNOWN') return { kind: 'SPOTTED' };
   const five = view.windows.find((w) => w.kind === 'FIVE_HOUR')?.remainingPercent;

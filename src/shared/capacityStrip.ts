@@ -129,11 +129,12 @@ export interface CapacityFreshnessView {
   expired?: ExpiredRows;
 }
 
-/** The degraded rows the renderer's expiry mask may substitute (§17, C2.11 crit 10). */
+/** The degraded rows the renderer's expiry mask may substitute (§17, C2.11 crit 10).
+ *  NORMAL only for a plain stale reading that keeps its last-known figures (STALE-RETAIN). */
 export interface ExpiredRows {
   state: CapacityState;
   stateText: string;
-  presentation: 'UNKNOWN';
+  presentation: 'UNKNOWN' | 'NORMAL';
   fiveHour: FiveHourStrip;
   weekly?: VisibleWeeklyStrip;
 }
@@ -318,7 +319,7 @@ const pool = object(
       expired: object({
         state: oneOf(CAPACITY_STATES),
         stateText: text,
-        presentation: exactly('UNKNOWN'),
+        presentation: oneOf(['UNKNOWN', 'NORMAL']),
         fiveHour
       }, { weekly })
     }),
@@ -361,8 +362,14 @@ function poolInvariants(v: Record<string, unknown>, at: string, errors: string[]
     if (isObj(exp)) {
       const ef = exp.fiveHour as Record<string, unknown> | undefined;
       const ew = exp.weekly as Record<string, unknown> | undefined;
-      if (isObj(ef) && 'meter' in ef) errors.push(`${at}.freshness.expired.fiveHour.meter: an expired row draws no meter`);
-      if (isObj(ew) && 'meter' in ew) errors.push(`${at}.freshness.expired.weekly.meter: an expired row draws no meter`);
+      // STALE-RETAIN: an expired view keeps a figure only as a retained NORMAL reading.
+      if (exp.presentation !== 'NORMAL') {
+        if (isObj(ef) && 'meter' in ef) errors.push(`${at}.freshness.expired.fiveHour.meter: no meter outside NORMAL`);
+        if (isObj(ew) && 'meter' in ew) errors.push(`${at}.freshness.expired.weekly.meter: no meter outside NORMAL`);
+      }
+      if (exp.presentation === 'NORMAL' && exp.state !== 'UNKNOWN') {
+        errors.push(`${at}.freshness.expired.presentation: only a plain stale reading (UNKNOWN) is retained`);
+      }
       // The expired view may only DEGRADE: it cannot disclose a weekly row the live
       // object keeps hidden (C2.9), or that would be a hidden weekly by another route.
       if (ew && !wk) errors.push(`${at}.freshness.expired.weekly: cannot reveal a weekly the strip hides`);

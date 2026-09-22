@@ -34,7 +34,7 @@ const TESTS = ['test/capacity-strip-contract.test.cjs', 'test/capacity-strip-ui.
   'test/capacity-banner.test.cjs', 'test/capacity-toast.test.cjs',
   'test/capacity-composer-note.test.cjs', 'test/capacity-copy-guards.test.cjs',
   'test/capacity-tidy-pins.test.cjs', 'test/capacity-usage-push.test.cjs',
-  'test/capacity-piedot.test.cjs', 'test/capacity-impact-push.test.cjs'];
+  'test/capacity-piedot.test.cjs', 'test/capacity-impact-push.test.cjs', 'test/capacity-stale-retain.test.cjs'];
 
 const STRIP = 'src/main/capacityStrip.ts';
 const SHARED = 'src/shared/capacityStrip.ts';
@@ -69,6 +69,7 @@ const PIE = 'src/renderer/src/capacity/pieDot.ts';
 const TOKENS = 'src/renderer/src/design/tokens.css';
 const IMPACT_HOOK = 'src/renderer/src/hooks/useAgentImpact.ts';
 const IMPACT_PUSH = 'src/main/agentImpactPush.ts';
+const DETAIL_BODY = 'src/renderer/src/components/CapacityDetailBody.tsx';
 
 /** [name, file, from, to] */
 const MUTANTS = [
@@ -192,7 +193,7 @@ const MUTANTS = [
   ['u5 wrong pool label (provider name instead of the strip label)', INDEX,
     'poolLabel: pool ? capacityStrip.labelOf(pool) : null', 'poolLabel: pool ? pool.provider : null'],
   ['u5 impact not sent on the snapshot', INDEX,
-    'capacityEvidence: gate.evidence, interfered, impact };', 'capacityEvidence: gate.evidence, interfered };'],
+    'capacityEvidence: f.gate.evidence, interfered: f.interfered, impact: f.impact };', 'capacityEvidence: f.gate.evidence, interfered: f.interfered };'],
   ['u5 "idle" leaks while held', IMPACT_VIEW,
     "export const RESTING_STATUSES: readonly StatusKind[] = ['idle', 'success'];",
     "export const RESTING_STATUSES: readonly StatusKind[] = ['success'];"],
@@ -226,7 +227,7 @@ const MUTANTS = [
     '  const errors = Object.keys(o).filter((k) => !allowed.includes(k)).map((k) => `${at}.${k}: property not allowed`);',
     '  const errors: string[] = [];'],
   ['mon usage rides on control:snapshot', INDEX,
-    'capacityEvidence: gate.evidence, interfered, impact };', 'capacityEvidence: gate.evidence, interfered, impact, agentUsage: null };'],
+    'capacityEvidence: f.gate.evidence, interfered: f.interfered, impact: f.impact };', 'capacityEvidence: f.gate.evidence, interfered: f.interfered, impact: f.impact, agentUsage: null };'],
   // ── CAPUI-MONITOR: the Monitor line ─────────────────────────────────────────
   ['mon the select offered to every provider', PANEL,
     "const usageCapable = agentProvider === 'claude' || agentProvider === 'codex';", 'const usageCapable = true;'],
@@ -419,10 +420,10 @@ const MUTANTS = [
   ["u14 never-read drawn as a plain ring", PIE,
     "  if (pool.state === 'UNKNOWN' || pool.presentation === 'UNKNOWN') return { kind: 'SPOTTED' };",
     "  if (pool.state === 'UNKNOWN' || pool.presentation === 'UNKNOWN') return { kind: 'RING' };"],
-  ["u14 stale drawn as a live pie", PIE,
+  ["u14 aged-without-a-figure (restored) drawn as a live pie", PIE,
     "  if (pool.masked || pool.freshness.verdict === 'STALE') return { kind: 'DIMMED' };",
     "  if (pool.masked || pool.freshness.verdict === 'STALE') return { kind: 'PIE', percent: 50 };"],
-  ["u14 stale no longer told apart from never-read", PIE,
+  ["u14 aged-without-a-figure (restored) no longer told apart from never-read", PIE,
     "  if (pool.masked || pool.freshness.verdict === 'STALE') return { kind: 'DIMMED' };\n",
     ""],
   ["u14 the dimmed dot carries a figure", VIEW,
@@ -484,6 +485,43 @@ const MUTANTS = [
   ["c15 a resolved interference does not push", INDEX,
     "  const resolved = ptyId ? automaticSubmit.resolveInterference(ptyId, how as InterferenceResolution) : false;\n  pushAgentImpact();\n",
     "  const resolved = ptyId ? automaticSubmit.resolveInterference(ptyId, how as InterferenceResolution) : false;\n"],
+  // ── STALE-RETAIN (supersedes A1): an aged reading keeps its figure; the age is in the details ──
+  ["sr a stale reading loses its figure again (A1 restored)", STRIP,
+    "    const retained = !fresh && pool.state === 'UNKNOWN' && pool.stateReason === 'STALE_READING';",
+    "    const retained = false;"],
+  ["sr restored evidence retained as if a live reading", STRIP,
+    "    const retained = !fresh && pool.state === 'UNKNOWN' && pool.stateReason === 'STALE_READING';",
+    "    const retained = !fresh && pool.state === 'UNKNOWN' && (pool.stateReason === 'STALE_READING' || pool.stateReason === 'RESTORED_UNCONFIRMED');"],
+  ["sr a retained stale weekly row is dropped", STRIP,
+    "    if (pool.state === 'UNKNOWN' && !retained) return null;",
+    "    if (pool.state === 'UNKNOWN') return null;"],
+  ["sr the mask drops the retained figure", STRIP,
+    "        presentation: exp.presentation === 'NORMAL' ? 'NORMAL' : 'UNKNOWN',",
+    "        presentation: 'UNKNOWN',"],
+  ["sr a retained figure drawn dimmed", PIE,
+    "  if (pool.presentation === 'NORMAL' && typeof five === 'number') return { kind: 'PIE', percent: five };",
+    "  if (pool.presentation === 'NORMAL' && typeof five === 'number' && !pool.masked && pool.freshness.verdict === 'FRESH') return { kind: 'PIE', percent: five };"],
+  ["sr the detail header ignores the last-known figure", PIE,
+    "  if (typeof kept === 'number') return { kind: 'PIE', percent: kept };\n",
+    ""],
+  ["sr the details omit the age", DETAIL,
+    "      ? { verdict: pool.freshness, text: freshnessText, ageText: notRefreshedText(pool.observedAt, now) }",
+    "      ? { verdict: pool.freshness, text: freshnessText }"],
+  ["sr the age is zeroed", DETAIL,
+    "  return `Not refreshed in ${Math.max(0, Math.floor((now - observedAt) / 60_000))} min`;",
+    "  return `Not refreshed in 0 min`;"],
+  ["sr the age counted in seconds", DETAIL,
+    "(now - observedAt) / 60_000",
+    "(now - observedAt) / 1000"],
+  ["sr the age taken from the receive clock, not the last observation", DETAIL,
+    "notRefreshedText(pool.observedAt, now)",
+    "notRefreshedText(now - 60_000, now)"],
+  ["sr the panel does not draw the age", DETAIL_BODY,
+    "      {view.freshness.ageText && (",
+    "      {false && ("],
+  ["sr the schema accepts a stale view with no age", DETAIL_SCHEMA,
+    "    if ((v.freshness.verdict === 'STALE') !== ('ageText' in v.freshness)) errors.push('$.freshness.ageText: present exactly when STALE');\n",
+    ""],
 ];
 
 // THE BASELINE MUST BE GREEN. Against already-failing tests every mutant "dies", and a

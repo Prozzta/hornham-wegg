@@ -313,7 +313,8 @@ export class CapacityStripPresenter {
       freshness.expired = {
         state: stale.state,
         stateText: STATE_TEXT[stale.state],
-        presentation: 'UNKNOWN',
+        // STALE-RETAIN: a plain stale reading keeps its figures, so the mask keeps them too.
+        presentation: exp.presentation === 'NORMAL' ? 'NORMAL' : 'UNKNOWN',
         fiveHour: exp.fiveHour
       };
       // Degrade only: the mask may keep a weekly row the strip shows (minus its
@@ -354,9 +355,16 @@ export class CapacityStripPresenter {
     fiveWindowId: string | null; weeklyWindowId: string | null;
   } {
     const fresh = pool.freshness === 'FRESH';
-    const known = fresh && pool.state !== 'UNKNOWN';
+    // STALE-RETAIN (human ruling 2026-09-22; SUPERSEDES A1, which stripped a stale reading's
+    // figures): a reading that has merely aged keeps its last-known figures on the strip and
+    // is drawn as an ordinary pool - a figure that is not moving usually means usage is not
+    // moving. The age is said in the provider details instead. Only a PLAIN stale reading
+    // qualifies (the tracker's STALE_READING): an open limit epoch keeps its own look, and
+    // evidence restored across a restart is not a reading this run has seen.
+    const retained = !fresh && pool.state === 'UNKNOWN' && pool.stateReason === 'STALE_READING';
+    const known = (fresh && pool.state !== 'UNKNOWN') || retained;
     const five = pool.windows.find((w) => w.kind === 'FIVE_HOUR' && applicabilityOf(w) === 'APPLICABLE') ?? null;
-    const weekly = this.weekly(pool, fresh, T);
+    const weekly = this.weekly(pool, fresh || retained, T, retained);
     const fiveRemaining = known && five ? validRemaining(five.remainingPercent) : null;
 
     // C2.7: the blocked frame needs MAIN evidence that weekly blocks ordinary use -
@@ -391,7 +399,7 @@ export class CapacityStripPresenter {
 
     let visibleWeekly: VisibleWeeklyStrip | undefined;
     if (weekly) {
-      const remaining = fresh && weekly.window ? validRemaining(weekly.window.remainingPercent) : null;
+      const remaining = (fresh || retained) && weekly.window ? validRemaining(weekly.window.remainingPercent) : null;
       visibleWeekly = {
         reason: weekly.reason,
         text: weeklyText(weekly.reason, remaining === null ? null : Math.floor(remaining)),
@@ -417,10 +425,11 @@ export class CapacityStripPresenter {
    * C2.4 precedence, C2.5 band. Returns null when weekly is normally hidden, and the
    * caller then leaves the property OUT — there is no hidden variant to send.
    */
-  private weekly(pool: PoolCapacitySnapshot, fresh: boolean, T: number):
+  private weekly(pool: PoolCapacitySnapshot, fresh: boolean, T: number, retained = false):
     { reason: WeeklyRevealReason; window: CapacityWindow | null } | null {
-    // C2.6: when the whole pool is UNKNOWN the pool-level row suffices.
-    if (pool.state === 'UNKNOWN') return null;
+    // C2.6: when the whole pool is UNKNOWN the pool-level row suffices - unless it is a
+    // retained stale reading (STALE-RETAIN), whose last-known weekly row stays as it was.
+    if (pool.state === 'UNKNOWN' && !retained) return null;
     const wk = pool.windows.find((w) => w.kind === 'SEVEN_DAY' && applicabilityOf(w) === 'APPLICABLE') ?? null;
     const value = wk && fresh ? validRemaining(wk.remainingPercent) : null;
 

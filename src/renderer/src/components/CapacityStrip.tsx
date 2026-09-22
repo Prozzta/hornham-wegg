@@ -172,8 +172,9 @@ function PieSvg({ percent }: { percent: number | null }) {
 }
 
 /**
- * STALE (S1 = a): a dimmed, WEDGE-LESS disc with a dashed rim. It takes no figure at all -
- * a stale reading has none on the strip (A1) - so it can never be drawn as a live pie.
+ * Aged with nothing to keep (restored evidence, a held recovery): a dimmed, WEDGE-LESS disc
+ * with a dashed rim. It takes no figure at all, so it can never be drawn as a live pie. A
+ * stale reading WITH a figure is the ordinary pie instead (STALE-RETAIN).
  */
 function DimmedSvg() {
   const d = PIE_DOT_SIZE;

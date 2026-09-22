@@ -72,14 +72,13 @@ const ALL = [HEALTHY, LOW_5H, REVEALED, BLOCKED, HELD_A2, STALE];
 
 // ─── UNKNOWN / stale / cold start FIRST (§20) ───────────────────────────────────
 
-test('stale pool: NO meter primitive — no track, no fill, no aria value — only main\'s text', () => {
+test('STALE-RETAIN (supersedes A1): a stale pool keeps its last-known figure - the ordinary pie and main\'s text', () => {
   const p = STALE();
-  assert.equal(p.presentation, 'UNKNOWN');
+  assert.equal(p.presentation, 'NORMAL');
   const html = render([p]);
-  assert.ok(!/role="(meter|progressbar)"|aria-valuenow|data-cap-meter/.test(html), 'an empty bar is a drawn claim of zero');
-  assert.ok(!/\d+%/.test(visibleNodes(html).join(' ')), 'stale removes the number');
-  assert.ok(visibleNodes(html).includes('5h · Capacity unknown · last update @1000'), 'absolute last-update time (A3)');
-  assert.ok(html.includes('data-cap-state-token="UNKNOWN"'));
+  assert.match(html, /role="meter"[^>]*aria-valuenow="80"/, 'the pie carries the last-known figure');
+  assert.ok(visibleNodes(html).includes('5h · 80% remaining'));
+  assert.ok(html.includes('data-cap-state-token="UNKNOWN"'), 'the state it is named by stays the tracker\'s');
 });
 
 test('C2.6 split: applicable-but-unknown weekly says "Weekly capacity unknown", text only', () => {
@@ -114,11 +113,11 @@ test('F3 cold start: no pools draws the unknown shape and main\'s emptyText — 
     'the connected strip uses main\'s emptyText, and the shared constant only before main has answered');
 });
 
-test('the expiry mask degrades a healthy row to UNKNOWN with no meter', () => {
+test('the expiry mask keeps a healthy row\'s figure (STALE-RETAIN) and names it by the stale state', () => {
   const p = HEALTHY();
   const html = render([presentPool(p, p.freshness.expiresAt + 1)]);
-  assert.ok(!/role="meter"/.test(html));
-  assert.ok(!/\d+%/.test(visibleNodes(html).join(' ')));
+  assert.match(html, /role="meter"/);
+  assert.ok(visibleNodes(html).some((n) => /^5h · \d+% remaining$/.test(n)));
   assert.ok(html.includes('data-cap-state-token="UNKNOWN"'));
 });
 

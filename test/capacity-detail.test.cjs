@@ -122,7 +122,7 @@ test('the schema: additionalProperties false, opaque ids only, and no current fi
     ['an account scope in a window', (c) => { c.windows[0].accountScope = ACCOUNT; }],
     ['a raw poolId', (c) => { c.poolId = POOL; }],
     ['an extra membership field', (c) => { c.membership.accountScope = ACCOUNT; }],
-    ['a stale pool with a meter figure', (c) => { c.freshness.verdict = 'STALE'; }],
+    ['a stale pool with a meter figure', (c) => { c.freshness.verdict = 'STALE'; c.freshness.ageText = 'Not refreshed in 5 min'; }],
     ['an out-of-range figure', (c) => { c.windows[0].remainingPercent = 120; }]
   ];
   for (const [name, fn] of cases) assert.notDeepEqual(bad(fn), [], `must reject ${name}`);

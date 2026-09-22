@@ -202,8 +202,11 @@ test('A2 (human ruling): RESERVE_ONLY with weekly freshly at 0 takes the blocked
     assert.equal(p.presentation, 'BLOCKED_SUBORDINATE');
     assert.equal(p.weekly.reason, 'NUMERICALLY_EXHAUSTED');
     assert.equal(p.fiveHour.text, '5h · 63% remaining · ordinary work held while Weekly is at 0%');
-    const json = JSON.stringify(p);
+    const json = JSON.stringify({ ...p, freshness: null });
     assert.ok(!json.includes('"meter"'), 'no meter on either window in the blocked frame');
+    // STALE-RETAIN: once it ages the tracker's state is UNKNOWN, so the frame goes and the
+    // last-known figures stay (the mask projects exactly that).
+    assert.equal(p.freshness.expired.presentation, 'NORMAL');
     // Human-facing strings only: enum identifiers such as BLOCKED_SUBORDINATE are not copy.
     const copy = [];
     JSON.stringify(p, (k, v) => { if (/^(text|stateText|resetText)$/.test(k)) copy.push(v); return v; });
@@ -220,7 +223,7 @@ test('A2 boundary: BOTH windows at 0 keeps the NORMAL frame — a 5h at 0 has no
   assert.equal(p.fiveHour.text, '5h · 0% remaining');
 });
 
-test('C2.6: whole-pool UNKNOWN is text only, and the pool-level row suffices (no weekly property)', () => {
+test('STALE-RETAIN (supersedes A1 here): an aged plain reading keeps its last-known figures as an ordinary NORMAL pool', () => {
   const r = rig();
   r.read(80, 10);
   r.at(r.now() + L0_SEM_POLICY.liveTtlMs + 10);
@@ -228,15 +231,14 @@ test('C2.6: whole-pool UNKNOWN is text only, and the pool-level row suffices (no
   const c = r.present();
   valid(c);
   const p = only(c);
-  assert.equal(p.state, 'UNKNOWN');
-  assert.equal(p.presentation, 'UNKNOWN');
+  assert.equal(p.state, 'UNKNOWN', 'the tracker state, verbatim');
+  assert.equal(p.presentation, 'NORMAL');
   assert.equal(p.freshness.verdict, 'STALE');
   assert.equal(p.freshness.expiresAt, null);
   assert.ok(!('expired' in p.freshness));
-  assert.match(p.fiveHour.text, /^5h · Capacity unknown · last update @/);
-  assert.ok(!('weekly' in p), 'an unknown pool does not repeat UNKNOWN per window');
-  assert.ok(!JSON.stringify(p).includes('"meter"'), 'an empty bar is a drawn claim of zero');
-  assert.ok(!/\d+% remaining/.test(JSON.stringify(p)), 'stale removes the number');
+  assert.equal(p.fiveHour.text, '5h · 80% remaining');
+  assert.equal(p.fiveHour.meter.remainingPercent, 80);
+  assert.equal(p.weekly.meter.remainingPercent, 10, 'a revealed weekly keeps its figure');
 });
 
 // ─── Reset-text gating (strip-polish, human ruling): only below the threshold ───
@@ -467,21 +469,22 @@ test('mirror: validated complete-replace, newer only; invalid and older are refu
   assert.equal(m.get(), null, 'reset forgets everything: no durable renderer cache');
 });
 
-test('one-way expiry mask: past main\'s expiresAt the row degrades to main\'s own expired rows', () => {
+test('one-way expiry mask: past main\'s expiresAt the row takes main\'s own expired rows (STALE-RETAIN: the figures stay)', () => {
   const r = rig();
   const p = only(r.read(80, 10));
   assert.equal(presentPool(p, p.freshness.expiresAt).masked, false, 'at the deadline itself the reading is still fresh');
   const m = presentPool(p, p.freshness.expiresAt + 1);
   assert.equal(m.masked, true);
   assert.equal(m.state, 'UNKNOWN');
-  assert.equal(m.presentation, 'UNKNOWN');
-  assert.ok(!('weekly' in m), 'an unknown pool row suffices');
-  assert.ok(!JSON.stringify({ ...m, freshness: null }).includes('"meter"'));
+  assert.equal(m.presentation, 'NORMAL');
+  assert.equal(m.fiveHour.meter.remainingPercent, 80);
+  assert.equal(m.weekly.meter.remainingPercent, 10);
   // The mask must say what main itself will say when the reading goes stale.
   r.at(p.freshness.expiresAt + 1);
   r.tracker.evaluate();
   const stale = only(r.present());
   assert.equal(stale.state, m.state);
+  assert.equal(stale.presentation, m.presentation);
   assert.equal(stale.fiveHour.text, m.fiveHour.text);
 });
 

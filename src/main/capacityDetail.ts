@@ -46,11 +46,21 @@ const KIND_ORDER: Record<CapacityWindow['kind'], number> = { FIVE_HOUR: 0, SEVEN
 const validRemaining = (v: number | null): number | null =>
   typeof v === 'number' && Number.isFinite(v) && v >= 0 && v <= 100 ? v : null;
 
+/**
+ * STALE-RETAIN: the strip keeps a stale reading's figure, so the provider details carry the
+ * honesty - how long since the last observed reading, in whole minutes (never negative).
+ */
+export function notRefreshedText(observedAt: number, now: number): string {
+  return `Not refreshed in ${Math.max(0, Math.floor((now - observedAt) / 60_000))} min`;
+}
+
 export function capacityDetailView(i: CapacityDetailInputs): ProviderCapacityDetailView {
   const { pool, now } = i;
   const fmt = i.formatTime ?? formatLocalTime;
   const restored = pool.stateReason === 'RESTORED_UNCONFIRMED';
   const current = pool.freshness === 'FRESH' && !restored;
+  // STALE-RETAIN: the same test the strip uses to keep a plain stale reading's figures.
+  const retained = pool.freshness === 'STALE' && pool.state === 'UNKNOWN' && pool.stateReason === 'STALE_READING';
   const blocked = i.presentation === 'BLOCKED_SUBORDINATE' ? blockedFrameNote(pool.state) : null;
 
   const windows: DetailWindow[] = [...pool.windows]
@@ -62,7 +72,10 @@ export function capacityDetailView(i: CapacityDetailInputs): ProviderCapacityDet
       if (applicabilityOf(w) === 'UNKNOWN') out.text = 'Additional limit status unknown';
       else if (r === null) out.text = `${w.label} · capacity unknown`;
       else if (current) { out.text = `${w.label} · ${Math.floor(r)}% remaining`; out.remainingPercent = r; }
-      else out.text = `${w.label} · ${Math.floor(r)}% remaining · not current`;
+      else {
+        out.text = `${w.label} · ${Math.floor(r)}% remaining · not current`;
+        if (retained && w.kind === 'FIVE_HOUR' && applicabilityOf(w) === 'APPLICABLE') out.lastKnownPercent = r;
+      }
       if (w.resetsAt !== null) {
         out.resetText = w.resetsAt > now ? `reset expected ~${fmt(w.resetsAt, now)}` : `reset was expected ~${fmt(w.resetsAt, now)}`;
       }
@@ -88,7 +101,9 @@ export function capacityDetailView(i: CapacityDetailInputs): ProviderCapacityDet
     domainRevision: pool.revision,
     state: pool.state,
     stateText: STATE_TEXT[pool.state],
-    freshness: { verdict: pool.freshness, text: freshnessText },
+    freshness: pool.freshness === 'STALE'
+      ? { verdict: pool.freshness, text: freshnessText, ageText: notRefreshedText(pool.observedAt, now) }
+      : { verdict: pool.freshness, text: freshnessText },
     windows,
     membership: { known: i.membershipKnown, text: membershipText, agentIds: members },
     sourceText: SOURCE_TEXT[pool.source]

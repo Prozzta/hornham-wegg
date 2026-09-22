@@ -18,6 +18,9 @@ export function CapacityDetailBody({ view, agentName }: {
         <StateDot look={detailDotOf(view)} state={view.state} name={view.stateText} />
         <span data-cap-detail-state="">{view.stateText}</span>
       </div>
+      {view.freshness.ageText && (
+        <div data-cap-detail-age="" style={{ ...muted, color: 'var(--cth-ink-700)' }}>{view.freshness.ageText}</div>
+      )}
       {view.statusNote && <div data-cap-detail-status="" style={muted}>{view.statusNote}</div>}
 
       <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>

@@ -28,6 +28,9 @@ export interface DetailWindow {
   text: string;
   /** Present ONLY for a current (fresh, valid) figure: the one thing a meter may draw. */
   remainingPercent?: number;
+  /** STALE-RETAIN: the five-hour row's last-known figure for a plain stale reading - the
+   *  figure the strip still draws, so the header dot matches it. Never offered to a meter. */
+  lastKnownPercent?: number;
   /** `reset expected ~14:30`, or `reset was expected ~14:30` once that time has passed. */
   resetText?: string;
   /** A relationship main knows about this window (provider attribution, a blocked 5h). */
@@ -44,7 +47,8 @@ export interface ProviderCapacityDetailView {
   stateText: string;
   /** The composer's own words for what admission is doing on this pool (e.g. the post-reset probe). */
   statusNote?: string;
-  freshness: { verdict: 'FRESH' | 'STALE'; text: string };
+  /** `ageText` ("Not refreshed in X min") is present exactly when the reading is STALE. */
+  freshness: { verdict: 'FRESH' | 'STALE'; text: string; ageText?: string };
   windows: DetailWindow[];
   membership: { known: boolean; text: string; agentIds: string[] };
   sourceText: string;
@@ -61,13 +65,19 @@ function extra(o: Record<string, unknown>, allowed: string[], at: string): strin
 
 function windowErrors(w: unknown, at: string): string[] {
   if (!isObj(w)) return [`${at}: not an object`];
-  const errors = extra(w, ['label', 'kind', 'text', 'remainingPercent', 'resetText', 'note'], at);
+  const errors = extra(w, ['label', 'kind', 'text', 'remainingPercent', 'lastKnownPercent', 'resetText', 'note'], at);
   if (!isText(w.label)) errors.push(`${at}.label: not text`);
   if (!['FIVE_HOUR', 'SEVEN_DAY', 'OTHER'].includes(w.kind as string)) errors.push(`${at}.kind: not a window kind`);
   if (!isText(w.text)) errors.push(`${at}.text: not text`);
   if ('remainingPercent' in w) {
     const r = w.remainingPercent;
     if (typeof r !== 'number' || !Number.isFinite(r) || r < 0 || r > 100) errors.push(`${at}.remainingPercent: not 0..100`);
+  }
+  if ('lastKnownPercent' in w) {
+    const r = w.lastKnownPercent;
+    if (typeof r !== 'number' || !Number.isFinite(r) || r < 0 || r > 100) errors.push(`${at}.lastKnownPercent: not 0..100`);
+    if (w.kind !== 'FIVE_HOUR') errors.push(`${at}.lastKnownPercent: five-hour row only`);
+    if ('remainingPercent' in w) errors.push(`${at}.lastKnownPercent: never beside a current figure`);
   }
   if ('resetText' in w && !isText(w.resetText)) errors.push(`${at}.resetText: not text`);
   if ('note' in w && !isText(w.note)) errors.push(`${at}.note: not text`);
@@ -88,9 +98,13 @@ export function validateCapacityDetail(v: unknown): string[] {
   if ('statusNote' in v && !isText(v.statusNote)) errors.push('$.statusNote: not text');
   if (!isObj(v.freshness)) errors.push('$.freshness: not an object');
   else {
-    errors.push(...extra(v.freshness, ['verdict', 'text'], '$.freshness'));
+    errors.push(...extra(v.freshness, ['verdict', 'text', 'ageText'], '$.freshness'));
     if (v.freshness.verdict !== 'FRESH' && v.freshness.verdict !== 'STALE') errors.push('$.freshness.verdict: not FRESH|STALE');
     if (!isText(v.freshness.text)) errors.push('$.freshness.text: not text');
+    if ((v.freshness.verdict === 'STALE') !== ('ageText' in v.freshness)) errors.push('$.freshness.ageText: present exactly when STALE');
+    if ('ageText' in v.freshness && !(isText(v.freshness.ageText) && /^Not refreshed in \d+ min$/.test(v.freshness.ageText as string))) {
+      errors.push('$.freshness.ageText: not "Not refreshed in X min"');
+    }
   }
   if (!Array.isArray(v.windows)) errors.push('$.windows: not an array');
   else v.windows.forEach((w, i) => errors.push(...windowErrors(w, `$.windows[${i}]`)));
@@ -106,6 +120,10 @@ export function validateCapacityDetail(v: unknown): string[] {
   if (isObj(v.freshness) && v.freshness.verdict === 'STALE' && Array.isArray(v.windows)
     && v.windows.some((w) => isObj(w) && 'remainingPercent' in w)) {
     errors.push('$.windows: a stale pool offers no current figure');
+  }
+  if (isObj(v.freshness) && v.freshness.verdict !== 'STALE' && Array.isArray(v.windows)
+    && v.windows.some((w) => isObj(w) && 'lastKnownPercent' in w)) {
+    errors.push('$.windows: a last-known figure belongs to a stale pool only');
   }
   return errors;
 }

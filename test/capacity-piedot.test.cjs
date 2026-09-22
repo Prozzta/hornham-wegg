@@ -4,8 +4,9 @@
  * v1.1.45 unit #14 PHASE 2 — the PIE-DOT, human-approved, pinned. Each rule kills a census
  * mutant (test/tools/capacity-mutants.cjs, "u14"):
  *   no bar on the strip; the wedge IS the remaining share; the colour ramp (green 100 ->
- *   amber ~50 -> dark red 0); LIMITED = stop sign; never read = spotted; STALE = dimmed and
- *   wedge-less with no figure (S1 = a, and A1's no-figure-on-stale re-pinned); the A2 frame
+ *   amber ~50 -> dark red 0); LIMITED = stop sign; never read = spotted; aged with nothing
+ *   to keep (restored) = dimmed and wedge-less with no figure (a stale reading WITH a figure
+ *   keeps the ordinary pie: STALE-RETAIN, test/capacity-stale-retain.test.cjs); the A2 frame
  *   = an empty pie with a dark-red rim, no stop sign (S3); one lead dot per pool (S2);
  *   PIE_DOT_SIZE 20; contrast in BOTH themes (S4), judged against the bar colours READ from
  *   tokens.css (so a tokens.css change to a low-contrast bar colour fails here).
@@ -76,18 +77,19 @@ test('never read is SPOTTED: cold start, and a fresh reading with no usable numb
   assert.ok(dotHtml(html).includes('data-cap-spotted'));
 });
 
-test('S1 (a): STALE is DIMMED and wedge-less - aged, restored, or masked - and carries NO figure (A1 re-pinned)', () => {
-  const cases = { stale: pool(std(80, 60), {}, { stale: true }), restored: pool(std(80, 60), {}, { restore: true }),
-    masked: pool(std(80, 60), {}, { mask: true }) };
-  assert.equal(cases.masked.masked, true, 'the mask really fired');
-  for (const [name, p] of Object.entries(cases)) {
+test('STALE-RETAIN (supersedes S1/A1): aged or masked keeps the ordinary pie; only RESTORED evidence is DIMMED, wedge-less, figure-free', () => {
+  for (const [name, p] of Object.entries({ stale: pool(std(80, 60), {}, { stale: true }), masked: pool(std(80, 60), {}, { mask: true }) })) {
     const html = render([p]);
-    assert.equal(dotOf(html), 'DIMMED', `${name}: dimmed, distinct from the never-read spotted dot`);
-    assert.ok(!/data-cap-fill|data-cap-pie|aria-valuenow/.test(html), `${name}: no wedge, no meter anywhere`);
-    assert.ok(!visible(html).some((n) => /%/.test(n)), `${name}: no figure on the strip`);
+    assert.equal(dotOf(html), 'PIE', `${name}: the ordinary pie`);
+    assert.match(html, /aria-valuenow="80"/, `${name}: its last-known figure`);
   }
+  const restored = pool(std(80, 60), {}, { restore: true });
+  const html = render([restored]);
+  assert.equal(dotOf(html), 'DIMMED', 'restored: dimmed, distinct from the never-read spotted dot');
+  assert.ok(!/data-cap-fill|data-cap-pie|aria-valuenow/.test(html), 'restored: no wedge, no meter anywhere');
+  assert.ok(!visible(html).some((n) => /%/.test(n)), 'restored: no figure on the strip');
   // The type itself refuses a figure: a dimmed look has nothing to carry one in.
-  assert.deepEqual(pie.leadDotOf(cases.stale), { kind: 'DIMMED' });
+  assert.deepEqual(pie.leadDotOf(restored), { kind: 'DIMMED' });
 });
 
 test('a live figure is a PIE whose wedge IS the remaining share, drawn as the pool\'s ONE lead dot (S2)', () => {
