@@ -76,8 +76,27 @@ interface AgentControl {
   steerQueue: string[];
 }
 
+/**
+ * A real change of one blocking flag (pre-M1 event-wake bridge). Main-only notification:
+ * the `*_RELEASED` / `RESUMED` kinds are retry edges for a pending inbox wake. Applying
+ * a block is reported too, but is never a retry edge. Nothing here changes a snapshot.
+ */
+export type ControlTransition =
+  | 'PAUSED' | 'UNPAUSED' | 'HALTED' | 'RESUMED'
+  | 'AUTO_DELIVERY_PAUSED' | 'AUTO_DELIVERY_RELEASED';
+
 export class ControlRegistry {
   private readonly map = new Map<string, AgentControl>();
+  private transitionObserver: ((agentId: string, transition: ControlTransition, snapshot: AgentControlSnapshot) => void) | null = null;
+
+  /** Observe real state changes only (a setter given its current value emits nothing). */
+  setTransitionObserver(cb: ((agentId: string, transition: ControlTransition, snapshot: AgentControlSnapshot) => void) | null): void {
+    this.transitionObserver = cb;
+  }
+
+  private emit(id: string, transition: ControlTransition): void {
+    try { this.transitionObserver?.(id, transition, this.snapshot(id)); } catch { /* notification only */ }
+  }
 
   private ensure(id: string): AgentControl {
     let c = this.map.get(id);
@@ -96,16 +115,31 @@ export class ControlRegistry {
 
   // ─── Operator actions (wired to IPC) ───────────────────────────────────────
 
-  pause(id: string, on: boolean): void { this.ensure(id).paused = on; }
+  pause(id: string, on: boolean): void {
+    const c = this.ensure(id);
+    if (c.paused === on) return;
+    c.paused = on;
+    this.emit(id, on ? 'PAUSED' : 'UNPAUSED');
+  }
   pauseAutoDelivery(id: string, on: boolean): void {
-    this.ensure(id).autoDeliveryPaused = on;
+    const c = this.ensure(id);
+    if (c.autoDeliveryPaused === on) return;
+    c.autoDeliveryPaused = on;
+    this.emit(id, on ? 'AUTO_DELIVERY_PAUSED' : 'AUTO_DELIVERY_RELEASED');
   }
   replaceAutoDeliveryPauses(ids: Iterable<string>): void {
     const paused = new Set(ids);
+    const changed: string[] = [];
     for (const [id, control] of this.map) {
-      control.autoDeliveryPaused = paused.has(id);
+      const on = paused.has(id);
+      if (control.autoDeliveryPaused !== on) { control.autoDeliveryPaused = on; changed.push(id); }
     }
-    for (const id of paused) this.ensure(id).autoDeliveryPaused = true;
+    for (const id of paused) {
+      const c = this.ensure(id);
+      if (!c.autoDeliveryPaused) { c.autoDeliveryPaused = true; changed.push(id); }
+    }
+    // Reported only for the ids that actually changed.
+    for (const id of changed) this.emit(id, this.map.get(id)!.autoDeliveryPaused ? 'AUTO_DELIVERY_PAUSED' : 'AUTO_DELIVERY_RELEASED');
   }
   gateTool(id: string, tool: string, on: boolean): void {
     const c = this.ensure(id);
@@ -125,12 +159,23 @@ export class ControlRegistry {
     q.push(t.slice(0, 10000)); // hook additionalContext cap
   }
   /** Request a graceful stop at the next hook boundary. */
-  halt(id: string): void { this.ensure(id).halted = true; }
+  halt(id: string): void {
+    const c = this.ensure(id);
+    if (c.halted) return;
+    c.halted = true;
+    this.emit(id, 'HALTED');
+  }
   /** Drop all queued-but-undelivered steer notes (e.g. closing time cancelled
    *  before a busy agent's next hook boundary consumed the instruction). */
   clearSteers(id: string): void { const c = this.map.get(id); if (c) c.steerQueue.length = 0; }
   /** Clear pause + halt (lets a paused/halted agent run again). Keeps gates. */
-  resume(id: string): void { const c = this.ensure(id); c.paused = false; c.halted = false; }
+  resume(id: string): void {
+    const c = this.ensure(id);
+    if (!c.paused && !c.halted) return;
+    c.paused = false;
+    c.halted = false;
+    this.emit(id, 'RESUMED');
+  }
 
   // ─── Reads (used by HookServer) ────────────────────────────────────────────
 

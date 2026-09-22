@@ -1,51 +1,45 @@
 /**
- * WorkerWakeWatchdog — main-process inbox-wake watchdog for worker agents (#151).
+ * The inbox-wake COORDINATOR (pre-M1 event-wake bridge; was the #151 worker watchdog).
  *
- * The renderer's idle inbox-wake nudge (useHive.ts effect #3) is the ONLY wake
- * path for a worker that has gone quiet at its prompt: it polls on a setInterval
- * in the renderer, so a throttled/occluded window (Chromium suspends background
- * setInterval timers) can miss the moment mail lands and the worker then sits on
- * an undrained inbox forever — the orchestrator ("god") never has this problem
- * because the main process re-engages it on its own heartbeat cadence.
+ * WHAT IT DECIDES. Which agent - any agent, god included - gets ONE guarded inbox-wake
+ * turn, for which inbox message ids, and what happened to those ids afterwards. It types
+ * nothing: every wake goes through the one main-owned submit transaction
+ * (`AutomaticSubmitOwner.submit`, CAPACITY_GATED), which owns admission, the prompt and
+ * human-input guards, the final revalidation and the Enter.
  *
- * This watchdog is the worker-side counterpart: on a cadence it finds live
- * workers that are genuinely idle, have newly arrived inbox mail, are not
- * paused / not awaiting a human decision, and have not been nudged recently —
- * then types the same guarded nudge the renderer would have, directly into the
- * PTY. Message ids make this edge-triggered: unchanged undrained mail is never
- * re-announced once a minute forever.
+ * WHO FEEDS IT. Events first: a durable inbox write (`HiveManager.setDeliveryObserver`),
+ * hook lifecycle edges (Stop, idle Notification, eligible SubagentStop), control releases
+ * and capacity changes. The 15s main beat is RECONCILIATION over the same state - it
+ * finds ids a lost callback or a restart missed. Both paths claim through `claim()`; there
+ * is no second decision path and no god special case.
  *
- * Safety mirrors the renderer's guarded queue-drain (useHive.ts dispatch):
- *  - only a GENUINELY idle worker is nudged (no PTY output for IDLE_MS — the
- *    same quiescence the renderer's idle fallback uses), never a mid-turn one,
- *  - never inside the boot sequence (BOOT_GRACE_MS from spawn, mirroring the
- *    renderer's bootGraceUntil),
- *  - delivery paused / agent paused / halted → no nudge (ControlRegistry),
- *  - a recent permission/HITL notification re-arms a block (HITL_REARM_MS) so a
- *    prompt the human is deciding on is never typed into,
- *  - a per-worker cooldown (NUDGE_COOLDOWN_MS) so the watchdog and the renderer
- *    nudge don't stack on top of each other.
+ * PER AGENT: one pending set, one in-flight claim, one held (INTERFERED) claim, and
+ * per-message-id dedup. Duplicate delivery / hook / control / scan signals coalesce; they
+ * can never produce a second turn.
  *
- * Deliberately the renderer's own nudge text. THIS MODULE DECIDES WHO TO NUDGE AND
- * NOTHING ELSE: since L0-FUSION stage 5 the typing itself - text, the TUI gap, the final
- * revalidation and the Enter - belongs to the one main-owned submit transaction
- * (`automaticSubmit.ts`), which every programmatic text+Enter path shares. This file used
- * to carry its own copy of that order; two copies of an order is how they drift.
+ *  - pendingIds    observed in the inbox, not yet in a committed wake;
+ *  - announcedIds  in a COMMITTED wake, while still on disk (never re-announced);
+ *  - inFlight      the sole claimed submission (immutable: new mail waits for the next edge);
+ *  - held          an INTERFERED claim, until a human says SEND_AGAIN or ALREADY_HANDLED.
  *
- * No electron import — unit-testable (mirrors ControlRegistry).
+ * Ids are ANNOUNCED ONLY AFTER COMMITTED. REFUSED / ABORTED / FAILED / REJECTED release
+ * them back to pending; INTERFERED holds them; HUMAN_HANDLED is terminal.
+ *
+ * No electron import, clock injected - every race is driven synchronously in tests.
  */
+import { createHash } from 'node:crypto';
 
-/** The exact nudge the renderer's inbox-wake loop would have typed. */
+/** The #151 nudge text, kept for reference; the wake itself uses `inboxNudgeText(ids)`. */
 export const WORKER_WAKE_NUDGE =
   'You have new hive inbox message(s) — read your inbox, act on them now, and move handled ones to inbox/.done/. Act autonomously; only message god if you genuinely need a decision.';
 
-/** No PTY output for this long = genuinely idle (renderer QUIESCE_IDLE_MS). */
+/** Reconciliation fallback: no PTY output for this long = quiescent (renderer QUIESCE_IDLE_MS). */
 export const WORKER_WAKE_IDLE_MS = 12_000;
-/** Never nudge inside the boot sequence (renderer BOOT_GRACE_MS). */
+/** Never wake inside the boot sequence (renderer BOOT_GRACE_MS). */
 export const WORKER_WAKE_BOOT_GRACE_MS = 35_000;
-/** Minimum gap between two watchdog nudges of the same worker. */
+/** Reconciliation only: minimum gap between two scan-driven attempts for one agent. */
 export const WORKER_WAKE_COOLDOWN_MS = 60_000;
-/** A permission/HITL notification blocks nudges for this long after it fires. */
+/** A permission/HITL notification blocks wakes for this long after it fires. */
 export const WORKER_WAKE_HITL_REARM_MS = 5 * 60_000;
 
 /** A hook event message that means "the agent needs the human" — permission /
@@ -70,98 +64,210 @@ export function classifyHook(event: string | undefined, message: string | undefi
   return null;
 }
 
-/** One worker's live facts, gathered by the caller each beat. */
+/** Hook events that prove the main agent is working (a stale idle assertion is cleared). */
+const ACTIVE_EVENTS = new Set(['SessionStart', 'UserPromptSubmit', 'PreToolUse', 'PostToolUse', 'PreCompact', 'PostCompact']);
+
+export type WakeLifecycle = 'active' | 'idle' | 'unknown';
+/** Why a wake was attempted (breadcrumbs only; never a decision input). */
+export type WakeCause = 'delivery' | 'hook' | 'control' | 'capacity' | 'interference' | 'reconcile';
+/** `event`: needs recorded lifecycle-idle evidence. `reconcile`: may also use PTY quiescence. */
+export type WakeMode = 'event' | 'reconcile';
+
+/** One agent's live facts, gathered by the caller immediately before a claim. */
 export interface WorkerWakeFacts {
-  /** Worker agent id (god is never a candidate). */
   agentId: string;
-  /** True when this agent is the orchestrator — god is never nudged. */
-  isGod?: boolean;
   /** Live PTY id, or undefined when the agent has no terminal. */
   ptyId?: string;
   /** Timestamp of the PTY's last output (0 = never output). */
   lastOutputAt: number;
-  /** IDs of undrained inbox messages (empty → nothing to wake for). */
-  inboxIds: readonly string[];
   /** ControlRegistry snapshot flags. */
   autoDeliveryPaused: boolean;
   paused: boolean;
   halted: boolean;
+  /** The submit owner holds an unresolved INTERFERED inhibition on this PTY. */
+  inhibited?: boolean;
+}
+
+/** One immutable claimed batch. */
+export interface WakeClaim {
+  agentId: string;
+  requestId: string;
+  /** Sorted, unique. Never enlarged after the claim. */
+  ids: readonly string[];
+  cause: WakeCause;
+}
+
+export type InterferenceHow = 'SEND_AGAIN' | 'ALREADY_HANDLED';
+
+interface AgentWake {
+  pending: Set<string>;
+  announced: Set<string>;
+  inFlight: WakeClaim | null;
+  held: WakeClaim | null;
+  lifecycle: WakeLifecycle;
+  lastHumanNeedsAt: number;
+  lastReconcileAttemptAt: number;
+}
+
+/** `inbox-wake:<agent>:<sha256 of the sorted ids>` - the same batch always has the same id. */
+export function inboxWakeRequestId(agentId: string, ids: readonly string[]): string {
+  const digest = createHash('sha256').update([...ids].sort().join('\n')).digest('hex');
+  return `inbox-wake:${agentId}:${digest}`;
 }
 
 export class WorkerWakeWatchdog {
   /** ptyId → spawn timestamp (boot grace). */
   private spawnedAt = new Map<string, number>();
-  /** agentId → last nudge timestamp (cooldown). */
-  private lastNudgeAt = new Map<string, number>();
-  /** agentId → inbox ids included in the last nudge. This turns the watchdog
-   *  into an edge trigger: a worker is nudged again only when a new id appears. */
-  private announcedInboxIds = new Map<string, Set<string>>();
-  /** agentId → timestamp of the last needsHuman hook notification. */
-  private lastHumanNeedsAt = new Map<string, number>();
+  private agents = new Map<string, AgentWake>();
 
-  /** Record a PTY spawn so its boot sequence is left alone. */
-  noteSpawn(ptyId: string, at = Date.now()): void {
-    this.spawnedAt.set(ptyId, at);
-  }
-
-  /** Feed hook events (from HookServer) so a HITL prompt blocks nudges. */
-  noteHook(agentId: string | undefined, event: string | undefined, message: string | undefined, at = Date.now()): void {
-    if (!agentId) return;
-    if (classifyHook(event, message) === 'needsHuman') this.lastHumanNeedsAt.set(agentId, at);
-  }
-
-  /** Forget per-agent state (e.g. the agent's PTY was closed). */
-  forget(agentId: string, ptyId?: string): void {
-    this.lastNudgeAt.delete(agentId);
-    this.announcedInboxIds.delete(agentId);
-    this.lastHumanNeedsAt.delete(agentId);
-    if (ptyId) this.spawnedAt.delete(ptyId);
-  }
-
-  /** The worker ids that should be nudged right now, in stable registry order.
-   *  Pure decision — the caller types the nudge. */
-  decide(facts: readonly WorkerWakeFacts[], now = Date.now()): string[] {
-    const out: string[] = [];
-    for (const f of facts) {
-      const inboxIds = new Set(f.inboxIds.filter((id) => typeof id === 'string' && id.length > 0));
-      if (inboxIds.size === 0) {
-        // A fully drained inbox starts a fresh announcement cycle and bounds the
-        // remembered set even for a worker that lives for months.
-        this.announcedInboxIds.delete(f.agentId);
-        continue;
-      }
-      if (f.isGod || !f.ptyId) continue;
-      if (f.autoDeliveryPaused || f.paused || f.halted) continue;
-      if (f.lastOutputAt <= 0) continue; // never produced output → still booting
-      if (now - f.lastOutputAt < WORKER_WAKE_IDLE_MS) continue; // mid-turn
-      const spawned = this.spawnedAt.get(f.ptyId) ?? 0;
-      if (spawned > 0 && now - spawned < WORKER_WAKE_BOOT_GRACE_MS) continue;
-      const lastHuman = this.lastHumanNeedsAt.get(f.agentId) ?? 0;
-      if (lastHuman > 0 && now - lastHuman < WORKER_WAKE_HITL_REARM_MS) continue;
-      const announced = this.announcedInboxIds.get(f.agentId);
-      if (announced && !Array.from(inboxIds).some((id) => !announced.has(id))) continue;
-      const lastNudge = this.lastNudgeAt.get(f.agentId) ?? 0;
-      if (lastNudge > 0 && now - lastNudge < WORKER_WAKE_COOLDOWN_MS) continue;
-      this.lastNudgeAt.set(f.agentId, now);
-      this.announcedInboxIds.set(f.agentId, inboxIds);
-      out.push(f.agentId);
+  private rec(agentId: string): AgentWake {
+    let r = this.agents.get(agentId);
+    if (!r) {
+      r = { pending: new Set(), announced: new Set(), inFlight: null, held: null, lifecycle: 'unknown', lastHumanNeedsAt: 0, lastReconcileAttemptAt: 0 };
+      this.agents.set(agentId, r);
     }
-    return out;
+    return r;
+  }
+
+  private known(r: AgentWake, id: string): boolean {
+    return r.pending.has(id) || r.announced.has(id) || !!r.inFlight?.ids.includes(id) || !!r.held?.ids.includes(id);
+  }
+
+  /** Record a PTY spawn: its boot sequence is left alone, its lifecycle starts unknown, and a
+   *  held INTERFERED claim from the previous incarnation goes back to pending (the owner
+   *  retires that inhibition with the process). */
+  noteSpawn(ptyId: string, at = Date.now(), agentId?: string): void {
+    this.spawnedAt.set(ptyId, at);
+    if (!agentId) return;
+    const r = this.rec(agentId);
+    r.lifecycle = 'unknown';
+    if (r.held) {
+      for (const id of r.held.ids) if (!r.announced.has(id)) r.pending.add(id);
+      r.held = null;
+    }
+  }
+
+  /** A durable inbox write landed. True when the id is new to this agent. */
+  noteDelivery(agentId: string, messageId: string): boolean {
+    if (!agentId || typeof messageId !== 'string' || !messageId) return false;
+    const r = this.rec(agentId);
+    if (this.known(r, messageId)) return false;
+    r.pending.add(messageId);
+    return true;
+  }
+
+  /** Feed a hook event. Returns true when it is a RETRY EDGE for pending work. */
+  noteHook(agentId: string | undefined, event: string | undefined, message: string | undefined, at = Date.now()): boolean {
+    if (!agentId || !event) return false;
+    const r = this.rec(agentId);
+    if (event === 'Stop') { r.lifecycle = 'idle'; return true; }
+    if (event === 'SubagentStop') return r.lifecycle === 'idle';   // never turns active into idle
+    if (event === 'Notification') {
+      if (classifyHook(event, message) === 'needsHuman') { r.lastHumanNeedsAt = at; return false; }
+      r.lifecycle = 'idle';
+      return true;
+    }
+    if (ACTIVE_EVENTS.has(event)) { r.lifecycle = 'active'; return false; }
+    if (event === 'SessionEnd') { r.lifecycle = 'unknown'; return false; }
+    return false;
   }
 
   /**
-   * The nudge `decide` chose was NOT delivered (capacity held it, the prompt was a
-   * human's, the terminal could not be proven safe to type into). Forget that its ids
-   * were announced, so the same undrained mail is tried again on a later beat instead of
-   * waiting for NEW mail that may never come. The cooldown is deliberately KEPT: a retry
-   * is at most one attempt per WORKER_WAKE_COOLDOWN_MS, never a tight loop.
+   * Align with the files, which are authoritative: ids no longer on disk leave every set,
+   * ids on disk that nothing knows about become pending (a lost callback, a restart). No
+   * ordering is inferred from the id strings.
    */
-  retract(agentId: string): void {
-    this.announcedInboxIds.delete(agentId);
+  reconcile(agentId: string, currentInboxIds: readonly string[]): void {
+    const current = new Set(currentInboxIds.filter((id) => typeof id === 'string' && id.length > 0));
+    const r = this.rec(agentId);
+    for (const id of [...r.pending]) if (!current.has(id)) r.pending.delete(id);
+    for (const id of [...r.announced]) if (!current.has(id)) r.announced.delete(id);
+    if (r.held && !r.held.ids.some((id) => current.has(id))) r.held = null;
+    for (const id of current) if (!this.known(r, id)) r.pending.add(id);
   }
 
-  /** Last time this worker was nudged (0 = never) — useful for diagnostics. */
-  lastNudge(agentId: string): number {
-    return this.lastNudgeAt.get(agentId) ?? 0;
+  /**
+   * At most ONE immutable batch, or null. Both modes fail closed on: no PTY, pause, halt,
+   * auto-delivery pause, an owner inhibition, a recent HITL prompt, boot grace, an existing
+   * in-flight or held claim. `event` mode needs recorded lifecycle-idle evidence;
+   * `reconcile` may also accept PTY quiescence, rate-limited per agent.
+   */
+  claim(f: WorkerWakeFacts, cause: WakeCause, mode: WakeMode, now = Date.now()): WakeClaim | null {
+    const r = this.rec(f.agentId);
+    if (r.inFlight || r.held || r.pending.size === 0) return null;
+    if (!f.ptyId || f.paused || f.halted || f.autoDeliveryPaused || f.inhibited) return null;
+    if (r.lastHumanNeedsAt > 0 && now - r.lastHumanNeedsAt < WORKER_WAKE_HITL_REARM_MS) return null;
+    const spawned = this.spawnedAt.get(f.ptyId) ?? 0;
+    if (spawned > 0 && now - spawned < WORKER_WAKE_BOOT_GRACE_MS) return null;
+    if (mode === 'event') {
+      if (r.lifecycle !== 'idle') return null;
+    } else {
+      const quiescent = f.lastOutputAt > 0 && now - f.lastOutputAt >= WORKER_WAKE_IDLE_MS;
+      if (r.lifecycle !== 'idle' && !quiescent) return null;
+      if (r.lastReconcileAttemptAt > 0 && now - r.lastReconcileAttemptAt < WORKER_WAKE_COOLDOWN_MS) return null;
+      r.lastReconcileAttemptAt = now;
+    }
+    const ids = [...r.pending].sort();
+    r.pending.clear();
+    const claim: WakeClaim = Object.freeze({ agentId: f.agentId, requestId: inboxWakeRequestId(f.agentId, ids), ids: Object.freeze(ids), cause });
+    r.inFlight = claim;
+    return claim;
+  }
+
+  /** The owner's outcome for a claim. Only the CURRENT in-flight claim is settled. */
+  settle(claim: WakeClaim, outcomeKind: string): void {
+    const r = this.agents.get(claim.agentId);
+    if (!r || r.inFlight?.requestId !== claim.requestId) return;
+    r.inFlight = null;
+    if (outcomeKind === 'COMMITTED') {
+      for (const id of claim.ids) r.announced.add(id);
+      r.lifecycle = 'active';          // a turn just started; new mail waits for its Stop
+    } else if (outcomeKind === 'HUMAN_HANDLED') {
+      for (const id of claim.ids) r.announced.add(id);
+    } else if (outcomeKind === 'INTERFERED') {
+      r.held = claim;                  // no automatic retry until a human rules
+    } else {
+      for (const id of claim.ids) if (!r.announced.has(id)) r.pending.add(id);
+    }
+  }
+
+  /** A human resolved the owner's INTERFERED hold. Returns true when a held claim moved. */
+  resolveInterference(agentId: string, how: InterferenceHow): boolean {
+    const r = this.agents.get(agentId);
+    if (!r?.held) return false;
+    const held = r.held;
+    r.held = null;
+    if (how === 'SEND_AGAIN') {
+      for (const id of held.ids) if (!r.announced.has(id)) r.pending.add(id);
+    } else {
+      for (const id of held.ids) r.announced.add(id);
+    }
+    return true;
+  }
+
+  /** Agents with pending ids (bounded retries after a capacity change or at startup). */
+  pendingAgents(): string[] {
+    return [...this.agents].filter(([, r]) => r.pending.size > 0).map(([id]) => id).sort();
+  }
+
+  /** Read-only view for diagnostics and tests. */
+  state(agentId: string): { pending: string[]; announced: string[]; inFlight: WakeClaim | null; held: WakeClaim | null; lifecycle: WakeLifecycle } {
+    const r = this.agents.get(agentId);
+    return {
+      pending: r ? [...r.pending].sort() : [],
+      announced: r ? [...r.announced].sort() : [],
+      inFlight: r?.inFlight ?? null,
+      held: r?.held ?? null,
+      lifecycle: r?.lifecycle ?? 'unknown'
+    };
+  }
+
+  /** Forget per-agent state (the agent's PTY was closed). */
+  forget(agentId: string, ptyId?: string): void {
+    this.agents.delete(agentId);
+    if (ptyId) this.spawnedAt.delete(ptyId);
   }
 }
+
+/** The plan's name for the same class. */
+export { WorkerWakeWatchdog as InboxWakeCoordinator };

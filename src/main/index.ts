@@ -92,7 +92,8 @@ import { validateBaseUrl, buildAuthHeaders, resolveUpstreamUrl, secretRefFor, IN
 import { RosterStore } from './roster';
 import { buildWorkerLaunch } from './workerLaunch';
 import { ControlRegistry } from './control';
-import { WorkerWakeWatchdog, type WorkerWakeFacts } from './workerWake';
+import { WorkerWakeWatchdog } from './workerWake';
+import { InboxWakeBridge } from './inboxWakeBridge';
 import { inboxNudgeText } from '../shared/hiveNudge';
 import { fetchHireManifest, readHireManifestFiles } from './hire';
 import { parseHireDeepLink, type HireManifest } from '../shared/hire';
@@ -372,11 +373,14 @@ function standingGoalFromRoster(agentId: string): string | null {
   }
   return null;
 }
-// Worker inbox-wake watchdog (#151): finds idle workers with undrained inbox mail
-// and types the same guarded nudge the renderer would have (so a throttled
-// background window can't leave a worker parked on an unread inbox forever).
-// HookServer feeds it the hook stream so a permission/HITL prompt blocks nudges.
+// Inbox-wake coordinator (pre-M1 event-wake bridge; was the #151 worker watchdog). EVERY
+// agent, god included, is woken the same way: a durable delivery, a lifecycle or control
+// release edge, or the reconciliation beat asks `inboxWake.requestInboxWake`, which
+// claims one batch here and submits it through the one owner (CAPACITY_GATED). HookServer
+// feeds it the hook stream, so a permission/HITL prompt blocks wakes.
 const workerWake = new WorkerWakeWatchdog();
+/** Built once the submit owner exists (below); null only during module start-up. */
+let inboxWake: InboxWakeBridge | null = null;
 // HookServer needs BOTH: Oscar's control registry (HITL pause/gate/steer/halt via
 // hook returns) AND Jim's breaker (feed recordToolUse on each PostToolUse).
 // L0 — provider allowance, keyed by provider-account/limit identity. Fed from
@@ -407,7 +411,9 @@ const providerCapacity = new CapacityRuntime({
       capacityStrip.noteIntent(intent, capacityToast(capacityStrip.toastFor(intent, providerCapacity.tracker.pool(intent.poolKey))));
     }
   },
-  onChange: () => { pushCapacityStrip(); pushAgentUsage(); pushAgentImpact(); },
+  // v1.1.46 integration: ONE onChange carries both followers - the CRIT-15-PRE impact push
+  // and the inbox-wake retry HINT (admission decides; the hint never submits by itself).
+  onChange: () => { pushCapacityStrip(); pushAgentUsage(); pushAgentImpact(); inboxWake?.onCapacityChange(); },
   onAdmission: () => pushAgentImpact()
 });
 // L0-FUSION stage 5 - THE ONE OWNER of programmatic stage -> final revalidation -> Enter.
@@ -444,6 +450,40 @@ const capacityStore = new CapacityStore(
   const restored = capacityStore.restore();
   if (restored) console.log(`[capacity] restored ${restored} pool(s) from the durable store as UNKNOWN/unconfirmed`);
 }
+// The one wake path (plan section 3). Registered before the router starts, so no durable
+// delivery can land unobserved.
+inboxWake = new InboxWakeBridge({
+  coordinator: workerWake,
+  inboxIds: (agentId) => hive.inbox(agentId).map((m) => m.id).filter(Boolean),
+  facts: (agentId) => {
+    const ptyId = ptyForAgent(agentId);
+    if (!ptyId) return null;
+    const snap = control.snapshot(agentId);
+    return {
+      ptyId,
+      lastOutputAt: ptyManager.lastOutputAt(ptyId) ?? 0,
+      autoDeliveryPaused: snap.autoDeliveryPaused,
+      paused: snap.paused,
+      halted: snap.halted,
+      inhibited: automaticSubmit.inhibition(ptyId) !== null
+    };
+  },
+  // L0-FUSION stage 5: a wake starts a provider turn nobody asked for in this moment, so
+  // it is CAPACITY_GATED work through the one submit owner - admission, the READY gate,
+  // the prompt and human-draft guards, the final revalidation next to the Enter.
+  submit: (req) => automaticSubmit.submit(req),
+  text: (ids) => inboxNudgeText([...ids]),
+  setImmediate: (fn) => { setImmediate(fn); },
+  now: () => Date.now(),
+  log: (line) => console.log(line)
+});
+hive.setDeliveryObserver(({ agentId, messageId }) => inboxWake?.onDelivery(agentId, messageId));
+// Only a RELEASE of a blocking state is a retry edge; applying pause/halt is not.
+control.setTransitionObserver((agentId, transition) => {
+  if (transition === 'UNPAUSED' || transition === 'RESUMED' || transition === 'AUTO_DELIVERY_RELEASED') {
+    inboxWake?.onControlRelease(agentId);
+  }
+});
 const hookServer = new HookServer(
   hive,
   () => liveWebContents(),
@@ -451,7 +491,9 @@ const hookServer = new HookServer(
   control,
   breaker,
   standingGoalFromRoster,
-  (agentId, event, message) => workerWake.noteHook(agentId, event, message),
+  // Observed BEFORE the hook response; the bridge defers any retry with setImmediate, so
+  // the Stop reply is never blocked and no turn is manufactured inside the hook.
+  (agentId, event, message) => inboxWake?.onHook(agentId, event, message),
   (agentId, obs) => { providerCapacity.ingest(agentId, obs); capacityStore.scheduleSave(); }
 );
 const memory = new MemoryManager(
@@ -3258,9 +3300,9 @@ async function spawnAgentCore(opts: AgentSpawnOptions, owner: Electron.WebConten
     pushCapacityStrip();
     pushAgentUsage();
     pushAgentImpact();
-    // Worker inbox-wake watchdog (#151): boot grace starts at spawn so the
-    // initial orientation prompt is never mistaken for an idle agent.
-    workerWake.noteSpawn(opts.id);
+    // Inbox wake: boot grace starts at spawn so the initial orientation prompt is never
+    // mistaken for an idle agent; a new incarnation also releases a stale INTERFERED hold.
+    workerWake.noteSpawn(opts.id, Date.now(), opts.hive.id);
   }
   // Pre-accept Claude Code's bypass-mode warning + folder-trust dialog so the
   // agent (spawned with --permission-mode bypassPermissions) doesn't stall on an
@@ -4534,6 +4576,9 @@ ipcMain.handle('autoSubmit:resolveInterference', (_evt, agentId: unknown, how: u
   const ptyId = ptyForAgent(agentId);
   const resolved = ptyId ? automaticSubmit.resolveInterference(ptyId, how as InterferenceResolution) : false;
   pushAgentImpact();
+  // The two human rulings stay distinct: SEND_AGAIN re-runs every guard, ALREADY_HANDLED
+  // resolves the ids with no further submit.
+  if (resolved) inboxWake?.onInterferenceResolved(agentId, how as InterferenceResolution);
   return resolved;
 });
 
@@ -5669,75 +5714,23 @@ function bootstrapHiveServices(): void {
   armAlwaysOnBeats();
 }
 
-/** Cadence of the worker inbox-wake watchdog (#151). Well under the renderer's
- *  own nudge cooldown so a throttled window is caught within ~15s of a stall. */
+/** Cadence of the inbox-wake RECONCILIATION beat. Events wake agents; this finds what a
+ *  lost callback or a restart missed. Unchanged in the pre-M1 bridge. */
 const WORKER_WAKE_POLL_MS = 15_000;
 let workerWakeTimer: ReturnType<typeof setInterval> | null = null;
 
-/** Monotonic per-process suffix for worker-wake request ids. */
-let workerWakeSeq = 0;
-
-/** Main-process inbox-wake beat (issue #151, fix A): the renderer's idle nudge
- *  (useHive.ts) is the only path that wakes a worker parked on an undrained
- *  inbox — and it lives on a setInterval in the renderer, which a throttled or
- *  occluded window stops honoring. This beat is the renderer-INDEPENDENT fallback:
- *  it gathers live-worker facts (PTY quiescence, inbox depth, control flags) and
- *  lets WorkerWakeWatchdog.decide apply the exact renderer guards (idle-only,
- *  post-boot-grace, not paused/halted, no pending HITL, cooldown), then types the
- *  same nudge the renderer would have. God is never a candidate (its heartbeat
- *  path already re-engages it). */
+/** Inbox-wake RECONCILIATION (pre-M1 bridge). Every live, non-archived agent - god
+ *  included, with no exclusion - goes through the SAME `requestInboxWake` the events use,
+ *  in reconcile mode (PTY quiescence may stand in for a missed Stop, rate-limited per
+ *  agent). There is no second submit implementation here. */
 function runWorkerWakeBeat(): void {
-  if (!hive.enabled()) return;
+  if (!hive.enabled() || !inboxWake) return;
   const reg = hive.registry();
-  if (!reg?.agents || !reg.godId) return;
-  const now = Date.now();
-  const facts: WorkerWakeFacts[] = [];
-  for (const [agentId, a] of Object.entries(reg.agents)) {
-    if (agentId === reg.godId || a?.archived) continue;
-    const ptyId = ptyForAgent(agentId);
-    if (!ptyId) continue;
-    const snap = control.snapshot(agentId);
-    facts.push({
-      agentId,
-      isGod: agentId === reg.godId,
-      ptyId,
-      lastOutputAt: ptyManager.lastOutputAt(ptyId) ?? 0,
-      inboxIds: hive.inbox(agentId).map((message) => message.id).filter(Boolean),
-      autoDeliveryPaused: snap.autoDeliveryPaused,
-      paused: snap.paused,
-      halted: snap.halted
-    });
-  }
-  for (const agentId of workerWake.decide(facts, now)) {
-    const ptyId = ptyForAgent(agentId);
-    if (!ptyId) continue;
-    // Re-read at delivery time, not from the facts snapshot: the agent may have
-    // drained the mail during the beat, and a nudge naming ids it already filed
-    // is the exact staleness #187 exists to stop.
-    const ids = hive.inbox(agentId).map((m) => m.id).filter(Boolean);
-    if (!ids.length) { console.log(`[worker-wake] ${agentId} drained before delivery, skipping`); continue; }
-    // L0-FUSION stage 5. A nudge starts a PROVIDER TURN that nobody asked for in this
-    // moment, so it is CAPACITY_GATED work and goes through the one submit owner like
-    // every other programmatic text+Enter: admission, the fail-closed READY gate, the
-    // final revalidation next to the Enter, ABORT or INTERFERED if it cannot commit. This
-    // path used to keep its own copy of that order (and its own `!== 'REFUSE'`), and it
-    // typed with no view of a human draft or an open picker at all.
-    //
-    // Same text the renderer queues (#187's inboxNudgeText), so the two wake paths produce
-    // byte-identical nudges and the queue's one-pending rule recognises either.
-    console.log(`[worker-wake] nudging ${agentId} on ${ptyId} (${ids.length} pending)`);
-    void automaticSubmit.submit({
-      requestId: `wake-${agentId}-${(workerWakeSeq += 1)}`,
-      agentId,
-      admissionClass: 'CAPACITY_GATED',
-      text: inboxNudgeText(ids)
-    }).then((outcome) => {
-      // Nothing was delivered, so these ids were not announced: let the next beat past
-      // the cooldown try again instead of waiting for NEW mail to arrive. An INTERFERED
-      // PTY refuses until a human resolves it, so this cannot become a typing loop.
-      if (outcome.kind !== 'COMMITTED') workerWake.retract(agentId);
-    });
-  }
+  if (!reg?.agents) return;
+  const live = Object.entries(reg.agents)
+    .filter(([agentId, a]) => !a?.archived && ptyForAgent(agentId))
+    .map(([agentId]) => agentId);
+  inboxWake.reconcileAll(live);
 }
 
 /** (Re)arm the always-on beats (decoupled from the optional heartbeat): the live

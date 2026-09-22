@@ -90,7 +90,7 @@ test('dedupe on the ROWS: an unchanged push is not sent again; a real usage chan
 
 test('main pushes on the owner onChange (carries FRESH -> STALE decay), agent leave, agent spawn and the display setter', () => {
   const main = codeOnly(readSource('src/main/index.ts'), 'index.ts');
-  assert.match(main, /onChange: \(\) => \{ pushCapacityStrip\(\); pushAgentUsage\(\); pushAgentImpact\(\); \}/);
+  assert.match(main, /onChange: \(\) => \{ pushCapacityStrip\(\); pushAgentUsage\(\); pushAgentImpact\(\); inboxWake\?\.onCapacityChange\(\); \}/);
   assert.match(main, /ptyProvider\.delete\(id\);\s*pushCapacityStrip\(\);\s*pushAgentUsage\(\);/, 'agent leave');
   assert.match(main, /ptyProvider\.set\(opts\.id, provider\);\s*pushCapacityStrip\(\);\s*pushAgentUsage\(\);/, 'agent spawn');
   assert.match(main, /ipcMain\.handle\('config:setAgentUsageDisplay', \(_evt, agentId: unknown, display: unknown\) => \{\s*const next = setAgentUsageDisplay\(agentId, display\);\s*pushAgentUsage\(\);\s*return next;/);

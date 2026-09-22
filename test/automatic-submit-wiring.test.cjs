@@ -32,6 +32,7 @@ assert.ok(L0_SEM_POLICY && L0_SEM_POLICY.liveTtlMs > 0, 'the production policy r
 const { automaticAbortCapability } = loadTs('src/shared/providerAutomation.ts');
 const { isTerminalPromptState } = loadTs('src/shared/promptState.ts');
 const { WorkerWakeWatchdog, WORKER_WAKE_IDLE_MS, WORKER_WAKE_COOLDOWN_MS } = loadTs('src/main/workerWake.ts');
+const { codeOnly: codeOnlyWake } = require('./read-source.cjs');
 
 const T0 = 1_800_000_000_000;
 // The observation shape is the one provider-capacity-delivery-death.test.cjs already
@@ -1104,18 +1105,23 @@ test('BEHAVIOUR CHANGE (reading 3): a wake beat onto a HUMAN DRAFT types nothing
     'a prompt that was never mirrored is UNKNOWN, and UNKNOWN is not free');
 });
 
-test('a refused wake is RETRIED after the cooldown, not forgotten until new mail arrives', () => {
+test('a refused wake keeps its ids and is RETRIED (reconciliation: after the cooldown), never announced', () => {
   const w = new WorkerWakeWatchdog();
-  const fact = (now) => ({ agentId: 'jim', ptyId: 'pty-jim', lastOutputAt: now - WORKER_WAKE_IDLE_MS - 1,
-    inboxIds: ['mail-1'], autoDeliveryPaused: false, paused: false, halted: false });
   let now = 1_000_000;
-  assert.deepEqual(w.decide([fact(now)], now), ['jim']);
+  const fact = () => ({ agentId: 'jim', ptyId: 'pty-jim', lastOutputAt: now - WORKER_WAKE_IDLE_MS - 1,
+    autoDeliveryPaused: false, paused: false, halted: false });
+  w.reconcile('jim', ['mail-1']);
+  const first = w.claim(fact(), 'reconcile', 'reconcile', now);
+  assert.deepEqual([...first.ids], ['mail-1']);
+  w.settle(first, 'REFUSED');                  // the owner refused: nothing was delivered
+  assert.deepEqual(w.state('jim').announced, [], 'a refused wake announces nothing');
+  assert.equal(w.claim(fact(), 'reconcile', 'reconcile', now + 1), null, 'never faster than the cooldown');
   now += WORKER_WAKE_COOLDOWN_MS + 1;
-  assert.deepEqual(w.decide([fact(now)], now), [], 'delivered mail is not re-announced');
-  w.retract('jim'); // ...but this one was REFUSED by the owner
-  assert.deepEqual(w.decide([fact(now)], now), ['jim'], 'so the same ids are tried again');
-  w.retract('jim');
-  assert.deepEqual(w.decide([fact(now + 1)], now + 1), [], 'and never faster than the cooldown');
+  const again = w.claim(fact(), 'reconcile', 'reconcile', now);
+  assert.equal(again.requestId, first.requestId, 'the same ids are tried again under the same stable id');
+  w.settle(again, 'COMMITTED');
+  now += WORKER_WAKE_COOLDOWN_MS + 1;
+  assert.equal(w.claim(fact(), 'reconcile', 'reconcile', now), null, 'delivered mail is not re-announced');
 });
 
 test('readiness is answered by MAIN, per incarnation', () => {
@@ -1504,15 +1510,19 @@ test('the prompt mirror is re-derived at every site that changes it, and caches 
 
 // ─── Static: the wake path holds no private submit order any more ─────────────────────
 
-test('workerWake.ts decides WHO and types nothing; index.ts sends the wake through the owner', () => {
+test('workerWake.ts decides WHO and types nothing; every wake goes through the owner via the ONE bridge path', () => {
   const wakeSrc = read('src/main/workerWake.ts');
-  assert.ok(!/submitWorkerNudge|writeSubmit|writeText|delaySubmit/.test(wakeSrc), 'the private order is gone');
+  assert.ok(!/submitWorkerNudge|writeSubmit|writeText|delaySubmit|ptyManager/.test(wakeSrc), 'the private order is gone');
   const index = read('src/main/index.ts');
   assert.equal(index.split('ptyManager.write(').length - 1, 1,
     'index.ts has exactly ONE direct ptyManager.write: the declared-origin pty:write handler');
   const beat = index.slice(index.indexOf('function runWorkerWakeBeat'), index.indexOf('/** (Re)arm the always-on beats'));
-  assert.match(beat, /automaticSubmit\.submit\(\{[\s\S]*admissionClass: 'CAPACITY_GATED'/, 'the beat submits CAPACITY_GATED work to the owner');
-  assert.ok(!/providerCapacity\.(admit|maySubmitNow|confirmLaunch|cancelGrant)/.test(beat),
+  assert.match(beat, /inboxWake\.reconcileAll\(live\)/, 'the beat is reconciliation through the one bridge path');
+  assert.ok(!/automaticSubmit\.submit|ptyManager/.test(beat), 'no second submit implementation in the beat');
+  assert.match(index, /submit: \(req\) => automaticSubmit\.submit\(req\)/, 'the bridge submits through the owner');
+  const bridge = codeOnlyWake(read('src/main/inboxWakeBridge.ts'), 'inboxWakeBridge.ts');
+  assert.match(bridge, /admissionClass: 'CAPACITY_GATED'/, 'as CAPACITY_GATED work');
+  assert.ok(!/providerCapacity\.(admit|maySubmitNow|confirmLaunch|cancelGrant)/.test(index.slice(index.indexOf('inboxWake = new InboxWakeBridge'), index.indexOf('const hookServer = new HookServer('))),
     'and keeps no capacity decision of its own - no private `!== REFUSE`');
   assert.match(index, /if \(!isTerminalPromptState\(state\)\) return \{ ok: false, error: 'invalid prompt state' \}/);
 });

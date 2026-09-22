@@ -85,9 +85,10 @@ export class HookServer {
     /** Standing goal text for an agent (from the durable roster). Optional so
      *  tests can omit it; when set, injected on SessionStart / UserPromptSubmit. */
     private getStandingGoal?: (agentId: string) => string | null,
-    /** Optional observer of every hook boundary (agentId, event, message). The
-     *  worker inbox-wake watchdog (workerWake.ts) feeds on this to learn when an
-     *  agent is parked on a permission/HITL prompt so it never types into it. */
+    /** Optional OBSERVER of every hook boundary (agentId, event, message), called
+     *  synchronously BEFORE this server returns its hook response. It must not submit
+     *  or block: the inbox-wake bridge only records lifecycle/HITL state here and defers
+     *  any retry with setImmediate, so the response (Stop included) is unchanged. */
     private onEvent?: (agentId: string | undefined, event: string, message: string | undefined) => void,
     /** L0 — provider allowance observed on the status line. Optional so the server
      *  runs unchanged where no tracker is wired (tests, and any build without L0).
@@ -281,8 +282,9 @@ export class HookServer {
       if (p.stop_hook_active) { this.emit(agentId, event, p); return {}; }
       // Never turn unread hive mail into a forced continuation at Stop. That old
       // path bypassed terminal-draft/HITL safety and could spend credits while a
-      // user was answering a question. Inbox files remain durable; the renderer
-      // wakes the agent later through its guarded idle-only delivery path.
+      // user was answering a question. Inbox files remain durable; main's inbox-wake
+      // bridge treats this Stop as a retry EDGE and wakes the agent after this response,
+      // through the one guarded submit owner. This return stays non-blocking.
       this.notify(agentId ?? 'Agent', 'finished — idle');
       this.emit(agentId, event, p);
       return {};
