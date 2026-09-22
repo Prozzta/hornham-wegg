@@ -20,7 +20,8 @@
  */
 import {
   existsSync, mkdirSync, readFileSync, writeFileSync, renameSync,
-  readdirSync, statSync, rmSync, appendFileSync, symlinkSync, copyFileSync, chmodSync
+  readdirSync, statSync, rmSync, appendFileSync, symlinkSync, copyFileSync, chmodSync,
+  watch, type FSWatcher
 } from 'node:fs';
 import { join, dirname, isAbsolute } from 'node:path';
 import { homedir } from 'node:os';
@@ -292,6 +293,31 @@ export function redactSecrets(text: unknown): string {
 
 // ─── HiveManager ────────────────────────────────────────────────────────────
 
+/** Pre-M1 event-wake bridge: one successful, durable inbox write (see `deliver()`). */
+export interface InboxDelivery {
+  agentId: string;
+  messageId: string;
+}
+
+/**
+ * The router's effects, injectable so a test can drive the event path with no timer at
+ * all. `watch` is only a LATENCY HINT: its callback never carries meaning (no filename,
+ * no count), it only asks for one authoritative whole-tree scan.
+ */
+export interface RouterRuntime {
+  watch: (dir: string, onHint: () => void) => Pick<FSWatcher, 'close' | 'on'>;
+  setImmediate: (fn: () => void) => void;
+  setInterval: (fn: () => void, ms: number) => unknown;
+  clearInterval: (handle: unknown) => void;
+}
+
+const NODE_ROUTER_RUNTIME: RouterRuntime = {
+  watch: (dir, onHint) => watch(dir, { persistent: false }, () => onHint()),
+  setImmediate: (fn) => { setImmediate(fn); },
+  setInterval: (fn, ms) => setInterval(fn, ms),
+  clearInterval: (h) => clearInterval(h as NodeJS.Timeout)
+};
+
 export class HiveManager {
   /**
    * @param getHome  Lazily resolve harnessHome so the hive follows config changes.
@@ -301,10 +327,20 @@ export class HiveManager {
    */
   constructor(
     private getHome: () => string | null,
-    private emit?: (channel: string, payload: unknown) => boolean | void
-  ) {}
+    private emit?: (channel: string, payload: unknown) => boolean | void,
+    routerRuntime: Partial<RouterRuntime> = {}
+  ) {
+    this.routerRuntime = { ...NODE_ROUTER_RUNTIME, ...routerRuntime };
+  }
 
-  private routerTimer: NodeJS.Timeout | null = null;
+  private readonly routerRuntime: RouterRuntime;
+  private routerTimer: unknown = null;
+  /** One non-recursive watcher per active outbox, keyed by its absolute path. */
+  private readonly outboxWatchers = new Map<string, Pick<FSWatcher, 'close' | 'on'>>();
+  /** At most one queued scan; hints arriving in the same turn coalesce into it. */
+  private routeQueued = false;
+  /** Bumped by start/stop, so a scan queued before a stop never runs after it. */
+  private routerGeneration = 0;
 
   /** The embedded OTLP collector's loopback URL, set by the main process once the
    *  collector is bound (telemetry.ts). null = telemetry off → no OTel env is
@@ -645,6 +681,8 @@ export class HiveManager {
     const dir = this.agentDir(meta.id);
     mkdirSync(join(dir, 'inbox', '.done'), { recursive: true });
     mkdirSync(join(dir, 'outbox', '.sent'), { recursive: true });
+    // A newly hired agent's outbox is watched at once, not at the next reconciliation.
+    if (this.routerTimer) this.refreshOutboxWatchers();
 
     // Resolve role BEFORE writing identity.md. A restart passes the floor
     // roster's `description`, which can be a status caption ("on standby").
@@ -1428,7 +1466,18 @@ export class HiveManager {
     const inbox = join(this.agentDir(toId), 'inbox');
     if (!existsSync(inbox)) return false; // unknown recipient — the caller reports it
     this.atomicWriteJson(join(inbox, `${msg.id}.json`), msg);
+    // THE successful-delivery edge (pre-M1 event-wake bridge): only after the durable write.
+    // An observer failure can never turn a written delivery into a routing failure.
+    try { this.deliveryObserver?.({ agentId: toId, messageId: msg.id }); } catch { /* observer error */ }
     return true;
+  }
+
+  private deliveryObserver: ((delivery: InboxDelivery) => void) | null = null;
+  /** Observe every durable inbox write, after it lands (direct and bounced to god alike).
+   *  Never fires for a missing inbox or a terminal handoff. Separate from
+   *  `setRoutedObserver`, whose targets are routing INTENT, not proof of a write. */
+  setDeliveryObserver(cb: ((delivery: InboxDelivery) => void) | null): void {
+    this.deliveryObserver = cb;
   }
 
   /** Inject a message directly (used by the orchestrator / UI / tests). */
@@ -1581,15 +1630,79 @@ export class HiveManager {
 
   // — router: drain outboxes → inboxes —
 
-  /** Poll-based router. Cheap and robust vs fs.watch quirks on macOS. */
+  /**
+   * HYBRID router (pre-M1 event-wake bridge). The FILES are authoritative: an fs.watch
+   * callback on any outbox only schedules one whole-tree `routeOnce()`, and the existing
+   * interval stays as reconciliation (it also repairs lost or broken watchers). Starting
+   * runs one immediate catch-up scan, so a restart or power-resume routes what waited.
+   */
   startRouter(intervalMs = 1500): void {
     if (this.routerTimer || !this.enabled()) return;
-    this.routerTimer = setInterval(() => {
-      try { this.routeOnce(); } catch { /* keep the loop alive */ }
+    this.routerGeneration++;
+    this.routerTimer = this.routerRuntime.setInterval(() => {
+      try { this.refreshOutboxWatchers(); this.routeOnce(); } catch { /* keep the loop alive */ }
     }, intervalMs);
+    try { this.refreshOutboxWatchers(); this.routeOnce(); } catch { /* the interval retries */ }
   }
   stopRouter(): void {
-    if (this.routerTimer) { clearInterval(this.routerTimer); this.routerTimer = null; }
+    if (this.routerTimer) { this.routerRuntime.clearInterval(this.routerTimer); this.routerTimer = null; }
+    this.routerGeneration++;
+    this.routeQueued = false;
+    for (const w of this.outboxWatchers.values()) { try { w.close(); } catch { /* already closed */ } }
+    this.outboxWatchers.clear();
+  }
+
+  /** Watch every active agent's outbox; close watchers whose directory is gone or archived. */
+  refreshOutboxWatchers(): void {
+    const root = this.root();
+    const want = new Set<string>();
+    const agentsDir = root ? join(root, 'agents') : null;
+    if (agentsDir && existsSync(agentsDir)) {
+      const agents = this.registry().agents;
+      for (const id of readdirSync(agentsDir)) {
+        if (agents[id]?.archived) continue;
+        const outbox = join(agentsDir, id, 'outbox');
+        if (existsSync(outbox)) want.add(outbox);
+      }
+    }
+    for (const [dir, w] of this.outboxWatchers) {
+      if (want.has(dir)) continue;
+      try { w.close(); } catch { /* already closed */ }
+      this.outboxWatchers.delete(dir);
+    }
+    for (const dir of want) {
+      if (this.outboxWatchers.has(dir)) continue;
+      try {
+        const w = this.routerRuntime.watch(dir, () => this.scheduleRouteOnce());
+        // A broken watcher is dropped; the next reconciliation re-attaches it.
+        const drop = (): void => {
+          if (this.outboxWatchers.get(dir) !== w) return;
+          this.outboxWatchers.delete(dir);
+          try { w.close(); } catch { /* already closed */ }
+        };
+        w.on('error', drop);
+        w.on('close', drop);
+        this.outboxWatchers.set(dir, w);
+      } catch { /* unwatchable now: the interval scan still routes it */ }
+    }
+  }
+
+  /** The directories currently watched (diagnostics and tests). */
+  watchedOutboxes(): string[] {
+    return [...this.outboxWatchers.keys()].sort();
+  }
+
+  /** Coalesce every hint in this turn into ONE authoritative scan (event scheduling, not a timer). */
+  private scheduleRouteOnce(): void {
+    if (this.routeQueued || !this.routerTimer) return;
+    this.routeQueued = true;
+    const generation = this.routerGeneration;
+    this.routerRuntime.setImmediate(() => {
+      if (generation !== this.routerGeneration) return;
+      this.routeQueued = false;
+      if (!this.routerTimer) return;
+      try { this.routeOnce(); } catch { /* the interval retries */ }
+    });
   }
 
   routeOnce(): number {
