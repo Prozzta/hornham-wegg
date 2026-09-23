@@ -448,6 +448,34 @@ async function pass(send, memPath, label, { decoys = false, make = fixtureMemory
     `${label}: this pass's FIRST backup (-p1) is the pre-image byte-for-byte`, firstOfThisPass[0] || 'none');
   check(!after.includes('MUST NEVER BE USED') && !after.includes('ANOTHER AGENT'),
     `${label}: no other session's text reached this memory`);
+
+  // fix3 (1.1.47 blocker) — NO MODEL-AUTHORED `## ` REACHED THE FILE.
+  //
+  // Jim's T5 asked for the stub to carry a `## ` heading in one pass, but this gate calls
+  // the REAL model: what it emits cannot be dictated, so a seeded heading is not a thing
+  // this canary can assert. The INVARIANT is model-independent and is exactly what god's
+  // live abort violated, so it is checked on EVERY pass instead of one: the condensed
+  // region must contain no `## ` line at all. A model-authored heading there does not
+  // render - it ENDS the region and spills the rest into recent, which is the
+  // recent-count-mismatch that blocked the release. If the model emitted one, the
+  // sanitizer demoted it and this still holds; if the sanitizer were removed, the pass
+  // above would already have failed with an abort, and this says why.
+  const condensedRegion = (() => {
+    const i = after.indexOf(CONDENSED);
+    if (i < 0) return null;
+    const rest = after.slice(i + CONDENSED.length);
+    const j = rest.indexOf('\n## ');
+    return j < 0 ? rest : rest.slice(0, j);
+  })();
+  const stray = (condensedRegion ?? '').split('\n').filter((l) => l.startsWith('## '));
+  check(condensedRegion !== null && stray.length === 0,
+    `${label}: no model-authored '## ' heading survived into the condensed region`,
+    stray.length ? stray.join(' | ') : 'clean');
+  // And the structure the re-parse depends on is still exactly one of each region heading.
+  for (const [name, heading] of [['pinned', PINNED], ['condensed', CONDENSED], ['recent', RECENT]]) {
+    check(after.split(`\n${heading}`).length - 1 === 1,
+      `${label}: exactly one ${name} region heading`, `${after.split(`\n${heading}`).length - 1}`);
+  }
   return after;
 }
 

@@ -101,6 +101,11 @@ const CONDENSE_SYSTEM = [
   '  Drop routine standup chatter, resolved blockers, and superseded plans.',
   '- "hoist" = any NEW high-importance durable fact found in (B) that belongs in the',
   '  pinned block and is not already in (C). Lines only; may be empty.',
+  // Belt and braces only. The sanitizer is the guarantee; this just saves the demotion
+  // on most calls, and it costs nothing because the prefix is still byte-identical
+  // across calls and still prompt-caches.
+  '- Never start a line with "## " — that is the file\'s own section delimiter. Use',
+  '  "### " for any structure inside "condensed".',
   '- Output ONLY the JSON object. No prose, no code fence.'
 ].join('\n');
 
@@ -414,6 +419,14 @@ export class MemoryReflector {
       this.logDiag(id, (e as { diag?: HiddenClaudeDiag }).diag, oldBytes);
       return { id, condensed: false, reason: 'summarize-failed', oldBytes };
     }
+    // 2b) SANITIZE, before the summary is allowed to influence anything. Applied HERE and
+    // exactly once, so mergePinned, rebuild and verify all see the same values and verify
+    // itself stays exact and untouched — it is the gate in front of memory.md, and a gate
+    // that compares different text from the thing it admitted is no gate.
+    summary = {
+      condensed: demoteHeadings(summary.condensed),
+      hoist: summary.hoist.map(demoteHeadings)
+    };
 
     // 3) REBUILD into the 3-region shape.
     const oldPinnedLines = pinnedLines(parsed.pinned);
@@ -506,6 +519,25 @@ export class MemoryReflector {
 }
 
 // ─── pure helpers (the deterministic, unit-testable half) ────────────────────
+
+/**
+ * Demote model-authored level-2 headings to level 3. Pure, idempotent, content-preserving.
+ *
+ * `## ` is not decoration in this file, it is the STRUCTURE: parseMemory carves regions
+ * and sections on it. So a summary line beginning `## ` does not render a heading inside
+ * the condensed region - it ENDS that region and starts a new section, and the re-parse
+ * then counts more sections than the rewrite kept. That is the 1.1.47 release blocker:
+ * `recent-count-mismatch`, near-deterministic for a heading-rich take like god's, and a
+ * matter of luck for everyone else. `## 📌` was worse still - it shadowed the pinned block
+ * with the model's own fragment, and the file was ACCEPTED.
+ *
+ * Demoting rather than REFUSING is the whole point. A refusal is re-emitted by the model
+ * on the next attempt and the file stalls exactly as it does today; a demotion makes the
+ * round-trip structurally true for ANY schema-valid summary. `### ` is ignored by
+ * parseMemory and is already a block boundary, so the text reads the same, one level
+ * smaller. The lookahead keeps `#### ` and bare `##text` untouched.
+ */
+export const demoteHeadings = (s: string): string => s.replace(/^##(?=\s)/gm, '###');
 
 /** One section as it appears in a prompt and in a rebuilt file — the SAME text in
  *  both, so planning measures exactly what gets sent and verify compares like for like. */
