@@ -24,6 +24,11 @@ export interface ModelPrice {
 
 // Anthropic list prices, USD per million tokens. Approximate, fallback-only —
 // the live path uses Claude's own per-model cost, so drift here is harmless.
+// Opus 5.5: https://www.anthropic.com/claude-opus-5-5 (2026-09-22).
+// Fable 5.1: https://www.anthropic.com/claude/fable (September 2026). Its
+// cache-write value is the standard 5-minute 1.25x input-price multiplier.
+const OPUS_5_5: ModelPrice = { inputPerM: 4, outputPerM: 20, cacheReadPerM: 0.2, cacheWritePerM: 5 };
+const FABLE_5_1: ModelPrice = { inputPerM: 10, outputPerM: 50, cacheReadPerM: 0.25, cacheWritePerM: 12.5 };
 const OPUS: ModelPrice = { inputPerM: 15, outputPerM: 75, cacheReadPerM: 1.5, cacheWritePerM: 18.75 };
 const SONNET: ModelPrice = { inputPerM: 3, outputPerM: 15, cacheReadPerM: 0.3, cacheWritePerM: 3.75 };
 const HAIKU: ModelPrice = { inputPerM: 0.8, outputPerM: 4, cacheReadPerM: 0.08, cacheWritePerM: 1.0 };
@@ -44,6 +49,8 @@ export function normalizeModel(model: string | undefined | null): string {
 /** Resolve a model id to its price row by family, falling back to Sonnet. */
 export function priceFor(model: string | undefined | null): ModelPrice {
   const m = normalizeModel(model).toLowerCase();
+  if (m === 'claude-opus-5-5') return OPUS_5_5;
+  if (m === 'claude-fable-5-1') return FABLE_5_1;
   if (m.includes('opus')) return OPUS;
   if (m.includes('haiku')) return HAIKU;
   if (m.includes('sonnet')) return SONNET;

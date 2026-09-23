@@ -175,7 +175,10 @@ export interface ModelOption {
 // happens to choose, which the UI cannot show and the user cannot predict. The
 // harness default is marked ` · default` instead, and it names a real model.
 export const AGENT_MODELS: ModelOption[] = [
+  { id: 'claude-fable-5-1', label: 'Fable 5.1' },
   { id: 'claude-fable-5', label: 'Fable 5' },
+  { id: 'claude-opus-5-5', label: 'Opus 5.5' },
+  { id: 'claude-opus-5-5[1m]', label: 'Opus 5.5 · 1M' },
   { id: 'claude-opus-5', label: 'Opus 5 · 1M' },
   { id: 'claude-opus-4-8', label: 'Opus 4.8' },
   { id: 'claude-opus-4-8[1m]', label: 'Opus 4.8 · 1M' },
