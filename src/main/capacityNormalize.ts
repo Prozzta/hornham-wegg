@@ -369,6 +369,16 @@ export interface AgyStatusTick {
   /** Always `[3p, gemini]`, in that order. Never merged, never one without the other. */
   observations: readonly [CapacityObservation, CapacityObservation];
   lifecycle: AgyLifecycle;
+  /**
+   * When the SHIM READ this status, on main's own clock - not when main received it.
+   *
+   * Arrival through one socket is monotone, so a delivery time can never show that one
+   * reading was taken before another. Reading time can, and the wake coordinator's
+   * ordering guard is meaningless without it (Jim, c4 audit). Falls back to the receipt
+   * time when the shim did not stamp one, and is never allowed to be in the FUTURE of
+   * receipt: a forward stamp is the only direction that could defeat the confirm grace.
+   */
+  readAt: number;
   /** The session/conversation this tick speaks for, or null when it names none.
    *  Carried on the TICK - not read back out of `observations[].streamId` - because
    *  the incarnation guard in the wake coordinator is a lifecycle concern and must
@@ -448,6 +458,8 @@ export function classifyAgyStatusLine(input: {
   payload: unknown;
   accountScope: string;
   receivedAt: number;
+  /** The shim's `read_at`, if it sent one. Clamped below; see `AgyStatusTick.readAt`. */
+  readAt?: unknown;
 }): AgyClassification {
   const p = input.payload;
   if (!isDict(p)) return { ok: false, driftCode: 'not-object', version: null };
@@ -543,9 +555,21 @@ export function classifyAgyStatusLine(input: {
     planType: null
   });
 
+  // A reading time is only ever believed BACKWARDS. A stamp in the future of receipt -
+  // a clock skew, a broken shim, anything at all - would age a fresh tick artificially
+  // and skip the confirm grace, which is the one direction that costs a double-type. So
+  // the receipt time is the ceiling, and anything absent or unusable falls back to it.
+  const stamped = input.readAt;
+  const readAt = typeof stamped === 'number' && Number.isFinite(stamped) && stamped <= input.receivedAt
+    ? stamped
+    : input.receivedAt;
+
   return {
     ok: true,
-    tick: { version, activeLimitId, observations: [obs('3p'), obs('gemini')], lifecycle, sessionId: sid ?? null }
+    tick: {
+      version, activeLimitId, observations: [obs('3p'), obs('gemini')], lifecycle,
+      readAt, sessionId: sid ?? null
+    }
   };
 }
 

@@ -150,11 +150,15 @@ export class InboxWakeBridge {
    * no second submit owner, no direct PTY write — the 1.1.46 lesson is that a second
    * producer is a second turn, and there is still exactly one.
    */
-  onProviderStatus(agentId: string | undefined, status: ProviderStatus, sessionId: string | null = null): void {
-    const edge = this.deps.coordinator.noteProviderStatus(agentId, status, this.deps.now(), sessionId);
+  onProviderStatus(agentId: string | undefined, status: ProviderStatus, sessionId: string | null = null, readAt?: number): void {
+    // `readAt` is when the shim READ the status. It is passed through in preference to the
+    // delivery clock because delivery order says nothing about reading order - the whole
+    // point of the coordinator's ordering guard. Absent one, the delivery clock stands in.
+    const at = typeof readAt === 'number' && Number.isFinite(readAt) ? readAt : this.deps.now();
+    const edge = this.deps.coordinator.noteProviderStatus(agentId, status, at, sessionId);
     // The session is a breadcrumb, not a secret: it is the provider's own conversation id
     // and is exactly what a packaged run needs to explain a discarded tick.
-    this.deps.diag?.('provider-status', { agentId: agentId ?? null, status, session: sessionId, edge });
+    this.deps.diag?.('provider-status', { agentId: agentId ?? null, status, session: sessionId, at, edge });
     if (edge && agentId) this.scheduleWake(agentId, 'hook');
   }
 

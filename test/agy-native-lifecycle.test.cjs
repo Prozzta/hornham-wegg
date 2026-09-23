@@ -26,10 +26,11 @@ const path = require('node:path');
 const loadTs = require('./load-ts.cjs');
 const { readSource, codeOnly } = require('./read-source.cjs');
 
-const { WorkerWakeWatchdog, inboxWakeRequestId, WORKER_WAKE_IDLE_MS, WORKER_WAKE_HITL_REARM_MS } =
+const { WorkerWakeWatchdog, inboxWakeRequestId, WORKER_WAKE_IDLE_MS, WORKER_WAKE_HITL_REARM_MS, PROVIDER_IDLE_CONFIRM_MS } =
   loadTs('src/main/workerWake.ts');
 const { InboxWakeBridge } = loadTs('src/main/inboxWakeBridge.ts');
 const { classifyAgyStatusLine } = loadTs('src/main/capacityNormalize.ts');
+const fsSync = require('node:fs');
 const { inboxNudgeText } = loadTs('src/shared/hiveNudge.ts');
 
 const src = (f) => codeOnly(readSource(f), path.basename(f));
@@ -99,13 +100,21 @@ function floor({ decide, ids = [] } = {}) {
    * rule rather than a convenient one: capacity always (elsewhere), lifecycle ONLY with an
    * agent id, and a refused tick routed nowhere at all.
    */
-  const deliver = (agentId, c) => {
+  //
+  // `at` is the tick's READING time, which is what index.ts forwards (tick.readAt) and is
+  // NOT the delivery clock. The fixture's own receipt time is pinned to its reset seconds
+  // and cannot move, so the reading time is supplied here explicitly; the payload -> readAt
+  // derivation is pinned separately by the READ_AT tests below. Default: "now", i.e. a tick
+  // read at the moment it is delivered.
+  const deliver = (agentId, c, at = now.t) => {
     if (!c.ok) return false;
     if (!agentId) return false;
-    bridge.onProviderStatus(agentId, c.tick.lifecycle, c.tick.sessionId);
+    bridge.onProviderStatus(agentId, c.tick.lifecycle, c.tick.sessionId, at);
     return true;
   };
-  return { coordinator, bridge, owner, now, inbox, facts, flush, deliver, diag };
+  /** Advance the floor clock, as time between two statusline renders. */
+  const advance = (ms) => { now.t += ms; return now.t; };
+  return { coordinator, bridge, owner, now, inbox, facts, flush, deliver, advance, diag };
 }
 
 // ─── the mapping ────────────────────────────────────────────────────────────
@@ -125,7 +134,10 @@ test('MEASURED SEQUENCE: authenticating yields NO tick; idle/working/tool_use/id
   for (const state of ['idle', 'working', 'tool_use', 'idle']) {
     const c = classify((p) => { p.agent_state = state; });
     assert.equal(c.ok, true, `${state} must normalize`);
-    f.deliver('a1', c);
+    // Renders are seconds apart, so the readings are too. Delivering the closing idle in
+    // the same instant as the working tick would be a sequence agy cannot produce, and
+    // the confirm grace would (correctly) refuse it.
+    f.deliver('a1', c, f.advance(30_000));
     seen.push({ state, canonical: c.tick.lifecycle, lifecycle: f.coordinator.state('a1').lifecycle });
   }
   assert.deepEqual(seen.map((s) => s.canonical), ['idle', 'running', 'running', 'idle'],
@@ -158,8 +170,11 @@ test('CONFIRMATION is BOTH active and a HITL hold: mail cannot be typed through 
   f.coordinator.noteDelivery('a1', 'm1');
   // Now let the provider say idle WHILE the hold is still inside its rearm window. The
   // lifecycle clears, and the claim is STILL refused - by the hold, which is the point.
-  f.coordinator.noteProviderStatus('a1', 'idle', NOW + 1_000, FIXTURE_SESSION);
-  const claim = f.coordinator.claim({ agentId: 'a1', ptyId: 'p', lastOutputAt: NOW, paused: false, halted: false, autoDeliveryPaused: false }, 'hook', 'event', NOW + 1_000);
+  // Past the confirm grace, so this idle is genuine terminal proof and not a leftover
+  // reading of the turn that put the confirmation up.
+  const settled = NOW + PROVIDER_IDLE_CONFIRM_MS + 1_000;
+  f.coordinator.noteProviderStatus('a1', 'idle', settled, FIXTURE_SESSION);
+  const claim = f.coordinator.claim({ agentId: 'a1', ptyId: 'p', lastOutputAt: NOW, paused: false, halted: false, autoDeliveryPaused: false }, 'hook', 'event', settled);
   assert.equal(claim, null);
   assert.equal(f.coordinator.whyNoClaim('a1'), 'hitl-hold', 'the confirmation hold outlives the confirmation state');
   // Past the rearm window it releases normally; nothing here is permanent.
@@ -360,7 +375,7 @@ test('INCARNATION: a tick naming NO session is accepted, and does not erase the 
   f.deliver('a1', named);
   const anonymous = classify((p) => { p.agent_state = 'idle'; delete p.session_id; delete p.conversation_id; });
   assert.equal(anonymous.tick.sessionId, null, 'the tick names no session');
-  f.deliver('a1', anonymous);
+  f.deliver('a1', anonymous, f.advance(30_000));
   // One statusline stream per PTY, so receive order settles it; refusing an unnamed tick
   // would blind us to exactly the builds most likely to have dropped the field.
   assert.equal(f.coordinator.state('a1').lifecycle, 'idle', 'an unnamed tick is still authoritative');
@@ -399,9 +414,148 @@ test('ORDERING: a long run of RUNNING ticks does not push the edge forward, so a
   // would have to beat the LAST tick rather than the start of the turn - and on a busy
   // agent something would always be newer, which is the stall all over again.
   for (let i = 1; i <= 20; i++) f.coordinator.noteProviderStatus('a1', 'running', NOW + i * 1_000, FIXTURE_SESSION);
-  assert.equal(f.coordinator.noteProviderStatus('a1', 'idle', NOW + 500, FIXTURE_SESSION), true,
+  // Past the epoch's confirm grace but well BEFORE the last running tick at +20s.
+  assert.equal(f.coordinator.noteProviderStatus('a1', 'idle', NOW + PROVIDER_IDLE_CONFIRM_MS + 1, FIXTURE_SESSION), true,
     'an idle newer than the EPOCH is terminal proof, even if older than the last running tick');
   assert.equal(f.coordinator.state('a1').lifecycle, 'idle');
+});
+
+// ─── the post-COMMITTED stale-idle race (Jim, c4 audit) ─────────────────────
+
+test('RACE REPLAY: a stale idle arriving 300ms after the wake NEVER types a second Enter', async () => {
+  // JIM'S REPLAY, with PRODUCTION-SHAPED timestamps only - no hand-made past instants.
+  // This is the case my first ORDERING test could not see: it passed `at = NOW - 1000` by
+  // hand, a value the real path cannot produce, so it pinned the guard's arithmetic and
+  // not its reachability. Every `at` below is a plausible reading time, monotonically
+  // increasing, exactly as the shim would stamp them.
+  const f = floor({ ids: ['m1'] });
+  f.deliver('a1', classify((p) => { p.agent_state = 'idle'; }));   // parked at its prompt
+  f.bridge.onDelivery('a1', 'm1');
+  await f.flush();
+  assert.equal(f.owner.calls.length, 1, 'the wake goes through');
+  assert.equal(f.coordinator.state('a1').lifecycle, 'active', 'and opens an active epoch');
+
+  // agy has not processed the typed nudge yet, so it goes on truthfully rendering idle.
+  // The reading is HONESTLY NEWER than the epoch - ordering cannot save us here.
+  const stale = classify((p) => { p.agent_state = 'idle'; });
+  f.deliver('a1', stale, f.advance(300));
+  assert.equal(f.coordinator.state('a1').lifecycle, 'active',
+    'a sub-grace idle must NOT close the epoch we just opened');
+
+  // …and the second message must not be typed into the live turn.
+  f.inbox.ids = ['m1', 'm2'];
+  f.advance(50);
+  f.bridge.onDelivery('a1', 'm2');
+  await f.flush();
+  assert.equal(f.owner.calls.length, 1, 'NO second submit into the running turn');
+  assert.deepEqual(f.owner.enters, ['a1'], 'and exactly ONE Enter');
+  assert.equal(f.coordinator.whyNoClaim('a1'), 'lifecycle-active', 'refused because the turn is live');
+
+  // The reconciliation beat inside the same window must not type either.
+  f.bridge.reconcileAll(['a1']);
+  await f.flush();
+  assert.equal(f.owner.calls.length, 1, 'nor through the beat');
+});
+
+test('CONFIRM GRACE: it expires, so a genuinely finished turn is still recovered', async () => {
+  const f = floor({ ids: ['m1'] });
+  f.deliver('a1', classify((p) => { p.agent_state = 'idle'; }));
+  f.bridge.onDelivery('a1', 'm1');
+  await f.flush();
+  const openedAt = f.now.t;
+  f.inbox.ids = ['m2'];
+  f.bridge.onDelivery('a1', 'm2');
+  await f.flush();
+  assert.equal(f.owner.calls.length, 1, 'held during the turn');
+
+  // Exactly at the boundary it is still refused…
+  assert.equal(
+    f.coordinator.noteProviderStatus('a1', 'idle', openedAt + PROVIDER_IDLE_CONFIRM_MS - 1, FIXTURE_SESSION),
+    false, 'one millisecond inside the grace is still refused');
+  // …and one millisecond past it, the turn is over and the wake proceeds.
+  const idle = classify((p) => { p.agent_state = 'idle'; });
+  f.deliver('a1', idle, openedAt + PROVIDER_IDLE_CONFIRM_MS);
+  await f.flush();
+  assert.equal(f.owner.calls.length, 2, 'past the grace the mail is delivered');
+  assert.equal(f.owner.calls[1].requestId, inboxWakeRequestId('a1', ['m2']));
+});
+
+test('CONFIRM GRACE does NOT need a running tick first: a short silent turn still recovers', async () => {
+  // The constraint Jim named. If the grace waited for a `working` tick, a turn that ended
+  // before agy ever rendered one would stay active forever - the 1.1.47 stall, rebuilt.
+  const f = floor({ ids: ['m1'] });
+  f.coordinator.noteHook('a1', 'Stop', undefined, NOW);   // parked at its prompt
+  f.coordinator.noteDelivery('a1', 'm1');
+  f.coordinator.settle(
+    f.coordinator.claim({ agentId: 'a1', ptyId: 'p', lastOutputAt: NOW, paused: false, halted: false, autoDeliveryPaused: false }, 'delivery', 'event', NOW),
+    'COMMITTED', NOW);
+  assert.equal(f.coordinator.state('a1').lifecycle, 'active');
+  // No `working` tick EVER arrives; the next thing agy says is idle, after the grace.
+  assert.equal(f.coordinator.noteProviderStatus('a1', 'idle', NOW + PROVIDER_IDLE_CONFIRM_MS, FIXTURE_SESSION), true,
+    'idle after the grace is accepted with no running tick in between');
+  assert.equal(f.coordinator.state('a1').lifecycle, 'idle');
+});
+
+test('the STALL recovery is untouched: a 16-minute-old epoch is closed by the first idle', () => {
+  const f = floor({ ids: ['m1'] });
+  f.coordinator.noteHook('a1', 'Stop', undefined, NOW);   // parked at its prompt
+  f.coordinator.noteDelivery('a1', 'm1');
+  f.coordinator.settle(
+    f.coordinator.claim({ agentId: 'a1', ptyId: 'p', lastOutputAt: NOW, paused: false, halted: false, autoDeliveryPaused: false }, 'delivery', 'event', NOW),
+    'COMMITTED', NOW);
+  // The incident's own timescale. A grace measured in seconds must not touch it.
+  assert.equal(f.coordinator.noteProviderStatus('a1', 'idle', NOW + 16 * 60_000, FIXTURE_SESSION), true);
+  assert.equal(f.coordinator.state('a1').lifecycle, 'idle');
+});
+
+// ─── reading time, not arrival time ─────────────────────────────────────────
+
+test('READ_AT: the tick carries the SHIM\'s reading time, clamped so it can never be in the future', () => {
+  const RECEIVED_AT = RECEIVED;
+  const at = (readAt) => classifyAgyStatusLine({
+    payload: golden(), accountScope: SCOPE, receivedAt: RECEIVED_AT, readAt
+  }).tick.readAt;
+
+  assert.equal(at(RECEIVED_AT - 4_000), RECEIVED_AT - 4_000, 'a stamp in the past is believed');
+  assert.equal(at(RECEIVED_AT), RECEIVED_AT, 'and the boundary is inclusive');
+  // A FORWARD stamp is the one direction that could age a fresh tick and skip the grace,
+  // so it is refused in favour of the receipt time. Clock skew must not cost a double-type.
+  assert.equal(at(RECEIVED_AT + 60_000), RECEIVED_AT, 'a stamp in the FUTURE is clamped to receipt');
+  // Anything unusable falls back to receipt rather than poisoning the arithmetic.
+  for (const bad of [undefined, null, 'soon', NaN, Infinity, {}, []]) {
+    assert.equal(at(bad), RECEIVED_AT, `unusable read_at (${String(bad)}) falls back to receipt`);
+  }
+});
+
+test('READ_AT: the shim stamps it, and the hook server threads it into the normaliser', () => {
+  const shim = src('src/main/agyStatuslineShim.ts');
+  assert.match(shim, /read_at: Date\.now\(\)/, 'the shim stamps its own reading time');
+  const hooks = src('src/main/hooks.ts');
+  const handler = between(hooks, 'private handleAgyStatus(', 'transcriptPath(agentId: string)');
+  assert.match(handler, /readAt: p\.read_at/, 'and the hook server hands it to the normaliser');
+});
+
+// ─── N9: god's ruling, pinned ───────────────────────────────────────────────
+
+test('N9: PreInvocation is NOT a coordinator active edge, and ACTIVE_EVENTS is exactly these five', () => {
+  // god's ruling (2026-09-24), pinned so a future change cannot quietly undo it: agy's
+  // Stop fires only on process EXIT, so a fallback ACTIVE edge with no guaranteed matching
+  // TERMINAL would re-arm the absorbing-active stall precisely when the statusline
+  // transport is the broken thing. PreInvocation stays a RENDERER-only display signal.
+  const wake = src('src/main/workerWake.ts');
+  const members = between(wake, 'const ACTIVE_EVENTS = new Set(', ');');
+  assert.ok(!/PreInvocation/.test(members), 'PreInvocation must never join ACTIVE_EVENTS');
+  for (const e of ['UserPromptSubmit', 'PreToolUse', 'PostToolUse', 'PreCompact', 'PostCompact']) {
+    assert.ok(members.includes(`'${e}'`), `${e} is still an active edge`);
+  }
+  assert.equal((members.match(/'/g) ?? []).length / 2, 5, 'exactly five, so an addition fails here');
+
+  // And behaviourally: PreInvocation moves nothing in the coordinator.
+  const f = floor();
+  assert.equal(f.coordinator.noteHook('a1', 'PreInvocation', undefined, NOW), false, 'not a retry edge');
+  assert.equal(f.coordinator.state('a1').lifecycle, 'unknown', 'and not an active assertion');
+  // The renderer keeps it, as god ruled - display only.
+  assert.match(src('src/renderer/src/hooks/useHive.ts'), /e\.event === 'PreInvocation'/);
 });
 
 // ─── the hook fallback ──────────────────────────────────────────────────────
@@ -430,7 +584,7 @@ test('STOP FALLBACK: with no native tick a Stop still idles; an explicit fullyId
 test('BREADCRUMB: every provider status is recorded with its session and whether it was an edge', () => {
   const f = floor();
   f.deliver('a1', classify((p) => { p.agent_state = 'working'; }));
-  f.deliver('a1', classify((p) => { p.agent_state = 'idle'; }));
+  f.deliver('a1', classify((p) => { p.agent_state = 'idle'; }), f.advance(30_000));
   const rows = f.diag.filter((d) => d.stage === 'provider-status');
   assert.equal(rows.length, 2, 'both readings leave a durable breadcrumb');
   assert.deepEqual(rows.map((r) => [r.status, r.edge]), [['running', false], ['idle', true]]);
@@ -456,7 +610,8 @@ test('CENSUS main: the classifier is the ONLY producer of a canonical status, an
   // anchor is a comment silently slices nothing the day somebody rewords it.
   const wiring = between(index, '(agentId, tick) => {', 'const memory = new MemoryManager');
   assert.match(wiring, /if \(!agentId\) return;/, 'lifecycle is routed ONLY with an agent id');
-  assert.match(wiring, /inboxWake\?\.onProviderStatus\(agentId, tick\.lifecycle, tick\.sessionId\)/);
+  // tick.readAt, never the delivery clock - the whole ordering guard depends on it.
+  assert.match(wiring, /inboxWake\?\.onProviderStatus\(agentId, tick\.lifecycle, tick\.sessionId, tick\.readAt\)/);
   assert.match(wiring, /send\('hive:providerStatus', \{ agentId, status: tick\.lifecycle \}\)/);
   assert.ok(!/agy_status/.test(wiring), 'the raw payload is not forwarded anywhere');
   // Capacity is ingested for a personal tick too - an allowance is an account fact.

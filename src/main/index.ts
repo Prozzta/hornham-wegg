@@ -574,7 +574,9 @@ const hookServer = new HookServer(
     });
     capacityStore.scheduleSave();
     if (!agentId) return;
-    inboxWake?.onProviderStatus(agentId, tick.lifecycle, tick.sessionId);
+    // tick.readAt, NOT the delivery time: arrival through one socket is monotone, so a
+    // delivery time cannot show that one reading was taken before another (Jim, c4 audit).
+    inboxWake?.onProviderStatus(agentId, tick.lifecycle, tick.sessionId, tick.readAt);
     // The renderer is TOLD the canonical status; it never re-derives one. Presentation
     // only — main remains the sole submission authority, so a renderer that misses this
     // push, or renders it late, cannot cause or prevent a single wake.

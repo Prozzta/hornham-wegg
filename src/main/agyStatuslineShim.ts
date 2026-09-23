@@ -93,9 +93,14 @@ function endpoint() {
 function send(p) {
   var sock = endpoint();
   if (!sock) return quit();
+  // read_at is when THIS shim read the status, not when main received it. The payload
+  // carries no generation time of its own, and arrival times through one socket are
+  // monotone - so without this the ordering guard in the wake coordinator can never fire.
+  // Plain wall clock, the same one main compares against.
   var envelope = JSON.stringify({
     hook_event_name: 'AgyStatusLine',
     agent_id: process.env.AGENT_ID || null,
+    read_at: Date.now(),
     agy_status: p
   }) + NL;
   var c = null;

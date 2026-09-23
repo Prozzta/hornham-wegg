@@ -42,6 +42,26 @@ export const WORKER_WAKE_COOLDOWN_MS = 60_000;
 /** A permission/HITL notification blocks wakes for this long after it fires. */
 export const WORKER_WAKE_HITL_REARM_MS = 5 * 60_000;
 
+/**
+ * How long a freshly opened active epoch refuses native IDLE readings (Jim, c4 audit).
+ *
+ * A statusline tick is dated by GENERATION, not by arrival. Several are in flight at once
+ * (one short-lived shim process per render), and agy keeps truthfully rendering `idle`
+ * until it has actually processed the prompt we just typed - the typed nudge itself
+ * causes renders. So right after a COMMITTED wake there is a systematically populated
+ * window of idle readings that describe the turn BEFORE this one. Believing one closes
+ * the epoch we just opened, and because event-mode `claim()` tests only the lifecycle -
+ * no quiescence - the next pending message is typed straight into the live turn.
+ *
+ * Five seconds is several times the render period, so a genuinely idle agent is accepted
+ * on the next tick after the grace (the statusline goes on rendering while idle - that is
+ * the premise of the duplicate-tick test). Stall recovery is measured in minutes and is
+ * untouched. It deliberately does NOT require a running tick first: a turn that finishes
+ * inside the grace without ever rendering `working` would otherwise be stuck active,
+ * which is the very stall c4 exists to remove.
+ */
+export const PROVIDER_IDLE_CONFIRM_MS = 5_000;
+
 /** A hook event message that means "the agent needs the human" — permission /
  *  approve / confirm prompts (mirrors the renderer's needsHuman detection in
  *  useHive.ts). Anything matching the idle-waiting shape is NOT a HITL hold. */
@@ -275,13 +295,25 @@ export class WorkerWakeWatchdog {
       if (r.providerSession !== null && r.providerSession !== sessionId) return false;
       r.providerSession = sessionId;
     }
-    // TERMINAL PROOF MUST BE NEWER THAN THE EDGE IT CLOSES. Each statusline tick is its
-    // own short-lived shim process on the named pipe, so two in flight at once can be
-    // received out of order. A reading taken BEFORE the active epoch opened describes the
-    // previous turn, and letting it close this one is the same class of mistake as
-    // believing a retired session. It is refused whole, like any tick we cannot trust.
+    // TERMINAL PROOF MUST BE NEWER THAN THE EDGE IT CLOSES, and it must be old enough to
+    // be ABOUT this turn. Two separate guards, because they catch two different lies.
+    //
+    // (1) ORDERING. Each tick is its own short-lived shim process on the named pipe, so
+    //     two in flight can be received out of order. `at` is the shim's READING time, not
+    //     the arrival time - arrival through one process is monotone and would make this
+    //     unreachable, which is exactly how the first version of this guard was decoration
+    //     (Jim, c4 audit). Stamped by the shim on the same clock as `activeSince`.
+    //
+    // (2) CONFIRM GRACE. Ordering alone cannot help when the reading is HONESTLY newer:
+    //     agy goes on rendering `idle` until it has processed the prompt we just typed, so
+    //     a tick generated after the Enter but before the state flips is both truthful and
+    //     about the previous turn. Refuse - never defer - for the grace; the next tick
+    //     after it decides. See PROVIDER_IDLE_CONFIRM_MS.
     if (status === 'idle') {
       if (r.activeSince > 0 && at < r.activeSince) return false;
+      if (r.lifecycle === 'active' && r.activeSince > 0 && at - r.activeSince < PROVIDER_IDLE_CONFIRM_MS) {
+        return false;
+      }
       r.lifecycle = 'idle';
       r.activeSince = 0;
       return true;

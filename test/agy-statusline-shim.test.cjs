@@ -134,9 +134,14 @@ test('SHIM: one sanitized line out, one envelope to HIVE_SOCK, exit 0 - fast', a
   const lines = srv.got[0].split('\n').filter(Boolean);
   assert.equal(lines.length, 1, 'newline-delimited, one message');
   const env = JSON.parse(lines[0]);
-  assert.deepEqual(Object.keys(env).sort(), ['agent_id', 'agy_status', 'hook_event_name']);
+  // Exact shape on purpose: a new envelope field must be noticed here. `read_at` joined in
+  // the c4 rework - the shim runs at READING time, and arrival times through one socket are
+  // monotone, so without it the wake coordinator's ordering guard can never fire.
+  assert.deepEqual(Object.keys(env).sort(), ['agent_id', 'agy_status', 'hook_event_name', 'read_at']);
   assert.equal(env.hook_event_name, 'AgyStatusLine');
   assert.equal(env.agent_id, 'andy-1');
+  assert.ok(Number.isFinite(env.read_at) && env.read_at > 0, 'read_at is a real instant');
+  assert.ok(Math.abs(Date.now() - env.read_at) < 60_000, 'stamped on this machine\'s clock, now');
   assert.deepEqual(env.agy_status, golden(), 'the payload travels whole, to be normalized in main');
 });
 

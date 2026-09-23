@@ -58,6 +58,9 @@ interface HookPayload {
    *  the statusline shim. NEVER logged, retained or re-sent - it carries the account's
    *  email. The normaliser reads the fields it needs and everything else is dropped. */
   agy_status?: unknown;
+  /** AgyStatusLine envelopes only: when the SHIM read the status, on this machine's
+   *  clock. Untrusted input - the normaliser clamps it to the receipt time. */
+  read_at?: unknown;
   /** Antigravity `Stop` only: the provider's own terminal qualifier, preserved by the
    *  agy hook shim. Claude never sends it, so absent must keep meaning "terminal" -
    *  only an explicit `false` refuses the Stop. Never a capacity or account fact. */
@@ -185,7 +188,8 @@ export class HookServer {
       const c = classifyAgyStatusLine({
         payload: p.agy_status,
         accountScope: agyAccountScope(),
-        receivedAt: Date.now()
+        receivedAt: Date.now(),
+        readAt: p.read_at
       });
       if (!c.ok) {
         // The boot tick is refused by design (N-1 b); it is not drift worth counting.
