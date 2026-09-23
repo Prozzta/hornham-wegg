@@ -17,6 +17,10 @@ const loadTs = require('./load-ts.cjs');
 
 const { HiveManager } = loadTs('src/main/hive.ts');
 const afterDebounce = () => new Promise((resolve) => setTimeout(resolve, 300));
+const olderThanFreshWriteGrace = (file) => {
+  const old = new Date(Date.now() - 2_000);
+  fs.utimesSync(file, old, old);
+};
 
 async function floor(t) {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'md-outbox-rejection-'));
@@ -47,10 +51,28 @@ test('a partial outbox write remains pending and routes after the writer finishe
   assert.equal(hive.inbox('god-1')[0].subject, 'writer finished');
 });
 
+test('a writer that remains partial for more than one second is still delivered once it finishes', async (t) => {
+  const { hive, outbox } = await floor(t);
+  const file = path.join(outbox, 'slow.json');
+  fs.writeFileSync(file, '{"to":"god-1"');
+
+  assert.equal(hive.routeOnce(), 0, 'a fresh file spends no parse retry budget');
+  await new Promise((resolve) => setTimeout(resolve, 1_100));
+  assert.equal(hive.routeOnce(), 0, 'the first eligible parse is still only one retry');
+  assert.equal(fs.existsSync(file), true);
+  fs.writeFileSync(file, JSON.stringify({ to: 'god-1', act: 'inform', subject: 'slow writer finished' }));
+
+  assert.equal(hive.routeOnce(), 1);
+  assert.equal(fs.existsSync(path.join(outbox, '.sent', 'slow.json')), true);
+  assert.equal(fs.existsSync(path.join(outbox, '.sent', 'bad-slow.json')), false);
+  assert.equal(hive.inbox('god-1')[0].subject, 'slow writer finished');
+});
+
 test('a final malformed outbox rejection is logged, surfaced, and notices the sender', async (t) => {
   const { hive, events, outbox } = await floor(t);
   const file = path.join(outbox, 'broken.json');
   fs.writeFileSync(file, '{ definitely not JSON');
+  olderThanFreshWriteGrace(file);
 
   assert.equal(hive.routeOnce(), 0);
   await afterDebounce();
@@ -62,13 +84,41 @@ test('a final malformed outbox rejection is logged, surfaced, and notices the se
   assert.equal(hive.routeOnce(), 0);
   assert.equal(fs.existsSync(path.join(outbox, '.sent', 'bad-broken.json')), true);
   const [notice] = hive.inbox('jim-1');
-  assert.match(notice.subject, /^\[outbox rejected — malformed JSON\] broken\.json$/);
+  assert.match(notice.subject, /^\[outbox rejected — malformed JSON after 3 attempts\] broken\.json$/);
   assert.match(notice.body, /after 3 attempts/);
   const [rejection] = hive.logTail(100).filter((entry) => entry.kind === 'outbox-rejected');
   assert.equal(rejection.from, 'jim-1');
   assert.equal(rejection.file, 'broken.json');
+  assert.equal(rejection.reason, 'parse-failed');
+  assert.match(rejection.detail, /malformed JSON after 3 attempts/);
   assert.equal(rejection.notified, true);
   assert.ok(events.some(({ channel, payload }) =>
     channel === 'hive:message' && payload.to === 'jim-1' && /^\[outbox rejected/.test(payload.subject)
   ), 'the sender notice must reach the floor event stream too');
+});
+
+test('parseable but unroutable files are rejected once with a sender notice', async (t) => {
+  const { hive, events, outbox } = await floor(t);
+  const cases = [
+    ['null.json', 'null', /message must be an object/],
+    ['number-to.json', JSON.stringify({ to: 123 }), /to must be a string/],
+    ['array-to.json', JSON.stringify({ to: ['god-1'] }), /to must be a string/]
+  ];
+
+  for (const [name, content, reason] of cases) {
+    fs.writeFileSync(path.join(outbox, name), content);
+    assert.equal(hive.routeOnce(), 0);
+    assert.equal(fs.existsSync(path.join(outbox, '.sent', `bad-${name}`)), true, name);
+    const matching = hive.inbox('jim-1').filter((message) => message.subject.endsWith(name));
+    assert.equal(matching.length, 1, `${name} must notify exactly once`);
+    assert.match(matching[0].subject, reason);
+    const rows = hive.logTail(100).filter((entry) => entry.kind === 'outbox-rejected' && entry.file === name);
+    assert.equal(rows.length, 1, `${name} must have one final rejection row`);
+    assert.equal(rows[0].reason, 'route-failed');
+    assert.match(rows[0].detail, reason);
+  }
+
+  assert.equal(hive.routeOnce(), 0, 'archived files cannot repeatedly reject');
+  assert.equal(hive.inbox('jim-1').length, cases.length);
+  assert.equal(events.filter(({ channel, payload }) => channel === 'hive:message' && payload.to === 'jim-1').length, cases.length);
 });

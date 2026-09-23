@@ -204,6 +204,7 @@ const HOP_CAP = 12;
  */
 const OUTBOX_PARSE_RETRY_LIMIT = 3;
 const OUTBOX_PARSE_RETRY_DEBOUNCE_MS = 250;
+const OUTBOX_FRESH_WRITE_GRACE_MS = 1_000;
 
 function sleepSync(ms: number): void {
   const sab = new SharedArrayBuffer(4);
@@ -346,6 +347,8 @@ export class HiveManager {
   private readonly outboxWatchers = new Map<string, Pick<FSWatcher, 'close' | 'on'>>();
   /** Parse failures awaiting the next polling debounce, keyed by full outbox path. */
   private readonly outboxParseRetries = new Map<string, { attempts: number; retryAfter: number }>();
+  /** A rejected file whose archival is temporarily locked has already notified its sender. */
+  private readonly outboxRejectNotices = new Map<string, string | null>();
   /** At most one queued scan; hints arriving in the same turn coalesce into it. */
   private routeQueued = false;
   /** Bumped by start/stop, so a scan queued before a stop never runs after it. */
@@ -1721,6 +1724,50 @@ export class HiveManager {
     });
   }
 
+  /** Stable enough to recognise an unchanged file after a rejected-file archive fails. */
+  private outboxFingerprint(full: string): string | null {
+    try {
+      const stat = statSync(full);
+      return `${stat.size}:${stat.mtimeMs}`;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * The single terminal path for malformed or unroutable outbox files. It always
+   * reports the failure to the sender and floor; an archive failure is remembered
+   * by fingerprint so an unchanged locked file cannot spam the log or its sender.
+   */
+  private rejectOutboxFile(
+    outbox: string,
+    full: string,
+    from: string,
+    file: string,
+    reason: 'parse-failed' | 'route-failed',
+    detail: string,
+    error: unknown
+  ): boolean {
+    let archived = false;
+    try {
+      renameSync(full, join(outbox, '.sent', `bad-${file}`));
+      archived = true;
+    } catch (archiveError) {
+      this.appendLog({ kind: 'outbox-reject-archive-failed', from, file, reason, detail, error: String(archiveError) });
+    }
+    const notice = this.normalize({
+      to: from,
+      act: 'inform',
+      subject: `[outbox rejected — ${detail}] ${file}`,
+      body: `The hive router rejected this outbox file: ${detail}. It${archived ? ' was archived' : ' could not be archived yet'} as bad-${file}; rewrite and resend it if it is still needed.`
+    }, 'system');
+    const notified = this.deliver(notice, from);
+    this.emitMessage(notice, notified ? [from] : []);
+    this.appendLog({ kind: 'outbox-rejected', from, file, reason, detail, error: String(error), notified, archived });
+    if (!archived) this.outboxRejectNotices.set(full, this.outboxFingerprint(full));
+    return true;
+  }
+
   routeOnce(): number {
     const root = this.root();
     if (!root) return 0;
@@ -1736,6 +1783,11 @@ export class HiveManager {
         if (!f.endsWith('.json')) continue;
         const full = join(outbox, f);
         liveOutboxFiles.add(full);
+        const priorRejection = this.outboxRejectNotices.get(full);
+        if (priorRejection !== undefined) {
+          if (priorRejection === this.outboxFingerprint(full)) continue;
+          this.outboxRejectNotices.delete(full);
+        }
         let partial: Partial<HiveMessage>;
         try {
           partial = JSON.parse(readFileSync(full, 'utf8')) as Partial<HiveMessage>;
@@ -1744,6 +1796,11 @@ export class HiveManager {
           // place for subsequent polling passes; only a bounded failure becomes
           // a visible rejection.
           const now = Date.now();
+          try {
+            if (now - statSync(full).mtimeMs < OUTBOX_FRESH_WRITE_GRACE_MS) continue;
+          } catch {
+            continue; // writer removed or replaced it; a later scan sees the new state
+          }
           const prior = this.outboxParseRetries.get(full);
           // fs.watch can report several chunks of one write in the same turn.
           // They are hints, not independent retries: wait before re-reading.
@@ -1755,39 +1812,28 @@ export class HiveManager {
             continue;
           }
           this.outboxParseRetries.delete(full);
-          let archived = false;
-          try {
-            renameSync(full, join(outbox, '.sent', `bad-${f}`));
-            archived = true;
-          } catch (archiveError) {
-            this.appendLog({ kind: 'outbox-reject-archive-failed', from: id, file: f, error: String(archiveError) });
-          }
-          if (archived) {
-            const notice = this.normalize({
-              to: id,
-              act: 'inform',
-              subject: `[outbox rejected — malformed JSON] ${f}`,
-              body: `The hive router could not parse this outbox file after ${OUTBOX_PARSE_RETRY_LIMIT} attempts. It was archived as bad-${f}; rewrite and resend it if it is still needed.`
-            }, 'system');
-            const notified = this.deliver(notice, id);
-            // Match normal routed mail on the floor: this rejection is an
-            // operator-visible event, not merely an inbox-side diagnostic.
-            this.emitMessage(notice, notified ? [id] : []);
-            this.appendLog({ kind: 'outbox-rejected', from: id, file: f, attempts, error: String(error), notified });
-            rejected++;
-          }
+          rejected += Number(this.rejectOutboxFile(
+            outbox, full, id, f,
+            'parse-failed',
+            `malformed JSON after ${attempts} attempts`,
+            error
+          ));
           continue;
         }
         this.outboxParseRetries.delete(full);
         try {
+          if (!partial || typeof partial !== 'object') throw new Error('unroutable: message must be an object');
+          if (partial.to !== undefined && typeof partial.to !== 'string') throw new Error('unroutable: to must be a string');
           const msg = this.normalize(partial, id);
           msg.from = id; // sender is authoritative — the owning directory
           this.routeMessage(msg);
           renameSync(full, join(outbox, '.sent', f)); // archive, don't reprocess
           routed++;
         } catch (error) {
-          // malformed file — quarantine so we don't spin on it
-          this.appendLog({ kind: 'outbox-route-failed', from: id, file: f, error: String(error) });
+          // A parsed payload that cannot route is terminal too: keep it visible,
+          // rather than retrying it forever on every watcher hint and poll.
+          const reason = error instanceof Error ? error.message : String(error);
+          rejected += Number(this.rejectOutboxFile(outbox, full, id, f, 'route-failed', reason, error));
         }
       }
     }
@@ -1795,6 +1841,9 @@ export class HiveManager {
     // retry count that could punish a later file reusing the same name.
     for (const full of this.outboxParseRetries.keys()) {
       if (!liveOutboxFiles.has(full)) this.outboxParseRetries.delete(full);
+    }
+    for (const full of this.outboxRejectNotices.keys()) {
+      if (!liveOutboxFiles.has(full)) this.outboxRejectNotices.delete(full);
     }
     if (routed > 0 || rejected > 0) this.commit(`hive: routed ${routed} message(s), rejected ${rejected}`);
     return routed;
