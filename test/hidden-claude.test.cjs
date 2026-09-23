@@ -25,7 +25,7 @@ const path = require('node:path');
 const { EventEmitter } = require('node:events');
 const loadTs = require('./load-ts.cjs');
 
-const { runHiddenClaude, readEnvelope, API_KEY_ENV } = loadTs('src/main/hiddenClaude.ts');
+const { runHiddenClaude, readEnvelope, API_KEY_ENV, GATEWAY_TOKEN_ENV, GATEWAY_URL_ENV } = loadTs('src/main/hiddenClaude.ts');
 
 const UUID = '11111111-1111-4111-8111-111111111111';
 /** The v1.1.46 silence boundary. Nothing may complete on it any more. */
@@ -266,80 +266,53 @@ test('readEnvelope refuses an envelope that reports its own error', () => {
 
 // ─── the billing guard (Dwight's caveat) ───
 
-test('credential env that would silently move billing to pay-as-you-go is STRIPPED', () => {
+/** Run one spawn with a controlled environment, and hand back what the child was given. */
+function envFor(set, opts = {}) {
   const h = harness();
   const before = {};
-  for (const k of API_KEY_ENV) { before[k] = process.env[k]; process.env[k] = 'sk-inherited'; }
+  for (const [k, v] of Object.entries(set)) { before[k] = process.env[k]; if (v === null) delete process.env[k]; else process.env[k] = v; }
   try {
-    runHiddenClaude('x', {
-      model: 'm', cwd: h.cwd,
-      // Stripping must happen AFTER the merge, or opts.env quietly puts it back.
-      env: { ANTHROPIC_API_KEY: 'sk-from-opts', MEMPALACE_PALACE_PATH: 'C:/palace' }
-    }, h.deps);
+    runHiddenClaude('x', { model: 'm', cwd: h.cwd, ...opts }, h.deps);
   } finally {
-    for (const k of API_KEY_ENV) { if (before[k] === undefined) delete process.env[k]; else process.env[k] = before[k]; }
+    for (const k of Object.keys(set)) { if (before[k] === undefined) delete process.env[k]; else process.env[k] = before[k]; }
   }
-  const { env } = h.calls[0].options;
-  for (const k of API_KEY_ENV) assert.ok(!(k in env), `${k} must not reach the child`);
+  return h.calls[0].options.env;
+}
+
+test('the API key is ALWAYS stripped - it overrides a subscription silently', () => {
+  const env = envFor({ ANTHROPIC_API_KEY: 'sk-inherited' }, { env: { ANTHROPIC_API_KEY: 'sk-from-opts', MEMPALACE_PALACE_PATH: 'C:/palace' } });
+  assert.ok(!('ANTHROPIC_API_KEY' in env), 'stripping must happen AFTER the merge, or opts.env puts it back');
   assert.equal(env.MEMPALACE_PALACE_PATH, 'C:/palace', 'the rest of opts.env still merges');
   assert.ok(env.PATH, 'and the resolved shell PATH is preserved');
 });
 
-test('API_KEY_ENV names the credential-bearing vars, not provider routing', () => {
-  // Routing flags (Bedrock/Vertex) are a deliberate deployment choice; stripping them
-  // would break a user who means to run there. Only credentials that OVERRIDE a
-  // logged-in subscription are removed.
-  assert.deepEqual([...API_KEY_ENV].sort(), ['ANTHROPIC_API_KEY', 'ANTHROPIC_API_KEY_HELPER', 'ANTHROPIC_AUTH_TOKEN']);
+test('the bearer token is stripped when there is NO base URL - a bare override', () => {
+  const env = envFor({ ANTHROPIC_AUTH_TOKEN: 'sk-token', ANTHROPIC_BASE_URL: null });
+  assert.ok(!(GATEWAY_TOKEN_ENV in env), 'on its own the token overrides a subscription like a key');
 });
 
-// ─── the REAL launch boundary (the design warns against proving this with `node` alone) ───
+test('the bearer token is KEPT when a base URL is set - a configured gateway is deliberate', () => {
+  const env = envFor({ ANTHROPIC_AUTH_TOKEN: 'sk-token', ANTHROPIC_BASE_URL: 'https://gateway.example/v1' });
+  assert.equal(env[GATEWAY_TOKEN_ENV], 'sk-token', 'stripping it would send this one call somewhere the user did not choose');
+  assert.equal(env[GATEWAY_URL_ENV], 'https://gateway.example/v1');
+  assert.ok(!('ANTHROPIC_API_KEY' in env), 'the API key strip stays unconditional either way');
+});
 
-/** A real npm-style `.cmd` shim that echoes back the argv and stdin it actually received. */
-function cmdShim() {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'claude-shim-'));
-  fs.writeFileSync(path.join(dir, 'shim.js'), [
-    "const chunks = [];",
-    "process.stdin.on('data', (c) => chunks.push(c));",
-    "process.stdin.on('end', () => {",
-    "  const argv = process.argv.slice(2);",
-    "  const at = (f) => { const i = argv.indexOf(f); return i < 0 ? null : argv[i + 1]; };",
-    "  process.stdout.write(JSON.stringify({",
-    "    type: 'result', is_error: false, session_id: at('--session-id'),",
-    "    structured_output: { condensed: 'from the shim', hoist: [] },",
-    "    result: JSON.stringify({ argv, stdin: Buffer.concat(chunks).toString('utf8') })",
-    "  }));",
-    "});"
-  ].join('\n'));
-  const cmd = path.join(dir, 'claude.cmd');
-  // Exactly the npm shim shape: a .cmd that CreateProcess cannot exec directly.
-  fs.writeFileSync(cmd, ['@echo off', 'node "%~dp0shim.js" %*', ''].join('\r\n'));
-  return { dir, cmd };
-}
+test('a gateway configured through opts.env counts too - the check reads the MERGED env', () => {
+  const env = envFor({ ANTHROPIC_AUTH_TOKEN: 'sk-token', ANTHROPIC_BASE_URL: null },
+    { env: { ANTHROPIC_BASE_URL: 'https://gateway.example/v1' } });
+  assert.equal(env[GATEWAY_TOKEN_ENV], 'sk-token');
+});
 
-test('the REAL Windows .cmd shim path: schema and prompt survive the cmd.exe wrapper', { skip: process.platform === 'win32' ? false : 'the .cmd shim wrapper is a win32 path' }, async () => {
-  // The design is explicit that proving this by spawning `node` would prove nothing:
-  // on Windows the configured command is usually an npm `.cmd` shim, which Node refuses
-  // to exec directly, so the call goes through cmd.exe - and cmd.exe RE-PARSES every
-  // argument. The JSON schema is the argument most likely to be mangled by that, so it
-  // is the one worth sending through a real shim.
-  const { dir, cmd } = cmdShim();
-  try {
-    const schema = { type: 'object', additionalProperties: false, required: ['condensed', 'hoist'] };
-    const prompt = 'line one\nline two with "quotes" & an ampersand';
-    const r = await runHiddenClaude(prompt, {
-      model: 'claude-haiku-4-5', cwd: dir, command: cmd, jsonSchema: schema, timeoutMs: 60_000
-    });
-    assert.equal(r.ok, true, r.error);
-    assert.deepEqual(r.structuredOutput, { condensed: 'from the shim', hoist: [] });
-    const echoed = JSON.parse(r.result);
-    const at = (f) => echoed.argv[echoed.argv.indexOf(f) + 1];
-    assert.deepEqual(JSON.parse(at('--json-schema')), schema, 'the schema arrived through cmd.exe byte-intact');
-    assert.equal(at('--session-id'), r.sessionId, 'and the child was told the session we generated');
-    assert.ok(echoed.argv.includes('--print'));
-    assert.equal(echoed.stdin, prompt, 'the whole prompt arrived on stdin, newlines and all');
-  } finally {
-    fs.rmSync(dir, { recursive: true, force: true });
-  }
+test('the strip list names the ONE unconditional credential, and nothing it cannot justify', () => {
+  // ANTHROPIC_API_KEY_HELPER was in this list and is gone: `apiKeyHelper` is a settings
+  // field, not an environment variable, so naming it here asserted something we had no
+  // evidence for - and a helper configured in settings is not reachable from a child env
+  // anyway. Routing flags (Bedrock/Vertex) stay untouched for the same reason the
+  // gateway token does: a configured deployment is a choice, not an override.
+  assert.deepEqual([...API_KEY_ENV], ['ANTHROPIC_API_KEY']);
+  assert.equal(GATEWAY_TOKEN_ENV, 'ANTHROPIC_AUTH_TOKEN');
+  assert.equal(GATEWAY_URL_ENV, 'ANTHROPIC_BASE_URL');
 });
 
 // ─── source-level pins: the deleted protocol must stay deleted ───

@@ -44,15 +44,25 @@ const MAX_STDOUT_BYTES = 1024 * 1024;
 const MAX_STDERR_BYTES = 8 * 1024;
 
 /**
- * Credential-bearing variables that make the CLI bill pay-as-you-go even when the user is
- * logged in to a subscription. Stripped from the child env AFTER every merge, so neither
- * the inherited environment nor `opts.env` can reintroduce one.
+ * The credential that silently overrides a logged-in subscription and bills
+ * pay-as-you-go. Stripped from the child env AFTER every merge, so neither the inherited
+ * environment nor `opts.env` can put it back.
  *
  * Deliberately NOT stripped: CLAUDE_CODE_USE_BEDROCK / CLAUDE_CODE_USE_VERTEX and the
- * like. Those route a deliberately-configured deployment rather than silently overriding
- * a subscription, and removing them would break a user who means to run there.
+ * like. Those route a deliberately-configured deployment rather than overriding a
+ * subscription, and removing them would break a user who means to run there.
  */
-export const API_KEY_ENV = ['ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN', 'ANTHROPIC_API_KEY_HELPER'] as const;
+export const API_KEY_ENV = ['ANTHROPIC_API_KEY'] as const;
+
+/**
+ * The bearer token is the same judgement one step further out. On its own it overrides a
+ * subscription exactly like an API key, so it goes. But paired with a base URL it is not
+ * an override at all - it is the credential for a gateway the user deliberately
+ * configured, and stripping it would send this one call somewhere they did not choose,
+ * or nowhere. So it is kept if and only if a base URL is set (god ruling, Jim C1(b)).
+ */
+export const GATEWAY_TOKEN_ENV = 'ANTHROPIC_AUTH_TOKEN';
+export const GATEWAY_URL_ENV = 'ANTHROPIC_BASE_URL';
 
 export interface HiddenClaudeOptions {
   /** Model to use (e.g. 'claude-haiku-4-5'). */
@@ -151,6 +161,8 @@ export function runHiddenClaude(
       ...(opts.env ?? {}),
     };
     for (const k of API_KEY_ENV) delete env[k];
+    // Read from the MERGED env, so a gateway configured through opts.env counts too.
+    if (!env[GATEWAY_URL_ENV]) delete env[GATEWAY_TOKEN_ENV];
 
     // Windows: CreateProcess cannot exec the npm `.cmd`/extensionless `claude` shim
     // directly (ERROR_BAD_EXE_FORMAT, error 193), and Node refuses a .cmd without a
