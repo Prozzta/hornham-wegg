@@ -971,6 +971,17 @@ const api = {
     ipcRenderer.on('hive:contextUpdate', listener);
     return () => ipcRenderer.removeListener('hive:contextUpdate', listener);
   },
+  /** The CANONICAL provider-native lifecycle for one agent (AGY 1.1.48), classified in
+   *  main from a version-validated statusline tick. The renderer displays it and does
+   *  not parse, re-derive or second-guess it: raw provider status never crosses this
+   *  boundary, and nothing the renderer does with this value authorises a submission. */
+  onHiveProviderStatus: (
+    cb: (e: { agentId: string; status: 'idle' | 'running' | 'waiting_for_confirmation' }) => void
+  ): (() => void) => {
+    const listener = (_e: IpcRendererEvent, payload: { agentId: string; status: 'idle' | 'running' | 'waiting_for_confirmation' }) => cb(payload);
+    ipcRenderer.on('hive:providerStatus', listener);
+    return () => ipcRenderer.removeListener('hive:providerStatus', listener);
+  },
   // --- Provider capacity, pool level (v1.1.45 unit #1) ---------------------------
   // Channel names are literals because this preload imports no runtime values; a
   // test pins them to the constants in src/shared/capacityStrip.ts.

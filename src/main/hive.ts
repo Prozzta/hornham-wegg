@@ -2993,7 +2993,13 @@ process.stdin.on('end', () => {
     transcript_path: agy.transcriptPath,
     cwd: Array.isArray(agy.workspacePaths) ? agy.workspacePaths[0] : undefined,
     tool_name: tc.name,
-    tool_input: tc.args
+    tool_input: tc.args,
+    // agy's OWN terminal qualifier on Stop. The shim used to drop it, which is how a
+    // mid-chain Stop looked exactly like the end of a turn. Only a real boolean is
+    // forwarded - anything else stays undefined, which keeps the Claude reading.
+    // Both spellings are read because only one of them has been measured.
+    fully_idle: typeof agy.fullyIdle === 'boolean' ? agy.fullyIdle
+      : (typeof agy.fully_idle === 'boolean' ? agy.fully_idle : undefined)
   };
   let resp = '';
   const done = () => {

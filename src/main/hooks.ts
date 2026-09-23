@@ -58,6 +58,10 @@ interface HookPayload {
    *  the statusline shim. NEVER logged, retained or re-sent - it carries the account's
    *  email. The normaliser reads the fields it needs and everything else is dropped. */
   agy_status?: unknown;
+  /** Antigravity `Stop` only: the provider's own terminal qualifier, preserved by the
+   *  agy hook shim. Claude never sends it, so absent must keep meaning "terminal" -
+   *  only an explicit `false` refuses the Stop. Never a capacity or account fact. */
+  fully_idle?: boolean;
 }
 
 /** How many distinct {version, driftCode} pairs are counted before they share one bucket. */
@@ -96,7 +100,7 @@ export class HookServer {
      *  synchronously BEFORE this server returns its hook response. It must not submit
      *  or block: the inbox-wake bridge only records lifecycle/HITL state here and defers
      *  any retry with setImmediate, so the response (Stop included) is unchanged. */
-    private onEvent?: (agentId: string | undefined, event: string, message: string | undefined) => void,
+    private onEvent?: (agentId: string | undefined, event: string, message: string | undefined, fullyIdle?: boolean) => void,
     /** L0 — provider allowance observed on the status line. Optional so the server
      *  runs unchanged where no tracker is wired (tests, and any build without L0).
      *  HookServer deliberately does not hold the tracker: it hands over a
@@ -104,8 +108,16 @@ export class HookServer {
     private onCapacity?: (agentId: string | null, obs: CapacityObservation) => void,
     /** AGY 1.1.48 - one COHERENT Antigravity statusline tick: both family observations
      *  plus the canonical lifecycle. `agentId` is null for a user's own session. Optional
-     *  and unwired until the two-pool ingestion lands, so a tick arriving before then is
-     *  normalised, counted if it drifts, and otherwise dropped. */
+     *  and unwired in a build with no capacity runtime, in which case a tick is
+     *  normalised, counted if it drifts, and otherwise dropped.
+     *
+     *  ONE CALLBACK CARRIES BOTH the allowance pair and the lifecycle, because they are
+     *  one indivisible reading: the tick that says which family is active is the same
+     *  tick that says whether the turn is running. Splitting it into a capacity callback
+     *  and a lifecycle callback would let a build accept half of a reading, and "the half
+     *  that parsed is exactly as suspect as the half that did not" is the rule this
+     *  normaliser is already built on. HookServer still knows nothing about pools, wake
+     *  or admission; it hands over the canonical record and the caller routes it. */
     private onAgyTick?: (agentId: string | null, tick: AgyStatusTick) => void
   ) {}
 
@@ -217,7 +229,7 @@ export class HookServer {
     // halt gate, the breaker and session recording. It can arrive with agent_id null
     // from a session nobody spawned, and none of that machinery is for it.
     if (event === 'AgyStatusLine') return this.handleAgyStatus(p);
-    this.onEvent?.(agentId, event, p.message);
+    this.onEvent?.(agentId, event, p.message, typeof p.fully_idle === 'boolean' ? p.fully_idle : undefined);
     if (agentId && typeof p.transcript_path === 'string' && p.transcript_path) {
       this.transcriptPaths.set(agentId, p.transcript_path);
     }

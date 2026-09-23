@@ -369,6 +369,11 @@ export interface AgyStatusTick {
   /** Always `[3p, gemini]`, in that order. Never merged, never one without the other. */
   observations: readonly [CapacityObservation, CapacityObservation];
   lifecycle: AgyLifecycle;
+  /** The session/conversation this tick speaks for, or null when it names none.
+   *  Carried on the TICK - not read back out of `observations[].streamId` - because
+   *  the incarnation guard in the wake coordinator is a lifecycle concern and must
+   *  not reach through the capacity domain to learn which turn it is looking at. */
+  sessionId: string | null;
 }
 
 /**
@@ -538,7 +543,10 @@ export function classifyAgyStatusLine(input: {
     planType: null
   });
 
-  return { ok: true, tick: { version, activeLimitId, observations: [obs('3p'), obs('gemini')], lifecycle } };
+  return {
+    ok: true,
+    tick: { version, activeLimitId, observations: [obs('3p'), obs('gemini')], lifecycle, sessionId: sid ?? null }
+  };
 }
 
 /**

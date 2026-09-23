@@ -266,7 +266,9 @@ test('index.ts wires every edge to the ONE bridge, registered before the router 
   assert.match(obs, /\(\{ agentId, messageId \}\)/, 'the observer takes the delivery');
   assert.match(obs, /inboxWake\?\.onDelivery\(agentId, messageId\)/, 'and hands it to the one bridge');
   assert.ok(!/automaticSubmit|ptyManager/.test(obs), 'the observer never submits or types by itself');
-  assert.match(index, /\(agentId, event, message\) => inboxWake\?\.onHook\(agentId, event, message\)/, 'the hook stream');
+  // AGY 1.1.48 c4: the hook stream now also carries agy's own terminal qualifier, so a
+  // Stop that says it is NOT fully idle can be refused. Still ONE hand-off to ONE bridge.
+  assert.match(index, /\(agentId, event, message, fullyIdle\) => inboxWake\?\.onHook\(agentId, event, message, fullyIdle\)/, 'the hook stream');
   assert.match(index, /transition === 'UNPAUSED' \|\| transition === 'RESUMED' \|\| transition === 'AUTO_DELIVERY_RELEASED'/, 'only releases retry');
   assert.match(index, /onChange: \(\) => \{ pushCapacityStrip\(\); pushAgentUsage\(\); pushAgentImpact\(\); inboxWake\?\.onCapacityChange\(\); \}/);
   assert.match(index, /if \(resolved\) inboxWake\?\.onInterferenceResolved\(agentId, how as InterferenceResolution\);/);

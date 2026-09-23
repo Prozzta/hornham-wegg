@@ -559,8 +559,27 @@ const hookServer = new HookServer(
   standingGoalFromRoster,
   // Observed BEFORE the hook response; the bridge defers any retry with setImmediate, so
   // the Stop reply is never blocked and no turn is manufactured inside the hook.
-  (agentId, event, message) => inboxWake?.onHook(agentId, event, message),
-  (agentId, obs) => { providerCapacity.ingest(agentId, obs); capacityStore.scheduleSave(); }
+  (agentId, event, message, fullyIdle) => inboxWake?.onHook(agentId, event, message, fullyIdle),
+  (agentId, obs) => { providerCapacity.ingest(agentId, obs); capacityStore.scheduleSave(); },
+  // AGY 1.1.48 — ONE validated statusline tick, routed to its two consumers. Capacity
+  // first: the allowance pair is a provider fact and is true for the account whether or
+  // not any hive agent is behind the tick. Lifecycle second, and ONLY with an agent id —
+  // a tick from the user's own `agy` session says nothing about a floor worker, and the
+  // one thing it must never do is make somebody else's running turn look finished.
+  (agentId, tick) => {
+    providerCapacity.ingestAgyTick(agentId, {
+      accountScope: tick.observations[0].accountScope,
+      activeLimitId: tick.activeLimitId,
+      observations: tick.observations
+    });
+    capacityStore.scheduleSave();
+    if (!agentId) return;
+    inboxWake?.onProviderStatus(agentId, tick.lifecycle, tick.sessionId);
+    // The renderer is TOLD the canonical status; it never re-derives one. Presentation
+    // only — main remains the sole submission authority, so a renderer that misses this
+    // push, or renders it late, cannot cause or prevent a single wake.
+    liveWebContents()?.send('hive:providerStatus', { agentId, status: tick.lifecycle });
+  }
 );
 const memory = new MemoryManager(
   () => readConfig().harnessHome,

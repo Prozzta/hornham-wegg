@@ -84,6 +84,16 @@ export function classifyHook(event: string | undefined, message: string | undefi
  */
 const ACTIVE_EVENTS = new Set(['UserPromptSubmit', 'PreToolUse', 'PostToolUse', 'PreCompact', 'PostCompact']);
 
+/**
+ * The canonical provider-native lifecycle, as the AGY statusline normaliser states it.
+ * It is NOT derived here and never inferred from silence, from the renderer, from inbox
+ * age or from the stall watchdog — it is read off a version-validated tick and nothing
+ * else. This is the authoritative recovery input the 1.1.47 false-active stall lacked:
+ * a `COMMITTED` wake opens an active epoch, and before this there was no observation in
+ * the main process capable of closing one once its terminal hook was lost.
+ */
+export type ProviderStatus = 'idle' | 'running' | 'waiting_for_confirmation';
+
 export type WakeLifecycle = 'active' | 'idle' | 'unknown';
 /** Why a wake was attempted (breadcrumbs only; never a decision input). */
 export type WakeCause = 'delivery' | 'hook' | 'control' | 'capacity' | 'interference' | 'reconcile' | 'renderer';
@@ -124,6 +134,14 @@ interface AgentWake {
   lifecycle: WakeLifecycle;
   lastHumanNeedsAt: number;
   lastReconcileAttemptAt: number;
+  /** The provider session this agent's native status ticks speak for, once one has
+   *  been learned. Null = nothing learned yet (accept and learn from the next tick). */
+  providerSession: string | null;
+  /** When the most recent active epoch opened (0 = none ever). Terminal proof must be
+   *  newer than this, so a reading that predates the turn cannot close it. It is only
+   *  ever read while the lifecycle IS active, so the hook path deliberately leaves a
+   *  spent value in place rather than spending a write clearing it. */
+  activeSince: number;
 }
 
 /** `inbox-wake:<agent>:<sha256 of the sorted ids>` - the same batch always has the same id. */
@@ -147,7 +165,7 @@ export class WorkerWakeWatchdog {
   private rec(agentId: string): AgentWake {
     let r = this.agents.get(agentId);
     if (!r) {
-      r = { pending: new Set(), announced: new Set(), inFlight: null, held: null, lifecycle: 'unknown', lastHumanNeedsAt: 0, lastReconcileAttemptAt: 0 };
+      r = { pending: new Set(), announced: new Set(), inFlight: null, held: null, lifecycle: 'unknown', lastHumanNeedsAt: 0, lastReconcileAttemptAt: 0, providerSession: null, activeSince: 0 };
       this.agents.set(agentId, r);
     }
     return r;
@@ -165,6 +183,11 @@ export class WorkerWakeWatchdog {
     if (!agentId) return;
     const r = this.rec(agentId);
     r.lifecycle = 'unknown';
+    // A new PTY incarnation is a new provider session. Forget the old one BEFORE any
+    // tick of the new one arrives: keeping it would make the first tick of the fresh
+    // session look like a mismatch and be discarded, and the agent would then have no
+    // native lifecycle at all — the exact blindness this commit exists to remove.
+    r.providerSession = null;
     if (r.held) {
       for (const id of r.held.ids) if (!r.announced.has(id)) r.pending.add(id);
       r.held = null;
@@ -180,24 +203,92 @@ export class WorkerWakeWatchdog {
     return true;
   }
 
-  /** Feed a hook event. Returns true when it is a RETRY EDGE for pending work. */
-  noteHook(agentId: string | undefined, event: string | undefined, message: string | undefined, at = Date.now()): boolean {
+  /**
+   * Feed a hook event. Returns true when it is a RETRY EDGE for pending work.
+   *
+   * `fullyIdle` is Antigravity's own terminal qualifier, preserved through the agy hook
+   * shim. It is read ONLY to REFUSE a Stop that says it is not terminal: Claude has no
+   * such field, so an absent one keeps the long-standing "any Stop means idle" reading
+   * and nothing about Claude moves. `false` is a provider statement that the turn is
+   * still running, and believing it over the event name is what stops a mid-chain Stop
+   * from opening a window for a second prompt.
+   */
+  noteHook(agentId: string | undefined, event: string | undefined, message: string | undefined, at = Date.now(), fullyIdle?: boolean): boolean {
     if (!agentId || !event) return false;
     const r = this.rec(agentId);
-    if (event === 'Stop') { r.lifecycle = 'idle'; return true; }
+    if (event === 'Stop') {
+      if (fullyIdle === false) return false;   // the provider says the turn is not over
+      r.lifecycle = 'idle';
+      return true;
+    }
     if (event === 'SubagentStop') return r.lifecycle === 'idle';   // never turns active into idle
     if (event === 'Notification') {
       if (classifyHook(event, message) === 'needsHuman') { r.lastHumanNeedsAt = at; return false; }
       r.lifecycle = 'idle';
       return true;
     }
-    if (ACTIVE_EVENTS.has(event)) { r.lifecycle = 'active'; return false; }
+    if (ACTIVE_EVENTS.has(event)) { r.lifecycle = 'active'; r.activeSince = at; return false; }
     // A session boundary moots whatever the previous session was doing, in both directions:
     // it never asserts a turn is running (the cold-boot deadlock above), and it must not
     // let a stale `active` from the old session survive into the new one either — a
     // --resume'd agent would inherit exactly the same deadlock. Not a retry edge: nothing
     // is known to be idle yet, so the reconciliation beat decides, behind boot grace.
     if (event === 'SessionStart' || event === 'SessionEnd') { r.lifecycle = 'unknown'; return false; }
+    return false;
+  }
+
+  /**
+   * Feed one PROVIDER-NATIVE status reading. Returns true when it is a RETRY EDGE.
+   *
+   * THE FIX FOR THE FALSE-ACTIVE STALL. `settle(COMMITTED)` opens an active epoch, and
+   * until now only a terminal HOOK could close one. When that hook was never delivered —
+   * as in the 1.1.47 incident, where no AGY lifecycle event reached main at all — the
+   * agent was known-active forever: event mode refuses anything but idle, and D3
+   * deliberately refuses to let PTY silence stand in for a positively active lifecycle.
+   * The watchdog could see the contradiction and say so, but had nothing authoritative
+   * to say it WITH. This is that input.
+   *
+   * THE MAPPING (design 4.1), and it is the whole of it:
+   *
+   *   idle                     -> lifecycle idle,   RETRY EDGE
+   *   running                  -> lifecycle active, no edge
+   *   waiting_for_confirmation -> lifecycle active + HITL hold, no edge
+   *
+   * Confirmation is BOTH: the turn is alive (so silence still cannot claim it) and a
+   * human is being asked something (so the existing HITL rearm blocks the claim for its
+   * full window). Mail can never be typed through a permission prompt.
+   *
+   * THE INCARNATION GUARD. A tick naming a session other than the learned one is
+   * discarded entirely — it cannot set idle, cannot set active, cannot arm HITL. A late
+   * tick from a session the PTY has already replaced is the one way a native reading
+   * could make a genuinely busy new turn look finished, and `noteSpawn` clears the
+   * learned session so the new incarnation starts by learning its own. A tick that names
+   * no session at all is accepted: it is one stream per PTY and receive order settles it.
+   *
+   * Nothing here claims, submits or types. It records what the provider said; the
+   * ordinary guarded path decides what, if anything, follows.
+   */
+  noteProviderStatus(agentId: string | undefined, status: ProviderStatus, at = Date.now(), sessionId: string | null = null): boolean {
+    if (!agentId) return false;
+    const r = this.rec(agentId);
+    if (sessionId) {
+      if (r.providerSession !== null && r.providerSession !== sessionId) return false;
+      r.providerSession = sessionId;
+    }
+    // TERMINAL PROOF MUST BE NEWER THAN THE EDGE IT CLOSES. Each statusline tick is its
+    // own short-lived shim process on the named pipe, so two in flight at once can be
+    // received out of order. A reading taken BEFORE the active epoch opened describes the
+    // previous turn, and letting it close this one is the same class of mistake as
+    // believing a retired session. It is refused whole, like any tick we cannot trust.
+    if (status === 'idle') {
+      if (r.activeSince > 0 && at < r.activeSince) return false;
+      r.lifecycle = 'idle';
+      r.activeSince = 0;
+      return true;
+    }
+    if (r.lifecycle !== 'active') r.activeSince = at;   // a new epoch, not a repeat of one
+    r.lifecycle = 'active';
+    if (status === 'waiting_for_confirmation') r.lastHumanNeedsAt = at;
     return false;
   }
 
@@ -262,13 +353,14 @@ export class WorkerWakeWatchdog {
   }
 
   /** The owner's outcome for a claim. Only the CURRENT in-flight claim is settled. */
-  settle(claim: WakeClaim, outcomeKind: string): void {
+  settle(claim: WakeClaim, outcomeKind: string, at = Date.now()): void {
     const r = this.agents.get(claim.agentId);
     if (!r || r.inFlight?.requestId !== claim.requestId) return;
     r.inFlight = null;
     if (outcomeKind === 'COMMITTED') {
       for (const id of claim.ids) r.announced.add(id);
       r.lifecycle = 'active';          // a turn just started; new mail waits for its Stop
+      r.activeSince = at;              // and THIS is the edge terminal proof must be newer than
     } else if (outcomeKind === 'HUMAN_HANDLED') {
       for (const id of claim.ids) r.announced.add(id);
     } else if (outcomeKind === 'INTERFERED') {
@@ -298,14 +390,15 @@ export class WorkerWakeWatchdog {
   }
 
   /** Read-only view for diagnostics and tests. */
-  state(agentId: string): { pending: string[]; announced: string[]; inFlight: WakeClaim | null; held: WakeClaim | null; lifecycle: WakeLifecycle } {
+  state(agentId: string): { pending: string[]; announced: string[]; inFlight: WakeClaim | null; held: WakeClaim | null; lifecycle: WakeLifecycle; providerSession: string | null } {
     const r = this.agents.get(agentId);
     return {
       pending: r ? [...r.pending].sort() : [],
       announced: r ? [...r.announced].sort() : [],
       inFlight: r?.inFlight ?? null,
       held: r?.held ?? null,
-      lifecycle: r?.lifecycle ?? 'unknown'
+      lifecycle: r?.lifecycle ?? 'unknown',
+      providerSession: r?.providerSession ?? null
     };
   }
 
