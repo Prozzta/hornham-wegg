@@ -28,6 +28,9 @@ const STALE_AFTER_MS = 60 * 60_000;
 
 const lockPath = (devRoot) => join(devRoot, '.canary-lock.json');
 
+/** The filesystem calls the claim step makes. Injectable so the steal race is testable. */
+const io = { writeFileSync, unlinkSync };
+
 /** Is that process still running? Signal 0 tests liveness without touching the process. */
 function pidAlive(pid) {
   if (!Number.isInteger(pid) || pid <= 0) return false;
@@ -67,6 +70,26 @@ function lockDecision(existing, { now, alive, force = false, staleAfterMs = STAL
   }
 
   if (force) return { action: 'steal', why: `override: discarding the lock held by ${who}` };
+
+  // OBS-2 (Jim): a HARD crash leaves a lock that is still marked clean, but `noteStash`
+  // had already recorded what this run moved aside. An hour later the stale branch below
+  // would take it over and the crashed run's originals would sit under .canary-bak
+  // forever — not destroyed, since the stamps are per-run, but silently orphaned. A
+  // recorded stash means real data is displaced RIGHT NOW, whatever the lock claims about
+  // its own cleanliness, so it is treated exactly like a dirty lock.
+  const stashed = Array.isArray(existing.stashed) ? existing.stashed : [];
+  if (stashed.length && !alive) {
+    return {
+      action: 'refuse',
+      message: [
+        `A canary run from ${who} is gone but left the dev root displaced — it recorded a stash and never restored it.`,
+        'Put these back before running again, or they will be orphaned:',
+        ...stashed.map((x) => `  ${x}`),
+        `Then delete ${lockPath(existing.devRoot || '<dev root>')}, or re-run with CANARY_FORCE=1 to discard them.`
+      ].join('\n')
+    };
+  }
+
   if (alive) {
     return {
       action: 'refuse',
@@ -92,6 +115,40 @@ function lockDecision(existing, { now, alive, force = false, staleAfterMs = STAL
   };
 }
 
+/**
+ * Create the lock file, or throw. `wx` is an atomic create, which settles the race between
+ * two canaries starting from cold — but only that one.
+ *
+ * OBS-1 (Jim): two processes can BOTH judge the same stale lock as stealable, and the old
+ * code then let both fall through to a plain overwrite, so both believed they had won and
+ * both went on to stash. Stealing is therefore unlink-then-create, and the create is still
+ * `wx`: whoever re-creates it first owns the lock, and the loser is refused rather than
+ * silently overwriting the winner.
+ */
+function claimLockFile(path, rec, steal, ops = io) {
+  const body = JSON.stringify(rec, null, 2);
+  const lost = () => {
+    const err = new Error('Another canary claimed the lock a moment ago; not racing it.');
+    err.canaryLocked = true;
+    return err;
+  };
+  try {
+    ops.writeFileSync(path, body, { flag: 'wx' });
+    return;
+  } catch (e) {
+    if (e.code !== 'EEXIST') throw e;
+    if (!steal) throw lost();
+  }
+  // Steal: drop the lock we judged, then race for the create like everyone else.
+  try { ops.unlinkSync(path); } catch (e) { if (e.code !== 'ENOENT') throw e; }
+  try {
+    ops.writeFileSync(path, body, { flag: 'wx' });
+  } catch (e) {
+    if (e.code !== 'EEXIST') throw e;
+    throw lost();          // someone re-created it between our unlink and our create
+  }
+}
+
 function readLock(devRoot) {
   try { return JSON.parse(readFileSync(lockPath(devRoot), 'utf8')); } catch { return null; }
 }
@@ -100,7 +157,7 @@ function readLock(devRoot) {
  * Take the lock, or throw with the reason. `wx` makes the create atomic, so two canaries
  * racing from cold cannot both believe they won.
  */
-function acquire(devRoot, { agent = process.env.AGENT_NAME || 'unknown', force = !!process.env.CANARY_FORCE, now = Date.now() } = {}) {
+function acquire(devRoot, { agent = process.env.AGENT_NAME || 'unknown', force = !!process.env.CANARY_FORCE, now = Date.now(), ops = io } = {}) {
   mkdirSync(devRoot, { recursive: true });
   const existing = readLock(devRoot);
   const decision = lockDecision(existing, { now, alive: existing ? pidAlive(existing.pid) : false, force });
@@ -111,19 +168,7 @@ function acquire(devRoot, { agent = process.env.AGENT_NAME || 'unknown', force =
   }
   if (decision.action === 'steal') console.warn(`[canary-lock] ${decision.why}`);
   const rec = { pid: process.pid, agent, startedAt: now, devRoot, dirty: false, stashed: [] };
-  try {
-    writeFileSync(lockPath(devRoot), JSON.stringify(rec, null, 2), { flag: 'wx' });
-  } catch (e) {
-    if (e.code !== 'EEXIST') throw e;
-    // We decided to take it and someone else got there first (a real race) — or we are
-    // replacing a lock we already judged. Only the steal path may overwrite.
-    if (decision.action !== 'steal') {
-      const err = new Error('Another canary took the lock a moment ago; not racing it.');
-      err.canaryLocked = true;
-      throw err;
-    }
-    writeFileSync(lockPath(devRoot), JSON.stringify(rec, null, 2));
-  }
+  claimLockFile(lockPath(devRoot), rec, decision.action === 'steal', ops);
   return rec;
 }
 
@@ -149,4 +194,4 @@ function release(devRoot, { dirty = false, stashed = [] } = {}) {
   writeFileSync(lockPath(devRoot), JSON.stringify({ ...rec, dirty: true, stashed }, null, 2));
 }
 
-module.exports = { lockDecision, acquire, release, noteStash, readLock, lockPath, pidAlive, STALE_AFTER_MS };
+module.exports = { lockDecision, acquire, release, noteStash, readLock, lockPath, pidAlive, claimLockFile, STALE_AFTER_MS };

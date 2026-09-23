@@ -127,3 +127,79 @@ test('the canary acquires BEFORE it stashes, and marks dirty on failure', () => 
   assert.match(src, /lock\.release\(DEV_ROOT, \{ dirty: true/, 'a failed run keeps a dirty lock');
   assert.match(src, /lock\.release\(DEV_ROOT\)/, 'a clean run releases it');
 });
+
+// ─── Jim's two hardening observations ───────────────────────────────────────
+
+test('OBS-1: two canaries stealing the SAME stale lock — only one wins', (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'canary-lock-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+
+  // A stale lock both would judge stealable: old, and its process is long gone.
+  writeFileSync(lockPath(dir), JSON.stringify({
+    pid: 999_999, agent: 'crashed', startedAt: NOW - 10 * STALE_AFTER_MS, devRoot: dir, dirty: false, stashed: []
+  }));
+
+  // `wx` only settles the race when there is NO file. Both of these decide 'steal', so
+  // without unlink-then-wx both would fall through to a plain overwrite and both would
+  // believe they owned the dev root. Here the competitor re-creates the lock in the
+  // window between our unlink and our create.
+  let created = 0;
+  const ops = {
+    unlinkSync: require('node:fs').unlinkSync,
+    writeFileSync: (p, body, opts) => {
+      if (opts && opts.flag === 'wx') {
+        created += 1;
+        if (created === 2) { const e = new Error('EEXIST'); e.code = 'EEXIST'; throw e; }
+      }
+      return require('node:fs').writeFileSync(p, body, opts);
+    }
+  };
+
+  assert.throws(() => acquire(dir, { agent: 'andy', now: NOW, ops }),
+    (e) => e.canaryLocked && /claimed the lock a moment ago/.test(e.message),
+    'the loser is refused, never allowed to overwrite the winner');
+});
+
+test('OBS-1: a clean steal still succeeds and the lock ends up OURS', (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'canary-lock-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  writeFileSync(lockPath(dir), JSON.stringify({
+    pid: 999_999, agent: 'crashed', startedAt: NOW - 10 * STALE_AFTER_MS, devRoot: dir, dirty: false, stashed: []
+  }));
+  const rec = acquire(dir, { agent: 'andy', now: NOW });
+  assert.equal(rec.pid, process.pid);
+  assert.equal(readLock(dir).agent, 'andy', 'the stale holder was replaced, not merged');
+});
+
+test('OBS-2: a crashed run that RECORDED a stash is never buried by the stale rule', () => {
+  // The gap: a hard crash leaves the lock still marked CLEAN, but noteStash had already
+  // written down what was moved aside. After an hour the stale branch used to take it
+  // over, orphaning those originals under .canary-bak forever.
+  const d = lockDecision(
+    held({ dirty: false, startedAt: NOW - 10 * STALE_AFTER_MS, stashed: ['D\hive.canary-bak-3'] }),
+    { now: NOW, alive: false }
+  );
+  assert.equal(d.action, 'refuse', 'a recorded stash outranks staleness');
+  assert.match(d.message, /left the dev root displaced/);
+  assert.match(d.message, /hive\.canary-bak-3/, 'and it names what to put back');
+});
+
+test('OBS-2: a stale lock with NOTHING stashed is still ordinary debris', () => {
+  // The fix must not make every crash permanently blocking — only the ones holding data.
+  const d = lockDecision(held({ dirty: false, startedAt: NOW - 10 * STALE_AFTER_MS, stashed: [] }),
+    { now: NOW, alive: false });
+  assert.equal(d.action, 'steal');
+});
+
+test('OBS-2: a LIVE holder with a stash is "already running", not "displaced"', () => {
+  // A stash is only orphaned if nobody is coming back for it.
+  const d = lockDecision(held({ stashed: ['x.canary-bak-1'] }), { now: NOW, alive: true });
+  assert.equal(d.action, 'refuse');
+  assert.match(d.message, /already running/);
+});
+
+test('OBS-2: force still overrides a displaced-stash refusal', () => {
+  const d = lockDecision(held({ startedAt: NOW - 10 * STALE_AFTER_MS, stashed: ['x'] }),
+    { now: NOW, alive: false, force: true });
+  assert.equal(d.action, 'steal');
+});
