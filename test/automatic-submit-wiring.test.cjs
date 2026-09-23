@@ -1210,7 +1210,7 @@ function bareEnterWriters(readFile) {
   return writers;
 }
 
-test('TRIPWIRE, NOT THE GUARANTEE: a bare Enter is SPELLED in exactly two places, and one is a declared private PTY', () => {
+test('TRIPWIRE, NOT THE GUARANTEE: a bare Enter is SPELLED in exactly one place - the submit owner', () => {
   // WHAT THIS IS WORTH (Dwight, validating stage 5.3): it proves a LITERAL CONVENTION and
   // no more. A regex over the DATA argument cannot enumerate the ways to spell a carriage
   // return, so it can never carry the design's closing claim (section 10: "no current
@@ -1220,15 +1220,20 @@ test('TRIPWIRE, NOT THE GUARANTEE: a bare Enter is SPELLED in exactly two places
   // for the ordinary case - someone pasting `write(id, '\r')` somewhere new.
   const writers = bareEnterWriters(read);
   const files = writers.map((w) => w.split(':')[0]).sort();
-  assert.deepEqual(files, ['src/main/automaticSubmit.ts', 'src/main/hiddenClaude.ts'],
-    `a bare Enter is written ONLY by the submit owner and by hiddenClaude's private PTY; found ${writers.join(', ')}`);
+  // 1.1.47 narrowed this to ONE: hiddenClaude stopped driving a PTY when condensation
+  // moved to a bounded `claude --print` process, so the submit owner is now the only
+  // place in main that spells a carriage return at all.
+  assert.deepEqual(files, ['src/main/automaticSubmit.ts'],
+    `a bare Enter is written ONLY by the submit owner; found ${writers.join(', ')}`);
   // The owner's one Enter is inside the critical section, nowhere else.
   const owner = read('src/main/automaticSubmit.ts');
   const section = owner.slice(owner.indexOf('export function commitSection('));
   assert.ok(section.slice(0, section.indexOf('\n}\n')).includes("safeWrite(deps, s.ptyId, '\\r')"), 'and the owner writes it inside commitSection');
-  // The exclusion is DECLARED where it lives, not merely tolerated here.
+  // hiddenClaude used to be the second speller, as a declared private PTY. It now runs a
+  // print-mode child with the prompt on STDIN, so the exclusion it needed is gone: there
+  // is no terminal, no Enter, and nothing to declare. Pinned so it cannot quietly return.
   const hidden = read('src/main/hiddenClaude.ts');
-  assert.match(hidden, /NOT routed through the main-owned submit transaction, and\s+\/\/ deliberately: this is a PRIVATE, hidden, single-use PTY/);
+  assert.ok(!/node-pty/.test(hidden), 'hiddenClaude must not go back to driving a PTY');
   assert.ok(!/ptyManager/.test(codeOnly(hidden)), 'hiddenClaude never touches an AGENT terminal: its code has no reference to ptyManager at all');
 });
 
@@ -1253,8 +1258,7 @@ const PTY_WRITERS = {
   'src/main/pty.ts': { 's.proc': 1 },                       // THE raw write, inside write(id, data, origin)
   'src/main/index.ts': { ptyManager: 1 },                   // the pty:write handler (renderer origin; PROGRAMMATIC refused)
   'src/main/automaticSubmitWiring.ts': { 'w.pty': 1 },      // the ONLY PROGRAMMATIC producer
-  'src/main/automaticSubmit.ts': { deps: 1 },               // safeWrite - the owner's one write
-  'src/main/hiddenClaude.ts': { ptyProc: 2 }                // a PRIVATE hidden PTY, declared, never an agent's
+  'src/main/automaticSubmit.ts': { deps: 1 }                // safeWrite - the owner's one write
 };
 const NON_PTY_WRITERS = {
   'src/main/index.ts': ['stream', 'roster'],                // a download stream; the roster file
@@ -1319,7 +1323,7 @@ function calleeCensus(readFile) {
   for (const [f, receivers] of Object.entries(NON_PTY_WRITERS)) {
     for (const receiver of receivers) assert.ok(found[f]?.[receiver], `CALLEE CENSUS: the allowlisted non-PTY writer \`${receiver}\` is still in ${f} (a stale allowance is a hole waiting for a name)`);
   }
-  assert.deepEqual([...new Set(importers)].sort(), ['src/main/hiddenClaude.ts', 'src/main/pty.ts'], 'CALLEE CENSUS: only these two files can hold a PTY process at all');
+  assert.deepEqual([...new Set(importers)].sort(), ['src/main/pty.ts'], 'CALLEE CENSUS: exactly ONE file can hold a PTY process at all (1.1.47: hiddenClaude gave its up for a print-mode child)');
   assert.equal(bareManager, 2, 'CALLEE CENSUS: the PTY manager appears as a bare value exactly twice in index.ts - its construction and its hand-off to the owner wiring - so it is never aliased');
   assert.deepEqual(channel.sort(), ['src/main/index.ts', 'src/preload/index.ts'], "CALLEE CENSUS: 'pty:write' is named once by its handler and once by its sender");
   assert.equal(safeWrites, 3, 'CALLEE CENSUS: the owner writes at exactly three points - the payload, the Enter, the measured clear');
