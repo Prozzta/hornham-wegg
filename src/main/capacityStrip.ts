@@ -62,6 +62,9 @@ export const STATE_TEXT: Record<CapacityState, string> = {
 // and this entry exists so the provider set stays exhaustive here.
 const PROVIDER_LABEL: Record<ProviderId, string> = { claude: 'Claude', codex: 'Codex', antigravity: 'Antigravity' };
 
+/** Antigravity's two allowance families, as people see them. Keyed by `limitId`. */
+const AGY_FAMILY_LABEL: Record<string, string> = { '3p': '3P', gemini: 'Gemini' };
+
 /**
  * One main-owned copy per reveal reason (C2.11 crit 18). The renderer never
  * concatenates semantic phrases, so the whole sentence is decided here.
@@ -179,6 +182,15 @@ export class CapacityStripPresenter {
    * One band implementation for all of them (`band`), so they cannot drift apart.
    */
   private readonly latches = new Map<string, WeeklyLatch>();
+  /**
+   * The lazy-row rule's two pieces of memory, per pool. EPHEMERAL and per app run: the
+   * visibility latch is per run by design, and this is UI-derived state that should
+   * rebuild itself from observations rather than be restored from disk. Pruned by the
+   * same end-of-compose line as the latches, so a pool that leaves and returns starts
+   * clean. Keyed by poolKey, not the opaque strip id: this never leaves main.
+   */
+  private readonly lastRemainder = new Map<string, string>();
+  private readonly moving = new Set<string>();
   private readonly notices = new Map<string, StoredNotice>();
   private collection: CapacityStripCollection = {
     collectionRevision: 0, domainRevision: 0, complete: true, emptyText: CAPACITY_EMPTY_TEXT, pools: []
@@ -247,6 +259,11 @@ export class CapacityStripPresenter {
     const pools: CapacityStripPool[] = [];
     for (const pool of inputs.snapshot.pools) {
       live.add(pool.poolKey);
+      // The lazy-row rule runs for EVERY pool, whether or not its row is shown: a pool
+      // has to be observed to be seen to move, and skipping hidden pools would mean the
+      // first consumption was the one reading that never got compared.
+      const show = this.isMoving(pool, inputs);
+      if (!show) continue;
       const body = this.poolBody(pool, inputs, T);
       const key = JSON.stringify(body);
       const prev = this.revisions.get(body.poolId);
@@ -257,6 +274,8 @@ export class CapacityStripPresenter {
     // A pool that left the complete-replace snapshot is gone: its latch and notice go
     // with it. Its revision counter stays, so a return continues upward.
     for (const k of [...this.latches.keys()]) if (!live.has(k.split('|')[0])) this.latches.delete(k);
+    for (const k of [...this.lastRemainder.keys()]) if (!live.has(k)) this.lastRemainder.delete(k);
+    for (const k of [...this.moving]) if (!live.has(k)) this.moving.delete(k);
     for (const k of [...this.notices.keys()]) if (!live.has(k)) this.notices.delete(k);
 
     const complete = inputs.snapshot.overflow === null;
@@ -499,12 +518,90 @@ export class CapacityStripPresenter {
   }
 
   /**
-   * The provider's name. There is only ever ONE pool per provider (human ruling at the
-   * strip review, 2026-09-21): at most two pools, Claude and Codex, so the name is the
-   * whole label and no second-account ordinal exists.
+   * The pool's name.
+   *
+   * The invariant is one pool per provider-ACCOUNT-LIMIT identity - not one per provider.
+   * That read the same until Antigravity: Claude and Codex each expose ONE current limit
+   * identity, so the provider name was the whole label (human ruling at the strip review,
+   * 2026-09-21, and still true of them). An Antigravity ACCOUNT exposes two allowance
+   * families at once, so its rows carry the family as well. No second-account ordinal
+   * exists for any provider.
    */
   private label(pool: PoolCapacitySnapshot): string {
-    return PROVIDER_LABEL[pool.provider];
+    const name = PROVIDER_LABEL[pool.provider];
+    // Antigravity is the one provider with two allowances per account, so the provider
+    // name alone would name two different rows. The family is part of the label, and the
+    // limit id IS the family (design 1.4). An unrecognised limit id falls back to the
+    // provider name rather than printing a raw identifier at a person.
+    if (pool.provider !== 'antigravity') return name;
+    const family = AGY_FAMILY_LABEL[pool.limitId];
+    return family ? `${name} · ${family}` : name;
+  }
+
+/**
+   * THE LAZY-ROW RULE (human ruling, 2026-09-23): "Two POSSIBLE rows. Surely we should
+   * see either 3P or Gemini moving? Once shown as moving, trigger that one. If the other
+   * starts, do that as well."
+   *
+   * Antigravity is the first provider whose account exposes TWO allowances, and most
+   * people only ever draw on one of them. Showing both from boot would put a permanently
+   * idle row on the strip next to a real one. So a row appears when its pool is MOVING,
+   * and thereafter stays.
+   *
+   * Moving is whichever comes first:
+   *   - CONSUMPTION: its remaining percentage changed between two readings we trusted; or
+   *   - GATING: a live agent's own readings land in this pool, i.e. its model draws on
+   *     this family. (`membersOf` is the runtime's accepted mapping, so an agent gating
+   *     on 3P reveals the 3P row before a single percentage has moved.)
+   *
+   * Applies to Antigravity only. Claude and Codex each expose ONE current limit identity,
+   * so their row has always been the provider's row and hiding it would be a regression.
+   */
+  private isMoving(pool: PoolCapacitySnapshot, inputs: CapacityStripInputs): boolean {
+    if (pool.provider !== 'antigravity') return true;
+    const key = pool.poolKey;
+    if (this.moving.has(key)) return true;                       // LATCHED for the run
+
+    const gating = inputs.membersOf(key).length > 0;
+
+    // SAFETY OVERRIDE (god, not negotiable). A pool that is out of allowance AND gating a
+    // live agent is always shown, even if it never moved this run: a hidden row silently
+    // blocking an agent is the one failure this strip must never have. It must not wait
+    // for a prior reading to compare against, so it is checked before the memory below.
+    //
+    // IT IS SUBSUMED BY THE GATING RULE BELOW, AND IS KEPT ANYWAY. The ratified rule makes
+    // gating a reveal on its own, so "blocking AND gating" can never be true while
+    // "gating" is false - deleting these two lines changes no behaviour today, and a
+    // mutant proved exactly that. They stay because the two rules answer different
+    // questions: gating is a display preference about idle rows, the override is a safety
+    // guarantee about blocked work. If gating is ever narrowed - to a fresh reading, to a
+    // recently-active agent - the preference may change; the guarantee may not. Written
+    // first and separately so that narrowing cannot silently take the guarantee with it.
+    const blocking = pool.state === 'LIMITED' || pool.state === 'RESERVE_ONLY';
+    if (blocking && gating) { this.moving.add(key); return true; }
+
+    // GATING: a live agent draws on this family (ratified rule 1b).
+    if (gating) { this.moving.add(key); return true; }
+
+    // CONSUMPTION. Only a FRESH reading is evidence: a STALE-RETAIN row re-presents the
+    // last safe numbers with their age, and re-reading them is not an observation. So a
+    // stale value neither overwrites what we remember nor counts as a change - otherwise
+    // a retained figure that happens to differ would reveal a row nobody consumed from.
+    if (pool.freshness !== 'FRESH') return false;
+    const now = remainderFingerprint(pool);
+    if (now === null) return false;                              // nothing numeric to compare
+    const before = this.lastRemainder.get(key);
+    if (before === undefined) { this.lastRemainder.set(key, now); return false; }  // seed only
+    if (before === now) return false;
+    // Compared EXACTLY, never with a tolerance: the percentage is derived deterministically
+    // from the provider's own fraction, so an unchanged reading is identical and any
+    // difference is real consumption. A tolerance would swallow exactly the small movement
+    // this rule exists to notice. A change that happened while the pool was STALE lands
+    // here on the next fresh reading, because it is compared against the last value we
+    // actually trusted - so consumption during a gap is revealed, not lost.
+    this.lastRemainder.set(key, now);
+    this.moving.add(key);
+    return true;
   }
 
   /**
@@ -529,6 +626,20 @@ export class CapacityStripPresenter {
   private opaque(value: string): string {
     return createHmac('sha256', this.idKey).update(value).digest('hex').slice(0, 16);
   }
+}
+
+/**
+ * What "the numbers moved" compares. Every APPLICABLE window's remaining percentage, in
+ * a stable order - not just one window, because a weekly allowance can be consumed while
+ * the five-hour figure is unchanged, and that is still the pool moving. null when the
+ * pool carries no numeric reading at all, which is not evidence of anything.
+ */
+function remainderFingerprint(pool: PoolCapacitySnapshot): string | null {
+  const parts = pool.windows
+    .filter((w) => applicabilityOf(w) === 'APPLICABLE' && validRemaining(w.remainingPercent) !== null)
+    .map((w) => `${w.windowId}=${w.remainingPercent}`)
+    .sort();
+  return parts.length ? parts.join('|') : null;
 }
 
 function provenanceOf(pool: PoolCapacitySnapshot): ProvenanceClass {
