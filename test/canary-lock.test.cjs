@@ -203,3 +203,83 @@ test('OBS-2: force still overrides a displaced-stash refusal', () => {
     { now: NOW, alive: false, force: true });
   assert.equal(d.action, 'steal');
 });
+
+// ─── OBS-1b: verify before unlink ───
+//
+// The staleness judgement is made against a record read a moment earlier. By the time
+// the steal runs, that record may belong to a DIFFERENT, live canary that took the lock
+// in between - and unlinking blind would delete a FRESH lock and put two runs in the same
+// dev root, the exact outcome this file exists to prevent. The seam is `ops.readFileSync`:
+// `acquire` judges with the real fs, the steal re-reads through ops, so a test can make
+// the file "change" between the two without a second process.
+
+const STALE_REC = (dir) => ({
+  pid: 999_999, agent: 'crashed', startedAt: NOW - 10 * STALE_AFTER_MS, devRoot: dir, dirty: false, stashed: []
+});
+
+/** ops whose first `wx` create reports EEXIST, so the steal path is always taken. */
+function stealOps({ reread, created = [] , unlinked = [] }) {
+  let creates = 0;
+  return {
+    readFileSync: reread,
+    unlinkSync: (path) => { unlinked.push(path); },
+    writeFileSync: (path, body, opts) => {
+      if (opts && opts.flag === 'wx') {
+        creates += 1;
+        if (creates === 1) { const e = new Error('EEXIST'); e.code = 'EEXIST'; throw e; }
+      }
+      created.push(path);
+    },
+    _unlinked: unlinked,
+    _created: created
+  };
+}
+
+test('OBS-1b: a stale lock REPLACED by a live one before the steal is refused, not removed', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'canary-lock-'));
+  writeFileSync(lockPath(dir), JSON.stringify(STALE_REC(dir)));
+  const unlinked = [];
+  // Between our judgement and our unlink, a live canary took the lock for itself.
+  const fresh = JSON.stringify({ ...STALE_REC(dir), pid: 4242, agent: 'jim', startedAt: NOW });
+  const ops = stealOps({ reread: () => fresh, unlinked });
+
+  assert.throws(() => acquire(dir, { agent: 'andy', now: NOW, ops }),
+    (e) => e.canaryLocked && /changed between the staleness check/.test(e.message),
+    'a lock that is no longer the one we judged must refuse');
+  assert.deepEqual(unlinked, [], 'and the live run\u2019s lock must still be on disk');
+});
+
+test('OBS-1b: the SAME stale lock is still stolen - the guard must not break recovery', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'canary-lock-'));
+  const stale = STALE_REC(dir);
+  writeFileSync(lockPath(dir), JSON.stringify(stale));
+  const unlinked = [];
+  const ops = stealOps({ reread: () => JSON.stringify(stale), unlinked });
+
+  const rec = acquire(dir, { agent: 'andy', now: NOW, ops });
+  assert.equal(rec.pid, process.pid);
+  assert.equal(unlinked.length, 1, 'genuine crash debris is still cleared');
+});
+
+test('OBS-1b: a lock that VANISHED before the steal is fine - wx still settles the race', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'canary-lock-'));
+  writeFileSync(lockPath(dir), JSON.stringify(STALE_REC(dir)));
+  const unlinked = [];
+  const gone = () => { const e = new Error('ENOENT'); e.code = 'ENOENT'; throw e; };
+  const ops = stealOps({ reread: gone, unlinked });
+
+  const rec = acquire(dir, { agent: 'andy', now: NOW, ops });
+  assert.equal(rec.pid, process.pid, 'nothing of ours is at risk, so the claim proceeds');
+});
+
+test('OBS-1b: CANARY_FORCE still overrides - it means override ANYTHING', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'canary-lock-'));
+  writeFileSync(lockPath(dir), JSON.stringify(STALE_REC(dir)));
+  const unlinked = [];
+  const fresh = JSON.stringify({ ...STALE_REC(dir), pid: 4242, agent: 'jim', startedAt: NOW });
+  const ops = stealOps({ reread: () => fresh, unlinked });
+
+  const rec = acquire(dir, { agent: 'andy', now: NOW, force: true, ops });
+  assert.equal(rec.pid, process.pid);
+  assert.equal(unlinked.length, 1, 'force already overrides a LIVE holder and a dirty lock; be consistent');
+});
