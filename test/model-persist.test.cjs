@@ -17,7 +17,7 @@ test('a status-line model is retained in the registry through an agent respawn',
   t.after(() => fs.rmSync(home, { recursive: true, force: true }));
   const hive = new HiveManager(() => home);
   await hive.ensureAgent({ id: 'worker-1', name: 'Worker', provider: 'claude', cwd: home });
-  hive.recordModel('worker-1', 'claude-opus-5-5[1m]');
+  hive.recordModel('worker-1', 'claude-opus-5-5[1m]', 'claude-fable-5');
   await hive.ensureAgent({ id: 'worker-1', name: 'Worker', provider: 'claude', cwd: home });
   assert.equal(hive.lastModel('worker-1'), 'claude-opus-5-5[1m]');
   const reg = JSON.parse(fs.readFileSync(path.join(home, 'hive', 'registry.json'), 'utf8'));

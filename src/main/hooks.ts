@@ -14,7 +14,7 @@ import { createServer, type Server } from 'node:net';
 import { existsSync, rmSync } from 'node:fs';
 import { Notification, type WebContents } from 'electron';
 import type { HiveManager } from './hive';
-import type { HarnessConfig } from './config';
+import { modelForHiveSpawn, type HarnessConfig } from './config';
 import type { ControlRegistry } from './control';
 import type { CircuitBreaker } from './breaker';
 import { estimateCostUsd } from './pricing';
@@ -183,7 +183,14 @@ export class HookServer {
       const statusModel = typeof p.model === 'object' && p.model !== null && typeof p.model.id === 'string'
         ? p.model.id.trim()
         : '';
-      if (agentId && statusModel) this.hive.recordModel(agentId, statusModel);
+      if (agentId && statusModel) {
+        const agent = this.hive.registry().agents[agentId];
+        // Do not let a bridged provider's display model become a future Claude
+        // argv. `recordModel` repeats this gate at the persistence boundary.
+        if (agent?.provider === 'claude') {
+          this.hive.recordModel(agentId, statusModel, modelForHiveSpawn(agent, this.getConfig()));
+        }
+      }
       const cw = p.context_window;
       if (agentId && cw && typeof cw.total_input_tokens === 'number'
         && typeof cw.context_window_size === 'number' && cw.context_window_size > 0) {

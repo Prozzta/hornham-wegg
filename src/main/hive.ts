@@ -46,6 +46,7 @@ import { selectBroadcastTargets } from '../shared/broadcast';
 import { preferredAgentRole } from '../shared/agentRole';
 import { mergeTaskLedger } from '../shared/taskLedger';
 import { expandTilde } from './fs';
+import { normalizeModel } from './pricing';
 
 /** The subset of HarnessConfig the hive consumes for the default-MCP merge.
  *  Kept as a local shape so hive.ts never imports the foundation-owned config
@@ -1103,16 +1104,35 @@ export class HiveManager {
     } catch { /* best-effort — never crash a hook handler */ }
   }
 
-  /** Persist a Claude status-line model only when it changes. This becomes the
-   *  per-agent default on a later respawn; explicit renderer `--model` still wins. */
-  recordModel(agentId: string, model: string): void {
+  /**
+   * Persist only a Claude `/model` divergence from the current app default.
+   * Returning to the default removes the pin, so Settings model changes continue
+   * to reach agents that have not deliberately selected another model.
+   */
+  recordModel(agentId: string, model: string, appDefault: string | undefined): void {
     const root = this.root();
     const next = model.trim();
     if (!root || !next) return;
     try {
       const reg = this.registry();
       const agent = reg.agents[agentId];
-      if (!agent || agent.model === next) return;
+      // Status payload shapes are shared by provider bridges. Only a real Claude
+      // agent may turn one into a Claude CLI argument on a later respawn.
+      if (!agent || agent.provider !== 'claude') return;
+      const key = normalizeModel(next).toLowerCase();
+      const defaultKey = normalizeModel(appDefault).toLowerCase();
+      if (defaultKey && key === defaultKey) {
+        if (!agent.model) return;
+        delete agent.model;
+        agent.lastSeen = Date.now();
+        this.atomicWriteJson(join(root, 'registry.json'), reg);
+        this.appendLog({ kind: 'model', agentId, model: null });
+        this.commit(`hive: model default ${agentId}`);
+        return;
+      }
+      // A status line may spell an already-saved 1M variant differently. Compare
+      // canonically so such reports do not churn registry writes or flip the pin.
+      if (normalizeModel(agent.model).toLowerCase() === key) return;
       agent.model = next;
       agent.lastSeen = Date.now();
       this.atomicWriteJson(join(root, 'registry.json'), reg);
