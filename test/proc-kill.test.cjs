@@ -27,8 +27,15 @@ fs.writeFileSync(path.join(out, 'procKill.js'), js, 'utf8');
 const { isAlive, hardKillTree, ensureKilled } = require(path.join(out, 'procKill.js'));
 
 if (process.platform === 'win32') {
-  console.log('  ok  (win32: smoke import only — POSIX group semantics not applicable)');
-  process.exit(0);
+  // The smoke import above IS the win32 assertion; everything below is POSIX-only. This
+  // used to `process.exit(0)`, which `node --test` counts as a plain `ok 1` with no marker
+  // at all — a file asserting nothing, indistinguishable in the summary from one that
+  // proved the whole group-reap. Announce the inertness instead, so it lands in `# skipped`.
+  require('./tools/inert.cjs').announceInert(
+    'procKill POSIX group semantics',
+    'win32: smoke import only — POSIX process-group semantics do not apply (the Windows path is taskkill /T /F)'
+  );
+  return;
 }
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
