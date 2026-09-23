@@ -911,7 +911,9 @@ const api = {
   /** Condense agent memory.md files (the janitor's missing half). With an id,
    *  condense that agent on demand; without, run a full threshold scan. Returns
    *  the per-agent outcomes ({ id, condensed, reason, oldBytes?, newBytes? }). */
-  reflectNow: (id?: string): Promise<Array<{ id: string; condensed: boolean; reason: string; oldBytes?: number; newBytes?: number }>> =>
+  // `passes` > 1 means an oversized file was dug out across several calls; `oldBytes`
+  // is then the size before the FIRST pass, not the last. GATE-4 asserts on it.
+  reflectNow: (id?: string): Promise<Array<{ id: string; condensed: boolean; reason: string; oldBytes?: number; newBytes?: number; passes?: number }>> =>
     ipcRenderer.invoke('memory:reflectNow', id),
 
   // ─── Enterprise Knowledge Graph (multimodal context for agents) ───────────

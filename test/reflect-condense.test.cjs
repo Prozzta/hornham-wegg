@@ -15,7 +15,7 @@ const os = require('node:os');
 const path = require('node:path');
 const loadTs = require('./load-ts.cjs');
 
-const { MemoryReflector, validateSummary } = loadTs('src/main/reflect.ts');
+const { MemoryReflector, validateSummary, planEviction, buildCondensePrompt } = loadTs('src/main/reflect.ts');
 
 const PINNED_HEADING = '## 📌 Durable facts (pinned — never condensed)';
 const CONDENSED_HEADING = '## 🗜 Condensed history';
@@ -171,4 +171,190 @@ test('validateSummary prefers structured output and refuses everything inexact',
   ]) {
     assert.equal(validateSummary(structured, result), null, `must refuse ${why}`);
   }
+});
+
+
+// ─── the byte bound and the dig-out (condense-packaged-fail) ─────────────────
+//
+// WHAT THESE ENCODE. Packaged 1.1.47: god's 944 KB memory.md produced a condense
+// prompt the model refused outright - terminal_reason 'prompt_too_long',
+// api_error_status 400, "~313578 tokens (limit 200000)". Nothing bounded the prompt
+// but the section COUNT, so its weight was whatever those sections happened to be,
+// and every retry was refused for the same reason: the file could never recover.
+// Now one pass carries a bounded chunk and the file walks down across passes.
+
+/** Mirrors the module's private constants. If either moves, these tests should be
+ *  read again rather than quietly re-baselined - they are the contract. */
+const MAX_PROMPT_BYTES = 300_000;
+const BUDGET_BYTES = 131_072;
+
+const bytes = (t) => Buffer.byteLength(t, 'utf8');
+const sect = (heading, body) => ({ heading, body });
+
+/** n sections of roughly "each" bytes, oldest first. */
+function sections(n, each = 10_000) {
+  const body = 'detail '.repeat(Math.ceil(each / 7));
+  return Array.from({ length: n }, (_, i) => sect('## day ' + i, 'item ' + i + ': ' + body));
+}
+
+/** A memory.md built from given sections, in the canonical three-region shape. */
+function memoryOf(secs, { condensed = 'previously condensed history', pinned = '- pinned: never lose this line' } = {}) {
+  return ['# Andy memory', '', PINNED_HEADING, pinned, '', CONDENSED_HEADING, condensed, '', RECENT_HEADING,
+    ...secs.flatMap((x) => [x.heading, x.body, ''])].join('\n');
+}
+
+/** fixture(), but with memory content of our choosing. */
+function fixtureWith(text, runHidden, settings = {}) {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'reflect-'));
+  const agentDir = path.join(home, 'hive', 'agents', 'andy');
+  fs.mkdirSync(agentDir, { recursive: true });
+  const mem = path.join(agentDir, 'memory.md');
+  fs.writeFileSync(mem, text);
+  const logs = [];
+  const reflector = new MemoryReflector(
+    () => home, () => 'claude', () => ({}),
+    () => ({ enabled: true, intervalMs: 60_000, byteTriggerPct: 50, sectionTrigger: 10, recentKeep: 5, minBytes: 1, ...settings }),
+    (e) => logs.push(e),
+    runHidden
+  );
+  return { home, mem, logs, reflector, cleanup: () => fs.rmSync(home, { recursive: true, force: true }) };
+}
+
+/** A runner that records every prompt it is given and returns a short summary. */
+function recordingRunner(summary = 'a much shorter history') {
+  const prompts = [];
+  const run = async (prompt) => {
+    prompts.push(prompt);
+    return { ok: true, structuredOutput: { condensed: summary, hoist: [] } };
+  };
+  return { run, prompts };
+}
+
+test('planEviction: bounds ONE call by BYTES, and defers the rest instead of dropping it', () => {
+  const secs = sections(100);                       // ~1 MB of backlog
+  const plan = planEviction(null, null, secs);
+
+  assert.ok(plan.fits, 'ordinary sections must fit');
+  assert.ok(plan.take.length > 0 && plan.take.length < secs.length,
+    'a 1 MB backlog must be split, not taken whole');
+  assert.ok(plan.promptBytes <= MAX_PROMPT_BYTES,
+    'THE regression: the prompt is bounded by bytes, not by section count');
+  assert.deepEqual([...plan.take, ...plan.defer], secs,
+    'take + defer must reconstruct the backlog EXACTLY - nothing may be lost in the split');
+});
+
+test('planEviction: measures the REAL prompt, not an estimate of it', () => {
+  const plan = planEviction('some prior summary', '- pinned: x', sections(50));
+  assert.equal(plan.promptBytes, bytes(buildCondensePrompt('some prior summary', plan.take, '- pinned: x')),
+    'the planner and the call must build the same artifact, or the budget drifts');
+});
+
+test('planEviction: takes the OLDEST first, so the summary stays chronological', () => {
+  const secs = sections(100);
+  const plan = planEviction(null, null, secs);
+  assert.equal(plan.take[0].heading, '## day 0');
+  assert.equal(plan.defer[plan.defer.length - 1].heading, '## day 99');
+});
+
+test('planEviction: REFUSES when one atomic section alone exceeds the cap', () => {
+  // A '## ' section is indivisible - splitting one puts half a thought in the summary
+  // and orphans the other half. There is nothing to do but refuse.
+  const plan = planEviction(null, null, [sect('## huge', 'x'.repeat(MAX_PROMPT_BYTES + 1))]);
+  assert.equal(plan.fits, false);
+  assert.equal(plan.take.length, 0, 'and it must not pretend to take it');
+});
+
+test('planEviction: REFUSES when the fixed overhead alone exceeds the cap', () => {
+  // Not the same case: here the backlog is tiny and the CURRENT summary is the problem.
+  const plan = planEviction('y'.repeat(MAX_PROMPT_BYTES + 1), null, sections(2, 100));
+  assert.equal(plan.fits, false);
+  assert.ok(plan.overheadBytes > MAX_PROMPT_BYTES, 'and it says which half did not fit');
+});
+
+test('DEFERRED SECTIONS SURVIVE A PASS BYTE-FOR-BYTE - the silent-data-loss regression', async () => {
+  // rebuild() writes pinned + summary + kept sections. A section that this pass did NOT
+  // summarize is in none of those unless it is explicitly carried over, so getting this
+  // wrong eats memory quietly: the file shrinks, every check passes, and the content is
+  // simply gone.
+  //
+  // Sized so ONE pass lands under budget while still deferring a remainder - otherwise
+  // the loop correctly eats the deferred sections on a later pass and there is nothing
+  // left to observe. (It ran green against a first draft of this test for exactly that
+  // reason: the invariant is per-pass, so the assertion has to be per-pass too.)
+  const secs = sections(38);
+  const f = fixtureWith(memoryOf(secs), recordingRunner().run);
+  const [r] = await f.reflector.reflectNow('andy');
+
+  assert.equal(r.condensed, true, r.reason);
+  assert.equal(r.passes, 1, 'this fixture must settle in ONE pass for the check below to mean anything');
+  const row = f.logs.find((e) => e.kind === 'condense');
+  assert.ok(row.deferred > 0, 'and it must actually defer something, or it proves nothing');
+
+  const after = fs.readFileSync(f.mem, 'utf8');
+  for (const x of secs.slice(row.evicted)) {
+    // rebuild() right-trims each section, so compare the shape it actually writes.
+    const want = (x.heading + '\n' + x.body).replace(/\s+$/, '');
+    assert.ok(after.includes(want), 'section lost: ' + x.heading);
+  }
+  f.cleanup();
+});
+
+test('PRE-FLIGHT REFUSAL: an unfittable input fails NAMED, and spends no API call', async () => {
+  const secs = [sect('## huge', 'x'.repeat(MAX_PROMPT_BYTES + 1)), ...sections(6, 1000)];
+  let called = 0;
+  const f = fixtureWith(memoryOf(secs), async () => { called++; return { ok: true }; });
+  const before = fs.readFileSync(f.mem, 'utf8');
+  const [r] = await f.reflector.reflectNow('andy');
+
+  assert.equal(r.reason, 'prompt-too-large', 'NAMED - not a bare "claude exited 1"');
+  assert.equal(r.condensed, false);
+  assert.equal(called, 0, 'THE point: the refusal is free. Discovering this cost a 400 before.');
+  assert.equal(fs.readFileSync(f.mem, 'utf8'), before, 'and the file is untouched');
+  const abort = f.logs.find((e) => e.kind === 'condense-abort');
+  assert.equal(abort.reason, 'prompt-too-large');
+  assert.match(String(abort.detail), /exceeds the 300000 B cap/, 'the log says which limit and by how much');
+  f.cleanup();
+});
+
+test('ITERATE: an oversized file digs DOWN UNDER BUDGET across passes', async () => {
+  const secs = sections(80);                        // ~800 KB: unfixable in one call
+  const rec = recordingRunner();
+  const f = fixtureWith(memoryOf(secs), rec.run);
+  const startBytes = bytes(fs.readFileSync(f.mem, 'utf8'));
+  assert.ok(startBytes > MAX_PROMPT_BYTES, 'fixture must exceed one call to be the case under test');
+
+  const [r] = await f.reflector.reflectNow('andy');
+
+  assert.equal(r.condensed, true, r.reason);
+  assert.ok(r.passes > 1, 'one call cannot do it - it must take several, got ' + r.passes);
+  assert.equal(r.oldBytes, startBytes, 'oldBytes is the ORIGINAL size, not the last pass input');
+  assert.ok(r.newBytes <= BUDGET_BYTES,
+    'the whole objective: ' + startBytes + ' B -> ' + r.newBytes + ' B, under ' + BUDGET_BYTES);
+  for (const prompt of rec.prompts) {
+    assert.ok(bytes(prompt) <= MAX_PROMPT_BYTES, 'EVERY pass stays inside the cap, not just the first');
+  }
+  assert.ok(fs.readFileSync(f.mem, 'utf8').includes('- pinned: never lose this line'),
+    'and the pinned line survives every pass');
+  f.cleanup();
+});
+
+test('ITERATE: stops at the per-scan cap instead of monopolising the sweep', async () => {
+  const f = fixtureWith(memoryOf(sections(300)), recordingRunner().run);   // ~3 MB
+  const [r] = await f.reflector.reflectNow('andy');
+
+  assert.equal(r.passes, 6, 'MAX_PASSES_PER_SCAN - the other agents get their turn');
+  assert.ok(r.newBytes < r.oldBytes, 'progress is still real; the next tick resumes it');
+  f.cleanup();
+});
+
+test('ITERATE: a pass that makes no progress stops the loop - never spins', async () => {
+  // The rewrite is rejected (not-smaller), so condensed:false and the loop must end.
+  const f = fixtureWith(memoryOf(sections(80)), async () => ({
+    ok: true, structuredOutput: { condensed: 'z'.repeat(900_000), hoist: [] }
+  }));
+  const [r] = await f.reflector.reflectNow('andy');
+
+  assert.equal(r.condensed, false);
+  assert.equal(r.passes, 1, 'a refused rewrite must not be retried with the same input');
+  f.cleanup();
 });

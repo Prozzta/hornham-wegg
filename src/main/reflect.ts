@@ -31,8 +31,53 @@ import { runHiddenClaude, type HiddenClaudeDiag } from './hiddenClaude';
 const BUDGET_BYTES = 131_072;
 /** Cheap tail-summarizer (DECIDED by god). The verify gate covers quality. */
 const CONDENSE_MODEL = 'claude-haiku-4-5';
-/** Hard cap so a wedged headless run can't stall the reflect loop. */
+/**
+ * Hard cap so a wedged headless run can't stall the reflect loop.
+ *
+ * DELIBERATELY UNCHANGED while MAX_PROMPT_BYTES was introduced (god, 2026-09-23).
+ * One packaged failure was a 180 s timeout on a ~600 KB file, and raising this was the
+ * obvious-looking fix. It is the wrong one to reach for first: bounding the prompt
+ * shrinks every call, which is the likelier cure, and a bigger budget would have HIDDEN
+ * the remaining possibility — contention with the floor's other live agents — rather
+ * than answered it. Raise this only when a `condense-diag` breadcrumb shows a prompt
+ * that was INSIDE the byte budget and still ran long.
+ */
 const DEFAULT_TIMEOUT_MS = 180_000;
+
+/**
+ * Hard ceiling on ONE condense prompt.
+ *
+ * WHAT THIS IS DEFENDING (packaged 1.1.47, 2026-09-23). A condense prompt is the
+ * evicted sections, and nothing bounded them but their COUNT — so their weight was
+ * whatever those sections happened to be. god's 944 KB memory produced a prompt the
+ * model refused outright: `terminal_reason: 'prompt_too_long'`, `api_error_status: 400`,
+ * "~313578 tokens (limit 200000)". Measured against the real CLI, the usable share of
+ * the 200K window is ~126K tokens - about 500 KB of text - because roughly 74K tokens
+ * go to the CLI's own system prompt and tool definitions before our first byte.
+ *
+ * 300 KB leaves a wide margin under that ~500 KB cliff, because the margin is paying
+ * for things we cannot measure from here: tokens-per-byte varies with content, and the
+ * CLI's own overhead is its business and may grow. A condense that is one release away
+ * from refusing everything is not a condense.
+ */
+const MAX_PROMPT_BYTES = 300_000;
+
+/**
+ * How many condense passes one scan will spend on a single file.
+ *
+ * A file far over budget cannot be fixed in one call any more - it digs out a chunk at
+ * a time. Bounded because the scan is serial: every pass one agent spends is a pass the
+ * others in the same sweep are waiting through. When the cap is hit the file is left
+ * smaller than it was and the next interval tick continues, so the dig-out completes
+ * across scans instead of monopolising one.
+ *
+ * SIX, not four. The worst real backlog measured was 944 KB (god's, 2026-09-23), and at
+ * MAX_PROMPT_BYTES a file that size needs four passes to reach budget - so four would
+ * clear it only if the arithmetic were perfect, and would leave the actual motivating
+ * case straddling a scan boundary. Six clears it with room and still terminates: the
+ * no-progress guard, not this number, is what makes the loop safe.
+ */
+const MAX_PASSES_PER_SCAN = 6;
 
 /** The fixed region headings of the bounded memory shape (the stable contract). */
 const PINNED_HEADING = '## 📌 Durable facts (pinned — never condensed)';
@@ -103,6 +148,23 @@ export interface ReflectResult {
   reason: string;            // why (skipped/aborted/done), for logging + UI
   oldBytes?: number;
   newBytes?: number;
+  /** How many condense passes this scan spent here. >1 means a backlog was dug out;
+   *  `oldBytes` is the size before the FIRST pass, `newBytes` after the last. */
+  passes?: number;
+}
+
+/** What one pass will actually send, decided before the call is spent. */
+export interface EvictionPlan {
+  /** The oldest sections that fit in this call, in file order. */
+  take: Section[];
+  /** The rest — kept VERBATIM in the rewritten file for a later pass to eat. */
+  defer: Section[];
+  /** False when not even the single oldest section fits: refuse, don't spend a call. */
+  fits: boolean;
+  /** The fixed cost (instructions + current summary + pinned) before any section. */
+  overheadBytes: number;
+  /** The measured size of the prompt this plan produces. */
+  promptBytes: number;
 }
 
 export class MemoryReflector {
@@ -179,7 +241,7 @@ export class MemoryReflector {
           if (!onlyId && !this.shouldCondense(bytes, mem, settings)) continue;
           text = readFileSync(mem, 'utf8');
         } catch { continue; }
-        results.push(await this.condense(home, id, mem, text, settings));
+        results.push(await this.condenseToBudget(home, id, mem, text, settings));
       }
     } finally {
       this.reflecting = false;
@@ -198,7 +260,53 @@ export class MemoryReflector {
     return sections > s.sectionTrigger;
   }
 
-  // — condense one file —
+  // — condense one file, as many passes as it takes —
+
+  /**
+   * Run condense passes until the file is under budget.
+   *
+   * WHY THIS LOOP EXISTS. One pass carries at most MAX_PROMPT_BYTES of backlog, so a
+   * file several times over budget cannot be fixed by a single call — and before the
+   * byte bound it was not fixed by ANY number of calls, because every one of them was
+   * refused for the same reason. god's memory reached 944 KB (7.2x budget) exactly this
+   * way. Each pass eats the oldest chunk it can carry and writes the rest back
+   * verbatim, so the file walks down instead of failing in place.
+   *
+   * Four stop conditions, and each one matters:
+   *   - under budget — done;
+   *   - a pass that did not condense (abort, nothing-to-evict, a refused rewrite) —
+   *     retrying it would repeat the same call with the same input;
+   *   - no progress — a pass that did not actually shrink the file cannot be the first
+   *     of a series that does, and this is the guard that makes the loop terminate
+   *     even if some future change breaks the arithmetic above;
+   *   - MAX_PASSES_PER_SCAN — the scan is serial, and the next tick resumes the dig-out.
+   *
+   * The result reports the ORIGINAL size and the FINAL one, so a caller sees the whole
+   * descent rather than the last step of it.
+   */
+  private async condenseToBudget(
+    home: string, id: string, mem: string, text: string, s: ReflectSettings
+  ): Promise<ReflectResult> {
+    const firstBytes = Buffer.byteLength(text, 'utf8');
+    let current = text;
+    let last: ReflectResult | null = null;
+    let passes = 0;
+
+    while (passes < MAX_PASSES_PER_SCAN) {
+      const before = Buffer.byteLength(current, 'utf8');
+      const r = await this.condense(home, id, mem, current, s);
+      passes++;
+      last = r;
+      if (!r.condensed) break;
+      const after = r.newBytes ?? before;
+      if (after >= before) break;                      // no progress — never loop on it
+      if (after <= BUDGET_BYTES) break;                // done
+      try { current = readFileSync(mem, 'utf8'); } catch { break; }
+    }
+
+    const final = last ?? { id, condensed: false, reason: 'no-pass-ran' };
+    return { ...final, oldBytes: firstBytes, passes };
+  }
 
   private async condense(
     home: string, id: string, mem: string, text: string, s: ReflectSettings
@@ -211,6 +319,22 @@ export class MemoryReflector {
     const evict = parsed.recent.slice(0, Math.max(0, parsed.recent.length - keepCount));
     if (evict.length === 0) {
       return { id, condensed: false, reason: 'nothing-to-evict', oldBytes };
+    }
+
+    // How much of that backlog fits in ONE call. The rest is DEFERRED — rewritten
+    // verbatim into the new file, not dropped — and a later pass takes the next chunk.
+    const plan = planEviction(parsed.condensed, parsed.pinned, evict);
+    if (!plan.fits) {
+      // PRE-FLIGHT REFUSAL. Named, and free: an unfittable input used to be discovered
+      // by spending the call and reading back `claude exited 1`.
+      const why = plan.take.length === 0 && evict.length > 0
+        ? `oldest section ${Buffer.byteLength(sectionText(evict[0]), 'utf8')} B + overhead ` +
+          `${plan.overheadBytes} B exceeds the ${MAX_PROMPT_BYTES} B cap`
+        : `prompt ${plan.promptBytes} B exceeds the ${MAX_PROMPT_BYTES} B cap`;
+      this.logAbort(id, 'prompt-too-large', why, {
+        oldBytes, overheadBytes: plan.overheadBytes, maxPromptBytes: MAX_PROMPT_BYTES
+      });
+      return { id, condensed: false, reason: 'prompt-too-large', oldBytes };
     }
 
     // 1) BACK UP first — a lossless cold copy makes every later step recoverable.
@@ -227,7 +351,7 @@ export class MemoryReflector {
     // 2) SUMMARIZE the (condensed + evicted) tail via headless Haiku.
     let summary: { condensed: string; hoist: string[] };
     try {
-      summary = await this.summarize(home, parsed.condensed, evict, parsed.pinned);
+      summary = await this.summarize(home, parsed.condensed, plan.take, parsed.pinned);
     } catch (e) {
       this.logAbort(id, 'summarize-failed', String(e));
       this.logDiag(id, (e as { diag?: HiddenClaudeDiag }).diag, oldBytes);
@@ -237,13 +361,17 @@ export class MemoryReflector {
     // 3) REBUILD into the 3-region shape.
     const oldPinnedLines = pinnedLines(parsed.pinned);
     const mergedPinned = mergePinned(oldPinnedLines, summary.hoist);
-    const rebuilt = rebuild(parsed.header, mergedPinned, summary.condensed, keep);
+    // The DEFERRED sections lead the kept ones, preserving file order. They are not in
+    // the summary, so if they were not written back they would simply be lost — and
+    // verify() round-trips every one of them byte-for-byte, deferred and kept alike.
+    const survivors = [...plan.defer, ...keep];
+    const rebuilt = rebuild(parsed.header, mergedPinned, summary.condensed, survivors);
     const newBytes = Buffer.byteLength(rebuilt, 'utf8');
 
     // 4) VERIFY-DON'T-TRUST — reject the rewrite unless every check holds.
     const verdict = verify({
       rebuilt, newBytes, oldBytes, oldPinnedLines, mergedPinned,
-      condensed: summary.condensed, keep
+      condensed: summary.condensed, keep: survivors
     });
     if (!verdict.ok) {
       this.logAbort(id, verdict.reason, undefined, { oldBytes, newBytes });
@@ -261,7 +389,10 @@ export class MemoryReflector {
     try {
       this.appendLog({
         kind: 'condense', agentId: id, oldBytes, newBytes,
-        evicted: evict.length, kept: keep.length, hoisted: summary.hoist.length, backup
+        // `evicted` is what THIS pass summarized; `deferred` is the backlog still to go,
+        // which is what tells a reader another pass is coming.
+        evicted: plan.take.length, deferred: plan.defer.length, kept: keep.length,
+        promptBytes: plan.promptBytes, hoisted: summary.hoist.length, backup
       });
     } catch { /* logging is best-effort */ }
     // The miner re-indexes within its next cycle — mtime changed, no extra wiring.
@@ -288,20 +419,7 @@ export class MemoryReflector {
   private async summarize(
     home: string, condensed: string | null, evict: Section[], pinned: string | null
   ): Promise<{ condensed: string; hoist: string[] }> {
-    const evictText = evict.map((s) => `${s.heading}\n${s.body}`).join('\n\n').trim();
-    const prompt = [
-      CONDENSE_SYSTEM,
-      '',
-      '--- INPUT ---',
-      '(A) CURRENT CONDENSED SUMMARY:',
-      condensed?.trim() || '(none yet)',
-      '',
-      '(B) OLDER SECTIONS BEING EVICTED:',
-      evictText || '(none)',
-      '',
-      '(C) PINNED DURABLE FACTS (context only — do not rewrite):',
-      pinned?.trim() || '(none)'
-    ].join('\n');
+    const prompt = buildCondensePrompt(condensed, evict, pinned);
 
     const result = await this.runHidden(prompt, {
       model: CONDENSE_MODEL,
@@ -330,6 +448,73 @@ export class MemoryReflector {
 }
 
 // ─── pure helpers (the deterministic, unit-testable half) ────────────────────
+
+/** One section as it appears in a prompt and in a rebuilt file — the SAME text in
+ *  both, so planning measures exactly what gets sent and verify compares like for like. */
+function sectionText(s: Section): string {
+  return `${s.heading}\n${s.body}`.replace(/\s+$/, '');
+}
+
+/**
+ * Build the condense prompt. Exported and used by BOTH the planner and the call, so the
+ * byte budget is enforced against the artifact that is actually sent — never against an
+ * estimate that can drift away from it.
+ */
+export function buildCondensePrompt(
+  condensed: string | null, evict: Section[], pinned: string | null
+): string {
+  const evictText = evict.map(sectionText).join('\n\n').trim();
+  return [
+    CONDENSE_SYSTEM,
+    '',
+    '--- INPUT ---',
+    '(A) CURRENT CONDENSED SUMMARY:',
+    condensed?.trim() || '(none yet)',
+    '',
+    '(B) OLDER SECTIONS BEING EVICTED:',
+    evictText || '(none)',
+    '',
+    '(C) PINNED DURABLE FACTS (context only — do not rewrite):',
+    pinned?.trim() || '(none)'
+  ].join('\n');
+}
+
+/**
+ * Decide how much of the backlog ONE call may carry.
+ *
+ * Oldest-first, because the oldest material is what the rolling summary is for and
+ * because taking it in file order keeps the deferred remainder contiguous with the kept
+ * newest sections — the rewritten file stays in chronological order either way.
+ *
+ * `fits: false` is the case worth naming: the fixed overhead alone, or one indivisible
+ * section, is already over the cap. A `## ` section is atomic — splitting one would put
+ * half a thought in the summary and leave the other half orphaned — so there is nothing
+ * to do but refuse, and refusing here costs no API call.
+ */
+export function planEviction(
+  condensed: string | null, pinned: string | null, evict: Section[], maxBytes = MAX_PROMPT_BYTES
+): EvictionPlan {
+  const overheadBytes = Buffer.byteLength(buildCondensePrompt(condensed, [], pinned), 'utf8');
+  const take: Section[] = [];
+  let total = overheadBytes;
+  for (const s of evict) {
+    // +2 for the '\n\n' this section will be joined with. Over-counting the first
+    // section by two bytes is the safe direction to be wrong in.
+    const cost = Buffer.byteLength(sectionText(s), 'utf8') + 2;
+    if (total + cost > maxBytes) break;
+    total += cost;
+    take.push(s);
+  }
+  // Measure the real thing once, rather than trusting the running total.
+  const promptBytes = Buffer.byteLength(buildCondensePrompt(condensed, take, pinned), 'utf8');
+  return {
+    take,
+    defer: evict.slice(take.length),
+    fits: take.length > 0 && promptBytes <= maxBytes,
+    overheadBytes,
+    promptBytes
+  };
+}
 
 /** Count level-2 (`## `) headings — `# ` H1 and `### ` deeper headings excluded. */
 export function countSections(text: string): number {

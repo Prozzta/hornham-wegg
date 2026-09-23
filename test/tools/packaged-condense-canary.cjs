@@ -9,6 +9,10 @@
  * condensation end to end.
  *
  * Two passes, per the design:
+ *   0. a ~1.1 MB backlog DIGS OUT across passes and ends under budget, with every
+ *      single pass inside the prompt cap; and an UNFITTABLE memory is refused BY NAME
+ *      (prompt-too-large) without spending an API call. Added after 1.1.47 shipped:
+ *      this gate passed 18/18 on a 90 KB fixture while the floor held 430-944 KB files.
  *   1. an oversized fixture memory condenses: one `condense` row, NOT `condense-abort`,
  *      a smaller file, and a backup of the original;
  *   2. the same again while OTHER transcripts in the same Claude project namespace are
@@ -76,12 +80,58 @@ const CONDENSED = '## \u{1F5DC} Condensed history';
 const RECENT = '## Recent';
 const CANARY_PIN = '- pinned: this line must survive the condensation byte-for-byte';
 
-function fixtureMemory() {
+/** Mirrors reflect.ts. If either moves there, this gate must be re-read, not
+ *  re-baselined - these are the numbers it exists to certify. */
+const BUDGET_BYTES = 131_072;
+const MAX_PROMPT_BYTES = 300_000;
+
+/**
+ * How big the dig-out fixture is.
+ *
+ * WHY IT IS THIS BIG NOW. Until 1.1.47 this gate used 40 small sections - about 90 KB -
+ * and passed 18/18 while the real floor files were 430 KB, 601 KB and 944 KB. It
+ * certified a size the floor does not have, so it could not see the defect that took
+ * the release down: a prompt past the model's context window, refused with
+ * 'prompt_too_long'. 110 sections is ~1.1 MB, at or above the largest real memory
+ * observed (god's, 944,234 B on 2026-09-23).
+ *
+ * Lower it with CANARY_SECTIONS for a quick local run - but a RELEASE run uses the
+ * default, because a gate that is cheaper than production is the bug this is fixing.
+ */
+const BACKLOG_SECTIONS = Number(process.env.CANARY_SECTIONS || 110);
+
+function fixtureMemory(sectionCount = BACKLOG_SECTIONS) {
   const out = ['# condense canary memory', '', PINNED, CANARY_PIN, '', CONDENSED,
     `Earlier history of this agent. ${'It shipped a release and wrote it down. '.repeat(300)}`, '', RECENT];
-  for (let i = 0; i < 40; i++) {
+  for (let i = 0; i < sectionCount; i++) {
     out.push(`## 2026-09-${String((i % 28) + 1).padStart(2, '0')} standup ${i}`);
-    out.push(`Worked item ${i}: ${'a long line of recorded detail that needs compacting. '.repeat(40)}`);
+    out.push(`Worked item ${i}: ${'a long line of recorded detail that needs compacting. '.repeat(190)}`);
+    out.push('');
+  }
+  return out.join('\n');
+}
+
+/**
+ * A memory whose OLDEST section alone is larger than one call may carry.
+ *
+ * A '## ' section is atomic - splitting one would put half a thought in the summary and
+ * orphan the other half - so this input can never be condensed, at any size limit. The
+ * only correct behaviour is to say so BY NAME and spend no API call. Before 1.1.47 the
+ * equivalent input was discovered by spending the call and reading back 'claude exited 1'.
+ */
+function overflowMemory() {
+  const giant = 'an indivisible wall of recorded detail. '.repeat(Math.ceil(MAX_PROMPT_BYTES / 39) + 500);
+  const out = ['# condense canary memory', '', PINNED, CANARY_PIN, '', CONDENSED,
+    'Earlier history of this agent.', '', RECENT];
+  // The giant goes FIRST (oldest) and is followed by comfortably more than
+  // reflectRecentKeep sections, so it lands in the evict list rather than the kept
+  // tail. A first draft used 8 followers, fewer than recentKeep: every section was
+  // kept, evict was empty, and the gate reported 'nothing-to-evict' - a pass for the
+  // wrong reason that would have certified nothing at all.
+  out.push('## 2026-09-01 the indivisible one', giant, '');
+  for (let i = 0; i < 20; i++) {
+    out.push(`## 2026-09-${String((i % 27) + 2).padStart(2, '0')} standup ${i}`);
+    out.push(`Worked item ${i}: ${'ordinary detail. '.repeat(50)}`);
     out.push('');
   }
   return out.join('\n');
@@ -124,9 +174,18 @@ function seed() {
     harnessHome: DEV_ROOT,
     onboardingComplete: true,
     orchestratorMaySpawn: false,
-    // No autonomous loop: this canary drives reflectNow explicitly, so the only
-    // condensation in the log is the one it asked for.
-    reflect: { enabled: false, intervalMs: 3_600_000, byteTriggerPct: 50, sectionTrigger: 10, recentKeep: 5, minBytes: 1024 }
+    // FLAT keys, because that is what index.ts reads (`c.reflectRecentKeep ?? 12`).
+    // This canary previously seeded a nested `reflect: { ... }` object, which the app
+    // never looks at - so every setting here was inert. The "no autonomous loop"
+    // guarantee below was fiction: the gate was relying on the 30-minute default
+    // interval not happening to fire inside a two-minute run. It got the right answer
+    // for the wrong reason, which is the kind of thing this file exists to catch.
+    reflectEnabled: false,          // no autonomous loop: this canary drives reflectNow itself
+    reflectIntervalMs: 3_600_000,
+    reflectByteTriggerPct: 50,
+    reflectSectionTrigger: 10,
+    reflectRecentKeep: 12,          // pinned to the production default, not left to drift
+    reflectMinBytes: 1024
   }, null, 2));
   // No restorable agents: this gate needs no terminals, and spawning none keeps the run
   // to exactly one hidden child - the one under test.
@@ -292,8 +351,8 @@ function backupsFor() {
 
 // ─── the two passes ───
 
-async function pass(send, memPath, label, { decoys = false } = {}) {
-  writeFileSync(memPath, fixtureMemory());
+async function pass(send, memPath, label, { decoys = false, make = fixtureMemory, digOut = false } = {}) {
+  writeFileSync(memPath, make());
   const before = readFileSync(memPath, 'utf8');
   const abortsBefore = rows().filter((r) => r.kind === 'condense-abort').length;
 
@@ -339,10 +398,61 @@ async function pass(send, memPath, label, { decoys = false } = {}) {
   check(after.length < before.length, `${label}: memory.md got smaller`,
     `${before.length} -> ${after.length} bytes`);
   check(after.includes(CANARY_PIN), `${label}: the pinned line survived byte-for-byte`);
+  if (digOut) {
+    // THE 1.1.47 REGRESSION, stated as two assertions. One call cannot carry a backlog
+    // this size, so the file has to walk down across passes - and it has to ARRIVE.
+    const passes = Array.isArray(out) && out[0] ? out[0].passes : 0;
+    check(passes > 1, `${label}: took MORE THAN ONE pass to dig out`, `passes=${passes}`);
+    check(after.length <= BUDGET_BYTES, `${label}: ended UNDER budget`,
+      `${before.length} -> ${after.length} bytes (budget ${BUDGET_BYTES})`);
+    const big = condenseRows.filter((r) => typeof r.promptBytes === 'number' && r.promptBytes > MAX_PROMPT_BYTES);
+    check(big.length === 0, `${label}: EVERY pass stayed inside the ${MAX_PROMPT_BYTES} B cap`,
+      big.length ? big.map((r) => r.promptBytes).join(',') : `max ${Math.max(0, ...condenseRows.map((r) => r.promptBytes || 0))} B`);
+  }
   check(backupsFor().length >= 1, `${label}: the original was backed up`, backupsFor().slice(-1)[0] || 'none');
   check(!after.includes('MUST NEVER BE USED') && !after.includes('ANOTHER AGENT'),
     `${label}: no other session's text reached this memory`);
   return after;
+}
+
+/**
+ * The input that CANNOT be condensed, and must say so by name for free.
+ *
+ * This is the case the old gate had no way to express: it only ever asked "did a
+ * condense happen?", so "it failed, and nobody can tell you why" scored the same as a
+ * clean refusal. Here the abort reason and the absence of an API call are the result.
+ */
+async function overflowPass(send, memPath) {
+  writeFileSync(memPath, overflowMemory());
+  const before = readFileSync(memPath, 'utf8');
+  const condenseBefore = rows().filter((r) => r.kind === 'condense' && r.agentId === AGENT).length;
+  const abortsBefore = rows().filter((r) => r.kind === 'condense-abort').length;
+
+  log(`PASS 3: asking the packaged app to condense an UNFITTABLE ${Math.round(before.length / 1024)} KB memory...`);
+  const t0 = Date.now();
+  const out = await reflect(send);
+  const took = Date.now() - t0;
+
+  const aborts = rows().filter((r) => r.kind === 'condense-abort').slice(abortsBefore);
+  const after = readFileSync(memPath, 'utf8');
+  const condenseAfter = rows().filter((r) => r.kind === 'condense' && r.agentId === AGENT).length;
+
+  check(Array.isArray(out) && out.length === 1 && out[0].condensed === false,
+    'PASS 3: reflectNow REFUSES the unfittable memory', JSON.stringify(out));
+  // Guard the guard: 'nothing-to-evict' is also a refusal, and it would mean the
+  // giant section never reached the planner - the gate passing while testing nothing.
+  check(Array.isArray(out) && out[0] && out[0].reason !== 'nothing-to-evict',
+    'PASS 3: the fixture actually reaches the eviction planner', out[0] && out[0].reason);
+  check(Array.isArray(out) && out[0] && out[0].reason === 'prompt-too-large',
+    'PASS 3: the refusal is NAMED prompt-too-large', out[0] && out[0].reason);
+  check(aborts.length === 1 && aborts[0].reason === 'prompt-too-large',
+    'PASS 3: log.jsonl carries the NAMED abort, not a bare "claude exited 1"',
+    aborts.map((a) => `${a.reason}: ${a.detail || ''}`).join(' | ') || 'none');
+  check(condenseAfter === condenseBefore, 'PASS 3: no condense row was written');
+  check(after === before, 'PASS 3: memory.md is BYTE-IDENTICAL - a refusal touches nothing');
+  // The pre-flight refusal happens before the spawn. A round trip to the model - even a
+  // rejected one - took ~2.8 s when this was measured by hand; 2 s is a generous floor.
+  check(took < 2_000, 'PASS 3: refused WITHOUT spending an API call', `${took} ms`);
 }
 
 async function main() {
@@ -392,8 +502,14 @@ async function main() {
     check(start.packaged === true, 'runs PACKAGED', `packaged=${start.packaged}`);
     check(start.version === '1.1.47', 'the artifact reports 1.1.47', `version=${start.version}`);
 
-    await pass(cdp.send, memPath, 'PASS 1 (quiet)');
-    await pass(cdp.send, memPath, 'PASS 2 (other transcripts changing)', { decoys: true });
+    // PASS 1 carries the full ~1.1 MB backlog: this is the dig-out proof.
+    await pass(cdp.send, memPath, 'PASS 1 (quiet, full backlog)', { digOut: true });
+    // PASS 2 is the v1.1.46 transcript-race check, and that race has nothing to do with
+    // size - so it runs a smaller fixture deliberately, to keep the gate's API spend
+    // proportionate. The size question is PASS 1's job and PASS 3's.
+    await pass(cdp.send, memPath, 'PASS 2 (other transcripts changing)',
+      { decoys: true, make: () => fixtureMemory(20) });
+    await overflowPass(cdp.send, memPath);
     decoyDir = projectDirFor(DEV_ROOT);
 
     const left = await lingeringAfterSettle(before);
