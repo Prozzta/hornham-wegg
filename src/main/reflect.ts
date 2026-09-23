@@ -79,6 +79,9 @@ const MAX_PROMPT_BYTES = 300_000;
  */
 const MAX_PASSES_PER_SCAN = 6;
 
+/** A pass must shrink the file by at least this fraction of the history it summarised. */
+const NOT_SMALLER_TAKE_RATIO = 0.25;
+
 /** The fixed region headings of the bounded memory shape (the stable contract). */
 const PINNED_HEADING = '## 📌 Durable facts (pinned — never condensed)';
 const CONDENSED_HEADING = '## 🗜 Condensed history';
@@ -165,6 +168,16 @@ export interface EvictionPlan {
   overheadBytes: number;
   /** The measured size of the prompt this plan produces. */
   promptBytes: number;
+  /** Bytes of history this pass sends - what the per-pass not-smaller rule is measured against. */
+  takeBytes: number;
+  /** Why nothing can be sent, when `fits` is false: the fixed overhead alone is too big, or
+   *  every evictable unit is a single line larger than a unit. Null when it fits. */
+  refusal: 'overhead' | 'all-unfittable' | null;
+  /** Single lines passed over in place because no pass could ever carry them. */
+  oversizeKept: Array<{ bytes: number; heading: string }>;
+  /** How many evict sections had to be split into units - the guard that proves the
+   *  splitter actually ran on an oversized input. */
+  splitSections: number;
 }
 
 export class MemoryReflector {
@@ -291,13 +304,31 @@ export class MemoryReflector {
     let current = text;
     let last: ReflectResult | null = null;
     let passes = 0;
+    let anyCondensed = false;
 
     while (passes < MAX_PASSES_PER_SCAN) {
       const before = Buffer.byteLength(current, 'utf8');
-      const r = await this.condense(home, id, mem, current, s);
+      const r = await this.condense(home, id, mem, current, s, passes + 1);
       passes++;
+      if (r.reason === 'prompt-too-large' && anyCondensed) {
+        // Earlier passes this scan made progress, and nothing takeable is left: what
+        // remains over budget is content no pass can carry. A NAMED end, not a spin;
+        // every later scan is a free prompt-too-large refusal with no call.
+        this.logAbort(id, 'budget-unreachable', `${Buffer.byteLength(current, 'utf8')} B remain over the ` +
+          `${BUDGET_BYTES} B budget and no pass can carry any of it`);
+        last = { ...(last as ReflectResult), reason: 'budget-unreachable' };
+        break;
+      }
+      if (!r.condensed) {
+        // A pass that changed nothing ends the scan - but it must not REPLACE the result
+        // of a pass that did. 'nothing-to-evict' after a successful pass is the normal end
+        // of a dig-out, and reporting it as the scan's outcome said condensed:false about a
+        // file that had just been rewritten.
+        if (!anyCondensed) last = r;
+        break;
+      }
       last = r;
-      if (!r.condensed) break;
+      anyCondensed = true;
       const after = r.newBytes ?? before;
       if (after >= before) break;                      // no progress — never loop on it
       if (after <= BUDGET_BYTES) break;                // done
@@ -309,7 +340,7 @@ export class MemoryReflector {
   }
 
   private async condense(
-    home: string, id: string, mem: string, text: string, s: ReflectSettings
+    home: string, id: string, mem: string, text: string, s: ReflectSettings, pass = 1
   ): Promise<ReflectResult> {
     const oldBytes = Buffer.byteLength(text, 'utf8');
     const parsed = parseMemory(text);
@@ -327,18 +358,44 @@ export class MemoryReflector {
     if (!plan.fits) {
       // PRE-FLIGHT REFUSAL. Named, and free: an unfittable input used to be discovered
       // by spending the call and reading back `claude exited 1`.
-      const why = plan.take.length === 0 && evict.length > 0
-        ? `oldest section ${Buffer.byteLength(sectionText(evict[0]), 'utf8')} B + overhead ` +
-          `${plan.overheadBytes} B exceeds the ${MAX_PROMPT_BYTES} B cap`
-        : `prompt ${plan.promptBytes} B exceeds the ${MAX_PROMPT_BYTES} B cap`;
+      // EVERY evict unit is checked, not only the oldest - the defect was an oversized
+      // section further back that the old oldest-only pre-flight never saw.
+      const biggest = plan.oversizeKept.reduce((m, u) => Math.max(m, u.bytes), 0);
+      const why = plan.refusal === 'all-unfittable'
+        ? `every evictable unit is a single line over ${UNIT_MAX_BYTES} B (largest ${biggest} B); ` +
+          `no pass can carry any of it within the ${MAX_PROMPT_BYTES} B cap`
+        : `overhead ${plan.overheadBytes} B leaves no room for history within the ${MAX_PROMPT_BYTES} B cap`;
       this.logAbort(id, 'prompt-too-large', why, {
         oldBytes, overheadBytes: plan.overheadBytes, maxPromptBytes: MAX_PROMPT_BYTES
       });
       return { id, condensed: false, reason: 'prompt-too-large', oldBytes };
     }
 
+    // THE PLAN MUST PARTITION THE BACKLOG. Every line of the evict sections goes either to
+    // the summary (take) or back into the file (defer) - never neither. verify() cannot see
+    // a planner that silently drops a split section's untaken units, because the survivors
+    // it compares against would be missing them too; this check does not trust the planner.
+    if (!partitionsExactly(evict, plan.take, plan.defer)) {
+      this.logAbort(id, 'plan-lost-content', 'take + defer do not reproduce the evicted lines', { oldBytes });
+      return { id, condensed: false, reason: 'plan-lost-content', oldBytes };
+    }
+
+    // A single line no pass could ever carry stays exactly where it is. Named, once per
+    // pass, because it is the one place the file's order is not strictly oldest-first.
+    if (plan.oversizeKept.length) {
+      try {
+        this.appendLog({
+          kind: 'condense-oversize-kept', agentId: id, units: plan.oversizeKept.length,
+          bytes: plan.oversizeKept.reduce((n, u) => n + u.bytes, 0),
+          heading: plan.oversizeKept[0].heading.slice(0, 120)
+        });
+      } catch { /* logging is best-effort */ }
+    }
+
     // 1) BACK UP first — a lossless cold copy makes every later step recoverable.
-    const stamp = utcStamp();
+    // Millisecond stamp AND the pass number: at one-second resolution, passes finishing
+    // inside the same second overwrote each other's backup - including the ORIGINAL.
+    const stamp = `${utcStamp()}-p${pass}`;
     const backup = join(home, 'hive', 'backups', stamp, id, 'memory.md');
     try {
       mkdirSync(dirname(backup), { recursive: true });
@@ -371,7 +428,7 @@ export class MemoryReflector {
     // 4) VERIFY-DON'T-TRUST — reject the rewrite unless every check holds.
     const verdict = verify({
       rebuilt, newBytes, oldBytes, oldPinnedLines, mergedPinned,
-      condensed: summary.condensed, keep: survivors
+      condensed: summary.condensed, keep: survivors, takeBytes: plan.takeBytes
     });
     if (!verdict.ok) {
       this.logAbort(id, verdict.reason, undefined, { oldBytes, newBytes });
@@ -392,7 +449,8 @@ export class MemoryReflector {
         // `evicted` is what THIS pass summarized; `deferred` is the backlog still to go,
         // which is what tells a reader another pass is coming.
         evicted: plan.take.length, deferred: plan.defer.length, kept: keep.length,
-        promptBytes: plan.promptBytes, hoisted: summary.hoist.length, backup
+        promptBytes: plan.promptBytes, takeBytes: plan.takeBytes, split: plan.splitSections,
+        hoisted: summary.hoist.length, backup
       });
     } catch { /* logging is best-effort */ }
     // The miner re-indexes within its next cycle — mtime changed, no extra wiring.
@@ -480,40 +538,191 @@ export function buildCondensePrompt(
 }
 
 /**
- * Decide how much of the backlog ONE call may carry.
+ * Units. The largest piece of one section a single pass will send.
  *
- * Oldest-first, because the oldest material is what the rolling summary is for and
- * because taking it in file order keeps the deferred remainder contiguous with the kept
- * newest sections — the rewritten file stays in chronological order either way.
+ * WHY SECTIONS ARE NO LONGER ATOMIC (1.1.47 re-cut, god's canary). A `## ` section used to
+ * be taken whole or not at all, so one section larger than a pass could carry could never
+ * be condensed - and because the planner took the oldest sections IN ORDER, it also
+ * blocked every section behind it. god's memory had exactly that: a 355,645-byte section
+ * of 312 bullets at the third-oldest position. Two sections fit ahead of it, the pass
+ * shrank the file by ~11 KB, the whole-file not-smaller rule rejected it, and the file
+ * could never move again (Jim, agents/jim-mtujpe28/god-notsmaller-DIAG.md).
  *
- * `fits: false` is the case worth naming: the fixed overhead alone, or one indivisible
- * section, is already over the cap. A `## ` section is atomic — splitting one would put
- * half a thought in the summary and leave the other half orphaned — so there is nothing
- * to do but refuse, and refusing here costs no API call.
+ * So an oversized section is split, IN MEMORY, at bullet or line boundaries into units
+ * no larger than `UNIT_MAX_BYTES`. Nothing is lost and nothing is reordered: the units
+ * a pass takes go to the summary, and every unit it does not take is written back in
+ * place as an ordinary section - the first keeps the original heading, later ones get
+ * `<heading> (continued k/n)`, which is the only text this adds to a file.
+ */
+export const UNIT_MAX_BYTES = 40_000;
+/** Room a unit's heading and the prompt's joins may need beyond its body. */
+const UNIT_HEADROOM_BYTES = 1_024;
+/** Worst case "(continued k/n)" suffix, reserved while packing before n is known. */
+const CONTINUED_SUFFIX_RESERVE = 32;
+
+/** A line that starts a new block: a bullet, a numbered item, or a sub-heading. A line
+ *  that does not is a continuation and stays with the block above it. */
+const BLOCK_START = /^(?:[-*] |#{3,} |\d+[.)] )/;
+
+const utf8 = (s: string): number => Buffer.byteLength(s, 'utf8');
+
+/** One piece the planner may send, with where it came from. */
+interface Unit {
+  section: Section;
+  /** Index of the evict section it belongs to. */
+  origin: number;
+  /** A single line too large to fit even alone: passed over, never sent, never blocking. */
+  fittable: boolean;
+}
+
+/**
+ * Split one section into units of at most `maxUnit` bytes (heading included).
+ *
+ * Blocks first: a bullet keeps its continuation lines. A block that is itself too big
+ * falls back to single lines. A single line too big even alone becomes its own unit,
+ * marked unfittable. Joining every unit's body with '\n' gives back the original body
+ * exactly - the split only chooses where the seams go.
+ */
+export function splitSection(s: Section, maxUnit: number): Array<{ section: Section; fittable: boolean }> {
+  if (utf8(sectionText(s)) <= maxUnit) return [{ section: s, fittable: true }];
+  const budget = maxUnit - utf8(s.heading) - CONTINUED_SUFFIX_RESERVE - 1;
+  const lines = s.body.split('\n');
+
+  const blocks: string[][] = [];
+  for (const line of lines) {
+    if (!blocks.length || BLOCK_START.test(line)) blocks.push([line]);
+    else blocks[blocks.length - 1].push(line);
+  }
+  // A block that cannot fit whole is broken into its lines - but a BLANK line never stands
+  // alone: it stays with the line above it. Otherwise a section body's trailing newline
+  // became a whitespace-only unit of its own, which is "fittable", got taken, and spent a
+  // call summarising nothing while counting as progress.
+  const pieces: string[][] = [];
+  for (const b of blocks) {
+    if (utf8(b.join('\n')) <= budget) { pieces.push(b); continue; }
+    for (const line of b) {
+      if (!line.trim() && pieces.length) pieces[pieces.length - 1].push(line);
+      else pieces.push([line]);
+    }
+  }
+
+  const bodies: string[][] = [];
+  let cur: string[] = [];
+  for (const p of pieces) {
+    const next = cur.concat(p);
+    if (cur.length && utf8(next.join('\n')) > budget) {
+      bodies.push(cur);
+      cur = p.slice();
+    } else {
+      cur = next;
+    }
+  }
+  if (cur.length) bodies.push(cur);
+  // Belt and braces: no unit may be whitespace only. Fold one into its neighbour.
+  for (let i = bodies.length - 1; i >= 0 && bodies.length > 1; i--) {
+    if (bodies[i].join('\n').trim()) continue;
+    if (i > 0) bodies[i - 1].push(...bodies[i]);
+    else bodies[1].unshift(...bodies[i]);
+    bodies.splice(i, 1);
+  }
+
+  const n = bodies.length;
+  return bodies.map((b, i) => {
+    const heading = i === 0 ? s.heading : `${s.heading} (continued ${i + 1}/${n})`;
+    const section = { heading, body: b.join('\n') };
+    return { section, fittable: utf8(sectionText(section)) <= maxUnit };
+  });
+}
+
+/**
+ * Decide what ONE pass sends, measured with the same builder the call uses.
+ *
+ * Oldest first, in order, until the first unit that does not fit - everything after it
+ * waits for a later pass, because summarising newer history ahead of older history that
+ * is still verbatim would scramble the file for no reason. The ONE exception is an
+ * unfittable unit (a single line bigger than a unit): it is PASSED OVER in place, logged,
+ * and never blocks what is behind it, because no pass could ever take it.
+ *
+ * A section whose units were ALL deferred is written back in its ORIGINAL form, not as
+ * fragments: splitting is how a pass takes part of a section, not something done to a
+ * section nobody touched. `(continued k/n)` headings therefore appear only where part of
+ * a section really was summarised.
  */
 export function planEviction(
   condensed: string | null, pinned: string | null, evict: Section[], maxBytes = MAX_PROMPT_BYTES
 ): EvictionPlan {
-  const overheadBytes = Buffer.byteLength(buildCondensePrompt(condensed, [], pinned), 'utf8');
-  const take: Section[] = [];
-  let total = overheadBytes;
-  for (const s of evict) {
-    // +2 for the '\n\n' this section will be joined with. Over-counting the first
-    // section by two bytes is the safe direction to be wrong in.
-    const cost = Buffer.byteLength(sectionText(s), 'utf8') + 2;
-    if (total + cost > maxBytes) break;
-    total += cost;
-    take.push(s);
+  const overheadBytes = utf8(buildCondensePrompt(condensed, [], pinned));
+  const maxUnit = Math.min(UNIT_MAX_BYTES, maxBytes - overheadBytes - UNIT_HEADROOM_BYTES);
+  if (maxUnit <= 0) {
+    return {
+      take: [], defer: evict.slice(), fits: false, overheadBytes,
+      promptBytes: overheadBytes, takeBytes: 0, refusal: 'overhead', oversizeKept: [], splitSections: 0
+    };
   }
-  // Measure the real thing once, rather than trusting the running total.
-  const promptBytes = Buffer.byteLength(buildCondensePrompt(condensed, take, pinned), 'utf8');
+
+  const units: Unit[] = [];
+  let splitSections = 0;
+  evict.forEach((s, origin) => {
+    const parts = splitSection(s, maxUnit);
+    if (parts.length > 1 || !parts[0].fittable) splitSections++;
+    for (const p of parts) units.push({ section: p.section, origin, fittable: p.fittable });
+  });
+
+  const taken = new Set<Unit>();
+  const oversizeKept: Array<{ bytes: number; heading: string }> = [];
+  let total = overheadBytes;
+  let stopped = false;
+  for (const u of units) {
+    if (!u.fittable) {
+      oversizeKept.push({ bytes: utf8(sectionText(u.section)), heading: u.section.heading });
+      continue;
+    }
+    // +2 for the '\n\n' this unit is joined with. Over-counting the first by two bytes
+    // is the safe direction to be wrong in.
+    const cost = utf8(sectionText(u.section)) + 2;
+    if (!stopped && total + cost <= maxBytes) {
+      taken.add(u);
+      total += cost;
+    } else {
+      stopped = true;
+    }
+  }
+
+  const take = units.filter((u) => taken.has(u)).map((u) => u.section);
+  const defer: Section[] = [];
+  evict.forEach((s, origin) => {
+    const mine = units.filter((u) => u.origin === origin);
+    if (!mine.some((u) => taken.has(u))) defer.push(s);          // untouched: original form
+    else for (const u of mine) if (!taken.has(u)) defer.push(u.section);
+  });
+
+  const promptBytes = utf8(buildCondensePrompt(condensed, take, pinned));
+  const takeBytes = take.reduce((n, s) => n + utf8(sectionText(s)), 0);
+  const fits = take.length > 0 && promptBytes <= maxBytes;
   return {
-    take,
-    defer: evict.slice(take.length),
-    fits: take.length > 0 && promptBytes <= maxBytes,
-    overheadBytes,
-    promptBytes
+    take, defer, fits, overheadBytes, promptBytes, takeBytes,
+    refusal: fits ? null : (units.length && units.every((u) => !u.fittable) ? 'all-unfittable' : 'overhead'),
+    oversizeKept, splitSections
   };
+}
+
+/** The content lines of some sections, for the partition check: non-blank, trailing space
+ *  dropped (rebuild() trims section ends), and the derived `(continued k/n)` headings left
+ *  out - they are the one thing a split adds, and they carry no history of their own. */
+function contentLines(sections: Section[]): string[] {
+  const out: string[] = [];
+  for (const sec of sections) {
+    if (!/ \(continued \d+\/\d+\)$/.test(sec.heading)) out.push(sec.heading.trimEnd());
+    for (const line of sec.body.split('\n')) if (line.trim()) out.push(line.trimEnd());
+  }
+  return out.sort();
+}
+
+/** Do take + defer hold exactly the lines of evict - nothing lost, nothing invented? */
+export function partitionsExactly(evict: Section[], take: Section[], defer: Section[]): boolean {
+  const a = contentLines(evict);
+  const b = contentLines([...take, ...defer]);
+  return a.length === b.length && a.every((line, i) => line === b[i]);
 }
 
 /** Count level-2 (`## `) headings — `# ` H1 and `### ` deeper headings excluded. */
@@ -593,8 +802,10 @@ export function verify(args: {
   rebuilt: string; newBytes: number; oldBytes: number;
   oldPinnedLines: string[]; mergedPinned: string[];
   condensed: string; keep: Section[];
+  /** Bytes of history this pass summarised. */
+  takeBytes: number;
 }): { ok: true } | { ok: false; reason: string } {
-  const { rebuilt, newBytes, oldBytes, oldPinnedLines, mergedPinned, condensed, keep } = args;
+  const { rebuilt, newBytes, oldBytes, oldPinnedLines, mergedPinned, condensed, keep, takeBytes } = args;
   // 6) Valid summary JSON already enforced upstream (validateSummary). Here: structure.
   // 1) Parses back into the 3-region structure.
   const re = parseMemory(rebuilt);
@@ -602,8 +813,17 @@ export function verify(args: {
   // 4) Non-empty + sane.
   if (newBytes <= 200) return { ok: false, reason: 'too-small' };
   if (!condensed.trim()) return { ok: false, reason: 'empty-condensed' };
-  // 3) Actually smaller (a no-op condense is a failure).
-  if (!(newBytes < oldBytes * 0.95)) return { ok: false, reason: 'not-smaller' };
+  // 3) Actually smaller - PER PASS, not per file. The old rule (newBytes < 0.95 x oldBytes)
+  // dates from the single-pass era: under partial eviction one pass may only carry a few
+  // percent of a large file, and it rejected god's real pass (14.6 KB summarised to ~4.9 KB,
+  // an ~11 KB real shrink on a 959 KB file) as not-smaller - permanently. What matters is
+  // that THIS pass made real progress on what it took: the file shrank, by at least a
+  // quarter of the history summarised. A summary that grows or barely shrinks still fails.
+  // (No whole-file floor is kept even when nothing is deferred: a final pass over a small
+  // tail cannot shrink a large file by 5%, and would stall just above budget forever.)
+  if (!(newBytes < oldBytes && oldBytes - newBytes >= NOT_SMALLER_TAKE_RATIO * takeBytes)) {
+    return { ok: false, reason: 'not-smaller' };
+  }
   // 2) Pinned preserved: every old pinned line survives (hoist only adds).
   const newPinned = new Set(pinnedLines(re.pinned));
   for (const line of oldPinnedLines) if (!newPinned.has(line)) return { ok: false, reason: 'pinned-line-dropped' };
@@ -649,7 +869,8 @@ function shapeSummary(value: unknown): { condensed: string; hoist: string[] } | 
 
 /** `20260606T110912Z` — matches the janitor's backup-dir stamp format. */
 function utcStamp(): string {
-  return new Date().toISOString().replace(/[-:]/g, '').replace(/\.\d{3}Z$/, 'Z');
+  // e.g. 20260923T175826123Z - milliseconds kept (see the per-pass backup note).
+  return new Date().toISOString().replace(/[-:.]/g, '');
 }
 
 /** Write `text` to `path` atomically: temp sibling → fsync → rename over target. */

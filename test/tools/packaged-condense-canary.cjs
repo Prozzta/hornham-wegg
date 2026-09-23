@@ -9,6 +9,8 @@
  * condensation end to end.
  *
  * Two passes, per the design:
+ *   3b. (1.1.47 re-cut) the god SHAPE - a ~355 KB multi-bullet section at a non-oldest
+ *      position in ~1 MB - converges under budget; the splitter must be seen to run.
  *   0. a ~1.1 MB backlog DIGS OUT across passes and ends under budget, with every
  *      single pass inside the prompt cap; and an UNFITTABLE memory is refused BY NAME
  *      (prompt-too-large) without spending an API call. Added after 1.1.47 shipped:
@@ -123,15 +125,42 @@ function overflowMemory() {
   const giant = 'an indivisible wall of recorded detail. '.repeat(Math.ceil(MAX_PROMPT_BYTES / 39) + 500);
   const out = ['# condense canary memory', '', PINNED, CANARY_PIN, '', CONDENSED,
     'Earlier history of this agent.', '', RECENT];
-  // The giant goes FIRST (oldest) and is followed by comfortably more than
-  // reflectRecentKeep sections, so it lands in the evict list rather than the kept
-  // tail. A first draft used 8 followers, fewer than recentKeep: every section was
-  // kept, evict was empty, and the gate reported 'nothing-to-evict' - a pass for the
-  // wrong reason that would have certified nothing at all.
+  // PASS 3a: the giant goes FIRST (oldest) followed by EXACTLY reflectRecentKeep (12)
+  // sections, so it is the ONLY evictable unit. Two ways to get this wrong, both lived:
+  //  - fewer followers than recentKeep: every section is kept, evict is empty, and the
+  //    gate reports 'nothing-to-evict' - a pass for the wrong reason;
+  //  - more followers than recentKeep: since the 1.1.47 re-cut fix a single oversized
+  //    LINE is passed over and the fittable sections behind it ARE condensed, so the
+  //    'refused, byte-identical' assertions would fail (Jim's spec 3.6).
   out.push('## 2026-09-01 the indivisible one', giant, '');
-  for (let i = 0; i < 20; i++) {
+  for (let i = 0; i < 12; i++) {
     out.push(`## 2026-09-${String((i % 27) + 2).padStart(2, '0')} standup ${i}`);
     out.push(`Worked item ${i}: ${'ordinary detail. '.repeat(50)}`);
+    out.push('');
+  }
+  return out.join('\n');
+}
+
+/**
+ * PASS 3b: the SHAPE of god's memory on 2026-09-23 - the case that blocked the 1.1.47
+ * canary. A multi-bullet `## ` section of ~355 KB (larger than a whole pass may carry)
+ * at the THIRD-oldest position among ~1 MB of ordinary sections. Before the fix the
+ * planner stopped at it, the tiny pass ahead of it failed the whole-file not-smaller
+ * rule, and the file could never move. Synthetic on purpose: an agent's real memory is
+ * never a gate fixture.
+ */
+function godShapeMemory() {
+  const out = ['# condense canary memory', '', PINNED, CANARY_PIN, '', CONDENSED,
+    'Earlier history of this agent.', '', RECENT];
+  for (let i = 0; i < 480; i++) {
+    if (i === 2) {
+      out.push('## 2026-09-10 11:25 Mission 2 COMPLETE');
+      for (let b = 0; b < 312; b++) out.push(`- mission bullet ${b}: ${'a recorded finding with its evidence. '.repeat(29)}`);
+      out.push('');
+      continue;
+    }
+    out.push(`## 2026-09-${String((i % 28) + 1).padStart(2, '0')} note ${i}`);
+    out.push(`Entry ${i}: ${'routine standup detail. '.repeat(55)}`);
     out.push('');
   }
   return out.join('\n');
@@ -455,6 +484,43 @@ async function overflowPass(send, memPath) {
   check(took < 2_000, 'PASS 3: refused WITHOUT spending an API call', `${took} ms`);
 }
 
+/**
+ * PASS 3b - the god shape converges. Guard-the-guard: a condense row must report `split`,
+ * or the gate could pass without the oversized section ever reaching the splitter.
+ */
+async function godShapePass(send, memPath) {
+  writeFileSync(memPath, godShapeMemory());
+  const before = readFileSync(memPath, 'utf8');
+  const rowsBefore = rows().length;
+  log(`PASS 3b: the god SHAPE - a ~355 KB section at the third-oldest position in ${Math.round(before.length / 1024)} KB...`);
+  const t0 = Date.now();
+  const out = await reflect(send);
+  const took = Math.round((Date.now() - t0) / 1000);
+  const after = readFileSync(memPath, 'utf8');
+  const mine = rows().slice(rowsBefore).filter((r) => r.agentId === AGENT);
+  const passes = mine.filter((r) => r.kind === 'condense');
+  const aborts = mine.filter((r) => r.kind === 'condense-abort');
+  const giant = before.split('\n').find((l) => l.startsWith('## 2026-09-10 11:25'));
+
+  check(before.length > 900_000, 'PASS 3b: the fixture is god-sized', `${before.length} bytes`);
+  check(Array.isArray(out) && out[0] && out[0].condensed === true && out[0].reason === 'condensed',
+    'PASS 3b: reflectNow reports a CONDENSE', JSON.stringify(out));
+  check(aborts.length === 0, 'PASS 3b: no condense-abort (no not-smaller stall)',
+    aborts.map((a) => `${a.reason}: ${a.detail || ''}`).join(' | ') || 'none');
+  check(passes.some((r) => (r.split || 0) >= 1), 'PASS 3b: the oversized section REACHED the splitter',
+    passes.map((r) => `split=${r.split}`).join(',') || 'no condense rows');
+  check(after.length <= BUDGET_BYTES, 'PASS 3b: converged UNDER budget',
+    `${before.length} -> ${after.length} bytes in ${passes.length} passes, ${took}s`);
+  check(passes.every((r) => typeof r.promptBytes === 'number' && r.promptBytes <= MAX_PROMPT_BYTES),
+    `PASS 3b: EVERY pass stayed inside the ${MAX_PROMPT_BYTES} B cap`,
+    `max ${Math.max(0, ...passes.map((r) => r.promptBytes || 0))} B`);
+  check(after.includes(CANARY_PIN), 'PASS 3b: the pinned line survived byte-for-byte');
+  // A derived heading may only exist while part of the giant is still verbatim.
+  const derived = (after.match(/ \(continued \d+\/\d+\)$/gm) || []).length;
+  check(derived === 0 || after.includes(giant), 'PASS 3b: (continued k/n) headings only for an untaken remainder',
+    `${derived} derived heading(s)`);
+}
+
 async function main() {
   if (!existsSync(APP_EXE)) {
     console.error(`FAIL: ${APP_EXE} not found. Build it first:\n  npm run build && npx electron-builder --win --dir --publish never -c.npmRebuild=false`);
@@ -510,6 +576,7 @@ async function main() {
     await pass(cdp.send, memPath, 'PASS 2 (other transcripts changing)',
       { decoys: true, make: () => fixtureMemory(20) });
     await overflowPass(cdp.send, memPath);
+    await godShapePass(cdp.send, memPath);
     decoyDir = projectDirFor(DEV_ROOT);
 
     const left = await lingeringAfterSettle(before);
