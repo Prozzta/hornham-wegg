@@ -164,6 +164,10 @@ export interface RegistryAgent extends AgentMeta {
    *  resume after a crash/restart) AND the cost accounting/dedup key on every
    *  AgentUsageSample / cost-ledger row. */
   sessionId?: string;
+  /** Most recent Claude model id reported by this agent's status line. This is
+   *  per-agent because Claude Code's global settings file cannot preserve
+   *  independent `/model` choices across a hive. */
+  model?: string;
   /** Whether `cwd` is actually usable for a (re)spawn — i.e. an ABSOLUTE path
    *  that exists as a directory. Computed + persisted at spawn so the roster
    *  reliably exposes each worker's environment validity. A non-absolute fragment
@@ -1099,10 +1103,33 @@ export class HiveManager {
     } catch { /* best-effort — never crash a hook handler */ }
   }
 
+  /** Persist a Claude status-line model only when it changes. This becomes the
+   *  per-agent default on a later respawn; explicit renderer `--model` still wins. */
+  recordModel(agentId: string, model: string): void {
+    const root = this.root();
+    const next = model.trim();
+    if (!root || !next) return;
+    try {
+      const reg = this.registry();
+      const agent = reg.agents[agentId];
+      if (!agent || agent.model === next) return;
+      agent.model = next;
+      agent.lastSeen = Date.now();
+      this.atomicWriteJson(join(root, 'registry.json'), reg);
+      this.appendLog({ kind: 'model', agentId, model: next });
+      this.commit(`hive: model ${agentId}`);
+    } catch { /* best-effort â€” never crash a status line */ }
+  }
+
   /** The last known session_id for an agent, or undefined. Used to build a
    *  `claude --resume <id>` spawn so a restarted agent resumes its thread. */
   lastSession(agentId: string): string | undefined {
     return this.registry().agents[agentId]?.sessionId;
+  }
+
+  /** The per-agent Claude model last reported by its status line. */
+  lastModel(agentId: string): string | undefined {
+    return this.registry().agents[agentId]?.model;
   }
 
   /** Claude Code settings that route every relevant hook through the shim, plus

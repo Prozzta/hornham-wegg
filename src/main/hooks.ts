@@ -47,9 +47,8 @@ interface HookPayload {
   /** Notification hook text, e.g. "Claude is waiting for your input" (idle) vs a
    *  permission request. Used to tell "needs you" from "just done / lingering". */
   message?: string;
-  /** CostSample payloads only (synthesized by the proxy-bridge sidecar for
-   *  qwen). Raw token counts for one response, fed to the cost ledger. */
-  model?: string;
+  /** Status payloads carry Claude's model object; CostSample uses a string. */
+  model?: string | { id?: unknown };
   input?: number;
   output?: number;
   cache_read?: number;
@@ -176,10 +175,15 @@ export class HookServer {
     // statusLine shim, not a real hook boundary — it must never trip the
     // HALT gate or feed the breaker's loop detector below. The early return
     // also (deliberately) skips recordSession for status ticks: a statusLine
-    // payload's session_id adds nothing the real hooks don't already record,
-    // and telemetry should never write to the registry. transcript_path IS
-    // still captured above, where every payload shape benefits from it.
+    // payload's session_id adds nothing the real hooks don't already record.
+    // The model is the exception: it is the authoritative per-agent `/model`
+    // observation and must survive a restart. transcript_path IS still captured
+    // above, where every payload shape benefits from it.
     if (event === 'Status') {
+      const statusModel = typeof p.model === 'object' && p.model !== null && typeof p.model.id === 'string'
+        ? p.model.id.trim()
+        : '';
+      if (agentId && statusModel) this.hive.recordModel(agentId, statusModel);
       const cw = p.context_window;
       if (agentId && cw && typeof cw.total_input_tokens === 'number'
         && typeof cw.context_window_size === 'number' && cw.context_window_size > 0) {
@@ -238,6 +242,7 @@ export class HookServer {
     // accounting schema uniform). Pure telemetry — never feeds the loop detector.
     if (event === 'CostSample') {
       if (agentId && p.session_id) {
+        const model = typeof p.model === 'string' ? p.model : '';
         const input = p.input ?? 0;
         const output = p.output ?? 0;
         const cacheRead = p.cache_read ?? 0;
@@ -250,8 +255,8 @@ export class HookServer {
           output,
           cacheRead,
           cacheCreation,
-          model: p.model ?? '',
-          usd: estimateCostUsd(p.model, {
+          model,
+          usd: estimateCostUsd(model, {
             inputTokens: input,
             outputTokens: output,
             cacheReadTokens: cacheRead,

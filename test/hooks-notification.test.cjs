@@ -112,3 +112,9 @@ test('notifications setting off suppresses the OS toast but the hook still resol
   assert.equal(notifications.length, 0, 'notifications:false must suppress the OS toast');
   assert.deepEqual(res, {}, 'the hook itself still resolves normally');
 });
+
+test('Status captures Claude model.id as the agent\'s restart-safe model', async (t) => {
+  const { hive, fire } = await floor(t);
+  await fire({ hook_event_name: 'Status', model: { id: 'claude-opus-5-5[1m]' } });
+  assert.equal(hive.lastModel('jim-1'), 'claude-opus-5-5[1m]');
+});
