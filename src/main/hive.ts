@@ -197,6 +197,13 @@ export interface SpawnInjection {
 }
 
 const HOP_CAP = 12;
+/**
+ * Agents normally write mail atomically, but the protocol also permits ordinary
+ * file writers. A poll can see one of those files between its create and close;
+ * give it a few later polls to become valid JSON before declaring it rejected.
+ */
+const OUTBOX_PARSE_RETRY_LIMIT = 3;
+const OUTBOX_PARSE_RETRY_DEBOUNCE_MS = 250;
 
 function sleepSync(ms: number): void {
   const sab = new SharedArrayBuffer(4);
@@ -337,6 +344,8 @@ export class HiveManager {
   private routerTimer: unknown = null;
   /** One non-recursive watcher per active outbox, keyed by its absolute path. */
   private readonly outboxWatchers = new Map<string, Pick<FSWatcher, 'close' | 'on'>>();
+  /** Parse failures awaiting the next polling debounce, keyed by full outbox path. */
+  private readonly outboxParseRetries = new Map<string, { attempts: number; retryAfter: number }>();
   /** At most one queued scan; hints arriving in the same turn coalesce into it. */
   private routeQueued = false;
   /** Bumped by start/stop, so a scan queued before a stop never runs after it. */
@@ -1718,26 +1727,76 @@ export class HiveManager {
     const agentsDir = join(root, 'agents');
     if (!existsSync(agentsDir)) return 0;
     let routed = 0;
+    let rejected = 0;
+    const liveOutboxFiles = new Set<string>();
     for (const id of readdirSync(agentsDir)) {
       const outbox = join(agentsDir, id, 'outbox');
       if (!existsSync(outbox)) continue;
       for (const f of readdirSync(outbox)) {
         if (!f.endsWith('.json')) continue;
         const full = join(outbox, f);
+        liveOutboxFiles.add(full);
+        let partial: Partial<HiveMessage>;
         try {
-          const partial = JSON.parse(readFileSync(full, 'utf8')) as Partial<HiveMessage>;
+          partial = JSON.parse(readFileSync(full, 'utf8')) as Partial<HiveMessage>;
+        } catch (error) {
+          // A non-atomic writer may still be streaming this file. Leave it in
+          // place for subsequent polling passes; only a bounded failure becomes
+          // a visible rejection.
+          const now = Date.now();
+          const prior = this.outboxParseRetries.get(full);
+          // fs.watch can report several chunks of one write in the same turn.
+          // They are hints, not independent retries: wait before re-reading.
+          if (prior && now < prior.retryAfter) continue;
+          const attempts = (prior?.attempts ?? 0) + 1;
+          if (attempts < OUTBOX_PARSE_RETRY_LIMIT) {
+            this.outboxParseRetries.set(full, { attempts, retryAfter: now + OUTBOX_PARSE_RETRY_DEBOUNCE_MS });
+            this.appendLog({ kind: 'outbox-parse-retry', from: id, file: f, attempts });
+            continue;
+          }
+          this.outboxParseRetries.delete(full);
+          let archived = false;
+          try {
+            renameSync(full, join(outbox, '.sent', `bad-${f}`));
+            archived = true;
+          } catch (archiveError) {
+            this.appendLog({ kind: 'outbox-reject-archive-failed', from: id, file: f, error: String(archiveError) });
+          }
+          if (archived) {
+            const notice = this.normalize({
+              to: id,
+              act: 'inform',
+              subject: `[outbox rejected — malformed JSON] ${f}`,
+              body: `The hive router could not parse this outbox file after ${OUTBOX_PARSE_RETRY_LIMIT} attempts. It was archived as bad-${f}; rewrite and resend it if it is still needed.`
+            }, 'system');
+            const notified = this.deliver(notice, id);
+            // Match normal routed mail on the floor: this rejection is an
+            // operator-visible event, not merely an inbox-side diagnostic.
+            this.emitMessage(notice, notified ? [id] : []);
+            this.appendLog({ kind: 'outbox-rejected', from: id, file: f, attempts, error: String(error), notified });
+            rejected++;
+          }
+          continue;
+        }
+        this.outboxParseRetries.delete(full);
+        try {
           const msg = this.normalize(partial, id);
           msg.from = id; // sender is authoritative — the owning directory
           this.routeMessage(msg);
           renameSync(full, join(outbox, '.sent', f)); // archive, don't reprocess
           routed++;
-        } catch {
+        } catch (error) {
           // malformed file — quarantine so we don't spin on it
-          try { renameSync(full, join(outbox, '.sent', `bad-${f}`)); } catch { /* noop */ }
+          this.appendLog({ kind: 'outbox-route-failed', from: id, file: f, error: String(error) });
         }
       }
     }
-    if (routed > 0) this.commit(`hive: routed ${routed} message(s)`);
+    // A file removed by its writer or routed successfully must not leave a stale
+    // retry count that could punish a later file reusing the same name.
+    for (const full of this.outboxParseRetries.keys()) {
+      if (!liveOutboxFiles.has(full)) this.outboxParseRetries.delete(full);
+    }
+    if (routed > 0 || rejected > 0) this.commit(`hive: routed ${routed} message(s), rejected ${rejected}`);
     return routed;
   }
 
