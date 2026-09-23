@@ -283,3 +283,34 @@ test('OBS-1b: CANARY_FORCE still overrides - it means override ANYTHING', () => 
   assert.equal(rec.pid, process.pid);
   assert.equal(unlinked.length, 1, 'force already overrides a LIVE holder and a dirty lock; be consistent');
 });
+
+test('OBS-1b: PID REUSE - same pid, different startedAt, is still a DIFFERENT run', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'canary-lock-'));
+  const stale = STALE_REC(dir);
+  writeFileSync(lockPath(dir), JSON.stringify(stale));
+  const unlinked = [];
+  // Windows recycles pids briskly. A lock carrying the SAME pid but a different
+  // startedAt is not the run we judged stale - it is a new holder that happened to be
+  // given the dead one’s number. Comparing pid alone would delete a live lock, so the
+  // identity is the PAIR. (Jim: a pid-only mutant survived without this.)
+  const reused = JSON.stringify({ ...stale, startedAt: NOW - 1000, agent: 'jim' });
+  const ops = stealOps({ reread: () => reused, unlinked });
+
+  assert.throws(() => acquire(dir, { agent: 'andy', now: NOW, ops }),
+    (e) => e.canaryLocked && /changed between the staleness check/.test(e.message),
+    'same pid + different startedAt must refuse');
+  assert.deepEqual(unlinked, [], 'the recycled-pid holder\u2019s lock must survive');
+});
+
+test('OBS-1b: and the mirror - same startedAt, different pid, also refuses', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'canary-lock-'));
+  const stale = STALE_REC(dir);
+  writeFileSync(lockPath(dir), JSON.stringify(stale));
+  const unlinked = [];
+  const other = JSON.stringify({ ...stale, pid: stale.pid + 1 });
+  const ops = stealOps({ reread: () => other, unlinked });
+
+  assert.throws(() => acquire(dir, { agent: 'andy', now: NOW, ops }),
+    (e) => e.canaryLocked && /changed between the staleness check/.test(e.message));
+  assert.deepEqual(unlinked, []);
+});

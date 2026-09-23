@@ -158,7 +158,7 @@ async function waitFor(label, budgetMs, fn) {
 function hiddenChildren() {
   try {
     const out = execFileSync('powershell.exe', ['-NoProfile', '-Command',
-      "Get-CimInstance Win32_Process | Where-Object { C:/Dunder/_work/andy-rel147.Name -ne 'powershell.exe' -and $_.CommandLine -like '*--output-format*json*' -and $_.CommandLine -like '*--session-id*' } | ForEach-Object { $_.ProcessId.ToString() + ' <<>> ' + $_.CommandLine }"
+      "Get-CimInstance Win32_Process | Where-Object { $_.Name -ne 'powershell.exe' -and $_.CommandLine -like '*--output-format*json*' -and $_.CommandLine -like '*--session-id*' } | ForEach-Object { $_.ProcessId.ToString() + ' <<>> ' + $_.CommandLine }"
     ], { encoding: 'utf8', timeout: 30_000 });
     const map = new Map();
     for (const line of out.split('\n')) {
@@ -166,7 +166,52 @@ function hiddenChildren() {
       if (pid) map.set(pid, (cmd || '').slice(0, 200));
     }
     return map;
-  } catch { return new Map(); }
+  } catch (e) {
+    // NOT an empty Map. An empty Map is indistinguishable from "nothing is running",
+    // which is how a probe that had been broken for three runs kept reporting all-clear.
+    throw new Error(`the lingering-child probe could not run: ${e && e.message ? e.message : e}`);
+  }
+}
+
+/**
+ * PROVE THE PROBE BEFORE TRUSTING IT.
+ *
+ * hiddenChildren() reads a PowerShell filter, and a filter that matches nothing answers
+ * every question with "all clear". That is not hypothetical: this file shipped with
+ * `$_.Name` replaced by a filesystem path, because the line was written through a shell
+ * that expanded it. PowerShell treats the result as an unknown command - a NON-terminating
+ * error - so the probe returned empty on every call and three consecutive runs reported
+ * "no lingering child" having looked for nothing. Jim caught it with a decoy.
+ *
+ * So: spawn a decoy carrying the exact argv shape, require the probe to FIND it, and kill
+ * it again. If this fails, the run fails - an unproven probe is worse than no probe,
+ * because it reads as evidence.
+ */
+async function proveProbe() {
+  const marker = 'canary-probe-self-test-' + process.pid;
+  // The decoy must carry our argv shape AND survive long enough to be seen. It runs a
+  // FILE, not `node -e`: everything after a script path is script arguments, whereas
+  // after `-e` node still parses `--output-format` as its own option, rejects it with
+  // "bad option" and exits instantly - a decoy that is never alive would make this
+  // self-test fail for a reason that has nothing to do with the probe.
+  const decoyJs = join(REPO, 'dist', `canary-probe-decoy-${process.pid}.js`);
+  mkdirSync(join(REPO, 'dist'), { recursive: true });
+  writeFileSync(decoyJs, 'setTimeout(() => {}, 120000);\n');
+  const decoy = spawn(process.execPath, [decoyJs, '--output-format', 'json', '--session-id', marker],
+    { stdio: 'ignore', windowsHide: true, detached: true });
+  try {
+    const found = await waitFor('the probe to see its own decoy', 30_000, async () => {
+      const hit = [...hiddenChildren()].find(([, cmd]) => cmd.includes(marker));
+      return hit ? hit[0] : null;
+    }).catch(() => null);
+    check(!!found, 'the lingering-child probe actually detects a child', found ? `found decoy pid ${found}` : 'THE PROBE IS BLIND - every clear result below is meaningless');
+    return !!found;
+  } finally {
+    try { process.kill(decoy.pid); } catch { /* already gone */ }
+    // Do not leave our own decoy behind to be found by the real check.
+    await waitFor('the decoy to exit', 15_000, async () => ![...hiddenChildren()].some(([, c]) => c.includes(marker)) || null).catch(() => null);
+    try { rmSync(decoyJs, { force: true }); } catch { /* ignore */ }
+  }
 }
 
 /** A child still winding down a second after its stream closed is not a leak; one still
@@ -316,6 +361,8 @@ async function main() {
   lock.noteStash(DEV_ROOT, moved.map(([, bak]) => bak));
   if (moved.length) log(`stashed ${moved.length} existing dev path(s); they are restored at the end`);
 
+  // Before anything else: prove the instrument, then take the baseline with it.
+  await proveProbe();
   const before = hiddenChildren();
   let app = null;
   let ws = null;
@@ -350,6 +397,8 @@ async function main() {
     decoyDir = projectDirFor(DEV_ROOT);
 
     const left = await lingeringAfterSettle(before);
+    // If this ever fires with a proven probe, it is a PRODUCT finding, not a canary one:
+    // a hidden condensation child outliving its run is a leak in the shipped app.
     check(left.size === 0, 'no hidden print-mode child outlived the run',
       left.size ? [...left].map(([pid, cmd]) => pid + ': ' + cmd).join(' | ') : 'none');
   } catch (e) {
