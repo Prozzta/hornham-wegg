@@ -628,6 +628,21 @@ test('REPORTING: a successful pass followed by nothing-to-evict still reports co
   f.cleanup();
 });
 
+test('CHRONOLOGY (Jim N1): after the first misfit, a smaller NEWER unit is deferred, not packed in', () => {
+  // Seven ~38 KB units fill the pass to ~268 KB. The next (~39 KB) does not fit the
+  // remaining room; the one after it (~1 KB) would. Taking it would summarise newer
+  // history while older history stays verbatim - no loss (the partition holds), but the
+  // summary would describe the file out of order. Oldest-first means STOP at the misfit.
+  const fill = Array.from({ length: 7 }, (_, i) => sect(`## fill ${i}`, `fill ${i} ${'y'.repeat(38_000)}`));
+  const misfit = sect('## the misfit', `misfit ${'z'.repeat(39_000)}`);
+  const small = sect('## small and newer', 'a short, newer note that would fit the leftover room');
+  const plan = planEviction(null, null, [...fill, misfit, small]);
+  assert.deepEqual(plan.take.map((s) => s.heading), fill.map((s) => s.heading), 'exactly the seven older units');
+  assert.ok(MAX_PROMPT_BYTES - plan.promptBytes > bytes(`${small.heading}\n${small.body}`) + 2,
+    'the fixture is the case: the small newer unit WOULD fit the leftover room');
+  assert.deepEqual(plan.defer.map((s) => s.heading), ['## the misfit', '## small and newer'], 'both wait, in order');
+});
+
 test('PASS-OVER vs UNTOUCHED: a splittable section entirely behind the cap point comes back in its ORIGINAL form', () => {
   // (continued k/n) headings exist to carry the REMAINDER of a section a pass partly took.
   // A section nobody touched is not fragmented just because it is big.
