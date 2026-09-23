@@ -337,9 +337,52 @@ export class HiveManager {
   constructor(
     private getHome: () => string | null,
     private emit?: (channel: string, payload: unknown) => boolean | void,
-    routerRuntime: Partial<RouterRuntime> = {}
+    routerRuntime: Partial<RouterRuntime> = {},
+    /**
+     * May THIS hive write the user's GLOBAL provider config? See `mayWriteGlobalConfig`.
+     *
+     * DEFAULT-CLOSED, AND THAT IS THE POINT. A HiveManager built anywhere other than the
+     * app's one live instance - a probe, a test, a script - refuses every global write
+     * without having to know it should. Only `index.ts` supplies the real predicate.
+     */
+    private isLiveHarnessHome: (home: string) => boolean = () => false
   ) {
     this.routerRuntime = { ...NODE_ROUTER_RUNTIME, ...routerRuntime };
+  }
+
+  /**
+   * The one gate in front of every write to the USER'S GLOBAL provider config:
+   * `~/.gemini/config/hooks.json` and `~/.gemini/antigravity-cli/hooks.json`
+   * (`installAgyHooks`), `~/.grok/hooks/munder-hive.json` (`installGrokHooks`), and the
+   * Antigravity `statusLine` lease (`startAgyStatusline`). Everything else this class
+   * writes lives under the hive root or an agent directory and is not affected.
+   *
+   * WHY IT EXISTS. These files are global and single-valued: whoever writes them last
+   * owns the user's Antigravity and Grok integrations. On 2026-09-23 a scratch probe
+   * built a HiveManager on a temp hive without redirecting HOME, and `installAgyHooks`
+   * pointed the human's real `~/.gemini` hooks at a directory that was then deleted -
+   * breaking hook delivery for the live floor AND for the user's own `agy` sessions.
+   * Nothing was malicious and nothing was wrong with the probe's intent: the writer was
+   * simply reachable from any HiveManager at all.
+   *
+   * So a global write now needs BOTH: this hive's home is the one the app is configured
+   * to run (not a temp dir, not a second hive), and we are not the dev build (which has
+   * its own pipe and would silently re-point Stable's agents at it). A refusal is named
+   * and logged, never silent - the same shape as the existing dev-isolation skip.
+   */
+  private mayWriteGlobalConfig(what: string): boolean {
+    if (DEV_ISOLATION) {
+      console.warn(`[dev-isolation] skipping global ${what} install (would re-point Stable agents)`);
+      return false;
+    }
+    const home = this.getHome();
+    if (!home || !this.isLiveHarnessHome(home)) {
+      console.warn(`[hive] refusing to write global ${what} config: ${home ? 'not the live harness home' : 'no home'}`);
+      try { this.appendLog({ kind: 'global-config-skipped', what, reason: home ? 'not-live-home' : 'no-home' }); }
+      catch { /* a hive we may not write to may have nowhere to log either */ }
+      return false;
+    }
+    return true;
   }
 
   private readonly routerRuntime: RouterRuntime;
@@ -829,21 +872,17 @@ export class HiveManager {
         env.HIVE_SOCK = sock;
         try {
           if (desc.kind === 'hooks') {
-            // MUNDER_DEV=1: the agy and grok bridges write GLOBAL hook files
-            // (~/.gemini/…/hooks.json, ~/.grok/hooks/munder-hive.json) whose
-            // socket is THIS process's pipe — installing them from a dev build
-            // would silently re-point Stable's Antigravity/Grok agents at the
-            // dev hive. Skipped in dev; those two providers lose hive parity
-            // in dev only (the renderer's idle inbox nudge still delivers).
+            // The agy and grok bridges write GLOBAL config (~/.gemini/…/hooks.json,
+            // ~/.grok/hooks/munder-hive.json) whose socket is THIS process's pipe, so
+            // both go through `mayWriteGlobalConfig` — which refuses for a dev build and
+            // for any hive that is not the configured one. The refusal lives INSIDE each
+            // installer, so a future caller cannot route around it.
             if (desc.shim === 'agy') {
-              if (DEV_ISOLATION) console.warn('[dev-isolation] skipping global Antigravity hook install (would re-point Stable agents)');
-              else {
-                this.installAgyHooks();
-                // The statusline lease is checked immediately before every interactive
-                // AGY spawn: a user may have replaced it since startup, and then capture
-                // stays off for this run rather than being forced back over their choice.
-                this.reconcileAgyStatusline();
-              }
+              this.installAgyHooks();
+              // The statusline lease is checked immediately before every interactive
+              // AGY spawn: a user may have replaced it since startup, and then capture
+              // stays off for this run rather than being forced back over their choice.
+              this.reconcileAgyStatusline();
             }
             else if (desc.shim === 'codex') {
               const codex = this.installCodexHooks(dir);
@@ -885,8 +924,7 @@ export class HiveManager {
               env.GEMINI_CLI_SYSTEM_SETTINGS_PATH = this.installGeminiHooks(dir);
             }
             else if (desc.shim === 'grok') {
-              if (DEV_ISOLATION) console.warn('[dev-isolation] skipping global Grok hook install (would re-point Stable agents)');
-              else this.installGrokHooks();
+              this.installGrokHooks();
             }
           } else if (desc.kind === 'proxy') {
             // Stable per-spawn session id, stamped on every synthesized payload so
@@ -1967,6 +2005,7 @@ export class HiveManager {
   private installAgyHooks(): void {
     const root = this.root();
     if (!root) return;
+    if (!this.mayWriteGlobalConfig('Antigravity hook')) return;
     const shim = join(root, 'bin', 'agy-hook.cjs');
     mkdirSync(join(root, 'bin'), { recursive: true });
     writeFileSync(shim, AGY_HOOK_SHIM, 'utf8');
@@ -2023,6 +2062,9 @@ export class HiveManager {
       this.appendLog({ kind: 'agy-statusline', code: 'dev-isolation' });
       return;
     }
+    // The lease writes the user's GLOBAL Antigravity settings, so it answers to the same
+    // gate as the hook installers: never from a hive that is not the configured one.
+    if (!this.mayWriteGlobalConfig('Antigravity statusline')) return;
     const root = this.root();
     if (!root) return;
     try {
@@ -2405,6 +2447,7 @@ export class HiveManager {
   private installGrokHooks(): void {
     const root = this.root();
     if (!root) return;
+    if (!this.mayWriteGlobalConfig('Grok hook')) return;
     try {
       const shim = join(root, 'bin', 'grok-hook.cjs');
       mkdirSync(join(root, 'bin'), { recursive: true });

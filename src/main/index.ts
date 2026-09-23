@@ -25,7 +25,7 @@ import {
   runStandupTick, projectTasks,
   type FloorState, type StandupDecision, type StandupSkipRecord
 } from './standupDelta';
-import { listDir, readFileText, readFileBinary, writeFileText, statAbs, expandTilde } from './fs';
+import { listDir, readFileText, readFileBinary, writeFileText, statAbs, expandTilde, samePath } from './fs';
 import { normalizeWeekly, weeklyDelayMs } from '../shared/weeklySchedule';
 import { isInputOrigin } from '../shared/inputOrigin';
 import { automaticDeliveryEligibility, isTerminalInputState } from '../shared/inputProvenance';
@@ -322,7 +322,13 @@ const hive = new HiveManager(
     const wc = liveWebContents();
     if (!wc) return false;
     try { wc.send(channel, payload); return true; } catch { return false; }
-  }
+  },
+  {},
+  // THE one place a hive is allowed to write the user's GLOBAL provider config
+  // (~/.gemini hooks, ~/.grok hooks, the Antigravity statusLine). Read fresh from
+  // config each time, so a home change takes effect without a restart; everywhere
+  // else a HiveManager is constructed, the default refuses. See mayWriteGlobalConfig.
+  (home) => samePath(home, readConfig().harnessHome)
 );
 // #7C — operator control state (pause/gate/steer/halt), read by the HookServer
 // when deciding hook returns.

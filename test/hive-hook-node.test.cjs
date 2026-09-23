@@ -107,7 +107,12 @@ test('the claude hook + statusLine commands run through the launcher', async (t)
 test('every hook installer routes through the launcher — none left on bare node', async (t) => {
   const home = tmpHome();
   t.after(() => fs.rmSync(home, { recursive: true, force: true }));
-  const hive = new HiveManager(() => home);
+  // AGY-HOOKS-GLOBAL-GUARD: the global hook installers refuse unless this hive IS the
+  // configured harness home, and that predicate is default-closed. This test is ABOUT
+  // what those installers write, so it declares itself the live hive - explicitly, which
+  // is the point of the guard: writing the user's global config is now something a caller
+  // has to say it means. (The refusal is covered by hive-global-config-guard.test.cjs.)
+  const hive = new HiveManager(() => home, undefined, {}, () => true);
   await hive.ensureAgent({ id: 'a1', name: 'A', provider: 'claude', cwd: home });
 
   // agy and grok install into the USER's home. Redirect it, and refuse to run
