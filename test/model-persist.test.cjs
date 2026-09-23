@@ -30,3 +30,23 @@ test('per-agent model wins over worker and god defaults, while an empty saved va
   assert.equal(modelForHiveSpawn({ id: 'worker', name: 'Worker' }, cfg, '  '), 'claude-fable-5');
   assert.equal(modelForHiveSpawn({ id: 'god', name: 'God', isGod: true }, cfg), 'claude-opus-4-8');
 });
+
+test('the 1M suffix is a deliberate god-model pin and a later plain report clears it', async (t) => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'md-model-1m-'));
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  const hive = new HiveManager(() => home);
+  const god = { id: 'god-1', name: 'God', provider: 'claude', cwd: home, isGod: true };
+  await hive.ensureAgent(god);
+
+  hive.recordModel('god-1', 'claude-opus-4-8[1m]', 'claude-opus-4-8');
+  assert.equal(hive.lastModel('god-1'), 'claude-opus-4-8[1m]');
+  await hive.ensureAgent(god);
+  assert.equal(
+    modelForHiveSpawn(hive.registry().agents['god-1'], cfg, hive.lastModel('god-1')),
+    'claude-opus-4-8[1m]',
+    'respawn must retain the distinct 1M selection'
+  );
+
+  hive.recordModel('god-1', 'claude-opus-4-8', 'claude-opus-4-8');
+  assert.equal(hive.lastModel('god-1'), undefined);
+});

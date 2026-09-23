@@ -124,8 +124,8 @@ test('a Status report at the app default leaves no pin, so a later Settings defa
   let config = { notifications: true, defaultModel: 'claude-opus-5-5', godProvider: 'claude', godModel: 'claude-opus-4-8' };
   const { hive, fire } = await floor(t, () => config);
 
-  // Case and the 1M suffix are status spelling only; neither may create a pin.
-  await fire({ hook_event_name: 'Status', model: { id: 'CLAUDE-OPUS-5-5[1m]' } });
+  // Case and surrounding whitespace are status spelling only; neither may create a pin.
+  await fire({ hook_event_name: 'Status', model: { id: '  CLAUDE-OPUS-5-5  ' } });
   assert.equal(hive.lastModel('jim-1'), undefined);
 
   config = { ...config, defaultModel: 'claude-fable-5-1' };

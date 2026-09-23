@@ -46,7 +46,6 @@ import { selectBroadcastTargets } from '../shared/broadcast';
 import { preferredAgentRole } from '../shared/agentRole';
 import { mergeTaskLedger } from '../shared/taskLedger';
 import { expandTilde } from './fs';
-import { normalizeModel } from './pricing';
 
 /** The subset of HarnessConfig the hive consumes for the default-MCP merge.
  *  Kept as a local shape so hive.ts never imports the foundation-owned config
@@ -1119,8 +1118,10 @@ export class HiveManager {
       // Status payload shapes are shared by provider bridges. Only a real Claude
       // agent may turn one into a Claude CLI argument on a later respawn.
       if (!agent || agent.provider !== 'claude') return;
-      const key = normalizeModel(next).toLowerCase();
-      const defaultKey = normalizeModel(appDefault).toLowerCase();
+      // `[1m]` selects a different context window and must remain a real pin.
+      // Only harmless whitespace/case differences are equivalent to the default.
+      const key = next.toLowerCase();
+      const defaultKey = appDefault?.trim().toLowerCase() ?? '';
       if (defaultKey && key === defaultKey) {
         if (!agent.model) return;
         delete agent.model;
@@ -1130,9 +1131,7 @@ export class HiveManager {
         this.commit(`hive: model default ${agentId}`);
         return;
       }
-      // A status line may spell an already-saved 1M variant differently. Compare
-      // canonically so such reports do not churn registry writes or flip the pin.
-      if (normalizeModel(agent.model).toLowerCase() === key) return;
+      if (agent.model?.trim().toLowerCase() === key) return;
       agent.model = next;
       agent.lastSeen = Date.now();
       this.atomicWriteJson(join(root, 'registry.json'), reg);
