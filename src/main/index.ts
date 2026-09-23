@@ -95,6 +95,7 @@ import { ControlRegistry } from './control';
 import { WorkerWakeWatchdog } from './workerWake';
 import { InboxWakeBridge } from './inboxWakeBridge';
 import { WakeStallWatch } from './wakeStall';
+import { WakeTelemetry } from './wakeTelemetry';
 import { inboxNudgeText } from '../shared/hiveNudge';
 import { fetchHireManifest, readHireManifestFiles } from './hire';
 import { parseHireDeepLink, type HireManifest } from '../shared/hire';
@@ -387,6 +388,10 @@ const workerWake = new WorkerWakeWatchdog();
 // hive event log instead, which agents and the human already read, so ONE canary run
 // says which stage is inert. Remove with this branch.
 const wakeDiagSeen = new Map<string, string>();
+// WAKE TELEMETRY (D8). Observability only — it counts, it never decides, and the wake path
+// never reads it. See wakeTelemetry.ts.
+const wakeTelemetry = new WakeTelemetry(Date.now());
+
 // THE STALL WATCHDOG (god's ruling A2). Decision in wakeStall.ts; this is the voice.
 const wakeStalls = new WakeStallWatch();
 
@@ -401,6 +406,9 @@ function noteWakeRefusal(agentId: string, why: string, inboxIds: number): void {
 }
 
 function wakeDiag(stage: string, fields: Record<string, unknown>): void {
+  // Counted FIRST, before the de-duplication below: the reconcile rows the log folds away
+  // are exactly the ones a stall is made of, so the counters must see every one.
+  try { wakeTelemetry.note(stage, fields, Date.now()); } catch { /* telemetry never decides */ }
   try {
     // The 15s reconciliation beat repeats every stage for every agent. Log one line per
     // CHANGE there (ignoring the always-moving idle age), so a 15-minute canary stays
@@ -1728,10 +1736,14 @@ function writeFleetSnapshot(): void {
           lastTool: spans.length ? spans[spans.length - 1].tool : null,
           lastActiveSecAgo: u ? Math.round((now - u.ts) / 1000) : null,
           inboxBacklog: hive.inboxBacklog(id),
-          onHold: !!a.onHold
+          onHold: !!a.onHold,
+          // D8: this agent's wake history, next to the backlog it is supposed to drain.
+          // Those two numbers together are the whole question — mail waiting, and whether
+          // anything is waking to read it.
+          wake: wakeTelemetry.forAgent(id)
         };
       });
-    hive.writeFleetSnapshot({ ts: now, agents });
+    hive.writeFleetSnapshot({ ts: now, agents, wake: wakeTelemetry.snapshot(now) });
   } catch (e) {
     console.error('[fleet] snapshot failed:', e);
   }
