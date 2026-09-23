@@ -22,6 +22,11 @@
  * is still the shipped artifact. The dev root is FIXED by that contract (the env override
  * was removed at Dwight's audit), so the canary borrows it and puts back what was there.
  *
+ * EXCLUSIVE FLOOR-WIDE. Because that dev root is fixed, only one canary may run anywhere at
+ * a time; a second would stash the first one's stash. A lockfile enforces it (canary-lock.cjs),
+ * and a FAILED run keeps the lock marked dirty so the next run refuses rather than burying
+ * the evidence it deliberately left behind. CANARY_FORCE=1 overrides.
+ *
  * NOT part of `node --test`: it takes minutes and opens a window. Run it directly:
  *   npm run build && npx electron-builder --win --dir --publish never -c.npmRebuild=false
  *   node test/tools/packaged-wake-canary.cjs
@@ -33,6 +38,7 @@ const { createHash } = require('node:crypto');
 const { mkdirSync, writeFileSync, readFileSync, existsSync, rmSync, renameSync } = require('node:fs');
 const { join, resolve } = require('node:path');
 const WebSocket = require('ws');
+const lock = require('./canary-lock.cjs');
 
 const REPO = resolve(__dirname, '..', '..');
 const APP_EXE = join(REPO, 'dist', 'win-unpacked', 'Munder Difflin.exe');
@@ -316,7 +322,20 @@ async function main() {
   }
   const stamp = Date.now();
   const stubsDir = join(REPO, 'dist', `canary-stubs-${stamp}`);
+
+  // BEFORE anything is moved: one canary at a time, floor-wide.
+  try {
+    lock.acquire(DEV_ROOT);
+  } catch (e) {
+    if (e.canaryLocked) { console.error(`
+[canary] REFUSING TO START
+
+${e.message}
+`); process.exit(2); }
+    throw e;
+  }
   const moved = stashDevRoot(stamp);
+  lock.noteStash(DEV_ROOT, moved.map(([, bak]) => bak));
   if (moved.length) log(`stashed ${moved.length} existing dev path(s); they are restored at the end`);
 
   const { pipe, typed } = seed(stubsDir);
@@ -430,8 +449,11 @@ async function main() {
   const failed = failures.length > 0;
   if (failed) {
     // Keep the evidence where it is; a failed canary is a thing to read, not to tidy.
+    // The lock stays, marked DIRTY and naming the stash, so the next run refuses to bury it.
+    lock.release(DEV_ROOT, { dirty: true, stashed: moved.map(([, bak]) => bak) });
     log('dev root LEFT IN PLACE for inspection:', DEV_HIVE);
     log('stubs + typed logs:', stubsDir);
+    log('lock kept DIRTY — the next canary run will refuse until the .canary-bak paths are restored');
   } else {
     try { rmSync(DEV_HIVE, { recursive: true, force: true }); } catch { /* best effort */ }
     try { rmSync(join(DEV_USERDATA, 'config.json'), { force: true }); } catch { /* best effort */ }
@@ -439,6 +461,7 @@ async function main() {
     try { rmSync(DEV_LOCALSTORAGE, { recursive: true, force: true }); } catch { /* best effort */ }
     try { rmSync(stubsDir, { recursive: true, force: true }); } catch { /* best effort */ }
     restoreDevRoot(moved);
+    lock.release(DEV_ROOT);
   }
 
   console.log('\n─── GATE-1 packaged cold-boot wake canary ───');
