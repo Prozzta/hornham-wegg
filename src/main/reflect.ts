@@ -56,6 +56,19 @@ const CONDENSE_SYSTEM = [
   '- Output ONLY the JSON object. No prose, no code fence.'
 ].join('\n');
 
+/** The exact shape the model must return: handed to the CLI as `--json-schema` and
+ *  validated again locally. Two gates deliberately — the CLI's validation is another
+ *  program's promise, and this one is the gate that stands in front of memory.md. */
+const CONDENSE_SCHEMA = {
+  type: 'object',
+  additionalProperties: false,
+  required: ['condensed', 'hoist'],
+  properties: {
+    condensed: { type: 'string', minLength: 1 },
+    hoist: { type: 'array', items: { type: 'string' } }
+  }
+} as const;
+
 export interface ReflectSettings {
   enabled: boolean;
   /** How often to scan for oversized memory files. */
@@ -111,7 +124,10 @@ export class MemoryReflector {
     private getCommand: () => string,
     private getMemoryEnv: () => Record<string, string>,
     private getSettings: () => ReflectSettings,
-    private appendLog: (event: Record<string, unknown>) => void
+    private appendLog: (event: Record<string, unknown>) => void,
+    /** The hidden model call. Injectable ONLY so the summarize path can be driven
+     *  deterministically in tests; production always uses the real print process. */
+    private runHidden: typeof runHiddenClaude = runHiddenClaude
   ) {}
 
   // — lifecycle (mirrors MemoryManager) —
@@ -276,20 +292,19 @@ export class MemoryReflector {
       pinned?.trim() || '(none)'
     ].join('\n');
 
-    const result = await runHiddenClaude(prompt, {
+    const result = await this.runHidden(prompt, {
       model: CONDENSE_MODEL,
       cwd: home,
       command: this.getCommand(),
       // Pure text transform — must never touch the repo or shell out.
       disallowedTools: ['Edit', 'Write', 'NotebookEdit', 'Bash'],
+      jsonSchema: CONDENSE_SCHEMA,
       env: this.getMemoryEnv(),
       timeoutMs: DEFAULT_TIMEOUT_MS,
     });
 
-    if (!result.ok || !result.text) {
-      throw new Error(result.error ?? 'condense: hidden session returned no text');
-    }
-    const parsed = parseSummary(result.text);
+    if (!result.ok) throw new Error(result.error ?? 'condense: hidden session failed');
+    const parsed = validateSummary(result.structuredOutput, result.result);
     if (!parsed) throw new Error('condense: response contained no parseable JSON');
     return parsed;
   }
@@ -376,7 +391,7 @@ export function verify(args: {
   condensed: string; keep: Section[];
 }): { ok: true } | { ok: false; reason: string } {
   const { rebuilt, newBytes, oldBytes, oldPinnedLines, mergedPinned, condensed, keep } = args;
-  // 6) Valid summary JSON already enforced upstream (parseSummary). Here: structure.
+  // 6) Valid summary JSON already enforced upstream (validateSummary). Here: structure.
   // 1) Parses back into the 3-region structure.
   const re = parseMemory(rebuilt);
   if (re.pinned === null || re.condensed === null) return { ok: false, reason: 'structure-missing-region' };
@@ -399,25 +414,33 @@ export function verify(args: {
   return { ok: true };
 }
 
-/** Pull `{condensed, hoist}` out of `claude -p --output-format json` output.
- *  Two layers: the CLI envelope `{result: "<text>"}`, then the model's strict
- *  JSON (tolerating an accidental ```json fence). Returns null on any failure. */
-export function parseSummary(stdout: string): { condensed: string; hoist: string[] } | null {
-  const raw = stdout.trim();
-  if (!raw) return null;
-  let inner = raw;
-  try {
-    const env = JSON.parse(raw) as { result?: unknown; text?: unknown };
-    if (typeof env.result === 'string') inner = env.result;
-    else if (typeof env.text === 'string') inner = env.text;
-  } catch { /* not the CLI envelope — treat stdout itself as the model output */ }
-  inner = inner.trim().replace(/^```(?:json)?\s*/i, '').replace(/```\s*$/, '').trim();
-  try {
-    const obj = JSON.parse(inner) as { condensed?: unknown; hoist?: unknown };
-    if (typeof obj.condensed !== 'string' || !obj.condensed.trim()) return null;
-    const hoist = Array.isArray(obj.hoist) ? obj.hoist.filter((x): x is string => typeof x === 'string') : [];
-    return { condensed: obj.condensed, hoist };
-  } catch { return null; }
+/**
+ * The ONLY way a model response becomes a summary.
+ *
+ * Preferred input is the CLI's `structured_output`, already validated against
+ * CONDENSE_SCHEMA by the CLI itself. For a Claude build that honours `--json-schema`
+ * but surfaces only `result`, exactly ONE fallback is allowed: the WHOLE `result`
+ * string must parse as the object. No brace scanning, no fence stripping, no substring
+ * rescue — the defect being fixed is plausible text from somewhere else being accepted
+ * as this agent's memory, so anything short of an exact match is a refusal.
+ */
+export function validateSummary(structured: unknown, result?: string): { condensed: string; hoist: string[] } | null {
+  const shaped = shapeSummary(structured);
+  if (shaped) return shaped;
+  if (typeof result !== 'string' || !result.trim()) return null;
+  let whole: unknown;
+  try { whole = JSON.parse(result.trim()); } catch { return null; }
+  return shapeSummary(whole);
+}
+
+/** The local half of the two gates: the exact `{condensed, hoist}` shape, or nothing. */
+function shapeSummary(value: unknown): { condensed: string; hoist: string[] } | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const obj = value as { condensed?: unknown; hoist?: unknown };
+  if (typeof obj.condensed !== 'string' || !obj.condensed.trim()) return null;
+  if (obj.hoist !== undefined && !Array.isArray(obj.hoist)) return null;
+  const hoist = Array.isArray(obj.hoist) ? obj.hoist.filter((x): x is string => typeof x === 'string') : [];
+  return { condensed: obj.condensed, hoist };
 }
 
 /** `20260606T110912Z` — matches the janitor's backup-dir stamp format. */
