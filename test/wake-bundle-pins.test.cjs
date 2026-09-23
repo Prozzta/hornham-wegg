@@ -22,6 +22,19 @@ const BUNDLE = join(__dirname, '..', 'out', 'main', 'index.js');
 const built = existsSync(BUNDLE);
 const src = built ? readFileSync(BUNDLE, 'utf8') : '';
 
+// The suite skip below is deliberate and stays: a source-only checkout must not go red for
+// not having run `npm run build`. But a skipped SUITE lands in `# suites`, never in
+// `# skipped`, so an unbuilt tree reported `tests 0 / fail 0 / skipped 0` — the same
+// numbers a GATE that ran and held produces. One skipped test puts the inertness where a
+// summary-reader will see it. Registered ONLY when out/ is ABSENT: a bundle that is
+// present but STALE is what the pins themselves are for, and must not be double-handled.
+if (!built) {
+  require('./tools/inert.cjs').announceInert(
+    'GATE-3 did not run: the main bundle is not built',
+    'out/main/index.js not built — run npm run build'
+  );
+}
+
 describe('GATE-3: the built main bundle still carries the wake path', { skip: built ? false : 'out/main/index.js not built — run npm run build' }, () => {
   /** Assert a symbol survived bundling (minify-safe: these are all strings or idents
    *  that rollup keeps because they are reachable from the entry). */
