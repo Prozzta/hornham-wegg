@@ -161,6 +161,8 @@ export function normalizeClaudeStatusLine(input: {
     streamId: input.streamId ?? `claude-status:${input.accountScope}`,
     sourceSequence: finiteNumber(input.sourceSequence),
     source: 'claude-status-line' satisfies ObservationSource,
+    // Claude's status line states no schema version on the path we read.
+    sourceVersion: null,
     observedAt: finiteNumber(input.observedAt) ?? input.receivedAt,
     receivedAt: input.receivedAt,
     windows,
@@ -325,6 +327,8 @@ export function normalizeCodexRateLimits(input: {
     streamId: input.streamId ?? null,
     sourceSequence: finiteNumber(input.sourceSequence),
     source,
+    // Neither Codex path states a version.
+    sourceVersion: null,
     observedAt: observedAt ?? input.receivedAt,
     receivedAt: input.receivedAt,
     windows,
@@ -335,6 +339,226 @@ export function normalizeCodexRateLimits(input: {
     ordinaryUsageAllowed: typeof allowedRaw === 'boolean' ? allowedRaw : null,
     planType: typeof planRaw === 'string' && planRaw ? planRaw : null
   };
+}
+
+// ─── Antigravity statusline (1.1.48) ─────────────────────────────────────────
+
+/** The four quota buckets, and nothing else. Two families x two windows. */
+export const AGY_QUOTA_KEYS = ['3p-5h', '3p-weekly', 'gemini-5h', 'gemini-weekly'] as const;
+type AgyQuotaKey = (typeof AGY_QUOTA_KEYS)[number];
+
+/** The fields a bucket carries, and nothing else. */
+const AGY_BUCKET_KEYS = ['remaining_fraction', 'reset_time', 'reset_in_seconds'] as const;
+
+/**
+ * The MEASURED `agent_state` set, closed. `tool_use` is one of its VALUES - there is no
+ * boolean `tool_use` property in the schema (Oscar's captures; Jim MF-1). A confirmation
+ * prompt is `agent_state: 'tool_use'` together with `tool_confirmation_pending: true`.
+ */
+export const AGY_AGENT_STATES = ['authenticating', 'idle', 'working', 'tool_use'] as const;
+
+/** The two allowance families. Also the two `limitId`s. */
+export type AgyFamily = '3p' | 'gemini';
+
+/** The canonical lifecycle one tick states. Never derived from anything but the tick. */
+export type AgyLifecycle = 'idle' | 'running' | 'waiting_for_confirmation';
+
+export interface AgyStatusTick {
+  version: string;
+  activeLimitId: AgyFamily;
+  /** Always `[3p, gemini]`, in that order. Never merged, never one without the other. */
+  observations: readonly [CapacityObservation, CapacityObservation];
+  lifecycle: AgyLifecycle;
+}
+
+/**
+ * Why a tick was refused. A CLOSED set of fixed strings, so a drift diagnostic can be
+ * counted and logged without carrying one byte of the payload that caused it.
+ */
+export const AGY_DRIFT_CODES = [
+  'not-object',
+  'version',
+  'model',
+  'quota-missing',
+  'quota-keys',
+  'bucket-keys',
+  'fraction',
+  'reset-time',
+  'reset-seconds',
+  'reset-disagree',
+  'agent-state',
+  'confirmation-flag',
+  'authenticating'
+] as const;
+export type AgyDriftCode = (typeof AGY_DRIFT_CODES)[number];
+
+export type AgyClassification =
+  | { ok: true; tick: AgyStatusTick }
+  /** `version` only when it was itself a valid version string; never anything else. */
+  | { ok: false; driftCode: AgyDriftCode; version: string | null };
+
+/** Receipt-relative reset seconds and the stated reset instant must agree this closely. */
+export const AGY_RESET_TOLERANCE_MS = 5_000;
+
+/** Longer than any real version string; short enough to be a safe diagnostic key. */
+const AGY_VERSION_MAX_CHARS = 64;
+
+/**
+ * RFC 3339 date-time, with a mandatory offset. `Date.parse` alone accepts a zoo of
+ * formats, including offset-less local times that would shift by the machine's zone -
+ * so the shape is checked first and the parse only supplies the instant.
+ */
+const RFC3339 = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})$/;
+
+const exactKeys = (d: Dict, keys: readonly string[]): boolean => {
+  const own = Object.keys(d);
+  return own.length === keys.length && keys.every((k) => Object.prototype.hasOwnProperty.call(d, k));
+};
+
+/**
+ * Which family a MEASURED model id draws from. Gemini-branded models draw the Gemini
+ * allowance; every other model draws 3P.
+ *
+ * CASE-SENSITIVE ON PURPOSE. The measured id is a display label, `Gemini 3.8 Flash
+ * (High)`. If a future build reports a slug (`gemini-3.8-flash`) this deliberately
+ * binds to 3P, and the golden-fixture test fails - which is the point: a silent
+ * lowercase match would keep working on a shape nobody has verified.
+ */
+export function agyFamilyOfModel(modelId: string): AgyFamily {
+  return modelId.startsWith('Gemini ') ? 'gemini' : '3p';
+}
+
+/**
+ * Classify one Antigravity statusline payload. See `normalizeAgyStatusLine`.
+ *
+ * ALL OR NOTHING. A valid tick needs every one of the four buckets, each complete and
+ * self-consistent, AND a recognised lifecycle. Anything short of that is refused
+ * whole: there is no clamping, no synthesised window, no positional fallback, and no
+ * publishing the valid half of a malformed tick - the half that parsed is exactly as
+ * suspect as the half that did not, because we cannot know which part the provider
+ * changed. Unknown TOP-LEVEL properties are ignored, so a new display-only field is not
+ * by itself drift; unknown keys inside `quota` or inside a bucket are.
+ */
+export function classifyAgyStatusLine(input: {
+  payload: unknown;
+  accountScope: string;
+  receivedAt: number;
+}): AgyClassification {
+  const p = input.payload;
+  if (!isDict(p)) return { ok: false, driftCode: 'not-object', version: null };
+
+  const version = typeof p.version === 'string' && p.version.length > 0
+    && p.version.length <= AGY_VERSION_MAX_CHARS && /^[\x21-\x7e]+$/.test(p.version)
+    ? p.version : null;
+  const drift = (driftCode: AgyDriftCode): AgyClassification => ({ ok: false, driftCode, version });
+  if (version === null) return drift('version');
+
+  // LIFECYCLE FIRST, because the boot tick is decided here. It carries
+  // `agent_state: 'authenticating'`, `model: null` and no quota map, and the ratified
+  // N-1 choice (b) is to accept an UNKNOWN lifecycle at boot rather than invent a
+  // lifecycle-only observation to make authentication look active.
+  const state = p.agent_state;
+  if (typeof state !== 'string' || !(AGY_AGENT_STATES as readonly string[]).includes(state)) {
+    return drift('agent-state');
+  }
+  const pendingRaw = p.tool_confirmation_pending;
+  if (pendingRaw !== undefined && typeof pendingRaw !== 'boolean') return drift('confirmation-flag');
+  let lifecycle: AgyLifecycle;
+  if (pendingRaw === true) lifecycle = 'waiting_for_confirmation';
+  else if (state === 'working' || state === 'tool_use') lifecycle = 'running';
+  else if (state === 'idle') lifecycle = 'idle';
+  else return drift('authenticating');
+
+  // The MEASURED model, never the configured one: the CLI default and an in-session
+  // switch can both differ from whatever `--model` said at launch.
+  const model = p.model;
+  if (!isDict(model) || typeof model.id !== 'string' || !model.id.trim()) return drift('model');
+  const activeLimitId = agyFamilyOfModel(model.id);
+
+  const quota = p.quota;
+  if (!isDict(quota)) return drift('quota-missing');
+  if (!exactKeys(quota, AGY_QUOTA_KEYS)) return drift('quota-keys');
+
+  const windows = {} as Record<AgyQuotaKey, CapacityWindow>;
+  for (const key of AGY_QUOTA_KEYS) {
+    const b = quota[key];
+    if (!isDict(b) || !exactKeys(b, AGY_BUCKET_KEYS)) return drift('bucket-keys');
+    const f = b.remaining_fraction;
+    if (typeof f !== 'number' || !Number.isFinite(f) || f < 0 || f > 1) return drift('fraction');
+    const rt = b.reset_time;
+    const resetsAt = typeof rt === 'string' && RFC3339.test(rt) ? Date.parse(rt) : NaN;
+    if (!Number.isFinite(resetsAt)) return drift('reset-time');
+    const rs = b.reset_in_seconds;
+    if (typeof rs !== 'number' || !Number.isFinite(rs) || rs < 0) return drift('reset-seconds');
+    // A CONSISTENCY CHECK, not a fallback. `reset_time` is the reset; the seconds are
+    // there to catch a payload whose two statements of it disagree. Measured drift
+    // across 116 real pairs was at most 0.9 s.
+    if (Math.abs(resetsAt - (input.receivedAt + rs * 1000)) > AGY_RESET_TOLERANCE_MS) return drift('reset-disagree');
+
+    const fiveHour = key.endsWith('-5h');
+    const kind = fiveHour ? 'FIVE_HOUR' : 'SEVEN_DAY';
+    const minutes = fiveHour ? FIVE_HOUR_MINUTES : SEVEN_DAY_MINUTES;
+    const remaining = f * 100;
+    windows[key] = {
+      // The family stays IN the window id as well as the limit id. Redundant on
+      // purpose: a log line, a fixture or a drift report names the window without
+      // anyone having to reconstruct which pool it came from.
+      windowId: key,
+      kind,
+      applicability: 'APPLICABLE',
+      label: windowLabel(kind, minutes),
+      windowMinutes: minutes,
+      // From the SAME number, so the pair always sums to exactly 100.
+      usedPercent: 100 - remaining,
+      remainingPercent: remaining,
+      resetsAt
+    };
+  }
+
+  const sid = [p.session_id, p.conversation_id].find((v): v is string => typeof v === 'string' && v.length > 0);
+  const obs = (family: AgyFamily): CapacityObservation => ({
+    poolKey: poolKeyOf('antigravity', input.accountScope, family),
+    provider: 'antigravity',
+    accountScope: input.accountScope,
+    limitId: family,
+    streamId: sid ?? null,
+    sourceSequence: null,
+    source: 'antigravity-status-line' satisfies ObservationSource,
+    sourceVersion: version,
+    // The payload has no authoritative observation time of its own.
+    observedAt: input.receivedAt,
+    receivedAt: input.receivedAt,
+    windows: [windows[`${family}-5h`], windows[`${family}-weekly`]],
+    // A zero remainder is NUMERICAL exhaustion only: the tracker derives it into
+    // `numericallyExhaustedWindowIds` and RESERVE_ONLY. Antigravity states no refusal
+    // and names no limiting window, so nothing here may claim it did (C2.4).
+    providerAttributedLimitingWindowId: null,
+    providerReachedType: null,
+    ordinaryUsageAllowed: null,
+    planType: null
+  });
+
+  return { ok: true, tick: { version, activeLimitId, observations: [obs('3p'), obs('gemini')], lifecycle } };
+}
+
+/**
+ * Antigravity statusline payload → exactly two observations, or null.
+ *
+ * One tick describes TWO pools - `antigravity:<scope>:3p` and
+ * `antigravity:<scope>:gemini` - and both are always returned together. They are never
+ * merged, compared by percentage, or reduced to a provider-wide worst value; the model
+ * reported in the same tick only chooses which of them gates the emitting agent.
+ *
+ * THE EMAIL IS NEVER READ. The payload carries one; this function does not look at it,
+ * and the account scope arrives already computed from the Gemini home path.
+ */
+export function normalizeAgyStatusLine(input: {
+  payload: unknown;
+  accountScope: string;
+  receivedAt: number;
+}): AgyStatusTick | null {
+  const c = classifyAgyStatusLine(input);
+  return c.ok ? c.tick : null;
 }
 
 /** Exported for the tracker's own reset arithmetic; kept in one place. */

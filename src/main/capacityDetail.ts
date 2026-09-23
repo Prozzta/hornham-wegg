@@ -38,7 +38,8 @@ export interface CapacityDetailInputs {
 const SOURCE_TEXT: Record<PoolCapacitySnapshot['source'], string> = {
   'claude-status-line': 'Claude status line',
   'codex-rollout': 'Codex session log',
-  'codex-account-read': 'Codex account read'
+  'codex-account-read': 'Codex account read',
+  'antigravity-status-line': 'Antigravity status line'
 };
 
 const KIND_ORDER: Record<CapacityWindow['kind'], number> = { FIVE_HOUR: 0, SEVEN_DAY: 1, OTHER: 2 };

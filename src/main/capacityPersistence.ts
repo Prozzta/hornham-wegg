@@ -200,6 +200,13 @@ function validPool(value: unknown): PersistedCapacityPool | null {
   if (!presentNullableBounded(o, 'providerAttributedLimitingWindowId', IDENTITY_LIMITS.identityChars)) return null;
   if (!presentNullableBounded(o, 'providerReachedType', FIELD_CHARS)) return null;
   if (!presentNullableBounded(o, 'planType', FIELD_CHARS)) return null;
+  // THE ONE MIGRATION IN THIS VALIDATOR, and it is deliberately narrow. `sourceVersion`
+  // was added in 1.1.48, so every store written before that lacks the key, and absence
+  // there means "written by an older build" - which migrates to null (no version was
+  // recorded). It is NEVER inferred from the source or anything else. A key that IS
+  // present must be null or a bounded string: a present-but-malformed value is not an
+  // old file, it is a wrong one, and rejects the store like any other bad field.
+  if ('sourceVersion' in o && !(o.sourceVersion === null || bounded(o.sourceVersion, IDENTITY_LIMITS.identityChars))) return null;
   if (!('ordinaryUsageAllowed' in o)) return null;
   if (!(o.ordinaryUsageAllowed === null || typeof o.ordinaryUsageAllowed === 'boolean')) return null;
   if (!Array.isArray(o.windows) || o.windows.length > RETENTION_CAPS.maxWindowsPerPool) return null;
@@ -254,6 +261,7 @@ function validPool(value: unknown): PersistedCapacityPool | null {
     accountScope: o.accountScope as string,
     limitId: o.limitId as string,
     source: o.source as CapacityObservation['source'],
+    sourceVersion: typeof o.sourceVersion === 'string' ? o.sourceVersion : null,
     streamId: (o.streamId as string | null) ?? null,
     sourceSequence: (o.sourceSequence as number | null) ?? null,
     observedAt: o.observedAt,

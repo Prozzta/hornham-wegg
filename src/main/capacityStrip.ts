@@ -57,7 +57,10 @@ export const STATE_TEXT: Record<CapacityState, string> = {
   RECOVERING: 'Recovering'
 };
 
-const PROVIDER_LABEL: Record<ProviderId, string> = { claude: 'Claude', codex: 'Codex' };
+// Antigravity's per-family labels (`Antigravity · 3P` / `Antigravity · Gemini`) are the
+// strip's business and land with the two-pool UI; until then no AGY pool is ingested,
+// and this entry exists so the provider set stays exhaustive here.
+const PROVIDER_LABEL: Record<ProviderId, string> = { claude: 'Claude', codex: 'Codex', antigravity: 'Antigravity' };
 
 /**
  * One main-owned copy per reveal reason (C2.11 crit 18). The renderer never

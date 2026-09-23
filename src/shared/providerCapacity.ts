@@ -22,8 +22,16 @@
  * error that turns this module into a source of false claims.
  */
 
-/** Provider families L0 collects from. */
-export const PROVIDER_IDS = ['claude', 'codex'] as const;
+/**
+ * Provider families L0 collects from.
+ *
+ * `antigravity` is the first provider with TWO live limit identities per account -
+ * a `3p` allowance for third-party models and a `gemini` allowance for Gemini-branded
+ * ones. They are two pools, not one provider-wide pool: the invariant everywhere in
+ * this module is one pool per provider-ACCOUNT-LIMIT identity, and Claude and Codex
+ * simply happen to expose one limit each.
+ */
+export const PROVIDER_IDS = ['claude', 'codex', 'antigravity'] as const;
 export type ProviderId = (typeof PROVIDER_IDS)[number];
 
 /**
@@ -77,7 +85,8 @@ export type CapacityFreshness = 'FRESH' | 'STALE';
 export const OBSERVATION_SOURCES = [
   'claude-status-line',
   'codex-rollout',
-  'codex-account-read'
+  'codex-account-read',
+  'antigravity-status-line'
 ] as const;
 
 export type ObservationSource = (typeof OBSERVATION_SOURCES)[number];
@@ -169,6 +178,17 @@ export interface CapacityObservation {
   accountScope: string;
   limitId: string;
   source: ObservationSource;
+  /**
+   * The provider's own schema/client version for this reading, or null.
+   *
+   * MANDATORY, AND NULLABLE. Claude and Codex state no version on the paths we read,
+   * so they emit null. Antigravity states one on every statusline tick, and recording
+   * it is what makes a later schema change auditable: a reading that fails structural
+   * validation after an upgrade can be matched to the version that introduced the
+   * drift. A persisted record written before this field existed migrates to null.
+   * The value is NEVER inferred - not from the source, not from a sibling reading.
+   */
+  sourceVersion: string | null;
   /** Provider event time where the source supplies one, else receipt time. */
   observedAt: number;
   receivedAt: number;
@@ -201,6 +221,8 @@ export interface PoolCapacitySnapshot {
    * the difference cannot tell a current reading from a re-read of an old one.
    */
   source: ObservationSource;
+  /** Copied from the observation behind this projection. See `CapacityObservation`. */
+  sourceVersion: string | null;
   freshness: CapacityFreshness;
   observedAt: number;
   receivedAt: number;

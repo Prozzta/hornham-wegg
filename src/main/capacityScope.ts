@@ -83,3 +83,29 @@ export function codexAccountScope(codexHome: string): string {
   const auth = join(codexHome, 'auth.json');
   return scopeHash(existsSync(auth) ? resolved(auth) : resolved(codexHome));
 }
+
+/**
+ * The Gemini home Antigravity reads its configuration and credential from.
+ *
+ * `GEMINI_CLI_HOME` when it is set to something non-blank, otherwise `~/.gemini`.
+ * The same resolution the statusline-ownership code uses for the settings file, so
+ * "which account" and "whose settings" can never disagree about the directory.
+ */
+export function geminiHome(env: NodeJS.ProcessEnv = process.env): string {
+  return env.GEMINI_CLI_HOME?.trim() || join(homedir(), '.gemini');
+}
+
+/**
+ * Antigravity's account scope: a hash of the resolved Gemini home PATH, and nothing else.
+ *
+ * THE STATUSLINE CARRIES THE ACCOUNT'S EMAIL, and it is deliberately not used - not
+ * accepted, not hashed, not retained. A hash of an email is still a stable identifier of
+ * a person, and it would travel into logs, pool keys and the durable store. The home
+ * directory is what actually distinguishes two accounts on this machine (the same rule
+ * Claude and Codex follow), and hashing a path discloses nothing about who is signed in.
+ * Case folding and symlink resolution are the shared rules above, so two spellings of
+ * one home are one pool and two homes are two.
+ */
+export function agyAccountScope(env: NodeJS.ProcessEnv = process.env): string {
+  return scopeHash(resolved(geminiHome(env)));
+}
