@@ -68,11 +68,12 @@ async function server(t, dir) {
 }
 
 /** Run the shim. `stdin` null leaves stdin OPEN (to test the watchdog). */
-function runShim(file, { stdin, env = {}, args = [] } = {}) {
+function runShim(file, { stdin, env = {}, args = [], preload = null } = {}) {
   return new Promise((resolve) => {
     const started = Date.now();
     const elapsedFile = path.join(path.dirname(file), `elapsed-${++elapsedSeq}.txt`);
-    const child = spawn(process.execPath, ['--require', path.join(path.dirname(file), 'timing-preload.cjs'), file, ...args], {
+    const extra = preload ? ['--require', preload] : [];
+    const child = spawn(process.execPath, ['--require', path.join(path.dirname(file), 'timing-preload.cjs'), ...extra, file, ...args], {
       env: { PATH: process.env.PATH, SystemRoot: process.env.SystemRoot, SHIM_ELAPSED_FILE: elapsedFile, ...env },
       stdio: ['pipe', 'pipe', 'pipe'],
       windowsHide: true
@@ -205,6 +206,22 @@ test('SHIM WATCHDOG: stdin that never closes still exits 0 at ~400 ms', async (t
   // It ends at all (no hang), and it ends because of the 400 ms watchdog - not before.
   assert.ok(r.inProcess >= WATCHDOG_MS - 10, `the WATCHDOG ended it, not an early exit: ${r.inProcess} ms in-process`);
   assert.ok(r.inProcess < WATCHDOG_MS + WATCHDOG_SLACK_MS, `and it did fire: ${r.inProcess} ms in-process`);
+});
+
+test('SHIM CONNECT DEADLINE: a socket that never connects is abandoned at ~150 ms, long before the watchdog', async (t) => {
+  // Jim's upgrade for mutant #11b, which a census alone could only kill structurally. The
+  // preload swaps net.createConnection for a socket that never connects and never errors,
+  // so ONLY the shim's own 150 ms deadline can end the attempt - without it, the 400 ms
+  // watchdog would, and this assertion fails.
+  const { dir, file } = shimFile(t);
+  const hang = path.join(dir, 'never-connects.cjs');
+  fs.writeFileSync(hang,
+    "const net = require('net');\n" +
+    "net.createConnection = function () { return new net.Socket(); };\n");
+  const r = await runShim(file, { stdin: JSON.stringify(golden()), env: { HIVE_SOCK: 'unused-by-the-fake' }, preload: hang });
+  assert.equal(r.code, 0);
+  assert.ok(r.inProcess !== null && r.inProcess >= 130, `it waited for the deadline: ${r.inProcess} ms`);
+  assert.ok(r.inProcess < 300, `and the DEADLINE ended it, not the 400 ms watchdog: ${r.inProcess} ms in-process`);
 });
 
 // ─── endpoint selection ─────────────────────────────────────────────────────
@@ -374,7 +391,26 @@ test('HOOKSERVER: the boot tick is not drift; the tally is bounded', (t) => {
 
 const read = (rel) => fs.readFileSync(path.join(__dirname, '..', rel), 'utf8');
 
-test('WIRING: startup leases after the HookServer listens; every teardown releases it', () => {
+test('WIRING: startup TAKES NOTHING - it gives back leftovers; the lease is taken on an AGY spawn', () => {
+  // god, on Jim's consent note: a Munder start with no AGY agent must not touch the user's
+  // global AGY settings. Plain substring checks - no regex escaping to get wrong.
+  const hive = read('src/main/hive.ts');
+  const start = hive.slice(hive.indexOf('  startAgyStatusline(): void {'), hive.indexOf('  reconcileAgyStatusline(): void {'));
+  assert.ok(start.includes('recoverStatuslineLeftovers(env)'), 'startup gives back what a dead run left');
+  assert.ok(!start.includes('.ensure(') && !start.includes('this.reconcileAgyStatusline()'),
+    'startup never takes the lease');
+  // The command is the UNQUOTED builder's - agy passes quote characters literally.
+  assert.ok(start.includes('buildStatuslineCommand(launcher, shim, token, locator)'));
+  assert.ok(!start.includes('this.nodeRun('), 'never the quoted nodeRun form');
+  assert.ok(start.includes("code: 'unsafe-command-path'"), 'an unexpressible path refuses the lease, named');
+  // Released when the LAST AGY agent leaves the floor.
+  const index = read('src/main/index.ts');
+  const teardown = index.slice(index.indexOf('function teardownPty(id: string): void {'), index.indexOf('// 2) Remove the isolated worktree'));
+  assert.ok(teardown.includes("leftProvider === 'antigravity' && ![...ptyProvider.values()].includes('antigravity')"));
+  assert.ok(teardown.includes('hive.agyAgentsGone()'));
+});
+
+test('WIRING: startup prepares after the HookServer listens; every teardown releases it', () => {
   const index = read('src/main/index.ts');
   const start = index.indexOf('hookServer.start();');
   const lease = index.indexOf('hive.startAgyStatusline();');

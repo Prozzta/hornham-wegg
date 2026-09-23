@@ -236,18 +236,9 @@ test('EXTERNAL EDIT seen before a spawn: relinquished, and capture STAYS OFF for
   assert.equal(fs.readFileSync(paths.settings, 'utf8'), before, 'and nothing is written');
 });
 
-test('AGY AUTO-DISABLE (enabled:false written back) is an edit: fail closed, never restored over', (t) => {
-  // agy 1.2.8 auto-disables a statusline after consecutive failures. If that persists,
-  // the value is no longer ours - and the safe reading is "changed", not "still Munder's".
-  const { home, paths } = sandbox(t, USER_SETTINGS);
-  const a = proc(home, worldOf());
-  const r = acquireStatuslineLease(a.env);
-  const s = readSettings(paths);
-  s.statusLine = { ...s.statusLine, enabled: false };
-  fs.writeFileSync(paths.settings, JSON.stringify(s));
-  assert.equal(releaseStatuslineLease(a.env, r.leaseId), 'adopted-user-edit');
-  assert.equal(readSettings(paths).statusLine.enabled, false);
-});
+// The old AUTO-DISABLE test pinned the BUG Jim found: it read AGY's enabled:false rewrite
+// as a user edit and deleted the journal, losing the user's prior statusline for good.
+// See the FIX 1 tests at the end of this file for the corrected behaviour.
 
 test('KEY ORDER is not an edit: agy rewriting the object in a different order is still ours', (t) => {
   const { home, paths } = sandbox(t, USER_SETTINGS);
@@ -465,6 +456,208 @@ test('THE SHAPE LIVES IN ONE PLACE: installedValueFor is the only statusLine con
   assert.deepEqual(installedValueFor('cmd'), { type: 'command', command: 'cmd', enabled: true });
   const src = fs.readFileSync(path.join(__dirname, '..', 'src', 'main', 'agyStatuslineOwnership.ts'), 'utf8');
   assert.equal((codeOnly(src).match(/type: 'command'/g) ?? []).length, 1);
+});
+
+// ─── Jim's c2 audit (agents/jim-mtujpe28/agy-c1c2-AUDIT.md) ────────────────
+
+const { buildStatuslineCommand, recoverStatuslineLeftovers, isOurs, isAutoDisabled,
+  LOCK_ABANDONED_MS, LEASE_STALE_MS } = loadTs('src/main/agyStatuslineOwnership.ts');
+
+/** AGY's own auto-disable: OUR object, rewritten with enabled:false. */
+function agyAutoDisables(paths) {
+  const s = readSettings(paths);
+  s.statusLine = { ...s.statusLine, enabled: false };
+  fs.writeFileSync(paths.settings, JSON.stringify(s, null, 2));
+}
+const PRIOR = { type: 'command', command: 'my-own-statusline.sh', enabled: true };
+
+test('FIX 1: AGY auto-disable then release RESTORES the prior byte-for-byte, and names it', (t) => {
+  const { home, paths } = sandbox(t, { ...USER_SETTINGS, statusLine: PRIOR });
+  const a = proc(home, worldOf());
+  const r = acquireStatuslineLease(a.env);
+  agyAutoDisables(paths);
+  assert.equal(releaseStatuslineLease(a.env, r.leaseId), 'restored', 'our command is ours, enabled or not');
+  assert.deepEqual(readSettings(paths).statusLine, PRIOR, 'the user gets THEIR statusline back');
+  assert.ok(a.reports.includes('agy-auto-disabled'), 'and the auto-disable is visible, not silent');
+  assert.ok(!exists(paths.journal));
+});
+
+test('FIX 1: auto-disable then reconcile then release - capture goes off, but the prior is still owed', (t) => {
+  const { home, paths } = sandbox(t, { ...USER_SETTINGS, statusLine: PRIOR });
+  const owner = new AgyStatuslineOwner(proc(home, worldOf()).env);
+  assert.equal(owner.ensure(), true);
+  agyAutoDisables(paths);
+  assert.equal(owner.ensure(), false, 'capture is off for the run');
+  assert.equal(owner.ownerToken(), null, 'so the locator is withdrawn');
+  assert.ok(owner.holdsLease(), 'but the lease is KEPT');
+  assert.ok(exists(paths.journal), 'and so is the journal - the only copy of the prior');
+  owner.release();
+  assert.deepEqual(readSettings(paths).statusLine, PRIOR);
+});
+
+test('FIX 1: a REAL user edit - a DIFFERENT command - is still adopted untouched', (t) => {
+  const { home, paths } = sandbox(t, { ...USER_SETTINGS, statusLine: PRIOR });
+  const a = proc(home, worldOf());
+  const r = acquireStatuslineLease(a.env);
+  const s = readSettings(paths);
+  s.statusLine = { type: 'command', command: 'their-brand-new-choice', enabled: false };
+  const bytes = JSON.stringify(s, null, 3);
+  fs.writeFileSync(paths.settings, bytes);
+  assert.equal(releaseStatuslineLease(a.env, r.leaseId), 'adopted-user-edit');
+  assert.equal(fs.readFileSync(paths.settings, 'utf8'), bytes, 'byte-for-byte');
+});
+
+test('FIX 1: an auto-disabled leftover at acquire - prior given back FIRST, then a fresh lease', (t) => {
+  const { home, paths } = sandbox(t, { statusLine: PRIOR });
+  const w = worldOf();
+  const a = proc(home, w);
+  const ra = acquireStatuslineLease(a.env);
+  agyAutoDisables(paths);
+  a.die();
+  const b = proc(home, w);
+  const rb = acquireStatuslineLease(b.env);
+  assert.equal(rb.code, 'owned', 'a new generation');
+  assert.notEqual(rb.token, ra.token);
+  assert.deepEqual(readJournal(paths).prior, { present: true, value: PRIOR },
+    'the prior recorded is the USER\'s value - never our disabled command');
+  assert.ok(b.reports.includes('agy-auto-disabled'));
+  releaseStatuslineLease(b.env, rb.leaseId);
+  assert.deepEqual(readSettings(paths).statusLine, PRIOR);
+});
+
+test('FIX 1: auto-disabled while another instance is live - no capture here, and that owner restores', (t) => {
+  const { home, paths } = sandbox(t, { statusLine: PRIOR });
+  const w = worldOf();
+  const a = proc(home, w);
+  const ra = acquireStatuslineLease(a.env);
+  agyAutoDisables(paths);
+  const b = proc(home, w);
+  assert.deepEqual(acquireStatuslineLease(b.env), { captureEnabled: false, code: 'agy-auto-disabled' });
+  assert.equal(releaseStatuslineLease(a.env, ra.leaseId), 'restored');
+  assert.deepEqual(readSettings(paths).statusLine, PRIOR);
+});
+
+test('isOurs / isAutoDisabled: the command decides, not the flag - and only OUR command', () => {
+  const ours = { type: 'command', command: 'node shim --owner abc', enabled: true };
+  assert.ok(isOurs({ ...ours, enabled: false }, ours));
+  assert.ok(isAutoDisabled({ ...ours, enabled: false }, ours));
+  assert.ok(!isAutoDisabled(ours, ours), 'intact is not auto-disabled');
+  assert.ok(!isOurs({ ...ours, command: 'node shim --owner xyz' }, ours), 'another generation is not ours');
+  assert.ok(!isOurs('node shim --owner abc', ours), 'a scalar is not our object');
+});
+
+test('FIX 2: an EMPTY lock older than a minute is recovered as abandoned', (t) => {
+  const { home, paths } = sandbox(t, USER_SETTINGS);
+  const w = worldOf();
+  w.clock = Date.now();
+  fs.writeFileSync(paths.lock, '');
+  const old = (Date.now() - LOCK_ABANDONED_MS - 5_000) / 1000;
+  fs.utimesSync(paths.lock, old, old);
+  const a = proc(home, w);
+  assert.equal(acquireStatuslineLease(a.env).code, 'owned', 'the wedge is gone');
+  assert.ok(a.reports.includes('lock-abandoned-recovered'));
+});
+
+test('FIX 2: a FRESH empty lock still refuses - it may be a holder mid-write', (t) => {
+  const { home, paths } = sandbox(t, USER_SETTINGS);
+  const w = worldOf();
+  w.clock = Date.now();
+  fs.writeFileSync(paths.lock, '');
+  assert.deepEqual(acquireStatuslineLease(proc(home, w).env), { captureEnabled: false, code: 'lock-ambiguous' });
+});
+
+test('FIX 2: a failed holder write never leaves the lock behind', (t) => {
+  const { home, paths } = sandbox(t, USER_SETTINGS);
+  const a = proc(home, worldOf(), { crashAt: (s) => { if (s === 'after-lock-open') throw new Error('disk full'); } });
+  assert.throws(() => acquireStatuslineLease(a.env), /disk full/);
+  assert.ok(!exists(paths.lock), 'no empty lock to wedge the next start');
+});
+
+test('FIX 3: a lease unseen for 24 h is pruned even though its pid still answers', (t) => {
+  // The owner crashed and Windows recycled its pid: kill(pid, 0) says "alive" forever.
+  const { home, paths } = sandbox(t, { statusLine: PRIOR });
+  const w = worldOf();
+  const a = proc(home, w);
+  const b = proc(home, w);
+  acquireStatuslineLease(a.env);
+  const rb = acquireStatuslineLease(b.env);
+  w.ambiguous.add(a.pid);                 // unprovable, not dead
+  w.clock += LEASE_STALE_MS + 60_000;
+  // b stays fresh by heartbeating; a never does.
+  const j = readJournal(paths);
+  j.leases = j.leases.map((l) => (l.id === rb.leaseId ? { ...l, lastSeen: w.clock } : l));
+  fs.writeFileSync(paths.journal, JSON.stringify(j));
+  assert.equal(releaseStatuslineLease(b.env, rb.leaseId), 'restored', 'the stale lease no longer withholds the restore');
+  assert.ok(b.reports.includes('lease-stale-pruned'));
+  assert.deepEqual(readSettings(paths).statusLine, PRIOR);
+});
+
+test('FIX 3: a heartbeat keeps a long-lived instance\'s lease alive', (t) => {
+  const { home, paths } = sandbox(t, { statusLine: PRIOR });
+  const w = worldOf();
+  const a = proc(home, w);
+  const b = proc(home, w);
+  const ownerA = new AgyStatuslineOwner(a.env);
+  assert.equal(ownerA.ensure(), true);
+  const rb = acquireStatuslineLease(b.env);
+  w.clock += LEASE_STALE_MS - 60_000;
+  ownerA.heartbeat();                      // an hourly beat
+  w.clock += 2 * 60_000;                   // now past 24 h since A's lease was taken
+  assert.equal(releaseStatuslineLease(b.env, rb.leaseId), 'released', 'A is still there: no restore under it');
+  assert.notDeepEqual(readSettings(paths).statusLine, PRIOR);
+});
+
+test('FIX 4: STARTUP TAKES NOTHING - no journal, nothing touched, nothing created', (t) => {
+  const { home, paths } = sandbox(t, USER_SETTINGS);
+  const before = fs.readFileSync(paths.settings, 'utf8');
+  const listing = fs.readdirSync(path.dirname(paths.settings)).sort();
+  assert.equal(recoverStatuslineLeftovers(proc(home, worldOf()).env), 'nothing-to-recover');
+  assert.equal(fs.readFileSync(paths.settings, 'utf8'), before);
+  assert.deepEqual(fs.readdirSync(path.dirname(paths.settings)).sort(), listing, 'not even a lock file');
+});
+
+test('FIX 4: STARTUP GIVES BACK a lease a dead run left installed (enabled or auto-disabled)', (t) => {
+  for (const disable of [false, true]) {
+    const { home, paths } = sandbox(t, { ...USER_SETTINGS, statusLine: PRIOR });
+    const w = worldOf();
+    const a = proc(home, w);
+    acquireStatuslineLease(a.env);
+    if (disable) agyAutoDisables(paths);
+    a.die();
+    assert.equal(recoverStatuslineLeftovers(proc(home, w).env), 'orphan-restored');
+    assert.deepEqual(readSettings(paths).statusLine, PRIOR);
+    assert.ok(!exists(paths.journal));
+  }
+});
+
+test('FIX 4: a LIVE instance\'s lease is left alone at startup', (t) => {
+  const { home, paths } = sandbox(t, { statusLine: PRIOR });
+  const w = worldOf();
+  acquireStatuslineLease(proc(home, w).env);
+  const before = fs.readFileSync(paths.settings, 'utf8');
+  assert.equal(recoverStatuslineLeftovers(proc(home, w).env), 'nothing-to-recover');
+  assert.equal(fs.readFileSync(paths.settings, 'utf8'), before);
+});
+
+test('FIX 4: released when the last AGY agent leaves, and leased again on the next spawn', (t) => {
+  const { home, paths } = sandbox(t, { statusLine: PRIOR });
+  const owner = new AgyStatuslineOwner(proc(home, worldOf()).env);
+  assert.equal(owner.ensure(), true);
+  owner.release();                                        // the last AGY agent left
+  assert.deepEqual(readSettings(paths).statusLine, PRIOR, 'the user has it back at once');
+  assert.equal(owner.ensure(), true, 'a later AGY spawn leases again');
+  assert.notDeepEqual(readSettings(paths).statusLine, PRIOR);
+});
+
+test('QUOTING: the command is UNQUOTED, and any path agy would mangle refuses the lease', () => {
+  // agy 1.2.9 passes quote characters literally: `-File '"C:/.../x.ps1"' ... Illegal characters in path`.
+  assert.equal(buildStatuslineCommand('C:\\hive\\bin\\hive-node.cmd', 'C:\\hive\\bin\\agy-statusline.cjs', 'a'.repeat(32),
+    'C:\\hive\\state\\agy-statusline-endpoint.json'),
+    `C:\\hive\\bin\\hive-node.cmd C:\\hive\\bin\\agy-statusline.cjs --owner ${'a'.repeat(32)} --locator C:\\hive\\state\\agy-statusline-endpoint.json`);
+  for (const bad of ['C:\\Program Files\\x.cmd', 'C:\\"quoted"\\x', "C:\\it's\\x", '', 'C:\\tab\there']) {
+    assert.equal(buildStatuslineCommand(bad, 's', 't', 'l'), null, JSON.stringify(bad));
+    assert.equal(buildStatuslineCommand('n', 's', 't', bad), null, JSON.stringify(bad));
+  }
 });
 
 /** Source with comment lines removed, so a census counts code and not prose about it. */

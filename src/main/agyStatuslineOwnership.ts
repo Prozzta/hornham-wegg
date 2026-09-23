@@ -27,7 +27,7 @@
  */
 import { createHash, randomBytes } from 'node:crypto';
 import {
-  closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync,
+  closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, statSync,
   unlinkSync, writeSync
 } from 'node:fs';
 import { dirname, join } from 'node:path';
@@ -51,7 +51,12 @@ export const STATUSLINE_DIAGNOSTICS = [
   'released',            // this instance's lease removed; others remain
   'restored',            // the last lease: the exact prior value put back
   'adopted-user-edit',   // the last lease, but the user changed it: left exactly as is
-  'restore-cas-failed'   // could not restore safely: journal left for the next run
+  'restore-cas-failed',  // could not restore safely: journal left for the next run
+  'agy-auto-disabled',   // AGY disabled OUR command (enabled:false): capture off, prior still owed
+  'orphan-restored',     // startup gave back a value a crashed run left installed
+  'lease-stale-pruned',  // a lease unseen for LEASE_STALE_MS, whatever its pid says
+  'lock-abandoned-recovered', // an empty/unreadable lock past LOCK_ABANDONED_MS
+  'unsafe-command-path'  // a path in the command has whitespace or quotes: never leased
 ] as const;
 export type StatuslineDiagnostic = (typeof STATUSLINE_DIAGNOSTICS)[number];
 
@@ -61,6 +66,8 @@ export interface StatuslineLease {
   pid: number;
   /** Identifies THIS start of that pid, so a recycled pid is never mistaken for it. */
   processStartedAt: number;
+  /** Last heartbeat. Missing on a lease written before heartbeats: the journal's createdAt stands in. */
+  lastSeen?: number;
 }
 
 /** Journal schema 1. Local control data only - never the whole settings document. */
@@ -100,6 +107,7 @@ export interface StatuslineEnv {
 
 /** Every step boundary a crash can fall between. */
 export type CrashStep =
+  | 'after-lock-open'
   | 'after-journal-prepared'
   | 'after-settings-replaced'
   | 'after-journal-owned'
@@ -129,6 +137,43 @@ export function statuslinePaths(geminiHome: string): StatuslinePaths {
  */
 export function installedValueFor(command: string): Record<string, unknown> {
   return { type: 'command', command, enabled: true };
+}
+
+/**
+ * The installed command, UNQUOTED - or null when it cannot be expressed safely.
+ *
+ * AGY PASSES QUOTE CHARACTERS LITERALLY. It splits the command on whitespace and hands the
+ * pieces over as-is, so a double-quoted path arrives with the quotes still on it. From
+ * AGY 1.2.9's own log, for a measurement probe whose command quoted its script path:
+ *   statusline: command failed ... Processing -File '"C:/.../status-capture.ps1"'
+ *   failed: Illegal characters in path. (failure 1/30)
+ * and after 30 such failures AGY auto-disables the statusline. The design's quoted form
+ * would have failed identically on every render. This is why the existing AGY hook
+ * commands are unquoted too - and it means no path in the command may contain
+ * whitespace or a quote at all. Such a path returns null and the lease is never taken
+ * (named `unsafe-command-path`): a command guaranteed to fail is worse than none.
+ */
+export function buildStatuslineCommand(launcher: string, shim: string, token: string, locator: string): string | null {
+  const parts = [launcher, shim, '--owner', token, '--locator', locator];
+  if (parts.some((part) => !part || /[\s"']/.test(part))) return null;
+  return parts.join(' ');
+}
+
+/**
+ * Is this value OUR installed statusline - whatever AGY has since done to its `enabled`?
+ * The command carries this lease generation's owner token, so no other tool, no user and
+ * no earlier lease can produce the same command.
+ */
+export function isOurs(current: unknown, installed: unknown): boolean {
+  if (sameValue(current, installed)) return true;
+  return isDict(current) && isDict(installed) && typeof installed.command === 'string'
+    && current.command === installed.command;
+}
+
+/** OUR command, switched off - AGY's own auto-disable after repeated failures. */
+export function isAutoDisabled(current: unknown, installed: unknown): boolean {
+  return isOurs(current, installed) && !sameValue(current, installed)
+    && isDict(current) && current.enabled === false;
 }
 
 // ─── primitives ──────────────────────────────────────────────────────────────
@@ -209,7 +254,8 @@ function validJournal(v: unknown): v is StatuslineJournal {
   if (prior.present && !('value' in prior)) return false;
   if (!Array.isArray(v.leases)) return false;
   return v.leases.every((l) => isDict(l) && typeof l.id === 'string'
-    && Number.isInteger(l.pid) && typeof l.processStartedAt === 'number');
+    && Number.isInteger(l.pid) && typeof l.processStartedAt === 'number'
+    && (l.lastSeen === undefined || typeof l.lastSeen === 'number'));
 }
 
 function readJournal(p: string): StatuslineJournal | null | 'corrupt' {
@@ -235,11 +281,24 @@ function quarantine(p: string, now: number): void {
 
 const LOCK_ATTEMPTS = 20;
 const LOCK_BACKOFF_MS = 25;
+/**
+ * How old an EMPTY or UNPARSEABLE lock must be before it counts as abandoned. The locked
+ * section is milliseconds long, so a minute is generous. Only an unreadable lock ages out:
+ * a PARSEABLE holder that is live or ambiguous is never broken, whatever its age.
+ */
+export const LOCK_ABANDONED_MS = 60_000;
 
 /**
  * Hold the adjacent exclusive lock for `fn`. BOUNDED: after `LOCK_ATTEMPTS` the answer
  * is 'lock-busy'. A holder that is provably dead is pruned; a holder we cannot prove dead
- * - including a lock file we cannot parse - is NEVER broken: this run gives up instead.
+ * is NEVER broken: this run gives up instead.
+ *
+ * THE WEDGE THIS CLOSES (Jim, c2 audit fix 2). The lock file is created, THEN its holder
+ * record written. A throw between the two - disk full, an antivirus lock - or a crash in
+ * that gap left an EMPTY lock, which read as an unparseable (ambiguous) holder and was
+ * never broken: every later start refused, and no release could ever restore the user's
+ * value. So a failed holder write now removes the lock before rethrowing, and an empty or
+ * unreadable lock older than `LOCK_ABANDONED_MS` is recovered as abandoned.
  */
 function withLock<T>(env: StatuslineEnv, lock: string, fn: () => T): T | 'lock-busy' | 'lock-ambiguous' {
   mkdirSync(dirname(lock), { recursive: true });
@@ -253,6 +312,13 @@ function withLock<T>(env: StatuslineEnv, lock: string, fn: () => T): T | 'lock-b
       let holder: unknown = null;
       try { holder = JSON.parse(readFileSync(lock, 'utf8')); } catch { holder = null; }
       if (!isDict(holder) || !Number.isInteger(holder.pid) || typeof holder.processStartedAt !== 'number') {
+        let age = 0;
+        try { age = env.now() - statSync(lock).mtimeMs; } catch { continue; } // gone: retry
+        if (age > LOCK_ABANDONED_MS) {
+          unlinkQuiet(lock);
+          env.report('lock-abandoned-recovered');
+          continue;
+        }
         return 'lock-ambiguous';
       }
       const alive = env.liveness(holder.pid as number, holder.processStartedAt as number);
@@ -262,10 +328,17 @@ function withLock<T>(env: StatuslineEnv, lock: string, fn: () => T): T | 'lock-b
       continue;
     }
     try {
-      writeSync(fd, mine);
-      fsyncSync(fd);
-    } finally {
-      closeSync(fd);
+      try {
+        env.crashAt?.('after-lock-open');
+        writeSync(fd, mine);
+        fsyncSync(fd);
+      } finally {
+        closeSync(fd);
+      }
+    } catch (e) {
+      // Never leave an empty lock behind: that is the wedge.
+      unlinkQuiet(lock);
+      throw e;
     }
     try {
       return fn();
@@ -276,20 +349,62 @@ function withLock<T>(env: StatuslineEnv, lock: string, fn: () => T): T | 'lock-b
   return 'lock-busy';
 }
 
-// ─── the state machine ───────────────────────────────────────────────────────
+// ─── leases ──────────────────────────────────────────────────────────────────
 
-/** Keep only leases whose process is provably dead. Ambiguous is KEPT: never restore under it. */
-function pruneDead(env: StatuslineEnv, leases: StatuslineLease[]): StatuslineLease[] {
-  return leases.filter((l) => env.liveness(l.pid, l.processStartedAt) !== 'dead');
+/**
+ * How long a lease may go without a heartbeat before it is presumed dead even though its
+ * pid answers.
+ *
+ * WHY (Jim, c2 audit): liveness for ANOTHER process is `kill(pid, 0)`, which cannot tell a
+ * crashed Munder from an unrelated process Windows later gave the same pid. Such a lease
+ * reads as live for as long as that process lives - days - and the user's statusline stays
+ * Munder's the whole time. A live instance refreshes `lastSeen` hourly and on every AGY
+ * spawn, so 24 hours without one means the owner is gone, whatever the pid says.
+ */
+export const LEASE_STALE_MS = 24 * 60 * 60 * 1000;
+
+/** Keep leases that are not provably dead AND have been seen recently. Ambiguous is KEPT. */
+function liveLeases(env: StatuslineEnv, j: StatuslineJournal): StatuslineLease[] {
+  const now = env.now();
+  return j.leases.filter((l) => {
+    if (env.liveness(l.pid, l.processStartedAt) === 'dead') return false;
+    if (now - (l.lastSeen ?? j.createdAt) > LEASE_STALE_MS) {
+      env.report('lease-stale-pruned');
+      return false;
+    }
+    return true;
+  });
 }
+
+const hasKey = (o: Dict): boolean => Object.prototype.hasOwnProperty.call(o, STATUSLINE_KEY);
+
+/** Does the current value still hold what the user had before Munder? */
+const isPrior = (j: StatuslineJournal, present: boolean, current: unknown): boolean =>
+  j.prior.present ? present && sameValue(current, j.prior.value) : !present;
+
+/** Put the user's prior value back, under CAS. False (and nothing written) if settings moved. */
+function restorePrior(env: StatuslineEnv, paths: StatuslinePaths, j: StatuslineJournal,
+  settings: { bytes: Buffer | null; obj: Dict }): boolean {
+  const next: Dict = { ...settings.obj };
+  if (j.prior.present) next[STATUSLINE_KEY] = j.prior.value;
+  else delete next[STATUSLINE_KEY];
+  if (!casWriteSettings(paths.settings, sha(settings.bytes), next)) return false;
+  env.crashAt?.('after-restore-write');
+  const verify = readSettings(paths.settings);
+  return verify !== 'malformed' && isPrior(j, hasKey(verify.obj), verify.obj[STATUSLINE_KEY]);
+}
+
+// ─── the state machine ───────────────────────────────────────────────────────
 
 export type AcquireResult =
   | { captureEnabled: true; token: string; leaseId: string; code: StatuslineDiagnostic }
   | { captureEnabled: false; code: StatuslineDiagnostic };
 
 /**
- * Install or join the lease. Called at startup and again just before an interactive
- * AGY spawn (both through `AgyStatuslineOwner`, which remembers a disable for the run).
+ * Install or join the lease. Called just before an interactive AGY spawn, through
+ * `AgyStatuslineOwner`, which remembers a disable for the run. Never at a bare startup:
+ * a Munder start with no AGY agent does not touch the user's global settings (god, on
+ * Jim's consent note) - see `recoverStatuslineLeftovers` for what startup does instead.
  */
 export function acquireStatuslineLease(env: StatuslineEnv): AcquireResult {
   const paths = statuslinePaths(env.geminiHome);
@@ -303,13 +418,15 @@ export function acquireStatuslineLease(env: StatuslineEnv): AcquireResult {
       quarantine(paths.journal, env.now());
       return { captureEnabled: false, code: 'corrupt-journal' };
     }
-    const lease: StatuslineLease = { id: env.randomToken(), pid: env.pid, processStartedAt: env.processStartedAt };
+    const lease: StatuslineLease = {
+      id: env.randomToken(), pid: env.pid, processStartedAt: env.processStartedAt, lastSeen: env.now()
+    };
 
     for (let attempt = 0; attempt < 2; attempt++) {
       const settings = readSettings(paths.settings);
       if (settings === 'malformed') return { captureEnabled: false, code: 'malformed-settings' };
       const current = settings.obj[STATUSLINE_KEY];
-      const present = Object.prototype.hasOwnProperty.call(settings.obj, STATUSLINE_KEY);
+      const present = hasKey(settings.obj);
       let j = attempt === 0 ? journal : readJournal(paths.journal);
       if (j === 'corrupt') { quarantine(paths.journal, env.now()); return { captureEnabled: false, code: 'corrupt-journal' }; }
 
@@ -319,20 +436,33 @@ export function acquireStatuslineLease(env: StatuslineEnv): AcquireResult {
       // the state a clean shutdown leaves, plus a leftover file - so the leftover goes and
       // this run starts fresh. (Without this, a crash inside the restore would disable
       // capture for the NEXT run as an "external override" of a value nobody changed.)
-      if (j && j.phase === 'owned' && pruneDead(env, j.leases).length === 0
-        && (j.prior.present ? present && sameValue(current, j.prior.value) : !present)) {
+      if (j && j.phase === 'owned' && liveLeases(env, j).length === 0 && isPrior(j, present, current)) {
         unlinkQuiet(paths.journal);
         j = null;
       }
 
+      // AGY AUTO-DISABLED A PREVIOUS GENERATION, and no live instance holds it. Give the
+      // user their value back first; then this run may try again with a fresh lease. If
+      // AGY gives up on it again, the next release restores again - the prior is never lost.
+      if (j && present && isAutoDisabled(current, j.installedValue) && liveLeases(env, j).length === 0) {
+        env.report('agy-auto-disabled');
+        if (!restorePrior(env, paths, j, settings)) return { captureEnabled: false, code: 'restore-cas-failed' };
+        unlinkQuiet(paths.journal);
+        continue; // the next attempt reads the restored settings and starts fresh
+      }
+
       if (j) {
-        const ours = present && sameValue(current, j.installedValue);
-        if (ours) {
+        if (present && sameValue(current, j.installedValue)) {
           // Crash leftover or another live instance. Either way the ORIGINAL prior value
           // is retained - adopting a lease must never re-record "prior" as our own value.
-          const next: StatuslineJournal = { ...j, phase: 'owned', leases: [...pruneDead(env, j.leases), lease] };
+          const next: StatuslineJournal = { ...j, phase: 'owned', leases: [...liveLeases(env, j), lease] };
           writeJournal(paths.journal, next);
           return { captureEnabled: true, token: j.token, leaseId: lease.id, code: 'adopted' };
+        }
+        if (present && isAutoDisabled(current, j.installedValue)) {
+          // Auto-disabled while ANOTHER live instance holds it: that instance's release
+          // restores the prior. Nothing to capture here.
+          return { captureEnabled: false, code: 'agy-auto-disabled' };
         }
         if (j.phase === 'prepared' && sha(settings.bytes) === j.settingsHashBefore) {
           // The crash fell between publishing the prepared journal and replacing
@@ -385,7 +515,7 @@ function finishInstall(
     unlinkQuiet(paths.journal);
     return { captureEnabled: false, code: 'external-override' };
   }
-  writeJournal(paths.journal, { ...j, phase: 'owned', leases: [...pruneDead(env, j.leases), lease] });
+  writeJournal(paths.journal, { ...j, phase: 'owned', leases: [...liveLeases(env, j), lease] });
   env.crashAt?.('after-journal-owned');
   return { captureEnabled: true, token: j.token, leaseId: lease.id, code: 'owned' };
 }
@@ -393,10 +523,11 @@ function finishInstall(
 /**
  * Just before an interactive AGY spawn: is Munder's value still installed?
  *
- * If it is not, that is a user (or another tool) choosing a different statusline while we
- * held the lease. It is RELINQUISHED on the spot - our lease removed, the setting left
- * byte-for-byte alone - and the caller keeps capture disabled for the rest of the run. A
- * later clean app start may begin a new lease and will record that value as its prior.
+ * Three answers. INTACT: capture on. A DIFFERENT value: a user (or another tool) chose a
+ * different statusline while we held the lease - RELINQUISHED on the spot, our lease
+ * removed, the setting left byte-for-byte alone, capture off for the run. OUR command with
+ * `enabled:false`: AGY auto-disabled it - capture off for the run, but the lease and the
+ * journal are KEPT, because the release still owes the user their prior value.
  */
 export function reconcileStatuslineLease(env: StatuslineEnv, leaseId: string): 'intact' | StatuslineDiagnostic {
   const paths = statuslinePaths(env.geminiHome);
@@ -406,9 +537,19 @@ export function reconcileStatuslineLease(env: StatuslineEnv, leaseId: string): '
     if (!j || !j.leases.some((l) => l.id === leaseId)) return 'external-override';
     const settings = readSettings(paths.settings);
     if (settings === 'malformed') return 'malformed-settings';
-    if (sameValue(settings.obj[STATUSLINE_KEY], j.installedValue)
-      && Object.prototype.hasOwnProperty.call(settings.obj, STATUSLINE_KEY)) return 'intact';
-    const rest = pruneDead(env, j.leases).filter((l) => l.id !== leaseId);
+    const current = settings.obj[STATUSLINE_KEY];
+    const present = hasKey(settings.obj);
+    // Every reconcile is also a heartbeat for this lease.
+    const beat = j.leases.map((l) => (l.id === leaseId ? { ...l, lastSeen: env.now() } : l));
+    if (present && sameValue(current, j.installedValue)) {
+      writeJournal(paths.journal, { ...j, leases: beat });
+      return 'intact';
+    }
+    if (present && isAutoDisabled(current, j.installedValue)) {
+      writeJournal(paths.journal, { ...j, leases: beat });
+      return 'agy-auto-disabled';
+    }
+    const rest = liveLeases(env, j).filter((l) => l.id !== leaseId);
     if (rest.length) writeJournal(paths.journal, { ...j, leases: rest });
     else unlinkQuiet(paths.journal);
     return 'external-override';
@@ -417,9 +558,27 @@ export function reconcileStatuslineLease(env: StatuslineEnv, leaseId: string): '
   return r;
 }
 
+/** Refresh this lease's `lastSeen`. Cheap; called hourly by a live instance. */
+export function heartbeatStatuslineLease(env: StatuslineEnv, leaseId: string): void {
+  const paths = statuslinePaths(env.geminiHome);
+  withLock(env, paths.lock, () => {
+    const j = readJournal(paths.journal);
+    if (!j || j === 'corrupt' || !j.leases.some((l) => l.id === leaseId)) return;
+    writeJournal(paths.journal, {
+      ...j, leases: j.leases.map((l) => (l.id === leaseId ? { ...l, lastSeen: env.now() } : l))
+    });
+  });
+}
+
 /**
- * Clean shutdown: drop this instance's lease; if it was the LAST live one, restore the
- * exact prior value - but only if the setting still holds Munder's value.
+ * Drop this instance's lease; if it was the LAST live one, restore the exact prior value -
+ * when the setting still holds OUR command, whether or not AGY has since disabled it.
+ *
+ * THE LOSS THIS CLOSES (Jim, c2 audit fix 1, blocking). AGY rewrites a statusline it gives
+ * up on as our own object with `enabled:false`. That used to read as a user edit: the
+ * journal - the only copy of the user's prior value - was deleted, and their settings were
+ * left pointing at a disabled Munder command, permanently. The command carries this lease
+ * generation's owner token, so it is provably ours whatever its `enabled` flag says.
  */
 export function releaseStatuslineLease(env: StatuslineEnv, leaseId: string): StatuslineDiagnostic {
   const paths = statuslinePaths(env.geminiHome);
@@ -427,40 +586,74 @@ export function releaseStatuslineLease(env: StatuslineEnv, leaseId: string): Sta
     const j = readJournal(paths.journal);
     if (j === 'corrupt') { quarantine(paths.journal, env.now()); return 'corrupt-journal'; }
     if (!j) return 'external-override';
-    const rest = pruneDead(env, j.leases).filter((l) => l.id !== leaseId);
+    const rest = liveLeases(env, j).filter((l) => l.id !== leaseId);
     if (rest.length) {
       writeJournal(paths.journal, { ...j, leases: rest });
       return 'released';
     }
-    const settings = readSettings(paths.settings);
-    if (settings === 'malformed') return 'restore-cas-failed';
-    const present = Object.prototype.hasOwnProperty.call(settings.obj, STATUSLINE_KEY);
-    if (!present || !sameValue(settings.obj[STATUSLINE_KEY], j.installedValue)) {
-      // The user changed it while we held it. Their value stands; ours is simply gone.
-      unlinkQuiet(paths.journal);
-      return 'adopted-user-edit';
-    }
-    const next: Dict = { ...settings.obj };
-    if (j.prior.present) next[STATUSLINE_KEY] = j.prior.value;
-    else delete next[STATUSLINE_KEY];
-    if (!casWriteSettings(paths.settings, sha(settings.bytes), next)) {
-      // Leave the journal: the next reconciliation decides with fresh evidence. Never guess.
-      writeJournal(paths.journal, { ...j, leases: [] });
-      return 'restore-cas-failed';
-    }
-    env.crashAt?.('after-restore-write');
-    const verify = readSettings(paths.settings);
-    const restored = verify !== 'malformed' && (j.prior.present
-      ? sameValue(verify.obj[STATUSLINE_KEY], j.prior.value)
-      : !Object.prototype.hasOwnProperty.call(verify.obj, STATUSLINE_KEY));
-    if (!restored) {
-      writeJournal(paths.journal, { ...j, leases: [] });
-      return 'restore-cas-failed';
-    }
-    unlinkQuiet(paths.journal);
-    return 'restored';
+    return restoreOrAdopt(env, paths, j);
   });
   env.report(r);
+  return r;
+}
+
+/** The last owner is gone: give the prior back if the value is ours, or adopt a real edit. */
+function restoreOrAdopt(env: StatuslineEnv, paths: StatuslinePaths, j: StatuslineJournal): StatuslineDiagnostic {
+  const settings = readSettings(paths.settings);
+  if (settings === 'malformed') return 'restore-cas-failed';
+  const current = settings.obj[STATUSLINE_KEY];
+  const present = hasKey(settings.obj);
+  if (isPrior(j, present, current)) {
+    unlinkQuiet(paths.journal); // already the user's value: only a leftover journal
+    return 'restored';
+  }
+  if (!present || !isOurs(current, j.installedValue)) {
+    // The user changed it to something else while we held it. Their value stands.
+    unlinkQuiet(paths.journal);
+    return 'adopted-user-edit';
+  }
+  if (!sameValue(current, j.installedValue)) env.report('agy-auto-disabled');
+  if (!restorePrior(env, paths, j, settings)) {
+    // Leave the journal: the next reconciliation decides with fresh evidence. Never guess.
+    writeJournal(paths.journal, { ...j, leases: [] });
+    return 'restore-cas-failed';
+  }
+  unlinkQuiet(paths.journal);
+  return 'restored';
+}
+
+/**
+ * STARTUP. Take nothing; give back anything left behind.
+ *
+ * A Munder start with no AGY agent must not TOUCH the user's global AGY settings (god's
+ * ruling on Jim's consent note) - the lease is taken only when an AGY agent actually
+ * spawns. But a previous run that crashed, or was killed, may have left Munder's value
+ * installed with nobody alive to restore it. Returning the user's own value is not taking
+ * anything, so it happens here: if no live lease remains, restore (or adopt a real edit)
+ * exactly as the last release would have. A live lease belongs to a running instance and
+ * is left alone.
+ */
+export function recoverStatuslineLeftovers(env: StatuslineEnv): StatuslineDiagnostic | 'nothing-to-recover' {
+  const paths = statuslinePaths(env.geminiHome);
+  if (!existsSync(paths.journal)) return 'nothing-to-recover';
+  const r = withLock(env, paths.lock, (): StatuslineDiagnostic | 'nothing-to-recover' => {
+    const j = readJournal(paths.journal);
+    if (!j) return 'nothing-to-recover';
+    if (j === 'corrupt') { quarantine(paths.journal, env.now()); return 'corrupt-journal'; }
+    if (liveLeases(env, j).length) return 'nothing-to-recover';
+    if (j.phase === 'prepared') {
+      // Never installed (settings still hash to the preimage) or never promoted: either
+      // way, what is there now is decided by the same rules as a release.
+      const settings = readSettings(paths.settings);
+      if (settings !== 'malformed' && sha(settings.bytes) === j.settingsHashBefore) {
+        unlinkQuiet(paths.journal);
+        return 'orphan-restored';
+      }
+    }
+    const out = restoreOrAdopt(env, paths, j);
+    return out === 'restored' ? 'orphan-restored' : out;
+  });
+  if (r !== 'nothing-to-recover') env.report(r);
   return r;
 }
 
@@ -473,9 +666,12 @@ function done<T extends { code: StatuslineDiagnostic }>(env: StatuslineEnv, r: T
 
 /**
  * One app run's relationship with the lease. Holds what the stateless functions above
- * cannot: the lease id, and the fact that capture was disabled - which is STICKY for the
- * run. Once Munder's value has been overridden it never tries again until a clean restart,
- * because "self-heal" that repeatedly reinstalls over a user's choice is not healing.
+ * cannot: the lease id, and whether capture is off - which is STICKY for the run. Once
+ * Munder's value has been overridden (or auto-disabled) it never reinstalls until a clean
+ * restart, because "self-heal" that repeatedly reinstalls over a choice is not healing.
+ *
+ * Capture off is not the same as holding no lease: after an auto-disable the lease is KEPT
+ * so that `release()` can still restore the user's prior value.
  */
 export class AgyStatuslineOwner {
   private leaseId: string | null = null;
@@ -484,12 +680,18 @@ export class AgyStatuslineOwner {
 
   constructor(private env: StatuslineEnv) {}
 
-  /** Startup, and just before an interactive AGY spawn. Returns whether capture is on. */
+  /** Just before an interactive AGY spawn. Returns whether capture is on. */
   ensure(): boolean {
     if (this.disabled) return false;
     if (this.leaseId) {
       const r = reconcileStatuslineLease(this.env, this.leaseId);
       if (r === 'intact') return true;
+      if (r === 'agy-auto-disabled') {
+        // Keep the lease: release() owes the user their prior value.
+        this.token = null;
+        this.disabled = true;
+        return false;
+      }
       this.leaseId = null;
       this.token = null;
       // A lock we could not take is a reason to skip THIS check, not evidence of an
@@ -509,12 +711,23 @@ export class AgyStatuslineOwner {
     return false;
   }
 
-  /** The current lease generation's owner token, for the endpoint locator. */
+  /** The current lease generation's owner token, for the endpoint locator. Null when off. */
   ownerToken(): string | null {
     return this.token;
   }
 
-  /** Clean shutdown. Idempotent. */
+  /** Whether this run currently holds a lease (capture may still be off). */
+  holdsLease(): boolean {
+    return this.leaseId !== null;
+  }
+
+  /** Refresh the lease's lastSeen. A no-op when no lease is held. */
+  heartbeat(): void {
+    if (this.leaseId) heartbeatStatuslineLease(this.env, this.leaseId);
+  }
+
+  /** Release - on quit, or when the last AGY agent leaves the floor. Idempotent. A later
+   *  AGY spawn may lease again (unless capture was overridden this run). */
   release(): void {
     const id = this.leaseId;
     this.leaseId = null;

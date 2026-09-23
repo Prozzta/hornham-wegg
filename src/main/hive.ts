@@ -47,9 +47,12 @@ import { preferredAgentRole } from '../shared/agentRole';
 import { mergeTaskLedger } from '../shared/taskLedger';
 import { expandTilde } from './fs';
 import {
-  AgyStatuslineOwner, PROCESS_STARTED_AT, newOwnerToken, osLiveness, removeStatuslineLocator,
-  writeStatuslineLocator
+  AgyStatuslineOwner, PROCESS_STARTED_AT, buildStatuslineCommand, newOwnerToken, osLiveness,
+  recoverStatuslineLeftovers, removeStatuslineLocator, writeStatuslineLocator, type StatuslineEnv
 } from './agyStatuslineOwnership';
+
+/** How often a live instance refreshes its statusline lease (see LEASE_STALE_MS). */
+const AGY_LEASE_HEARTBEAT_MS = 60 * 60 * 1000;
 import { AGY_STATUSLINE_SHIM } from './agyStatuslineShim';
 import { geminiHome } from './capacityScope';
 
@@ -581,6 +584,8 @@ export class HiveManager {
   private agyStatusline: AgyStatuslineOwner | null = null;
   /** The owner token the locator was last written with, so a new lease rewrites it. */
   private agyLocatorToken: string | null = null;
+  /** The lease heartbeat, running only while a lease is held. */
+  private agyHeartbeat: NodeJS.Timeout | null = null;
 
   // — bootstrap —
 
@@ -2005,7 +2010,8 @@ export class HiveManager {
   }
 
   /**
-   * Startup: write the shim and take (or join) the statusline lease. Stable only.
+   * Startup: write the shim and give back any lease a dead run left behind - but TAKE
+   * nothing; the lease is taken on the first AGY spawn. Stable only.
    *
    * MUNDER_DEV=1 never touches the real Gemini home - the same reason the dev build does
    * not install the global AGY hooks: its pipe is the DEV pipe, and a dev build that
@@ -2024,10 +2030,18 @@ export class HiveManager {
       mkdirSync(join(root, 'bin'), { recursive: true });
       writeFileSync(shim, AGY_STATUSLINE_SHIM, 'utf8');
       const locator = this.agyLocatorPath(root);
-      this.agyStatusline = new AgyStatuslineOwner({
+      const launcher = this.nodeLauncher();
+      // AGY passes quote characters literally, so the command is UNQUOTED - which is only
+      // possible when no path in it contains whitespace. Checked once, here, with a
+      // representative token: if the answer is no, this run never leases at all.
+      if (!launcher || !buildStatuslineCommand(launcher, shim, '0'.repeat(32), locator)) {
+        this.appendLog({ kind: 'agy-statusline', code: 'unsafe-command-path' });
+        return;
+      }
+      const env: StatuslineEnv = {
         geminiHome: geminiHome(),
         // The exact installed string, owner token included, is the ownership identity.
-        commandFor: (token) => this.nodeRun(shim, '--owner', token, '--locator', `"${locator}"`),
+        commandFor: (token) => buildStatuslineCommand(launcher, shim, token, locator) as string,
         pid: process.pid,
         processStartedAt: PROCESS_STARTED_AT,
         now: () => Date.now(),
@@ -2035,15 +2049,20 @@ export class HiveManager {
         liveness: osLiveness,
         sleep: sleepSync,
         report: (code) => this.appendLog({ kind: 'agy-statusline', code })
-      });
-      this.reconcileAgyStatusline();
+      };
+      this.agyStatusline = new AgyStatuslineOwner(env);
+      // STARTUP TAKES NOTHING. A Munder start with no AGY agent does not touch the user's
+      // global AGY settings; the lease is taken on the first AGY spawn. What startup DOES
+      // do is give back a value a crashed or killed earlier run left installed.
+      recoverStatuslineLeftovers(env);
     } catch (e) {
       // Telemetry. It never blocks startup.
       console.error('[hive] AGY statusline start failed:', e);
     }
   }
 
-  /** Confirm (or take) the lease, and keep the locator in step with its token. */
+  /** Just before an AGY spawn: confirm (or take) the lease, keep the locator in step with
+   *  its token, and keep the lease's heartbeat running while one is held. */
   reconcileAgyStatusline(): void {
     const owner = this.agyStatusline;
     const root = this.root();
@@ -2062,22 +2081,42 @@ export class HiveManager {
         removeStatuslineLocator(locator, this.agyLocatorToken);
         this.agyLocatorToken = null;
       }
+      // A live instance proves it is alive hourly, so its lease never ages out from under
+      // it - and a crashed one's lease does, whatever its recycled pid says.
+      if (owner.holdsLease() && !this.agyHeartbeat) {
+        this.agyHeartbeat = setInterval(() => {
+          try { this.agyStatusline?.heartbeat(); } catch { /* telemetry */ }
+        }, AGY_LEASE_HEARTBEAT_MS);
+        this.agyHeartbeat.unref?.();
+      }
     } catch (e) {
       console.error('[hive] AGY statusline reconcile failed:', e);
     }
   }
 
-  /** Clean shutdown: withdraw the locator, then release the lease (restoring the user's
-   *  prior value if this was the last live Munder instance). Idempotent. */
-  stopAgyStatusline(): void {
-    const owner = this.agyStatusline;
-    this.agyStatusline = null;
+  /** Release the lease and withdraw the locator, keeping the owner so a later AGY spawn
+   *  can lease again. Idempotent. */
+  private releaseAgyLease(): void {
     const root = this.root();
     try {
       if (root && this.agyLocatorToken) removeStatuslineLocator(this.agyLocatorPath(root), this.agyLocatorToken);
     } catch { /* best effort */ }
     this.agyLocatorToken = null;
-    try { owner?.release(); } catch (e) { console.error('[hive] AGY statusline release failed:', e); }
+    if (this.agyHeartbeat) { clearInterval(this.agyHeartbeat); this.agyHeartbeat = null; }
+    try { this.agyStatusline?.release(); } catch (e) { console.error('[hive] AGY statusline release failed:', e); }
+  }
+
+  /** The last AGY agent has left the floor: the user's statusline goes back to them now,
+   *  not at quit. The next AGY spawn takes a fresh lease. */
+  agyAgentsGone(): void {
+    this.releaseAgyLease();
+  }
+
+  /** Quit / reset / change of home: release (restoring the prior value if this was the
+   *  last live Munder instance) and forget the owner. Idempotent. */
+  stopAgyStatusline(): void {
+    this.releaseAgyLease();
+    this.agyStatusline = null;
   }
 
   /** Official Google Gemini CLI lifecycle bridge. Gemini's hook payload is

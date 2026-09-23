@@ -698,12 +698,19 @@ function teardownPty(id: string): void {
   // 1) Archive the agent — retained + flagged; only live-PTY agents are active.
   const agentId = ptyToAgent.get(id);
   if (agentId) {
+    const leftProvider = ptyProvider.get(id);
     ptyToAgent.delete(id);
     ptyProvider.delete(id);
     // Pool membership completeness can change when an agent leaves.
     pushCapacityStrip();
     pushAgentUsage();
     pushAgentImpact();
+    // AGY statusline lease: held only while an AGY agent is on the floor. When the last
+    // one goes, the user's global statusline goes back to them now - not at quit.
+    // (After the pushes: capacity censuses pin the delete-then-push adjacency.)
+    if (leftProvider === 'antigravity' && ![...ptyProvider.values()].includes('antigravity')) {
+      try { hive.agyAgentsGone(); } catch (e) { console.error('[hive] agyAgentsGone failed:', e); }
+    }
     // Drop watchdog state so a dead agent can't get nudged or leak its grace.
     try { workerWake.forget(agentId, id); } catch { /* best-effort */ }
     // Drop breaker state so a dead agent can't leak/zombie a tripped level.
@@ -5779,9 +5786,10 @@ function bootstrapHiveServices(): void {
   // reply still belongs in the history.
   if ((readConfig().webhookTriggers ?? []).length > 0) startWebhookDoneObserver();
   hookServer.start();
-  // AGY 1.1.48 - lease Antigravity's global statusline so AGY sessions report their
-  // quota and lifecycle here. After hookServer.start(): the endpoint locator it writes
-  // must name a pipe that is already listening. Stable only; a no-op under MUNDER_DEV.
+  // AGY 1.1.48 - prepare Antigravity statusline capture. This TAKES nothing: the lease
+  // on the user's global statusline is taken on the first AGY spawn and released when
+  // the last AGY agent leaves. Startup only gives back a lease a dead run left behind.
+  // After hookServer.start(), so a locator always names a listening pipe. Stable only.
   hive.startAgyStatusline();
   // Bind the telemetry collector BEFORE the renderer spawns any agent, then point
   // the hive at it so every subsequent spawn is instrumented. Best-effort — a bind
