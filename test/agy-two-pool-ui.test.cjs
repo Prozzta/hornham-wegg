@@ -224,7 +224,12 @@ test('A POOL THAT LEAVES AND RETURNS starts clean - the memory is pruned with th
   f.presenter.present({ snapshot: { pools: [], overflow: null, collectionRevision: 99, updatedAt: f.now },
     membersOf: () => [], membershipKnown: () => true, freshUntil: () => null, now: f.now });
   f.advance(60_000);
-  f.ingest(tickAt(f.now, { gemFive: 0.97 }));
+  // It comes back with a DIFFERENT remainder on purpose (Jim, c3 audit 1). Returning with
+  // the SAME number pinned only the `moving` prune: the remembered remainder would have
+  // matched, so the row stayed hidden either way and deleting the `lastRemainder` prune
+  // changed nothing any assertion could see. A different number separates the two - if the
+  // memory survived the pool's departure, this reads as movement and the row appears.
+  f.ingest(tickAt(f.now, { gemFive: 0.80 }));
   assert.deepEqual(f.labels(), [], 'its first reading back is a seed again, not movement');
 });
 
@@ -277,6 +282,28 @@ test('A STALE reading with DIFFERENT numbers neither reveals the row NOR overwri
     'real consumption from the remembered value still reveals it');
 });
 
+test('SAFETY OVERRIDE holds for a STALE limiting pool that is gating a live agent (Jim, c3 audit 3)', () => {
+  // The override's own comment says it must not wait on freshness, but nothing tested that:
+  // hoisting the freshness guard above it changed no assertion, because every path that
+  // reaches membership today begins with an ACCEPTED FRESH tick, which reveals and latches
+  // the row anyway. A restored-from-store projection is the case where it would matter, and
+  // the hand-built pool is the only way to express it (see handPool).
+  //
+  // A pool that is OUT OF ALLOWANCE and gating live work must be shown even though its
+  // reading is stale: hiding it would hide the reason somebody's turn is not running.
+  const presenter = new CapacityStripPresenter({ formatTime: (t) => `@${t - T0}`, idKey: Buffer.alloc(32, 1) });
+  const stale = handPool(PG, 'gemini', { fresh: false, five: 0, state: 'LIMITED' });
+  const shown = presenter.present({
+    snapshot: { pools: [stale], overflow: null, collectionRevision: 1, updatedAt: T0 },
+    membersOf: (key) => (key === PG ? ['phyllis-1'] : []),
+    membershipKnown: () => true,
+    freshUntil: () => null,
+    now: T0
+  }).pools.map((p) => p.poolLabel);
+  assert.deepEqual(shown, ['Antigravity · Gemini'],
+    'a LIMITED pool gating a live agent is shown even when the reading is STALE');
+});
+
 // ─── the coherent pair (runtime) ────────────────────────────────────────────
 
 function runtime() {
@@ -326,6 +353,39 @@ test('ingestAgyTick: ONE publish for the pair, not one per observation', () => {
   const rt = runtime();
   rt.r.ingestAgyTick('phyllis-1', { ...tickAt(T0), accountScope: SCOPE });
   assert.equal(rt.changes.length, 1, 'a tick that moves both pools is still a single push');
+});
+
+test('ingestAgyTick: a HALF-ACCEPTED pair never remaps the agent (Jim, c3 audit 2)', () => {
+  // The case no test reached: not an incoherent pair, but a WELL-FORMED one where the
+  // tracker accepts only ONE half. Jim's recipe: let the gemini pool already hold a NEWER
+  // reading, then deliver an OLDER complete pair. Gemini is rejected as stale; 3P accepts
+  // it as its first reading. The binding is all-or-nothing, so the agent must not move -
+  // and until now `ra.accepted && rb.accepted` could be weakened to `||` with nothing
+  // failing, which is exactly what the committed mutant table (D-7) reported.
+  const rt = runtime();
+  const MID = T0 + 30_000;
+  const LATER = T0 + 60_000;
+
+  // 1) A complete pair binds the agent to 3P.
+  rt.r.ingestAgyTick('worker-1', { ...tickAt(T0, { model: 'Claude Sonnet 5' }), accountScope: SCOPE });
+  assert.equal(rt.r.poolKeyOf('worker-1'), P3, 'gated by 3P to begin with');
+
+  // 2) A newer GEMINI-ONLY reading (the single-observation path, as a personal session or
+  //    another source would produce) pushes that one family's record ahead. The harness
+  //    clock must advance first: a reading dated ahead of `now` is refused for FUTURE_SKEW,
+  //    which would leave gemini back at T0 and make the pair below acceptable whole - the
+  //    test would then pass for entirely the wrong reason.
+  rt.advance(60_000);
+  rt.r.ingest(null, tickAt(LATER).observations[1]);
+
+  // 3) Now a complete, well-formed pair from a Gemini-branded model, dated BETWEEN the
+  //    two. 3P accepts it (newer than T0); gemini refuses it (older than LATER). The pair
+  //    is well-formed and coherent - it is simply not acceptable WHOLE.
+  const before = rt.r.poolKeyOf('worker-1');
+  rt.r.ingestAgyTick('worker-1', { ...tickAt(MID), accountScope: SCOPE });
+  assert.equal(rt.r.poolKeyOf('worker-1'), before,
+    'a pair we could not accept WHOLE never moves the agent off the pool gating it');
+  assert.deepEqual(rt.r.membersOf(PG), [], 'and never joins it to the sibling');
 });
 
 test('ingestAgyTick: an INCOHERENT pair never remaps the agent', () => {

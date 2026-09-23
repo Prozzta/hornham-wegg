@@ -296,7 +296,17 @@ export class WorkerWakeWatchdog {
       r.providerSession = sessionId;
     }
     // TERMINAL PROOF MUST BE NEWER THAN THE EDGE IT CLOSES, and it must be old enough to
-    // be ABOUT this turn. Two separate guards, because they catch two different lies.
+    // be ABOUT this turn.
+    //
+    // HONEST BOOKKEEPING (Jim, c4 re-audit P6): these two are NOT independent. While the
+    // lifecycle is active the grace SUBSUMES the ordering check, because `at < activeSince`
+    // implies `at - activeSince < 0 < PROVIDER_IDLE_CONFIRM_MS` - so deleting the ordering
+    // line alone changes nothing any test can see, exactly as c3's safety override is
+    // subsumed by the ratified gating rule. Its only behavioural residue is in the
+    // NOT-active case, where a pre-epoch reading yields a spurious (and harmless) retry
+    // edge instead of silence. It is kept as NARROWING INSURANCE: the grace is a tuning
+    // constant and someone will shorten it one day, and the ordering rule must not leave
+    // with it. Two rules, one guarantee - said plainly rather than implied.
     //
     // (1) ORDERING. Each tick is its own short-lived shim process on the named pipe, so
     //     two in flight can be received out of order. `at` is the shim's READING time, not
