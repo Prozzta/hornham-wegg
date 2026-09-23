@@ -383,6 +383,7 @@ function backupsFor() {
 async function pass(send, memPath, label, { decoys = false, make = fixtureMemory, digOut = false } = {}) {
   writeFileSync(memPath, make());
   const before = readFileSync(memPath, 'utf8');
+  const backupsBefore = new Set(backupsFor());
   const abortsBefore = rows().filter((r) => r.kind === 'condense-abort').length;
 
   let stop = null;
@@ -439,6 +440,12 @@ async function pass(send, memPath, label, { decoys = false, make = fixtureMemory
       big.length ? big.map((r) => r.promptBytes).join(',') : `max ${Math.max(0, ...condenseRows.map((r) => r.promptBytes || 0))} B`);
   }
   check(backupsFor().length >= 1, `${label}: the original was backed up`, backupsFor().slice(-1)[0] || 'none');
+  // "A backup exists" is not "the ORIGINAL was backed up" - on a multi-pass run the check
+  // above happily prints the LAST pass's backup (Jim N2). This pass's FIRST backup must be
+  // the pre-image, byte for byte: that is what a lost-memory recovery would reach for.
+  const firstOfThisPass = backupsFor().filter((b) => !backupsBefore.has(b) && /-p1[\\/]/.test(b));
+  check(firstOfThisPass.length === 1 && readFileSync(firstOfThisPass[0], 'utf8') === before,
+    `${label}: this pass's FIRST backup (-p1) is the pre-image byte-for-byte`, firstOfThisPass[0] || 'none');
   check(!after.includes('MUST NEVER BE USED') && !after.includes('ANOTHER AGENT'),
     `${label}: no other session's text reached this memory`);
   return after;
