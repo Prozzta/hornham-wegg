@@ -25,7 +25,7 @@ import {
   mkdirSync, copyFileSync, renameSync, openSync, fsyncSync, closeSync
 } from 'node:fs';
 import { join, dirname } from 'node:path';
-import { runHiddenClaude } from './hiddenClaude';
+import { runHiddenClaude, type HiddenClaudeDiag } from './hiddenClaude';
 
 /** Total memory.md budget — mirrors the janitor's CONTEXT_BUDGET_BYTES (128 KB). */
 const BUDGET_BYTES = 131_072;
@@ -230,6 +230,7 @@ export class MemoryReflector {
       summary = await this.summarize(home, parsed.condensed, evict, parsed.pinned);
     } catch (e) {
       this.logAbort(id, 'summarize-failed', String(e));
+      this.logDiag(id, (e as { diag?: HiddenClaudeDiag }).diag, oldBytes);
       return { id, condensed: false, reason: 'summarize-failed', oldBytes };
     }
 
@@ -265,6 +266,16 @@ export class MemoryReflector {
     } catch { /* logging is best-effort */ }
     // The miner re-indexes within its next cycle — mtime changed, no extra wiring.
     return { id, condensed: true, reason: 'condensed', oldBytes, newBytes };
+  }
+
+  /** The failure breadcrumb: a SECOND line beside condense-abort, never folded into
+   *  it. The abort row is the stable, parsed record other tools already read; this one
+   *  is diagnostic detail that may grow or change shape, and it must not destabilise
+   *  the row anybody depends on. Absent on success — nothing to explain. */
+  private logDiag(id: string, diag: HiddenClaudeDiag | undefined, oldBytes: number): void {
+    if (!diag) return;
+    try { this.appendLog({ kind: 'condense-diag', agentId: id, oldBytes, ...diag }); }
+    catch { /* best-effort */ }
   }
 
   private logAbort(id: string, reason: string, detail?: string, extra?: Record<string, unknown>): void {
@@ -303,7 +314,15 @@ export class MemoryReflector {
       timeoutMs: DEFAULT_TIMEOUT_MS,
     });
 
-    if (!result.ok) throw new Error(result.error ?? 'condense: hidden session failed');
+    if (!result.ok) {
+      // The breadcrumb rides ON the error, so the single catch that already logs
+      // condense-abort can emit it without a second failure path to keep in step.
+      const e = new Error(result.error ?? 'condense: hidden session failed') as Error & {
+        diag?: HiddenClaudeDiag;
+      };
+      e.diag = result.diag;
+      throw e;
+    }
     const parsed = validateSummary(result.structuredOutput, result.result);
     if (!parsed) throw new Error('condense: response contained no parseable JSON');
     return parsed;

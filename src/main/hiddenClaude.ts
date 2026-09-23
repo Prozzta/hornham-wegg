@@ -42,6 +42,10 @@ import { ensureKilled } from './procKill';
 const MAX_STDOUT_BYTES = 1024 * 1024;
 /** Enough stderr for a diagnosis, never enough to be a log-sized payload. */
 const MAX_STDERR_BYTES = 8 * 1024;
+/** How much of each stream a failure breadcrumb carries. Small on purpose: a
+ *  timed-out child's stdout can hold a partial summary, i.e. the agent's own
+ *  memory, and a breadcrumb is not a place to copy that. */
+const DIAG_TAIL_BYTES = 2 * 1024;
 
 /**
  * The credential that silently overrides a logged-in subscription and bills
@@ -93,6 +97,42 @@ export interface HiddenClaudeResult {
   result?: string;
   /** Stable category/detail. Never the prompt, the memory, or the full response. */
   error?: string;
+  /** Present on every FAILURE. What the caller needs to tell a rejected flag from a
+   *  refused prompt from a dead binary, without re-running anything. */
+  diag?: HiddenClaudeDiag;
+}
+
+/**
+ * The failure breadcrumb.
+ *
+ * WHY IT EXISTS: 1.1.47 shipped with `claude exited 1` as the entire record of a
+ * failure. stderr was empty, so not even the tail survived — and print mode puts its
+ * own errors on STDOUT, which the close handler discarded. A whole class of failure
+ * (a refused prompt, a rejected flag, an auth problem) reached the log as four
+ * indistinguishable words.
+ *
+ * SECRETS: env is reported as KEY NAMES ONLY, never values. argv is safe by
+ * construction — the prompt goes on stdin precisely so it is never on a command line.
+ */
+export interface HiddenClaudeDiag {
+  /** What resolveCommand actually found, and what was handed to CreateProcess. */
+  exe: string;
+  spawnFile: string;
+  /** Full argv as spawned (cmd wrapper included). Carries no prompt and no secret. */
+  argv: string[];
+  cwd: string;
+  /** NAMES only. A missing/extra key is the evidence; a value never is. */
+  envKeys: string[];
+  promptBytes: number;
+  exitCode: number | null;
+  durationMs: number;
+  stdoutBytes: number;
+  stderrBytes: number;
+  stdoutTail: string;
+  stderrTail: string;
+  /** Lifted from the print-mode envelope when stdout held one. */
+  terminalReason?: string;
+  apiErrorStatus?: number;
 }
 
 /** The effects this module owns, injectable so the race is testable on a fake clock. */
@@ -119,6 +159,40 @@ interface ClaudeEnvelope {
   result?: unknown;
   is_error?: unknown;
   subtype?: unknown;
+  /** Why the CLI stopped: 'completed', 'prompt_too_long', … */
+  terminal_reason?: unknown;
+  /** The HTTP status when the CLI's own API call failed (400 for a refused prompt). */
+  api_error_status?: unknown;
+}
+
+/** Parse stdout as the print-mode envelope, or null if it is not one. */
+function tryEnvelope(stdout: string): ClaudeEnvelope | null {
+  try {
+    const v: unknown = JSON.parse(stdout.trim());
+    return v && typeof v === 'object' && !Array.isArray(v) ? (v as ClaudeEnvelope) : null;
+  } catch { return null; }
+}
+
+/**
+ * Describe a non-zero exit using everything the child actually said.
+ *
+ * THE BUG THIS REPLACES: this reported only the stderr TAIL. `claude --print` reports
+ * its own failures as a JSON envelope on STDOUT and leaves stderr empty, so the entire
+ * explanation was thrown away and every such failure logged as `claude exited 1`.
+ * A refused prompt (api 400, terminal_reason 'prompt_too_long') was indistinguishable
+ * from a rejected flag or a missing binary.
+ */
+export function describeExitFailure(code: number | null, stdout: string, stderr: string): string {
+  const parts = [`claude exited ${code ?? 'null'}`];
+  const env = tryEnvelope(stdout);
+  const reason = typeof env?.terminal_reason === 'string' ? env.terminal_reason : null;
+  const status = typeof env?.api_error_status === 'number' ? env.api_error_status : null;
+  const said = typeof env?.result === 'string' ? env.result : null;
+  if (reason && reason !== 'completed') parts.push(reason);
+  if (status !== null) parts.push(`api ${status}`);
+  const tail = (said ?? stderr).trim().split('\n').slice(-3).join(' | ').slice(0, 500);
+  if (tail) parts.push(tail);
+  return parts.join(': ');
 }
 
 export function runHiddenClaude(
@@ -141,6 +215,7 @@ export function runHiddenClaude(
     const disallowed = opts.disallowedTools ?? ['Edit', 'Write', 'NotebookEdit'];
     const addDirs = (opts.addDirs ?? []).filter((d) => d && existsSync(d));
     const timeoutMs = opts.timeoutMs ?? 180_000;
+    const startedAt = Date.now();
 
     const args: string[] = [
       '--print',
@@ -191,6 +266,23 @@ export function runHiddenClaude(
     let overflowed = false;
     let timer: NodeJS.Timeout | null = null;
 
+    const diag = (exitCode: number | null): HiddenClaudeDiag => {
+      const env2 = tryEnvelope(stdout);
+      return {
+        exe, spawnFile, argv: spawnArgs, cwd,
+        envKeys: Object.keys(env).sort(),            // NAMES only — never a value
+        promptBytes: Buffer.byteLength(prompt, 'utf8'),
+        exitCode,
+        durationMs: Date.now() - startedAt,
+        stdoutBytes: stdout.length,
+        stderrBytes: stderr.length,
+        stdoutTail: stdout.slice(-DIAG_TAIL_BYTES),
+        stderrTail: stderr.slice(-DIAG_TAIL_BYTES),
+        ...(typeof env2?.terminal_reason === 'string' ? { terminalReason: env2.terminal_reason } : {}),
+        ...(typeof env2?.api_error_status === 'number' ? { apiErrorStatus: env2.api_error_status } : {}),
+      };
+    };
+
     // Hidden sessions are ephemeral CHECKS — nothing they spawn (MCP servers, helpers)
     // may outlive them. Kill politely, then sweep the process tree so every check
     // releases its PIDs even if `claude` shrugs off the signal.
@@ -209,8 +301,10 @@ export function runHiddenClaude(
 
     const abort = (error: string): void => {
       if (settled) return;
+      // Snapshot BEFORE the kill: teardown must never be able to edit the evidence.
+      const d = diag(null);
       kill();
-      finish({ ok: false, error });
+      finish({ ok: false, error, diag: d });
     };
 
     child.on('error', (e: Error) => abort(e.message));
@@ -238,11 +332,11 @@ export function runHiddenClaude(
     child.on('close', (code: number | null) => {
       if (settled) return;
       if (code !== 0) {
-        const tail = stderr.trim().split('\n').slice(-3).join(' | ').slice(0, 500);
-        finish({ ok: false, error: `claude exited ${code ?? 'null'}${tail ? `: ${tail}` : ''}` });
+        finish({ ok: false, error: describeExitFailure(code, stdout, stderr), diag: diag(code) });
         return;
       }
-      finish(readEnvelope(stdout, sessionId));
+      const r = readEnvelope(stdout, sessionId);
+      finish(r.ok ? r : { ...r, diag: diag(code) });
     });
 
     timer = deps.setTimeout(() => abort('hidden session timed out'), timeoutMs);

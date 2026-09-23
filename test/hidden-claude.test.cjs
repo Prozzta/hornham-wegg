@@ -25,7 +25,7 @@ const path = require('node:path');
 const { EventEmitter } = require('node:events');
 const loadTs = require('./load-ts.cjs');
 
-const { runHiddenClaude, readEnvelope, API_KEY_ENV, GATEWAY_TOKEN_ENV, GATEWAY_URL_ENV } = loadTs('src/main/hiddenClaude.ts');
+const { runHiddenClaude, readEnvelope, describeExitFailure, API_KEY_ENV, GATEWAY_TOKEN_ENV, GATEWAY_URL_ENV } = loadTs('src/main/hiddenClaude.ts');
 
 const UUID = '11111111-1111-4111-8111-111111111111';
 /** The v1.1.46 silence boundary. Nothing may complete on it any more. */
@@ -324,4 +324,110 @@ test('PIN: the newest-mtime transcript scan is gone from the condensation path',
     assert.ok(!code.includes(gone), `${gone} must not come back - a dormant fallback is a regression waiting to happen`);
   }
   assert.ok(code.includes("'close'"), 'completion is the close event');
+});
+
+
+// ─── the failure breadcrumb (condense-packaged-fail) ─────────────────────────
+//
+// THE REAL FAILURE THIS ENCODES. Packaged 1.1.47, 2026-09-23: god's condensation
+// logged exactly `Error: claude exited 1` and nothing else. Reproduced by hand with
+// the identical argv and a 944,569-byte prompt: exit 1 after 2,775 ms, stderr EMPTY,
+// and the entire explanation sitting on STDOUT, which the close handler discarded:
+//   terminal_reason 'prompt_too_long', api_error_status 400,
+//   result 'Prompt is too long · the request is ~313578 tokens (limit 200000)…'
+// Four words reached the log where a precise, actionable cause was available.
+
+/** The captured envelope, trimmed to the fields that carry the diagnosis. */
+const REFUSED = JSON.stringify({
+  type: 'result',
+  session_id: UUID,
+  is_error: true,
+  subtype: 'success',
+  terminal_reason: 'prompt_too_long',
+  api_error_status: 400,
+  result: 'Prompt is too long \u00b7 the request is ~313578 tokens (limit 200000)'
+});
+
+test('describeExitFailure: a refused prompt names itself instead of "exited 1"', () => {
+  const msg = describeExitFailure(1, REFUSED, '');
+  assert.match(msg, /claude exited 1/, 'keeps the exit code');
+  assert.match(msg, /prompt_too_long/, 'THE regression: terminal_reason must survive');
+  assert.match(msg, /api 400/, 'the HTTP status distinguishes a refusal from a crash');
+  assert.match(msg, /~313578 tokens \(limit 200000\)/, 'and the CLI\u2019s own sentence');
+});
+
+test('describeExitFailure: stdout is used even though stderr is EMPTY', () => {
+  // The v1.1.47 code read the stderr tail alone. With print mode that is nothing.
+  const msg = describeExitFailure(1, REFUSED, '');
+  assert.notEqual(msg, 'claude exited 1', 'the whole bug in one assertion');
+});
+
+test('describeExitFailure: falls back to stderr when stdout is not an envelope', () => {
+  const msg = describeExitFailure(127, 'not json at all', 'claude: command not found');
+  assert.match(msg, /claude exited 127/);
+  assert.match(msg, /command not found/, 'a non-print failure still reports its stderr');
+});
+
+test('describeExitFailure: a null exit code is reported, not swallowed', () => {
+  assert.match(describeExitFailure(null, '', ''), /claude exited null/);
+});
+
+test('breadcrumb: a non-zero exit carries diag with the resolved argv and exit code', async () => {
+  const h = harness();
+  const p = runHiddenClaude('condense this', { model: 'm', cwd: h.cwd }, h.deps);
+  h.child.stdout.emit('data', REFUSED);
+  h.child.emit('close', 1);
+  const r = await p;
+
+  assert.equal(r.ok, false);
+  assert.ok(r.diag, 'a failure MUST explain itself');
+  assert.equal(r.diag.exitCode, 1);
+  assert.ok(r.diag.argv.includes('--print'), 'the exact argv, for a rejected-flag diagnosis');
+  assert.ok(r.diag.argv.includes('--json-schema') === false || r.diag.argv.length > 0);
+  assert.equal(r.diag.promptBytes, Buffer.byteLength('condense this', 'utf8'));
+  assert.equal(r.diag.terminalReason, 'prompt_too_long', 'lifted from the envelope');
+  assert.equal(r.diag.apiErrorStatus, 400);
+  assert.match(r.diag.stdoutTail, /prompt_too_long/, 'the stream the old code threw away');
+});
+
+test('breadcrumb: env is reported as KEY NAMES ONLY - never a value', async () => {
+  const h = harness();
+  const SECRET = 'sk-ant-do-not-log-me';
+  const p = runHiddenClaude('x', {
+    model: 'm', cwd: h.cwd,
+    env: { ANTHROPIC_BASE_URL: 'https://gw.example', ANTHROPIC_AUTH_TOKEN: SECRET, MEMPALACE_PALACE_PATH: '/p' }
+  }, h.deps);
+  h.child.emit('close', 1);
+  const r = await p;
+
+  const blob = JSON.stringify(r.diag);
+  assert.ok(r.diag.envKeys.includes('ANTHROPIC_AUTH_TOKEN'), 'the KEY is the evidence');
+  assert.ok(!blob.includes(SECRET), 'and the VALUE must never appear anywhere in the breadcrumb');
+  assert.ok(!blob.includes('https://gw.example'), 'a base URL is configuration, still not ours to log');
+  assert.deepEqual([...r.diag.envKeys], [...r.diag.envKeys].sort(), 'sorted, so two breadcrumbs diff cleanly');
+});
+
+test('breadcrumb: a TIMEOUT is explained too, and snapshots before the kill', async () => {
+  const h = harness();
+  const p = runHiddenClaude('x', { model: 'm', cwd: h.cwd, timeoutMs: 180000 }, h.deps);
+  h.child.stdout.emit('data', 'partial output so far');
+  h.clock.advance(180000);
+  const r = await p;
+
+  assert.equal(r.error, 'hidden session timed out');
+  assert.ok(r.diag, 'the timeout that told us nothing on the floor now says how long and how far it got');
+  assert.equal(r.diag.exitCode, null, 'no exit code exists - the child was killed');
+  assert.equal(r.diag.stdoutBytes, 'partial output so far'.length, 'how much the child had produced');
+  assert.ok(r.diag.durationMs >= 0);
+});
+
+test('breadcrumb: a SUCCESS carries no diag - there is nothing to explain', async () => {
+  const h = harness();
+  const p = runHiddenClaude('x', { model: 'm', cwd: h.cwd }, h.deps);
+  h.child.stdout.emit('data', envelope());
+  h.child.emit('close', 0);
+  const r = await p;
+
+  assert.equal(r.ok, true);
+  assert.equal(r.diag, undefined, 'breadcrumbs are for failures; a success must stay quiet');
 });
