@@ -3741,6 +3741,7 @@ ipcMain.handle('config:changeHome', async (_evt, payload: unknown) => {
   try { stopEphemeralWorkerWatcher(); } catch (e) { console.error('[changeHome] stopWorkerWatcher:', e); }
   try { integrationBroker.stop(); } catch (e) { console.error('[changeHome] broker.stop:', e); }
   try { hive.stopRouter(); } catch (e) { console.error('[changeHome] stopRouter:', e); }
+  try { hive.stopAgyStatusline(); } catch (e) { console.error('[changeHome] stopAgyStatusline:', e); }
   try { hookServer.stop(); } catch (e) { console.error('[changeHome] hookServer.stop:', e); }
   try { stopSlackServer(); } catch (e) { console.error('[changeHome] slack.stop:', e); }
   try { stopWebhookServer(); } catch (e) { console.error('[changeHome] webhook.stop:', e); }
@@ -4241,6 +4242,7 @@ function teardownAndQuit(): void {
   try { stopEphemeralWorkerWatcher(); } catch (e) { console.error('[quit] stopWorkerWatcher:', e); }
   try { integrationBroker.stop(); } catch (e) { console.error('[quit] broker.stop:', e); }
   try { hive.stopRouter(); } catch (e) { console.error('[quit] stopRouter:', e); }
+  try { hive.stopAgyStatusline(); } catch (e) { console.error('[quit] stopAgyStatusline:', e); }
   try { hookServer.stop(); } catch (e) { console.error('[quit] hookServer.stop:', e); }
   try { telemetry.stop(); } catch (e) { console.error('[quit] telemetry.stop:', e); }
   try { stopSlackServer(); } catch (e) { console.error('[quit] slack.stop:', e); }
@@ -4302,6 +4304,7 @@ ipcMain.handle('app:resetAll', () => {
   try { stopEphemeralWorkerWatcher(); } catch (e) { console.error('[reset] stopWorkerWatcher:', e); }
   try { integrationBroker.stop(); } catch (e) { console.error('[reset] broker.stop:', e); }
   try { hive.stopRouter(); } catch (e) { console.error('[reset] stopRouter:', e); }
+  try { hive.stopAgyStatusline(); } catch (e) { console.error('[reset] stopAgyStatusline:', e); }
   try { hookServer.stop(); } catch (e) { console.error('[reset] hookServer.stop:', e); }
   try { telemetry.stop(); } catch (e) { console.error('[reset] telemetry.stop:', e); }
   try { stopSlackServer(); } catch (e) { console.error('[reset] slack.stop:', e); }
@@ -5776,6 +5779,10 @@ function bootstrapHiveServices(): void {
   // reply still belongs in the history.
   if ((readConfig().webhookTriggers ?? []).length > 0) startWebhookDoneObserver();
   hookServer.start();
+  // AGY 1.1.48 - lease Antigravity's global statusline so AGY sessions report their
+  // quota and lifecycle here. After hookServer.start(): the endpoint locator it writes
+  // must name a pipe that is already listening. Stable only; a no-op under MUNDER_DEV.
+  hive.startAgyStatusline();
   // Bind the telemetry collector BEFORE the renderer spawns any agent, then point
   // the hive at it so every subsequent spawn is instrumented. Best-effort — a bind
   // failure just leaves telemetry off (transcript reconciler stays). No breaker.start():
@@ -6030,7 +6037,15 @@ app.on('before-quit', (e) => {
 // The last chance to flush a coalesced capacity write. `before-quit` can be
 // preventDefault-ed by the running-terminals warning above, so the flush hangs off
 // `will-quit`, which only fires once the quit is actually going ahead.
-app.on('will-quit', () => { capacityStore.saveNow(); capacityDetailTicker.stopAll(); });
+app.on('will-quit', () => {
+  capacityStore.saveNow();
+  capacityDetailTicker.stopAll();
+  // AGY statusline lease. `before-quit` only routes through teardownAndQuit when
+  // terminals are open, so an ordinary quit with none would otherwise leave the user's
+  // statusline pointing at Munder while Munder is closed. Idempotent: a no-op when the
+  // teardown path already released it.
+  try { hive.stopAgyStatusline(); } catch (e) { console.error('[will-quit] stopAgyStatusline:', e); }
+});
 
 app.on('window-all-closed', () => {
   if (process.platform !== 'darwin') {

@@ -46,6 +46,12 @@ import { selectBroadcastTargets } from '../shared/broadcast';
 import { preferredAgentRole } from '../shared/agentRole';
 import { mergeTaskLedger } from '../shared/taskLedger';
 import { expandTilde } from './fs';
+import {
+  AgyStatuslineOwner, PROCESS_STARTED_AT, newOwnerToken, osLiveness, removeStatuslineLocator,
+  writeStatuslineLocator
+} from './agyStatuslineOwnership';
+import { AGY_STATUSLINE_SHIM } from './agyStatuslineShim';
+import { geminiHome } from './capacityScope';
 
 /** The subset of HarnessConfig the hive consumes for the default-MCP merge.
  *  Kept as a local shape so hive.ts never imports the foundation-owned config
@@ -570,6 +576,12 @@ export class HiveManager {
    *  dead agent never leaks an orphan loopback listener. */
   private proxyChildren = new Map<string, ChildProcess>();
 
+  /** AGY 1.1.48 - this run's lease on Antigravity's global statusline, or null when it
+   *  was never started (dev isolation, no hive) or has been stopped. */
+  private agyStatusline: AgyStatuslineOwner | null = null;
+  /** The owner token the locator was last written with, so a new lease rewrites it. */
+  private agyLocatorToken: string | null = null;
+
   // — bootstrap —
 
   /** Create the hive skeleton + git repo if missing. Idempotent. */
@@ -820,7 +832,13 @@ export class HiveManager {
             // in dev only (the renderer's idle inbox nudge still delivers).
             if (desc.shim === 'agy') {
               if (DEV_ISOLATION) console.warn('[dev-isolation] skipping global Antigravity hook install (would re-point Stable agents)');
-              else this.installAgyHooks();
+              else {
+                this.installAgyHooks();
+                // The statusline lease is checked immediately before every interactive
+                // AGY spawn: a user may have replaced it since startup, and then capture
+                // stays off for this run rather than being forced back over their choice.
+                this.reconcileAgyStatusline();
+              }
             }
             else if (desc.shim === 'codex') {
               const codex = this.installCodexHooks(dir);
@@ -1974,6 +1992,92 @@ export class HiveManager {
         writeFileSync(p, JSON.stringify(existing, null, 2), 'utf8');
       } catch { /* best-effort per file */ }
     }
+  }
+
+  // — AGY statusline ownership (1.1.48) —
+  //
+  // hive.ts only INVOKES the lease at startup, before an interactive AGY spawn, and on
+  // shutdown. Every decision about the user's settings lives in agyStatuslineOwnership.ts.
+
+  /** Path of the endpoint locator a user's own AGY statusline reads. */
+  private agyLocatorPath(root: string): string {
+    return join(root, 'state', 'agy-statusline-endpoint.json');
+  }
+
+  /**
+   * Startup: write the shim and take (or join) the statusline lease. Stable only.
+   *
+   * MUNDER_DEV=1 never touches the real Gemini home - the same reason the dev build does
+   * not install the global AGY hooks: its pipe is the DEV pipe, and a dev build that
+   * leased the user's statusline would point every personal AGY session at it.
+   */
+  startAgyStatusline(): void {
+    if (this.agyStatusline) return;
+    if (DEV_ISOLATION) {
+      this.appendLog({ kind: 'agy-statusline', code: 'dev-isolation' });
+      return;
+    }
+    const root = this.root();
+    if (!root) return;
+    try {
+      const shim = join(root, 'bin', 'agy-statusline.cjs');
+      mkdirSync(join(root, 'bin'), { recursive: true });
+      writeFileSync(shim, AGY_STATUSLINE_SHIM, 'utf8');
+      const locator = this.agyLocatorPath(root);
+      this.agyStatusline = new AgyStatuslineOwner({
+        geminiHome: geminiHome(),
+        // The exact installed string, owner token included, is the ownership identity.
+        commandFor: (token) => this.nodeRun(shim, '--owner', token, '--locator', `"${locator}"`),
+        pid: process.pid,
+        processStartedAt: PROCESS_STARTED_AT,
+        now: () => Date.now(),
+        randomToken: newOwnerToken,
+        liveness: osLiveness,
+        sleep: sleepSync,
+        report: (code) => this.appendLog({ kind: 'agy-statusline', code })
+      });
+      this.reconcileAgyStatusline();
+    } catch (e) {
+      // Telemetry. It never blocks startup.
+      console.error('[hive] AGY statusline start failed:', e);
+    }
+  }
+
+  /** Confirm (or take) the lease, and keep the locator in step with its token. */
+  reconcileAgyStatusline(): void {
+    const owner = this.agyStatusline;
+    const root = this.root();
+    const sock = this.sockPath();
+    if (!owner || !root || !sock) return;
+    try {
+      const on = owner.ensure();
+      const token = owner.ownerToken();
+      const locator = this.agyLocatorPath(root);
+      if (on && token && token !== this.agyLocatorToken) {
+        writeStatuslineLocator(locator, {
+          sock, pid: process.pid, processStartedAt: PROCESS_STARTED_AT, token, createdAt: Date.now()
+        });
+        this.agyLocatorToken = token;
+      } else if (!on && this.agyLocatorToken) {
+        removeStatuslineLocator(locator, this.agyLocatorToken);
+        this.agyLocatorToken = null;
+      }
+    } catch (e) {
+      console.error('[hive] AGY statusline reconcile failed:', e);
+    }
+  }
+
+  /** Clean shutdown: withdraw the locator, then release the lease (restoring the user's
+   *  prior value if this was the last live Munder instance). Idempotent. */
+  stopAgyStatusline(): void {
+    const owner = this.agyStatusline;
+    this.agyStatusline = null;
+    const root = this.root();
+    try {
+      if (root && this.agyLocatorToken) removeStatuslineLocator(this.agyLocatorPath(root), this.agyLocatorToken);
+    } catch { /* best effort */ }
+    this.agyLocatorToken = null;
+    try { owner?.release(); } catch (e) { console.error('[hive] AGY statusline release failed:', e); }
   }
 
   /** Official Google Gemini CLI lifecycle bridge. Gemini's hook payload is

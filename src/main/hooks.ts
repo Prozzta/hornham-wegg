@@ -18,8 +18,8 @@ import type { HarnessConfig } from './config';
 import type { ControlRegistry } from './control';
 import type { CircuitBreaker } from './breaker';
 import { estimateCostUsd } from './pricing';
-import { normalizeClaudeStatusLine } from './capacityNormalize';
-import { claudeAccountScope } from './capacityScope';
+import { classifyAgyStatusLine, normalizeClaudeStatusLine, type AgyStatusTick } from './capacityNormalize';
+import { agyAccountScope, claudeAccountScope } from './capacityScope';
 import { CodexRolloutCapacitySource } from './codexRolloutCapacity';
 import type { CapacityObservation } from '../shared/providerCapacity';
 
@@ -54,7 +54,14 @@ interface HookPayload {
   output?: number;
   cache_read?: number;
   cache_creation?: number;
+  /** AgyStatusLine envelopes only: Antigravity's statusline payload, forwarded whole by
+   *  the statusline shim. NEVER logged, retained or re-sent - it carries the account's
+   *  email. The normaliser reads the fields it needs and everything else is dropped. */
+  agy_status?: unknown;
 }
+
+/** How many distinct {version, driftCode} pairs are counted before they share one bucket. */
+const AGY_DRIFT_KEYS_MAX = 32;
 
 export class HookServer {
   private server: Server | null = null;
@@ -94,8 +101,22 @@ export class HookServer {
      *  runs unchanged where no tracker is wired (tests, and any build without L0).
      *  HookServer deliberately does not hold the tracker: it hands over a
      *  normalised observation and knows nothing about states, thresholds or pools. */
-    private onCapacity?: (agentId: string | null, obs: CapacityObservation) => void
+    private onCapacity?: (agentId: string | null, obs: CapacityObservation) => void,
+    /** AGY 1.1.48 - one COHERENT Antigravity statusline tick: both family observations
+     *  plus the canonical lifecycle. `agentId` is null for a user's own session. Optional
+     *  and unwired until the two-pool ingestion lands, so a tick arriving before then is
+     *  normalised, counted if it drifts, and otherwise dropped. */
+    private onAgyTick?: (agentId: string | null, tick: AgyStatusTick) => void
   ) {}
+
+  /** Bounded drift tally, keyed `version|driftCode`. Fixed-string keys only: the payload
+   *  that drifted is never stored, so this can be read out or logged safely. */
+  private agyDrift = new Map<string, number>();
+
+  /** A snapshot of the drift tally (diagnostics, tests). */
+  agyDriftCounts(): Record<string, number> {
+    return Object.fromEntries(this.agyDrift);
+  }
 
   start(): void {
     const sock = this.hive.sockPath();
@@ -140,6 +161,42 @@ export class HookServer {
     } catch { /* telemetry must never break a hook boundary */ }
   }
 
+  /**
+   * One Antigravity statusline envelope. Always answers `{}`.
+   *
+   * A refused tick changes NOTHING - not the last good pool, not the lifecycle - and
+   * is counted under its fixed drift code. The raw payload goes no further than the
+   * normaliser: it is not logged, not stored, and not passed on.
+   */
+  private handleAgyStatus(p: HookPayload): unknown {
+    try {
+      const c = classifyAgyStatusLine({
+        payload: p.agy_status,
+        accountScope: agyAccountScope(),
+        receivedAt: Date.now()
+      });
+      if (!c.ok) {
+        // The boot tick is refused by design (N-1 b); it is not drift worth counting.
+        if (c.driftCode === 'authenticating') return {};
+        const key = `${c.version ?? '-'}|${c.driftCode}`;
+        const bucket = this.agyDrift.has(key) || this.agyDrift.size < AGY_DRIFT_KEYS_MAX ? key : 'overflow';
+        const n = (this.agyDrift.get(bucket) ?? 0) + 1;
+        this.agyDrift.set(bucket, n);
+        // First sighting of each kind only: a drifting build ticks after every render. To
+        // the event log as well as the console, because log.jsonl is where a drift after an
+        // AGY upgrade gets noticed - and the row is the fixed code and version, nothing else.
+        if (n === 1) {
+          console.warn('[agy-statusline] drift', { version: c.version, driftCode: c.driftCode });
+          try { this.hive.appendLog({ kind: 'agy-statusline-drift', version: c.version, driftCode: c.driftCode }); } catch { /* best effort */ }
+        }
+        return {};
+      }
+      const agentId = typeof p.agent_id === 'string' && p.agent_id ? p.agent_id : null;
+      this.onAgyTick?.(agentId, c.tick);
+    } catch { /* telemetry must never break the pipe */ }
+    return {};
+  }
+
   /** The transcript file of an agent's CURRENT session, if any hook has fired. */
   transcriptPath(agentId: string): string | undefined {
     return this.transcriptPaths.get(agentId);
@@ -154,6 +211,12 @@ export class HookServer {
   private handle(p: HookPayload): unknown {
     const agentId = p.agent_id ?? undefined;
     const event = p.hook_event_name ?? 'Unknown';
+    // AGY statusline telemetry is not a hook boundary, and it is handled BEFORE
+    // everything else here: before the lifecycle observer (a tick is not a hook event
+    // and must not be mistaken for one), before transcript capture, and before the
+    // halt gate, the breaker and session recording. It can arrive with agent_id null
+    // from a session nobody spawned, and none of that machinery is for it.
+    if (event === 'AgyStatusLine') return this.handleAgyStatus(p);
     this.onEvent?.(agentId, event, p.message);
     if (agentId && typeof p.transcript_path === 'string' && p.transcript_path) {
       this.transcriptPaths.set(agentId, p.transcript_path);
