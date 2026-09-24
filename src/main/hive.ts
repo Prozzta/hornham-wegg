@@ -349,6 +349,8 @@ export class HiveManager {
   private readonly outboxParseRetries = new Map<string, { attempts: number; retryAfter: number }>();
   /** A rejected file whose archival is temporarily locked has already notified its sender. */
   private readonly outboxRejectNotices = new Map<string, string | null>();
+  /** A delivered file whose normal archive failed must never be delivered twice. */
+  private readonly outboxDeliveredArchives = new Map<string, string | null>();
   /** At most one queued scan; hints arriving in the same turn coalesce into it. */
   private routeQueued = false;
   /** Bumped by start/stop, so a scan queued before a stop never runs after it. */
@@ -1768,6 +1770,19 @@ export class HiveManager {
     return true;
   }
 
+  /** Archive after delivery; a transient archive lock is never a route failure. */
+  private archiveDeliveredOutbox(outbox: string, full: string, from: string, file: string): boolean {
+    try {
+      renameSync(full, join(outbox, '.sent', file));
+      this.outboxDeliveredArchives.delete(full);
+      return true;
+    } catch (error) {
+      this.outboxDeliveredArchives.set(full, this.outboxFingerprint(full));
+      this.appendLog({ kind: 'outbox-archive-failed', from, file, error: String(error) });
+      return false;
+    }
+  }
+
   routeOnce(): number {
     const root = this.root();
     if (!root) return 0;
@@ -1775,6 +1790,7 @@ export class HiveManager {
     if (!existsSync(agentsDir)) return 0;
     let routed = 0;
     let rejected = 0;
+    let archived = 0;
     const liveOutboxFiles = new Set<string>();
     for (const id of readdirSync(agentsDir)) {
       const outbox = join(agentsDir, id, 'outbox');
@@ -1783,6 +1799,15 @@ export class HiveManager {
         if (!f.endsWith('.json')) continue;
         const full = join(outbox, f);
         liveOutboxFiles.add(full);
+        const deliveredFingerprint = this.outboxDeliveredArchives.get(full);
+        if (deliveredFingerprint !== undefined) {
+          if (deliveredFingerprint === this.outboxFingerprint(full)) {
+            archived += Number(this.archiveDeliveredOutbox(outbox, full, id, f));
+            continue;
+          }
+          // The sender replaced the stranded file, so route the new payload normally.
+          this.outboxDeliveredArchives.delete(full);
+        }
         const priorRejection = this.outboxRejectNotices.get(full);
         if (priorRejection !== undefined) {
           if (priorRejection === this.outboxFingerprint(full)) continue;
@@ -1827,14 +1852,15 @@ export class HiveManager {
           const msg = this.normalize(partial, id);
           msg.from = id; // sender is authoritative — the owning directory
           this.routeMessage(msg);
-          renameSync(full, join(outbox, '.sent', f)); // archive, don't reprocess
           routed++;
         } catch (error) {
           // A parsed payload that cannot route is terminal too: keep it visible,
           // rather than retrying it forever on every watcher hint and poll.
           const reason = error instanceof Error ? error.message : String(error);
           rejected += Number(this.rejectOutboxFile(outbox, full, id, f, 'route-failed', reason, error));
+          continue;
         }
+        this.archiveDeliveredOutbox(outbox, full, id, f);
       }
     }
     // A file removed by its writer or routed successfully must not leave a stale
@@ -1845,7 +1871,12 @@ export class HiveManager {
     for (const full of this.outboxRejectNotices.keys()) {
       if (!liveOutboxFiles.has(full)) this.outboxRejectNotices.delete(full);
     }
-    if (routed > 0 || rejected > 0) this.commit(`hive: routed ${routed} message(s), rejected ${rejected}`);
+    for (const full of this.outboxDeliveredArchives.keys()) {
+      if (!liveOutboxFiles.has(full)) this.outboxDeliveredArchives.delete(full);
+    }
+    if (routed > 0 || rejected > 0 || archived > 0) {
+      this.commit(`hive: routed ${routed} message(s), rejected ${rejected}, archived ${archived}`);
+    }
     return routed;
   }
 

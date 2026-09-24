@@ -24,7 +24,19 @@ const olderThanFreshWriteGrace = (file) => {
 
 async function floor(t) {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'md-outbox-rejection-'));
-  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  const priorHome = process.env.HOME;
+  const priorUserProfile = process.env.USERPROFILE;
+  process.env.HOME = home;
+  process.env.USERPROFILE = home;
+  assert.equal(process.env.HOME, home, 'HOME must be jailed before HiveManager construction');
+  assert.equal(process.env.USERPROFILE, home, 'USERPROFILE must be jailed before HiveManager construction');
+  t.after(() => {
+    if (priorHome === undefined) delete process.env.HOME;
+    else process.env.HOME = priorHome;
+    if (priorUserProfile === undefined) delete process.env.USERPROFILE;
+    else process.env.USERPROFILE = priorUserProfile;
+    fs.rmSync(home, { recursive: true, force: true });
+  });
   const events = [];
   const hive = new HiveManager(() => home, (channel, payload) => { events.push({ channel, payload }); });
   await hive.ensureAgent({ id: 'god-1', name: 'Michael', provider: 'claude', cwd: home, isGod: true });
@@ -121,4 +133,35 @@ test('parseable but unroutable files are rejected once with a sender notice', as
   assert.equal(hive.routeOnce(), 0, 'archived files cannot repeatedly reject');
   assert.equal(hive.inbox('jim-1').length, cases.length);
   assert.equal(events.filter(({ channel, payload }) => channel === 'hive:message' && payload.to === 'jim-1').length, cases.length);
+});
+
+test('a delivered message retries only its archive when .sent is temporarily unavailable', async (t) => {
+  const { hive, events, outbox } = await floor(t);
+  const sent = path.join(outbox, '.sent');
+  const heldSent = path.join(outbox, '.sent-held');
+  fs.renameSync(sent, heldSent);
+  t.after(() => {
+    if (fs.existsSync(heldSent) && !fs.existsSync(sent)) fs.renameSync(heldSent, sent);
+  });
+  const file = path.join(outbox, 'delivered-before-archive.json');
+  fs.writeFileSync(file, JSON.stringify({ to: 'god-1', act: 'inform', subject: 'delivered before archive' }));
+
+  assert.equal(hive.routeOnce(), 1, 'the message must be delivered before archive retry state is recorded');
+  assert.equal(hive.inbox('god-1').length, 1);
+  assert.equal(hive.inbox('jim-1').length, 0);
+  assert.equal(fs.existsSync(file), true, 'a failed archive leaves the delivered source file in place');
+  assert.equal(hive.logTail(100).filter((entry) => entry.kind === 'outbox-archive-failed').length, 1);
+
+  assert.equal(hive.routeOnce(), 0, 'an unchanged delivered file must only retry archival');
+  assert.equal(hive.inbox('god-1').length, 1, 'archive retry must never redeliver');
+  assert.equal(hive.inbox('jim-1').length, 0, 'archive failure must not reject the sender');
+
+  fs.renameSync(heldSent, sent);
+  assert.equal(hive.routeOnce(), 0, 'successful archive retry is not a new route');
+  assert.equal(fs.existsSync(path.join(sent, 'delivered-before-archive.json')), true);
+  assert.equal(hive.inbox('god-1').length, 1, 'successful archive retry still must not redeliver');
+  assert.equal(hive.inbox('jim-1').length, 0);
+  assert.equal(events.filter(({ channel, payload }) =>
+    channel === 'hive:message' && /^\[outbox rejected/.test(payload.subject)
+  ).length, 0, 'archive failure must produce no sender rejection notice');
 });

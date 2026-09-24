@@ -25,7 +25,19 @@ const { HiveManager } = loadTs('src/main/hive.ts');
 
 async function floor(t) {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'md-unknown-to-'));
-  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  const priorHome = process.env.HOME;
+  const priorUserProfile = process.env.USERPROFILE;
+  process.env.HOME = home;
+  process.env.USERPROFILE = home;
+  assert.equal(process.env.HOME, home, 'HOME must be jailed before HiveManager construction');
+  assert.equal(process.env.USERPROFILE, home, 'USERPROFILE must be jailed before HiveManager construction');
+  t.after(() => {
+    if (priorHome === undefined) delete process.env.HOME;
+    else process.env.HOME = priorHome;
+    if (priorUserProfile === undefined) delete process.env.USERPROFILE;
+    else process.env.USERPROFILE = priorUserProfile;
+    fs.rmSync(home, { recursive: true, force: true });
+  });
   const hive = new HiveManager(() => home);
   await hive.ensureAgent({ id: 'god-1', name: 'Michael', provider: 'claude', cwd: home, isGod: true });
   await hive.ensureAgent({ id: 'jim-1', name: 'Jim', provider: 'claude', cwd: home });
