@@ -165,3 +165,58 @@ test('a delivered message retries only its archive when .sent is temporarily una
     channel === 'hive:message' && /^\[outbox rejected/.test(payload.subject)
   ).length, 0, 'archive failure must produce no sender rejection notice');
 });
+
+/**
+ * Jim's router-148 note 1 (surviving mutant M3). The retry above remembers a delivered
+ * file by FINGERPRINT, and the fingerprint is the whole guard: drop the comparison
+ * (`if (true)`) and the router archives whatever now sits at that path as though it
+ * were the message it already delivered. A sender who reuses a filename for a SECOND,
+ * never-delivered message would have it swallowed silently - no delivery, no rejection,
+ * no trace but an archived file that looks handled.
+ *
+ * The code handles it; nothing pinned it. This is that pin: strand a delivered file so
+ * its archive fails, overwrite it with a DIFFERENT payload, restore `.sent`, and require
+ * that the second payload REACHES the recipient rather than being archived on the first
+ * one's ticket.
+ */
+test('a stranded delivered file REPLACED by a new message routes the new payload, not the archive', async (t) => {
+  const { hive, events, outbox } = await floor(t);
+  const sent = path.join(outbox, '.sent');
+  const heldSent = path.join(outbox, '.sent-held');
+  fs.renameSync(sent, heldSent);
+  t.after(() => {
+    if (fs.existsSync(heldSent) && !fs.existsSync(sent)) fs.renameSync(heldSent, sent);
+  });
+
+  // 1. Deliver, and strand it: .sent is gone, so the archive fails and the router
+  //    remembers this exact file by fingerprint.
+  const file = path.join(outbox, 'reused-name.json');
+  fs.writeFileSync(file, JSON.stringify({ to: 'god-1', act: 'inform', subject: 'the first message' }));
+  assert.equal(hive.routeOnce(), 1, 'the first message must be delivered before it can be stranded');
+  assert.equal(hive.inbox('god-1').length, 1);
+  assert.equal(fs.existsSync(file), true, 'a failed archive leaves the delivered source in place');
+
+  // 2. The sender REUSES the name for a different message. Size AND mtime both move, so
+  //    the fingerprint cannot match by accident - a same-size rewrite inside one
+  //    millisecond would compare equal and this test would prove nothing. mtime goes
+  //    BACKWARDS, not forwards, so it can never be mistaken for a fresh partial write.
+  const before = fs.statSync(file);
+  fs.writeFileSync(file, JSON.stringify({ to: 'god-1', act: 'inform', subject: 'the SECOND message, same filename', body: 'x'.repeat(64) }));
+  const past = new Date(Date.now() - 5_000);
+  fs.utimesSync(file, past, past);
+  const after = fs.statSync(file);
+  assert.notEqual(`${before.size}:${before.mtimeMs}`, `${after.size}:${after.mtimeMs}`,
+    'FIXTURE: the replacement must not share the stranded file\'s fingerprint, or nothing is being tested');
+
+  // 3. .sent comes back. The new payload must be DELIVERED, not archived as the old one.
+  fs.renameSync(heldSent, sent);
+  assert.equal(hive.routeOnce(), 1, 'the replacement is a NEW route, not an archive retry');
+  assert.equal(hive.inbox('god-1').length, 2, 'the second message must REACH the recipient');
+  assert.equal(hive.inbox('god-1')[1].subject, 'the SECOND message, same filename',
+    'the payload delivered must be the replacement, not a re-send of the first');
+  assert.equal(fs.existsSync(path.join(sent, 'reused-name.json')), true, 'and it is archived once delivered');
+  assert.equal(hive.inbox('jim-1').length, 0, 'a replaced file is not a sender error');
+  assert.equal(events.filter(({ channel, payload }) =>
+    channel === 'hive:message' && /^\[outbox rejected/.test(payload.subject)
+  ).length, 0, 'no rejection notice for a legitimately replaced file');
+});
