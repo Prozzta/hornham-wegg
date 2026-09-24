@@ -441,11 +441,22 @@ export function useHive(config: HarnessConfig | null): void {
         // Antigravity (agy): the model is being called — it's thinking/working.
         if (!breakerArmed) updateAgent(e.agentId, { status: 'working', action: 'thinking' });
       } else if (e.event === 'PostInvocation') {
-        // agy's per-turn boundary. Unlike Claude, agy's Stop fires only on process
-        // EXIT, so without this an agy worker would never register as idle and the
-        // inbox-wake nudge (idle-only) could never reach it — its mail would sit
-        // undrained. Treat it as idle; a follow-up tool/turn re-sets working.
-        if (!breakerArmed) updateAgent(e.agentId, { status: 'idle', action: 'idle', carrying: undefined });
+        // AGY 1.1.48 — PostInvocation IS NO LONGER IDLE, here or anywhere.
+        //
+        // It is agy's per-invocation boundary, not its per-TURN boundary: one turn that
+        // calls tools makes several invocations, so this fires repeatedly mid-turn. It
+        // was read as idle because agy's Stop fires only on process EXIT and something
+        // had to make a worker reachable — but the price was a floor display that said
+        // "idle" in the middle of a tool chain, and the split-brain in the 1.1.47 stall,
+        // where the UI showed idle while main correctly refused with lifecycle-active.
+        //
+        // The replacement is the native statusline status pushed on hive:providerStatus
+        // below, which is the provider's own answer rather than our inference. No status
+        // It is now treated exactly like PostToolUse — the conservative reading that a
+        // turn is still in progress between invocations — and only the native tick ends
+        // it. Asserting idle from a boundary we know fires mid-turn is the one reading
+        // that cannot be recovered from; asserting working merely waits.
+        if (!breakerArmed) updateAgent(e.agentId, { status: 'working' });
       } else if (e.event === 'Stop' || e.event === 'SubagentStop') {
         // A blocked Stop means the agent is being re-engaged to process its
         // inbox — it's NOT idle, so keep it working until it genuinely stops.
@@ -481,6 +492,31 @@ export function useHive(config: HarnessConfig | null): void {
           // Idle notification — responded, nothing to do. Linger, don't flag.
           updateAgent(e.agentId, { status: 'idle', action: 'idle', carrying: undefined });
         }
+      }
+    });
+  }, []);
+
+  // 2a-bis) The CANONICAL provider-native status (AGY 1.1.48). Main classifies one
+  //     version-validated statusline tick and pushes the result; this displays it.
+  //     Nothing is parsed or inferred here, and nothing here authorises a wake — main
+  //     owns submission, and it reached the same conclusion from the same tick before
+  //     this push was sent. The breaker keeps precedence, as it does over hook events.
+  useEffect(() => {
+    return window.cth.onHiveProviderStatus((e) => {
+      const { updateAgent, agents } = useStore.getState();
+      const self = agents.find((a) => a.id === e.agentId);
+      if (!self) return;
+      const blevel = breakerLevel.current[e.agentId];
+      if (blevel === 'constrained' || blevel === 'stopped') return;
+      if (e.status === 'idle') {
+        updateAgent(e.agentId, { status: 'idle', action: 'idle', carrying: undefined });
+      } else if (e.status === 'running') {
+        updateAgent(e.agentId, { status: 'working' });
+      } else {
+        // A confirmation prompt is genuinely blocked on a person. Same split the
+        // Notification branch makes: only god escalates to the human, a worker reads
+        // as waiting on god rather than on you.
+        updateAgent(e.agentId, { status: self.isGod ? 'blocked' : 'waiting', carrying: undefined });
       }
     });
   }, []);

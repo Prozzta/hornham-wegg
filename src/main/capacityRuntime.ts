@@ -31,7 +31,9 @@
 import { CapacityAdmission, ADMISSION_REASON, RECOVERY_RESERVATION_TTL_MS, type AdmissionDecision, type WorkClass } from './capacityAdmission';
 import { CapacityNotifier, type CapacityNotifyIntent } from './capacityNotify';
 import { ProviderCapacityTracker, staleLastKnown } from './providerCapacityTracker';
-import type { CapacityCollectionSnapshot, CapacityObservation } from '../shared/providerCapacity';
+import { poolKeyOf as poolKeyFor, type CapacityCollectionSnapshot, type CapacityObservation }
+  from '../shared/providerCapacity';
+import type { AgyFamily } from './capacityNormalize';
 
 /**
  * Never schedule a boundary closer than this. A reading whose deadline is already
@@ -101,6 +103,9 @@ export class CapacityRuntime {
   readonly admission: CapacityAdmission;
   private readonly notifier = new CapacityNotifier();
   private readonly poolForAgent = new Map<string, string>();
+  /** agentId → the Antigravity ACCOUNT scope its accepted ticks came from. Lets Monitor
+   *  name the sibling family an agent is not gated by, without making it a member of it. */
+  private readonly agyScopeByAgent = new Map<string, string>();
   private readonly now: () => number;
   private readonly setTimer: (fn: () => void, ms: number) => unknown;
   private readonly clearTimer: (handle: unknown) => void;
@@ -147,6 +152,72 @@ export class CapacityRuntime {
     if (result.changed) this.publish();
     else if (moved) this.deps.onChange?.();
     this.rearm();
+  }
+
+/**
+   * ONE Antigravity statusline tick: two observations, ingested as a COHERENT PAIR.
+   *
+   * WHY THIS EXISTS AND `ingest` COULD NOT BE REUSED (design 1.3). A tick describes TWO
+   * pools - the account's 3P allowance and its Gemini allowance - and `ingest` records
+   * `poolForAgent` per call, so calling it twice would leave the agent mapped to whichever
+   * observation went in LAST. The agent draws on exactly one of the two, chosen by the
+   * model in that same tick, so the mapping has to be decided for the pair rather than by
+   * arrival order.
+   *
+   * ALL OR NOTHING FOR THE BINDING. Both observations are offered to the tracker, but the
+   * agent is re-mapped only if BOTH were accepted and the pair is coherent (same provider,
+   * same account scope, exactly the 3p and gemini pool keys of that scope). A tick we
+   * could not accept whole must not move an agent off a pool it is currently gated by -
+   * the same rule `ingest` applies to a single rejected reading, one level up.
+   *
+   * `agentId` is null for the user's OWN interactive AGY session: both pools are still
+   * ingested and displayed, because capacity is account-wide, but no hive member and no
+   * wake lifecycle is invented for a session nobody spawned.
+   *
+   * At most one publish, one onChange and one rearm for the pair, so a tick that moves
+   * both pools is still a single push.
+   */
+  ingestAgyTick(agentId: string | null, tick: {
+    accountScope: string;
+    activeLimitId: AgyFamily;
+    observations: readonly [CapacityObservation, CapacityObservation];
+  }): void {
+    const [a, b] = tick.observations;
+    const coherent = a.provider === 'antigravity' && b.provider === 'antigravity'
+      && a.accountScope === tick.accountScope && b.accountScope === tick.accountScope
+      && a.poolKey === poolKeyFor('antigravity', tick.accountScope, '3p')
+      && b.poolKey === poolKeyFor('antigravity', tick.accountScope, 'gemini');
+
+    const ra = this.tracker.ingestDetailed(a);
+    const rb = this.tracker.ingestDetailed(b);
+
+    let moved = false;
+    if (agentId && coherent && ra.accepted && rb.accepted) {
+      const active = tick.activeLimitId === 'gemini' ? b : a;
+      moved = this.poolForAgent.get(agentId) !== active.poolKey;
+      this.poolForAgent.set(agentId, active.poolKey);
+      // Which ACCOUNT this agent draws on, so Monitor can name the sibling family it is
+      // not gated by. Committed with the mapping, for the same reason.
+      this.agyScopeByAgent.set(agentId, tick.accountScope);
+    }
+
+    if (ra.changed || rb.changed) this.publish();
+    else if (moved) this.deps.onChange?.();
+    this.rearm();
+  }
+
+  /**
+   * The pool key for ONE of this agent's two Antigravity families, or null.
+   *
+   * For Monitor, which shows both families of the account an agent draws on. It reads the
+   * account scope committed with an ACCEPTED tick, so it can never invent a pool for an
+   * agent whose readings were refused. It does NOT make the agent a member of the
+   * inactive family: admission, recovery grants and final revalidation all continue to
+   * use the one active `poolForAgent` mapping, so a 3P zero cannot block a Gemini turn.
+   */
+  poolKeyForAgyFamily(agentId: string, family: AgyFamily): string | null {
+    const scope = this.agyScopeByAgent.get(agentId);
+    return scope ? poolKeyFor('antigravity', scope, family) : null;
   }
 
   /** Agents whose own accepted readings landed in this pool. A copy: never a handle. */

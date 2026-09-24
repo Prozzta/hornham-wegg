@@ -32,9 +32,16 @@ const win = (id, remaining, resetsAt = RESET_5H) => ({
   remainingPercent: remaining, resetsAt
 });
 
+// `sourceVersion: null` is part of the fixture because it is part of every real
+// observation since 1.1.48, and this file pins byte-exact transitions. The pool cap is
+// charged on the OBSERVATION and the collection cap on the PUBLISHED projection, so an
+// observation that omitted the field would publish 20 bytes it was never charged for -
+// which is what moved these transitions when the field was added. Real producers carry
+// it on the way in, so they pay for it; the fixture has to be the same shape to measure
+// the same thing.
 const obs = (over = {}) => ({
   poolKey: 'codex:acct-a:codex', provider: 'codex', accountScope: 'acct-a', limitId: 'codex',
-  source: 'codex-rollout', streamId: 's', sourceSequence: 1,
+  source: 'codex-rollout', sourceVersion: null, streamId: 's', sourceSequence: 1,
   observedAt: T0, receivedAt: T0, windows: [win('five_hour', 80)],
   providerAttributedLimitingWindowId: null, providerReachedType: null,
   ordinaryUsageAllowed: null, planType: 'plus', ...over

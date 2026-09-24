@@ -25,7 +25,7 @@ import {
   runStandupTick, projectTasks,
   type FloorState, type StandupDecision, type StandupSkipRecord
 } from './standupDelta';
-import { listDir, readFileText, readFileBinary, writeFileText, statAbs, expandTilde } from './fs';
+import { listDir, readFileText, readFileBinary, writeFileText, statAbs, expandTilde, samePath } from './fs';
 import { normalizeWeekly, weeklyDelayMs } from '../shared/weeklySchedule';
 import { isInputOrigin } from '../shared/inputOrigin';
 import { automaticDeliveryEligibility, isTerminalInputState } from '../shared/inputProvenance';
@@ -322,7 +322,13 @@ const hive = new HiveManager(
     const wc = liveWebContents();
     if (!wc) return false;
     try { wc.send(channel, payload); return true; } catch { return false; }
-  }
+  },
+  {},
+  // THE one place a hive is allowed to write the user's GLOBAL provider config
+  // (~/.gemini hooks, ~/.grok hooks, the Antigravity statusLine). Read fresh from
+  // config each time, so a home change takes effect without a restart; everywhere
+  // else a HiveManager is constructed, the default refuses. See mayWriteGlobalConfig.
+  (home) => samePath(home, readConfig().harnessHome)
 );
 // #7C — operator control state (pause/gate/steer/halt), read by the HookServer
 // when deciding hook returns.
@@ -553,8 +559,29 @@ const hookServer = new HookServer(
   standingGoalFromRoster,
   // Observed BEFORE the hook response; the bridge defers any retry with setImmediate, so
   // the Stop reply is never blocked and no turn is manufactured inside the hook.
-  (agentId, event, message) => inboxWake?.onHook(agentId, event, message),
-  (agentId, obs) => { providerCapacity.ingest(agentId, obs); capacityStore.scheduleSave(); }
+  (agentId, event, message, fullyIdle) => inboxWake?.onHook(agentId, event, message, fullyIdle),
+  (agentId, obs) => { providerCapacity.ingest(agentId, obs); capacityStore.scheduleSave(); },
+  // AGY 1.1.48 — ONE validated statusline tick, routed to its two consumers. Capacity
+  // first: the allowance pair is a provider fact and is true for the account whether or
+  // not any hive agent is behind the tick. Lifecycle second, and ONLY with an agent id —
+  // a tick from the user's own `agy` session says nothing about a floor worker, and the
+  // one thing it must never do is make somebody else's running turn look finished.
+  (agentId, tick) => {
+    providerCapacity.ingestAgyTick(agentId, {
+      accountScope: tick.observations[0].accountScope,
+      activeLimitId: tick.activeLimitId,
+      observations: tick.observations
+    });
+    capacityStore.scheduleSave();
+    if (!agentId) return;
+    // tick.readAt, NOT the delivery time: arrival through one socket is monotone, so a
+    // delivery time cannot show that one reading was taken before another (Jim, c4 audit).
+    inboxWake?.onProviderStatus(agentId, tick.lifecycle, tick.sessionId, tick.readAt);
+    // The renderer is TOLD the canonical status; it never re-derives one. Presentation
+    // only — main remains the sole submission authority, so a renderer that misses this
+    // push, or renders it late, cannot cause or prevent a single wake.
+    liveWebContents()?.send('hive:providerStatus', { agentId, status: tick.lifecycle });
+  }
 );
 const memory = new MemoryManager(
   () => readConfig().harnessHome,
@@ -698,12 +725,19 @@ function teardownPty(id: string): void {
   // 1) Archive the agent — retained + flagged; only live-PTY agents are active.
   const agentId = ptyToAgent.get(id);
   if (agentId) {
+    const leftProvider = ptyProvider.get(id);
     ptyToAgent.delete(id);
     ptyProvider.delete(id);
     // Pool membership completeness can change when an agent leaves.
     pushCapacityStrip();
     pushAgentUsage();
     pushAgentImpact();
+    // AGY statusline lease: held only while an AGY agent is on the floor. When the last
+    // one goes, the user's global statusline goes back to them now - not at quit.
+    // (After the pushes: capacity censuses pin the delete-then-push adjacency.)
+    if (leftProvider === 'antigravity' && ![...ptyProvider.values()].includes('antigravity')) {
+      try { hive.agyAgentsGone(); } catch (e) { console.error('[hive] agyAgentsGone failed:', e); }
+    }
     // Drop watchdog state so a dead agent can't get nudged or leak its grace.
     try { workerWake.forget(agentId, id); } catch { /* best-effort */ }
     // Drop breaker state so a dead agent can't leak/zombie a tripped level.
@@ -3739,6 +3773,7 @@ ipcMain.handle('config:changeHome', async (_evt, payload: unknown) => {
   try { stopEphemeralWorkerWatcher(); } catch (e) { console.error('[changeHome] stopWorkerWatcher:', e); }
   try { integrationBroker.stop(); } catch (e) { console.error('[changeHome] broker.stop:', e); }
   try { hive.stopRouter(); } catch (e) { console.error('[changeHome] stopRouter:', e); }
+  try { hive.stopAgyStatusline(); } catch (e) { console.error('[changeHome] stopAgyStatusline:', e); }
   try { hookServer.stop(); } catch (e) { console.error('[changeHome] hookServer.stop:', e); }
   try { stopSlackServer(); } catch (e) { console.error('[changeHome] slack.stop:', e); }
   try { stopWebhookServer(); } catch (e) { console.error('[changeHome] webhook.stop:', e); }
@@ -4239,6 +4274,7 @@ function teardownAndQuit(): void {
   try { stopEphemeralWorkerWatcher(); } catch (e) { console.error('[quit] stopWorkerWatcher:', e); }
   try { integrationBroker.stop(); } catch (e) { console.error('[quit] broker.stop:', e); }
   try { hive.stopRouter(); } catch (e) { console.error('[quit] stopRouter:', e); }
+  try { hive.stopAgyStatusline(); } catch (e) { console.error('[quit] stopAgyStatusline:', e); }
   try { hookServer.stop(); } catch (e) { console.error('[quit] hookServer.stop:', e); }
   try { telemetry.stop(); } catch (e) { console.error('[quit] telemetry.stop:', e); }
   try { stopSlackServer(); } catch (e) { console.error('[quit] slack.stop:', e); }
@@ -4300,6 +4336,7 @@ ipcMain.handle('app:resetAll', () => {
   try { stopEphemeralWorkerWatcher(); } catch (e) { console.error('[reset] stopWorkerWatcher:', e); }
   try { integrationBroker.stop(); } catch (e) { console.error('[reset] broker.stop:', e); }
   try { hive.stopRouter(); } catch (e) { console.error('[reset] stopRouter:', e); }
+  try { hive.stopAgyStatusline(); } catch (e) { console.error('[reset] stopAgyStatusline:', e); }
   try { hookServer.stop(); } catch (e) { console.error('[reset] hookServer.stop:', e); }
   try { telemetry.stop(); } catch (e) { console.error('[reset] telemetry.stop:', e); }
   try { stopSlackServer(); } catch (e) { console.error('[reset] slack.stop:', e); }
@@ -5774,6 +5811,11 @@ function bootstrapHiveServices(): void {
   // reply still belongs in the history.
   if ((readConfig().webhookTriggers ?? []).length > 0) startWebhookDoneObserver();
   hookServer.start();
+  // AGY 1.1.48 - prepare Antigravity statusline capture. This TAKES nothing: the lease
+  // on the user's global statusline is taken on the first AGY spawn and released when
+  // the last AGY agent leaves. Startup only gives back a lease a dead run left behind.
+  // After hookServer.start(), so a locator always names a listening pipe. Stable only.
+  hive.startAgyStatusline();
   // Bind the telemetry collector BEFORE the renderer spawns any agent, then point
   // the hive at it so every subsequent spawn is instrumented. Best-effort — a bind
   // failure just leaves telemetry off (transcript reconciler stays). No breaker.start():
@@ -6028,7 +6070,15 @@ app.on('before-quit', (e) => {
 // The last chance to flush a coalesced capacity write. `before-quit` can be
 // preventDefault-ed by the running-terminals warning above, so the flush hangs off
 // `will-quit`, which only fires once the quit is actually going ahead.
-app.on('will-quit', () => { capacityStore.saveNow(); capacityDetailTicker.stopAll(); });
+app.on('will-quit', () => {
+  capacityStore.saveNow();
+  capacityDetailTicker.stopAll();
+  // AGY statusline lease. `before-quit` only routes through teardownAndQuit when
+  // terminals are open, so an ordinary quit with none would otherwise leave the user's
+  // statusline pointing at Munder while Munder is closed. Idempotent: a no-op when the
+  // teardown path already released it.
+  try { hive.stopAgyStatusline(); } catch (e) { console.error('[will-quit] stopAgyStatusline:', e); }
+});
 
 app.on('window-all-closed', () => {
   if (process.platform !== 'darwin') {

@@ -18,7 +18,7 @@
  * HookServer finish its synchronous Stop response before any submit is attempted.
  * Electron-free; every effect is injected.
  */
-import type { InterferenceHow, WakeCause, WakeClaim, WakeMode, WorkerWakeFacts, WorkerWakeWatchdog } from './workerWake';
+import type { InterferenceHow, ProviderStatus, WakeCause, WakeClaim, WakeMode, WorkerWakeFacts, WorkerWakeWatchdog } from './workerWake';
 
 export interface InboxWakeSubmit {
   requestId: string;
@@ -115,7 +115,7 @@ export class InboxWakeBridge {
       .then((outcome) => outcome?.kind ?? 'FAILED', () => 'FAILED')
       .then((kind) => {
         this.deps.diag?.('settle', { agentId, cause, mode, outcome: kind, requestId: claim.requestId });
-        coordinator.settle(claim, kind);
+        coordinator.settle(claim, kind, this.deps.now());
         this.deps.log?.(`[inbox-wake] ${kind === 'COMMITTED' ? 'commit' : 'release'} ${agentId} cause=${cause} outcome=${kind}`);
       });
     return claim;
@@ -129,8 +129,8 @@ export class InboxWakeBridge {
   }
 
   /** HookServer observation (before its response): record lifecycle, retry after the turn. */
-  onHook(agentId: string | undefined, event: string | undefined, message: string | undefined): void {
-    const edge = this.deps.coordinator.noteHook(agentId, event, message, this.deps.now());
+  onHook(agentId: string | undefined, event: string | undefined, message: string | undefined, fullyIdle?: boolean): void {
+    const edge = this.deps.coordinator.noteHook(agentId, event, message, this.deps.now(), fullyIdle);
     // The lifecycle is sourced ONLY here, from the live hook stream - the one input no
     // in-harness test ever drove. Every hook boundary is recorded so a packaged run shows
     // whether Stop/Notification ever arrive at all, and what the lifecycle became.
@@ -138,6 +138,28 @@ export class InboxWakeBridge {
     if (edge && agentId) {
       this.scheduleWake(agentId, 'hook');
     }
+  }
+
+  /**
+   * A provider-native status reading (today: one validated Antigravity statusline tick).
+   *
+   * It rides the SAME scheduling path as a hook edge, deliberately: a native idle is one
+   * more observation that an agent may be able to take a turn, not a new authority. It
+   * coalesces with hook and delivery edges for the turn, goes through `requestInboxWake`,
+   * and is refused by every guard a hook-driven wake is refused by. No second request id,
+   * no second submit owner, no direct PTY write — the 1.1.46 lesson is that a second
+   * producer is a second turn, and there is still exactly one.
+   */
+  onProviderStatus(agentId: string | undefined, status: ProviderStatus, sessionId: string | null = null, readAt?: number): void {
+    // `readAt` is when the shim READ the status. It is passed through in preference to the
+    // delivery clock because delivery order says nothing about reading order - the whole
+    // point of the coordinator's ordering guard. Absent one, the delivery clock stands in.
+    const at = typeof readAt === 'number' && Number.isFinite(readAt) ? readAt : this.deps.now();
+    const edge = this.deps.coordinator.noteProviderStatus(agentId, status, at, sessionId);
+    // The session is a breadcrumb, not a secret: it is the provider's own conversation id
+    // and is exactly what a packaged run needs to explain a discarded tick.
+    this.deps.diag?.('provider-status', { agentId: agentId ?? null, status, session: sessionId, at, edge });
+    if (edge && agentId) this.scheduleWake(agentId, 'hook');
   }
 
   /** A blocking control state cleared (unpause, resume, auto-delivery release). */

@@ -363,6 +363,9 @@ const sameProjection = (a: PoolCapacitySnapshot, b: PoolCapacitySnapshot): boole
   // from a live status line and from a replayed rollout are different facts, and a
   // consumer that never sees the change cannot tell one from the other.
   && a.source === b.source
+  // A changed provider version with identical numbers is still a changed fact about
+  // where the reading came from, so it republishes.
+  && a.sourceVersion === b.sourceVersion
   && a.freshness === b.freshness
   && a.observedAt === b.observedAt
   && a.providerAttributedLimitingWindowId === b.providerAttributedLimitingWindowId
@@ -1031,6 +1034,8 @@ export class ProviderCapacityTracker {
       && boundedIdentity(obs.accountScope) !== null
       && boundedIdentity(obs.limitId) !== null
       && (OBSERVATION_SOURCES as readonly string[]).includes(obs.source)
+      // Retained verbatim and copied through a stand-in, so it is bounded like an identity.
+      && (obs.sourceVersion === null || obs.sourceVersion === undefined || boundedIdentity(obs.sourceVersion) !== null)
       && (obs.streamId === null || obs.streamId === undefined || boundedStreamId(obs.streamId) !== null);
   }
 
@@ -1041,6 +1046,8 @@ export class ProviderCapacityTracker {
       accountScope: obs.accountScope,
       limitId: obs.limitId,
       source: obs.source,
+      // Bounded by identityIsBounded before a stand-in can be built.
+      sourceVersion: obs.sourceVersion ?? null,
       streamId: obs.streamId,
       sourceSequence: obs.sourceSequence,
       observedAt: obs.observedAt,
@@ -1176,6 +1183,8 @@ export class ProviderCapacityTracker {
       stateReason,
       windows: obs.windows,
       source: obs.source,
+      // `?? null`: a producer that predates the field must publish null, never undefined.
+      sourceVersion: obs.sourceVersion ?? null,
       freshness,
       observedAt: obs.observedAt,
       receivedAt: obs.receivedAt,
@@ -1426,6 +1435,7 @@ function blankProjection(obs: CapacityObservation, floor = 0): PoolCapacitySnaps
     stateReason: REASON.NO_READING,
     windows: [],
     source: obs.source,
+    sourceVersion: null,
     freshness: 'STALE',
     observedAt: 0,
     receivedAt: 0,

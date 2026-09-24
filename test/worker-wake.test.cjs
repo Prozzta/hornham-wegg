@@ -117,7 +117,10 @@ test('B5 inbox drain prunes pending and announced; a reappearing id is ONE recon
   const c = idleWith(['m1']);
   c.settle(c.claim(fact(), 'delivery', 'event', NOW), 'COMMITTED');
   c.reconcile('alice', []);
-  assert.deepEqual(c.state('alice'), { pending: [], announced: [], inFlight: null, held: null, lifecycle: 'active' });
+  // Exact shape on purpose: a new field in the coordinator's public state must be noticed
+  // here. `providerSession` is null because nothing in this test feeds a native status tick
+  // (AGY 1.1.48 c4); the drain behaviour it guards is unchanged.
+  assert.deepEqual(c.state('alice'), { pending: [], announced: [], inFlight: null, held: null, lifecycle: 'active', providerSession: null });
   // A new process: nothing in memory, the file is still on disk.
   const fresh = new WorkerWakeWatchdog();
   fresh.reconcile('alice', ['m1']);

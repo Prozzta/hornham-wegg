@@ -1,0 +1,23 @@
+{
+  "cwd": "C:\\fixture-workspace\\agy-project",
+  "session_id": "c7d28ffd-108c-451b-8029-fd8920993b71",
+  "conversation_id": "c7d28ffd-108c-451b-8029-fd8920993b71",
+  "transcript_path": "C:\\fixture-home\\.gemini\\antigravity\\brain\\c7d28ffd-108c-451b-8029-fd8920993b71\\.system_generated\\logs\\transcript.jsonl",
+  "model": { "id": "Gemini 3.8 Flash (High)", "display_name": "Gemini 3.8 Flash (High)", "effort": "high" },
+  "workspace": { "current_dir": "C:\\fixture-workspace\\agy-project", "project_dir": "C:\\fixture-workspace\\agy-project" },
+  "version": "1.2.8",
+  "context_window": { "total_input_tokens": 12659, "total_output_tokens": 269, "context_window_size": 1048576, "used_percentage": 1.23291015625, "remaining_percentage": 98.76708984375, "current_usage": null },
+  "exceeds_200k_tokens": null,
+  "product": "antigravity",
+  "quota": {
+    "3p-5h": { "remaining_fraction": 1, "reset_time": "2026-09-22T14:44:06Z", "reset_in_seconds": 18003 },
+    "3p-weekly": { "remaining_fraction": 1, "reset_time": "2026-09-29T09:44:06Z", "reset_in_seconds": 604803 },
+    "gemini-5h": { "remaining_fraction": 0.9763053, "reset_time": "2026-09-22T14:27:03Z", "reset_in_seconds": 16980 },
+    "gemini-weekly": { "remaining_fraction": 0.8447577, "reset_time": "2026-09-23T05:36:34Z", "reset_in_seconds": 71551 }
+  },
+  "agent_state": "working",
+  "sandbox": { "enabled": true },
+  "plan_tier": "Google AI Pro",
+  "email": "fixture.person@example.invalid",
+  "terminal_width": 120
+}
