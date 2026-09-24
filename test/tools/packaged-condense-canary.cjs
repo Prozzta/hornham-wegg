@@ -302,13 +302,89 @@ async function proveProbe() {
   }
 }
 
+/**
+ * The pids in `root`'s process tree, `root` included.
+ *
+ * WHY THIS EXISTS. hiddenChildren() matches `claude --print` ANYWHERE ON THE MACHINE,
+ * which is right for proving the probe can see (the decoy below is a child of the
+ * CANARY, not of the app) and wrong for deciding who leaked. On a floor where the
+ * INSTALLED app is running, its own condensation children are born mid-run, so they
+ * are absent from the `before` snapshot and get attributed to this canary - a FALSE
+ * product finding on a gate whose comment invites you to believe it. Observed
+ * 2026-09-24: two live children of
+ * `%LOCALAPPDATA%\Programs\Munder Difflin\Munder Difflin.exe` failed this check while
+ * the canary's own app, under dist\win-unpacked, had leaked nothing.
+ *
+ * An orphan whose parent is already gone is deliberately NOT claimed: its
+ * ParentProcessId points at a dead pid that Windows may have reused, so attributing it
+ * would be a guess. The app is still alive when this runs, so a child it leaked is
+ * still reachable through it.
+ */
+function treeOf(root) {
+  const out = execFileSync('powershell.exe', ['-NoProfile', '-Command',
+    "Get-CimInstance Win32_Process | ForEach-Object { $_.ProcessId.ToString() + ' ' + $_.ParentProcessId.ToString() }"
+  ], { encoding: 'utf8', timeout: 30_000 });
+  const parent = new Map();
+  for (const line of out.split('\n')) {
+    const [pid, ppid] = line.trim().split(' ');
+    if (pid) parent.set(pid, ppid);
+  }
+  const tree = new Set([String(root)]);
+  // Repeat to a fixed point: Win32_Process is not ordered parents-first.
+  for (let grew = true; grew; ) {
+    grew = false;
+    for (const [pid, ppid] of parent) {
+      if (!tree.has(pid) && tree.has(ppid)) { tree.add(pid); grew = true; }
+    }
+  }
+  return tree;
+}
+
+/**
+ * PROVE THE TREE FILTER BEFORE TRUSTING IT, in both directions.
+ *
+ * Narrowing the leak check to the app's tree is what stops a FALSE product finding -
+ * and a narrowing that matches nothing would make the check blind, which is the same
+ * failure proveProbe() exists to catch, one level down. So: spawn a decoy in the argv
+ * shape, parented to the CANARY rather than to the app, and require that the probe
+ * SEES it (not blind) while the app's tree REFUSES it (not machine-wide). One decoy
+ * answers both questions, because only a filter that discriminates can pass both.
+ */
+async function proveTreeFilter(appPid) {
+  const marker = 'canary-tree-filter-self-test-' + process.pid;
+  const decoyJs = join(REPO, 'dist', `canary-tree-decoy-${process.pid}.js`);
+  mkdirSync(join(REPO, 'dist'), { recursive: true });
+  writeFileSync(decoyJs, 'setTimeout(() => {}, 120000);\n');
+  const decoy = spawn(process.execPath, [decoyJs, '--output-format', 'json', '--session-id', marker],
+    { stdio: 'ignore', windowsHide: true, detached: true });
+  try {
+    const seen = await waitFor('the probe to see the tree-filter decoy', 30_000, async () => {
+      const hit = [...hiddenChildren()].find(([, cmd]) => cmd.includes(marker));
+      return hit ? hit[0] : null;
+    }).catch(() => null);
+    check(!!seen, 'tree filter: the probe still SEES a decoy anywhere on the machine',
+      seen ? `decoy pid ${seen}` : 'THE PROBE IS BLIND - the leak check below proves nothing');
+    check(!!seen && !treeOf(appPid).has(seen),
+      "tree filter: and the app's tree REFUSES a decoy it did not father",
+      seen ? `decoy ${seen} not in the tree of app ${appPid}` : 'no decoy to test with');
+  } finally {
+    try { process.kill(decoy.pid); } catch { /* already gone */ }
+    await waitFor('the tree-filter decoy to exit', 15_000,
+      async () => ![...hiddenChildren()].some(([, c]) => c.includes(marker)) || null).catch(() => null);
+    try { rmSync(decoyJs, { force: true }); } catch { /* ignore */ }
+  }
+}
+
 /** A child still winding down a second after its stream closed is not a leak; one still
  *  there after the settle window is. Poll rather than sample once - the first run of
- *  this canary flagged a pid that had already exited by the time it was looked up. */
-async function lingeringAfterSettle(before, settleMs = 20_000) {
+ *  this canary flagged a pid that had already exited by the time it was looked up.
+ *  Scoped to `appPid`'s tree: see treeOf() for why machine-wide is a false alarm. */
+async function lingeringAfterSettle(before, appPid, settleMs = 20_000) {
   const until = Date.now() + settleMs;
   for (;;) {
-    const left = new Map([...hiddenChildren()].filter(([pid]) => !before.has(pid)));
+    const tree = treeOf(appPid);
+    const left = new Map([...hiddenChildren()]
+      .filter(([pid]) => !before.has(pid) && tree.has(pid)));
     if (!left.size || Date.now() > until) return left;
     await sleep(1000);
   }
@@ -597,11 +673,11 @@ async function main() {
     await openTheConfig(cdp.send);
     log('config opened');
 
-    // Prove it is the 1.1.47 artifact, not a stale build or the live install. The app
+    // Prove it is the 1.1.48 artifact, not a stale build or the live install. The app
     // writes one app-start row per launch; that row is the authoritative statement.
     const start = await waitFor('the app-start row', 60_000, () => rows().find((r) => r.kind === 'app-start') || null);
     check(start.packaged === true, 'runs PACKAGED', `packaged=${start.packaged}`);
-    check(start.version === '1.1.47', 'the artifact reports 1.1.47', `version=${start.version}`);
+    check(start.version === '1.1.48', 'the artifact reports 1.1.48', `version=${start.version}`);
 
     // PASS 1 carries the full ~1.1 MB backlog: this is the dig-out proof.
     await pass(cdp.send, memPath, 'PASS 1 (quiet, full backlog)', { digOut: true });
@@ -614,9 +690,12 @@ async function main() {
     await godShapePass(cdp.send, memPath);
     decoyDir = projectDirFor(DEV_ROOT);
 
-    const left = await lingeringAfterSettle(before);
-    // If this ever fires with a proven probe, it is a PRODUCT finding, not a canary one:
-    // a hidden condensation child outliving its run is a leak in the shipped app.
+    await proveTreeFilter(app.pid);
+    const left = await lingeringAfterSettle(before, app.pid);
+    // If this fires with a proven probe AND the child is in THIS app's tree, it is a
+    // PRODUCT finding, not a canary one: a hidden condensation child outliving its run
+    // is a leak in the shipped app. Both halves are load-bearing - before the tree
+    // filter this fired on the INSTALLED app's children and blamed the build under test.
     check(left.size === 0, 'no hidden print-mode child outlived the run',
       left.size ? [...left].map(([pid, cmd]) => pid + ': ' + cmd).join(' | ') : 'none');
   } catch (e) {
