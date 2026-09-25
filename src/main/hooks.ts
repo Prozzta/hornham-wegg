@@ -283,6 +283,9 @@ export class HookServer {
   private countsMinute = 0;
   private oversizeLogged = new Set<string>();
   private brokerDownLogged = false;
+  private portStolenLogged = false;
+  /** Agents whose hook URLs named a port another process took: they need a respawn. */
+  private respawnNeeded = new Set<string>();
 
   private startHttp(port = 0): void {
     this.httpStopped = false;
@@ -301,6 +304,7 @@ export class HookServer {
         }
         this.httpDown = false;
         this.brokerDownLogged = false;
+        this.portStolenLogged = false;
         this.relistenAttempt = 0;
       }
     });
@@ -311,6 +315,18 @@ export class HookServer {
     if (this.http !== server || this.httpStopped) return;
     try { server.close(); } catch { /* noop */ }
     this.http = null;
+    // PORT STOLEN: another process now holds OUR port, so every running agent whose hooks name
+    // it is posting to that process instead (or getting refused). They cannot be switched while
+    // running; they need a respawn, which gives them command hooks while the broker is down.
+    // Logged once per outage, with the agents to respawn; the renderer is told the same.
+    if ((e as NodeJS.ErrnoException)?.code === 'EADDRINUSE' && this.httpPort !== null && !this.portStolenLogged) {
+      this.portStolenLogged = true;
+      const agents = [...this.hookTokens.keys()];
+      this.respawnNeeded = new Set(agents);
+      console.error(`[hive] hook broker port ${this.httpPort} was taken by another process; agents needing a respawn: ${agents.join(', ') || '(none)'}`);
+      try { this.hive.appendLog({ kind: 'hook-broker-port-stolen', port: this.httpPort, agents }); } catch { /* best effort */ }
+      try { this.getWebContents()?.send('hive:hookBrokerPortStolen', { port: this.httpPort, agents }); } catch { /* best effort */ }
+    }
     const delays = HOOK_HTTP_RELISTEN_DELAYS_MS;
     const delay = delays[Math.min(this.relistenAttempt, delays.length - 1)] ?? 10_000;
     if (this.relistenAttempt >= delays.length) {
@@ -348,7 +364,11 @@ export class HookServer {
   /** The URL this agent's Claude hooks POST to, minting a fresh token (the previous spawn's is
    *  revoked). Null when the broker is not listening: the caller then writes command hooks. */
   hookUrl(agentId: string): string | null {
-    if (!this.http || this.httpPort === null || this.httpDown || this.httpStopped || !agentId) return null;
+    if (!this.http || this.httpPort === null || this.httpDown || this.httpStopped || !agentId) {
+      // A spawn while the broker is down gets command hooks: its previous URL is dead weight.
+      if (agentId) this.revokeHookToken(agentId);
+      return null;
+    }
     const token = randomBytes(16);
     this.hookTokens.set(agentId, token);
     return `http://127.0.0.1:${this.httpPort}/hook/${encodeURIComponent(agentId)}/${token.toString('hex')}`;
@@ -356,7 +376,11 @@ export class HookServer {
 
   revokeHookToken(agentId: string): void {
     this.hookTokens.delete(agentId);
+    this.respawnNeeded.delete(agentId);
   }
+
+  /** Agents that must be respawned after the broker port was taken (diagnostics, UI). */
+  agentsNeedingRespawn(): string[] { return [...this.respawnNeeded]; }
 
   /** The bound broker port (diagnostics, tests), or null. */
   hookBrokerPort(): number | null { return this.httpDown ? null : this.httpPort; }

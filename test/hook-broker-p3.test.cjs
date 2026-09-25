@@ -228,3 +228,10 @@ test('STATIC: the MCP-routed events are exactly Pre/PostToolUse, and no hook typ
     assert.doesNotMatch(codeOnly(readSource(f)), /type = "(prompt|agent)"|type: '(prompt|agent)'/, f);
   }
 });
+
+test('rebuildToolHook: two PENDING parallel calls are ambiguous for PreToolUse -> degraded, no name claimed', () => {
+  const tail = [L.turnContext(TURN), L.call('c1', 'exec', 'a'), L.call('c2', 'exec', 'b')].join('\n');
+  assert.deepEqual(mcp.rebuildToolHook(tail, 'PreToolUse'), { turnId: TURN, degraded: true });
+  const one = [L.turnContext(TURN), L.call('c1', 'exec', 'a'), L.out('c1', 'x'), L.call('c2', 'exec', 'b')].join('\n');
+  assert.equal(mcp.rebuildToolHook(one, 'PreToolUse').toolName, 'exec', 'one pending is unambiguous');
+});

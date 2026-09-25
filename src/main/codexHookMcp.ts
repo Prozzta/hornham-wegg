@@ -81,6 +81,11 @@ export function rebuildToolHook(tail: string, event: McpHookEvent): RebuiltToolH
   }
   if (event === 'PreToolUse') {
     if (!pending) return { turnId, degraded: true };
+    // Two or more calls still pending (parallel tool calls): which one this hook is for is not
+    // knowable from the rollout, so no name is claimed (a gate then fails closed if active).
+    let open = 0;
+    for (const id of calls.keys()) if (!outputs.has(id)) open += 1;
+    if (open >= 2) return { turnId, degraded: true };
     return { turnId, toolName: typeof pending.name === 'string' ? pending.name : undefined, toolInput: toolInputOf(pending), callId: pending.call_id as string, degraded: typeof pending.name !== 'string' };
   }
   // PostToolUse runs as soon as the tool returns, and Codex writes the tool's OUTPUT item a

@@ -294,3 +294,26 @@ test('P1 pins (Jim): a GET with a valid token is not a hook (405, never handled)
   const r = await post(`http://127.0.0.1:${fresh.port}${oldPath}`, { hook_event_name: 'Stop' });
   assert.equal(r.status, 403, 'a token minted before stop() is dead after it');
 });
+
+test('PORT STOLEN: a re-listen refused with EADDRINUSE logs once which agents need a respawn, tells the renderer, and a respawn clears the flag (command hooks)', async (t) => {
+  const saved = [...HOOK_HTTP_RELISTEN_DELAYS_MS];
+  HOOK_HTTP_RELISTEN_DELAYS_MS.splice(0, Infinity, 20, 20);
+  t.after(() => HOOK_HTTP_RELISTEN_DELAYS_MS.splice(0, Infinity, ...saved));
+  const { s, rec } = await broker(t);
+  const realErr = console.error; console.error = () => {}; t.after(() => { console.error = realErr; });
+  const port = s.hookBrokerPort();
+  s.hookUrl(A); s.hookUrl(B);
+  const blocker = net.createServer();
+  s.http.close(); s.http.emit('error', new Error('listener died'));
+  await new Promise((r) => blocker.listen(port, '127.0.0.1', r));   // someone else takes OUR port
+  t.after(() => blocker.close());
+  for (let i = 0; i < 400 && !rec.logs.some((l) => l.kind === 'hook-broker-port-stolen'); i++) await new Promise((r) => setTimeout(r, 5));
+  for (let i = 0; i < 400 && s.hookBrokerPort() !== null; i++) await new Promise((r) => setTimeout(r, 5));
+  const stolen = rec.logs.filter((l) => l.kind === 'hook-broker-port-stolen');
+  assert.equal(stolen.length, 1, 'logged once per outage');
+  assert.deepEqual(stolen[0].agents.sort(), [A, B].sort());
+  assert.ok(rec.sent.some((m) => m.ch === 'hive:hookBrokerPortStolen'), 'the renderer is told');
+  assert.deepEqual(s.agentsNeedingRespawn().sort(), [A, B].sort());
+  assert.equal(s.hookUrl(A), null, 'a respawn gets command hooks while the broker is down');
+  assert.deepEqual(s.agentsNeedingRespawn(), [B], 'and that agent is no longer flagged');
+});
