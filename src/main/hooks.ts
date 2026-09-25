@@ -85,7 +85,55 @@ interface HookPayload {
   payload_degraded?: boolean;
 }
 
-export type HookTransport = 'http' | 'pipe' | 'mcp';
+export type HookTransport = 'http' | 'pipe' | 'mcp' | 'pipe-oneway';
+
+/**
+ * HOOK-BROKER P4 (AGY): the one-way pipe framing. AGY has no zero-process hook or statusline
+ * transport, so its observational events run `agy-oneway.cmd` (cmd built-ins + findstr, ~34 ms)
+ * instead of the Electron shim (~450 ms): the first line is a header, the rest is AGY's raw JSON,
+ * and the client closes without reading a reply. Headers:
+ *   `agy <Event> <agentId>`            PostToolUse / PostInvocation
+ *   `agy-status <ownerToken> <agentId>` the statusline
+ * An empty agent id is a user's own (non-hive) AGY session.
+ */
+export interface OnewayFrame { kind: 'hook' | 'status'; event: string; token: string; agentId: string | null; body: unknown; bodyOk: boolean }
+export const ONEWAY_EVENTS = new Set(['PostToolUse', 'PostInvocation']);
+export function parseOnewayFrame(text: string): OnewayFrame | null {
+  const nl = text.indexOf('\n');
+  const header = (nl < 0 ? text : text.slice(0, nl)).replace(/\r$/, '').trim();
+  const parts = header.split(/\s+/);
+  let frame: Omit<OnewayFrame, 'body' | 'bodyOk'>;
+  if (parts[0] === 'agy' && ONEWAY_EVENTS.has(parts[1] ?? '')) {
+    frame = { kind: 'hook', event: parts[1], token: '', agentId: parts[2] || null };
+  } else if (parts[0] === 'agy-status' && /^[0-9a-f]{16,}$/i.test(parts[1] ?? '')) {
+    frame = { kind: 'status', event: 'AgyStatusLine', token: parts[1], agentId: parts[2] || null };
+  } else return null;
+  // A literal %AGENT_ID% (the variable was not set) is the same as none.
+  if (frame.agentId && /^%.*%$/.test(frame.agentId)) frame.agentId = null;
+  let body: unknown = null;
+  let bodyOk = false;
+  // findstr corrupts lines over ~8 KB (measured), so a long PostToolUse body can arrive
+  // truncated: the header still says which event it was.
+  try { body = JSON.parse(nl < 0 ? '' : text.slice(nl + 1)); bodyOk = !!body && typeof body === 'object' && !Array.isArray(body); } catch { /* degraded */ }
+  return { ...frame, body: bodyOk ? body : null, bodyOk };
+}
+
+/** AGY's hook JSON -> the Claude-shaped payload (the same mapping as AGY_HOOK_SHIM). */
+export function agyHookPayload(event: string, agentId: string, agy: Record<string, unknown> | null): HookPayload {
+  const a = agy ?? {};
+  const tc = (a.toolCall && typeof a.toolCall === 'object' ? a.toolCall : {}) as Record<string, unknown>;
+  const p: HookPayload = {
+    hook_event_name: event,
+    agent_id: agentId,
+    session_id: typeof a.conversationId === 'string' ? a.conversationId : undefined,
+    transcript_path: typeof a.transcriptPath === 'string' ? a.transcriptPath : undefined,
+    cwd: Array.isArray(a.workspacePaths) && typeof a.workspacePaths[0] === 'string' ? a.workspacePaths[0] : undefined,
+    tool_name: typeof tc.name === 'string' ? tc.name : undefined,
+    tool_input: tc.args
+  };
+  if (!agy) p.payload_degraded = true;
+  return p;
+}
 
 /** HOOK-BROKER: the largest HTTP hook body accepted (a PostToolUse tool_response can be big). */
 export const HOOK_HTTP_BODY_MAX = 8 * 1024 * 1024;
@@ -183,8 +231,12 @@ export class HookServer {
 
     this.server = createServer((conn) => {
       let buf = '';
+      let oneway = false;
+      conn.on('end', () => { if (oneway) this.onOneway(buf); });
       conn.on('data', (d) => {
         buf += d.toString();
+        // P4: a one-way AGY frame (a text header, not JSON): read to the end, never reply.
+        if (oneway || /^agy(-status)? /.test(buf)) { oneway = true; if (buf.length > HOOK_HTTP_BODY_MAX) { oneway = false; conn.destroy(); } return; }
         const nl = buf.indexOf('\n');
         if (nl === -1) return; // wait for the full line
         let payload: HookPayload = {};
@@ -227,7 +279,7 @@ export class HookServer {
   private hookTokens = new Map<string, Buffer>();
   private seqByAgent = new Map<string, number>();
   /** Hooks per agent per transport in the current minute; flushed to log.jsonl on rollover. */
-  private transportCounts = new Map<string, { http: number; pipe: number; mcp: number }>();
+  private transportCounts = new Map<string, Record<HookTransport, number>>();
   private countsMinute = 0;
   private oversizeLogged = new Set<string>();
   private brokerDownLogged = false;
@@ -454,6 +506,25 @@ export class HookServer {
     return { result: out ?? {} };
   }
 
+  /** P4: one AGY one-way frame. A hook from a hive agent is handled like the shim's (the reply
+   *  is dropped: only observational events come this way). A statusline frame must carry the
+   *  CURRENT lease's owner token; a user's own session (no agent id) still feeds capacity,
+   *  with agent_id null, exactly as the shim did. Anything else is ignored. */
+  private onOneway(text: string): void {
+    const f = parseOnewayFrame(text);
+    if (!f) return;
+    try {
+      if (f.kind === 'hook') {
+        if (!f.agentId) return;   // a user's own AGY session: not ours (the shim no-ops too)
+        this.handle(this.stampArrival(agyHookPayload(f.event, f.agentId, f.body as Record<string, unknown> | null), 'pipe-oneway'));
+        return;
+      }
+      const owner = this.hive.agyStatuslineOwnerToken() ?? null;
+      if (!owner || f.token !== owner || !f.bodyOk) return;
+      this.handle(this.stampArrival({ hook_event_name: 'AgyStatusLine', agent_id: f.agentId, read_at: Date.now(), agy_status: f.body }, 'pipe-oneway'));
+    } catch { /* telemetry must never break the pipe */ }
+  }
+
   /** Stamp the arrival order and transport before handle() (never trusted from the body),
    *  and count it for the per-minute transport log. */
   private stampArrival(p: HookPayload, transport: HookTransport): HookPayload {
@@ -465,7 +536,7 @@ export class HookServer {
     p.seq = seq;
     const minute = Math.floor(Date.now() / 60_000);
     if (minute !== this.countsMinute) { this.flushTransportCounts(); this.countsMinute = minute; }
-    const c = this.transportCounts.get(agentId) ?? { http: 0, pipe: 0, mcp: 0 };
+    const c = this.transportCounts.get(agentId) ?? { http: 0, pipe: 0, mcp: 0, 'pipe-oneway': 0 };
     c[transport] += 1;
     this.transportCounts.set(agentId, c);
     return p;
@@ -481,7 +552,7 @@ export class HookServer {
   }
 
   /** Hooks by transport per agent in the current minute (diagnostics, tests). */
-  transportCountsNow(): Record<string, { http: number; pipe: number; mcp: number }> {
+  transportCountsNow(): Record<string, Record<HookTransport, number>> {
     return Object.fromEntries(this.transportCounts);
   }
 

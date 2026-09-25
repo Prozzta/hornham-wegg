@@ -91,6 +91,9 @@ export interface StatuslineEnv {
   geminiHome: string;
   /** Builds the command string for a lease generation's owner token. */
   commandFor: (token: string) => string;
+  /** HOOK-BROKER P4: the one-way command prints nothing, so AGY's own default statusline
+   *  stays visible beside it (`stack_with_default`). */
+  stackWithDefault?: boolean;
   pid: number;
   processStartedAt: number;
   now: () => number;
@@ -135,8 +138,10 @@ export function statuslinePaths(geminiHome: string): StatuslinePaths {
  * generation: another tool's statusline, the user's own, or an older Munder lease can
  * never compare equal to it.
  */
-export function installedValueFor(command: string): Record<string, unknown> {
-  return { type: 'command', command, enabled: true };
+export function installedValueFor(command: string, stackWithDefault = false): Record<string, unknown> {
+  const value: Record<string, unknown> = { type: 'command', command, enabled: true };
+  if (stackWithDefault) value.stack_with_default = true;
+  return value;
 }
 
 /**
@@ -481,7 +486,7 @@ export function acquireStatuslineLease(env: StatuslineEnv): AcquireResult {
         schema: 1,
         phase: 'prepared',
         token,
-        installedValue: installedValueFor(env.commandFor(token)),
+        installedValue: installedValueFor(env.commandFor(token), env.stackWithDefault === true),
         prior: present ? { present: true, value: current } : { present: false },
         settingsHashBefore: sha(settings.bytes),
         leases: [],

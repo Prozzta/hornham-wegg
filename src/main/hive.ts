@@ -257,6 +257,23 @@ function shortRand(): string {
  *  scratch state, and it stays on disk (so resume still works) either way. */
 const MINE_IGNORE_LINES = ['settings.json', 'cursor.json', 'inbox/', 'outbox/', '.codex/'];
 
+/**
+ * HOOK-BROKER P4 (AGY): `<hive>/bin/agy-oneway.cmd`, the cheap one-way delivery for AGY's
+ * observational hooks and its statusline. AGY 1.2.11 can only run commands (no http or MCP hook,
+ * no socket statusline), so every event is a process: this makes it cmd built-ins + findstr.exe
+ * (~34 ms, two small signed OS binaries) instead of cmd + the Electron shim (~450 ms).
+ *   - A .cmd, because AGY already runs our .cmd hooks, whatever way it launches commands, and
+ *     because AGY passes quote characters literally (so no quotes appear anywhere).
+ *   - AGENT_ID is read from the environment inside the batch (empty for a user's own session).
+ *   - One-way: nothing is printed (AGY fail-closes on stdout JSON) and no reply is read, so only
+ *     events that never need a directive come this way. The OUTER `2>nul` also swallows cmd's
+ *     own "cannot find the file" when the pipe is gone (measured: an inner one does not), and
+ *     `exit /b 0`: a closed app fails fast and silently.
+ */
+export function agyOnewayCmd(pipe: string): string {
+  return ['@echo off', `((echo %1 %2 %AGENT_ID%& findstr /v /c:@@m@@) > ${pipe}) 2>nul`, 'exit /b 0', ''].join('\r\n');
+}
+
 /** HOOK-BROKER: what the hive asks the in-process hook endpoint for at spawn. */
 export interface HookBroker {
   /** A Claude agent's HTTP hook URL (fresh token), or null: command hooks. */
@@ -2259,11 +2276,18 @@ export class HiveManager {
     const plain = (event: string) => ({
       hooks: [{ type: 'command', command: this.nodeRunUnquoted(shim, event), timeout: 0 }]
     });
+    // HOOK-BROKER P4: the observational events go one-way (cheap); the ones that must be able to
+    // answer (a PreToolUse deny, a PreInvocation steer, a Stop block) keep the shim.
+    const oneway = this.writeAgyOneway();
+    const cheap = (event: string, matcher?: string) => ({
+      ...(matcher ? { matcher } : {}),
+      hooks: [{ type: 'command', command: `${oneway} agy ${event}`, timeout: 0 }]
+    });
     const group = {
       PreToolUse: [tool('PreToolUse')],
-      PostToolUse: [tool('PostToolUse')],
+      PostToolUse: [oneway ? cheap('PostToolUse', '*') : tool('PostToolUse')],
       PreInvocation: [plain('PreInvocation')],
-      PostInvocation: [plain('PostInvocation')],
+      PostInvocation: [oneway ? cheap('PostInvocation') : plain('PostInvocation')],
       Stop: [plain('Stop')]
     };
     const gem = join(homedir(), '.gemini');
@@ -2284,6 +2308,27 @@ export class HiveManager {
   //
   // hive.ts only INVOKES the lease at startup, before an interactive AGY spawn, and on
   // shutdown. Every decision about the user's settings lives in agyStatuslineOwnership.ts.
+
+  /** P4: write `agy-oneway.cmd` for this hive's pipe and return its path, or null (not Windows,
+   *  no hive, or a path AGY could not run unquoted: then the shim is used, as before). */
+  private writeAgyOneway(): string | null {
+    const root = this.root();
+    const sock = this.sockPath();
+    if (process.platform !== 'win32' || !root || !sock) return null;
+    const path = join(root, 'bin', 'agy-oneway.cmd');
+    if (/[\s"']/.test(path) || /[\s"']/.test(sock)) return null;
+    try {
+      mkdirSync(join(root, 'bin'), { recursive: true });
+      writeFileSync(path, agyOnewayCmd(sock), 'utf8');
+      return path;
+    } catch { return null; }
+  }
+
+  /** The CURRENT AGY statusline lease's owner token (HookServer checks one-way status frames
+   *  against it), or null when no lease is held. */
+  agyStatuslineOwnerToken(): string | null {
+    try { return this.agyStatusline?.ownerToken() ?? null; } catch { return null; }
+  }
 
   /** Path of the endpoint locator a user's own AGY statusline reads. */
   private agyLocatorPath(root: string): string {
@@ -2318,6 +2363,9 @@ export class HiveManager {
       // AGY passes quote characters literally, so the command is UNQUOTED - which is only
       // possible when no path in it contains whitespace. Checked once, here, with a
       // representative token: if the answer is no, this run never leases at all.
+      // HOOK-BROKER P4: on Windows the statusline is the cheap one-way command (plus AGY's own
+      // default line beside it); elsewhere the node shim, as before.
+      const oneway = this.writeAgyOneway();
       if (!launcher || !buildStatuslineCommand(launcher, shim, '0'.repeat(32), locator)) {
         this.appendLog({ kind: 'agy-statusline', code: 'unsafe-command-path' });
         return;
@@ -2325,7 +2373,8 @@ export class HiveManager {
       const env: StatuslineEnv = {
         geminiHome: geminiHome(),
         // The exact installed string, owner token included, is the ownership identity.
-        commandFor: (token) => buildStatuslineCommand(launcher, shim, token, locator) as string,
+        commandFor: (token) => oneway ? `${oneway} agy-status ${token}` : buildStatuslineCommand(launcher, shim, token, locator) as string,
+        stackWithDefault: !!oneway,
         pid: process.pid,
         processStartedAt: PROCESS_STARTED_AT,
         now: () => Date.now(),
@@ -3278,7 +3327,7 @@ process.stdin.on('end', () => {
 // user's own agy usage — only hive workers (spawned with AGENT_ID set) bridge.
 // NOTE (agy bug, antigravity-cli#49): the loader reads ~/.gemini/antigravity-cli/
 // hooks.json but the trigger reads ~/.gemini/config/hooks.json — we write BOTH.
-const AGY_HOOK_SHIM = `#!/usr/bin/env node
+export const AGY_HOOK_SHIM = `#!/usr/bin/env node
 'use strict';
 const net = require('net');
 const event = process.argv[2] || 'Unknown';

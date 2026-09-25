@@ -237,7 +237,7 @@ test('the pipe path is stamped too (transport pipe, the same per-agent seq)', as
   const last = rec.handled.at(-1);
   assert.equal(last.transport, 'pipe', 'never trusted from the sender');
   assert.equal(last.seq, 2);
-  assert.deepEqual(s.transportCountsNow()[A], { http: 1, pipe: 1, mcp: 0 });
+  assert.deepEqual(s.transportCountsNow()[A], { http: 1, pipe: 1, mcp: 0, 'pipe-oneway': 0 });
 });
 
 test('N1/N2: a subagent hook never consumes the agent\'s steer; under HALT a subagent Stop is not emitted', async (t) => {
