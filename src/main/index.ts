@@ -95,6 +95,7 @@ import { ControlRegistry } from './control';
 import { WorkerWakeWatchdog } from './workerWake';
 import { InboxWakeBridge } from './inboxWakeBridge';
 import { WakeStallWatch } from './wakeStall';
+import { newBreadcrumbMemory, shouldLogBreadcrumb } from './wakeBreadcrumb';
 import { WakeTelemetry } from './wakeTelemetry';
 import { inboxNudgeText } from '../shared/hiveNudge';
 import { fetchHireManifest, readHireManifestFiles } from './hire';
@@ -393,7 +394,7 @@ const workerWake = new WorkerWakeWatchdog();
 // no console attached and no file sink: the output is discarded. These write to the
 // hive event log instead, which agents and the human already read, so ONE canary run
 // says which stage is inert. Remove with this branch.
-const wakeDiagSeen = new Map<string, string>();
+const wakeDiagSeen = newBreadcrumbMemory();
 // WAKE TELEMETRY (D8). Observability only — it counts, it never decides, and the wake path
 // never reads it. See wakeTelemetry.ts.
 const wakeTelemetry = new WakeTelemetry(Date.now());
@@ -416,15 +417,12 @@ function wakeDiag(stage: string, fields: Record<string, unknown>): void {
   // are exactly the ones a stall is made of, so the counters must see every one.
   try { wakeTelemetry.note(stage, fields, Date.now()); } catch { /* telemetry never decides */ }
   try {
-    // The 15s reconciliation beat repeats every stage for every agent. Log one line per
-    // CHANGE there (ignoring the always-moving idle age), so a 15-minute canary stays
-    // readable while every real transition is still captured. Event-path lines always log.
-    if (fields.mode === 'reconcile') {
-      const key = `${stage}:${String(fields.agentId)}`;
-      const sig = JSON.stringify({ ...fields, idleMs: undefined });
-      if (wakeDiagSeen.get(key) === sig) return;
-      wakeDiagSeen.set(key, sig);
-    }
+    // The reconciliation cadences repeat every stage for every agent. Log one line per
+    // CHANGE there, so a 15-minute canary stays readable while every real transition is
+    // still captured. Event-path lines always log. The decision — and the reason the
+    // version of it that shipped in 1.1.48 suppressed nothing at all — is in
+    // wakeBreadcrumb.ts; this is only the voice.
+    if (!shouldLogBreadcrumb(wakeDiagSeen, stage, fields)) return;
     hive.appendLog({ kind: 'wake', stage, ...fields });
   } catch { /* the diagnosis must never break the path it is watching */ }
 }

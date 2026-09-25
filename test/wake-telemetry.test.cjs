@@ -147,6 +147,9 @@ test('it is OBSERVABILITY ONLY — the wake path must never read it back', () =>
   for (const f of ['src/main/workerWake.ts', 'src/main/inboxWakeBridge.ts', 'src/main/wakeStall.ts']) {
     const src = fs.readFileSync(join(root, f), 'utf8');
     assert.ok(!/wakeTelemetry|WakeTelemetry/.test(src), `${f} must not read the counters`);
+    // 1.1.49: the breadcrumb de-duplication is the same kind of thing — it decides what is
+    // WRITTEN, never what is done — so the wake path must not read it back either.
+    assert.ok(!/wakeBreadcrumb|shouldLogBreadcrumb/.test(src), `${f} must not read the breadcrumb memory`);
   }
   const tel = fs.readFileSync(join(root, 'src/main/wakeTelemetry.ts'), 'utf8');
   assert.ok(!/from '\.\/(workerWake|inboxWakeBridge|automaticSubmit)'/.test(tel),
@@ -154,8 +157,15 @@ test('it is OBSERVABILITY ONLY — the wake path must never read it back', () =>
   // It is fed from the sink, and counted BEFORE the log folds reconcile rows away.
   const index = fs.readFileSync(join(root, 'src/main/index.ts'), 'utf8');
   const noteAt = index.indexOf('wakeTelemetry.note(');
-  const dedupeAt = index.indexOf("if (fields.mode === 'reconcile')");
-  assert.ok(noteAt > 0 && dedupeAt > 0 && noteAt < dedupeAt,
+  // The de-duplication moved OUT of index.ts in 1.1.49 (the inline `fields.mode ===
+  // 'reconcile'` check suppressed nothing — see wakeBreadcrumb.ts), so this anchors on the
+  // call that replaced it. The INVARIANT is unchanged and is the whole point of the test:
+  // counting happens first. Both anchors are required to be found, so if either call site
+  // is renamed again this fails loudly rather than passing vacuously on a -1.
+  const dedupeAt = index.indexOf('shouldLogBreadcrumb(');
+  assert.ok(noteAt > 0, 'wakeTelemetry.note( not found in index.ts — anchor is stale');
+  assert.ok(dedupeAt > 0, 'shouldLogBreadcrumb( not found in index.ts — anchor is stale');
+  assert.ok(noteAt < dedupeAt,
     'counted before the de-duplication, or a stall would be invisible to the counters too');
 });
 

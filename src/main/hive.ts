@@ -21,6 +21,7 @@
 import {
   existsSync, mkdirSync, readFileSync, writeFileSync, renameSync,
   readdirSync, statSync, rmSync, appendFileSync, symlinkSync, copyFileSync, chmodSync,
+  openSync, readSync, closeSync,
   watch, type FSWatcher
 } from 'node:fs';
 import { join, dirname, isAbsolute } from 'node:path';
@@ -218,6 +219,11 @@ const HOP_CAP = 12;
 const OUTBOX_PARSE_RETRY_LIMIT = 3;
 const OUTBOX_PARSE_RETRY_DEBOUNCE_MS = 250;
 const OUTBOX_FRESH_WRITE_GRACE_MS = 1_000;
+
+/** First window logTail() reads off the end of log.jsonl. Sized so the default 200 rows
+ *  (~170 B each on this floor) land in one read with room to spare; it quadruples from
+ *  here if a caller asks for more than fits, so a large `n` still works, just not for free. */
+const LOG_TAIL_WINDOW_BYTES = 256 * 1024;
 
 function sleepSync(ms: number): void {
   const sab = new SharedArrayBuffer(4);
@@ -2778,11 +2784,62 @@ export class HiveManager {
         + 'Route work to someone on this list before spawning anyone new.';
     } catch { return null; }
   }
+  /**
+   * The last `n` events, read from the END of the log rather than through all of it.
+   *
+   * THE 1.1.49 CRAWL. This used to be
+   *   readFileSync(whole file).trim().split('\n')
+   * to return 200 lines. It is called on the ELECTRON MAIN PROCESS - by `hive:log`, which
+   * the Command Center's Activity tab polls every 3 SECONDS, and by the heartbeat digest -
+   * so its cost is time the main thread is BLOCKED: no IPC, no PTY pumping, no wake path.
+   * Against the 61 MB log this floor had actually grown, one call measured 328 ms and
+   * allocated the file three times over (the string, the trimmed copy, a 380,900-element
+   * array) to keep 60 rows. Polled every 3s that is ~11% of wall-clock with main frozen,
+   * and it gets monotonically worse as the log grows, in EVERY app built on this hive -
+   * which is why a second one appearing was enough to tip the first into "crawl".
+   *
+   * Now it reads a bounded window off the tail and grows it only if `n` lines are not in
+   * it, so cost tracks what was ASKED FOR, not what the file happens to weigh. Output is
+   * byte-identical to reading the whole file; the test pins that, including the case where
+   * the window splits a line.
+   */
   logTail(n = 200): unknown[] {
     const root = this.root();
     if (!root || !existsSync(join(root, 'log.jsonl'))) return [];
-    const lines = readFileSync(join(root, 'log.jsonl'), 'utf8').trim().split('\n').filter(Boolean);
-    return lines.slice(-n).map((l) => { try { return JSON.parse(l); } catch { return { raw: l }; } });
+    const file = join(root, 'log.jsonl');
+    const parse = (l: string): unknown => { try { return JSON.parse(l); } catch { return { raw: l }; } };
+    if (n <= 0) return [];
+    try {
+      const size = statSync(file).size;
+      if (size === 0) return [];
+      let fd: number | null = null;
+      try {
+        fd = openSync(file, 'r');
+        // Grow the window until it holds n+1 line starts (so we know the first line in it
+        // is whole) or we have read the entire file.
+        for (let want = Math.min(size, LOG_TAIL_WINDOW_BYTES); ; want = Math.min(size, want * 4)) {
+          const from = size - want;
+          const buf = Buffer.alloc(want);
+          readSync(fd, buf, 0, want, from);
+          let text = buf.toString('utf8');
+          // A window that starts mid-file almost certainly starts mid-LINE. Drop that
+          // fragment: keeping it would hand back a corrupt row, and JSON.parse failing on
+          // it would surface as a bogus {raw} event rather than an error anyone notices.
+          if (from > 0) {
+            const nl = text.indexOf('\n');
+            if (nl === -1) { if (want >= size) return []; continue; }
+            text = text.slice(nl + 1);
+          }
+          const lines = text.split('\n').filter(Boolean);
+          if (lines.length >= n || want >= size) return lines.slice(-n).map(parse);
+        }
+      } finally { if (fd !== null) closeSync(fd); }
+    } catch {
+      // Any read problem falls back to the whole-file path: correctness over speed, and a
+      // log small enough to be unreadable this way is small enough for it not to matter.
+      const lines = readFileSync(file, 'utf8').trim().split('\n').filter(Boolean);
+      return lines.slice(-n).map(parse);
+    }
   }
 
   private listMessages(dir: string): HiveMessage[] {
