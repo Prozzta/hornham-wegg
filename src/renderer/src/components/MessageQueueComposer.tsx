@@ -204,6 +204,7 @@ export function MessageQueueComposer({ agent }: MessageQueueComposerProps) {
       onDrop={onDrop}
       style={{
         flexShrink: 0,
+        position: 'relative', // anchors the pending-list overlay (LAG-150)
         borderTop: '1px solid var(--cth-ink-700)',
         background: 'var(--cth-cream-100)',
         display: 'flex',
@@ -295,12 +296,25 @@ export function MessageQueueComposer({ agent }: MessageQueueComposerProps) {
         )}
       </div>
 
-      {/* Pending list */}
+      {/* Pending list. LAG-150: an OVERLAY rising from the composer's top edge over the
+          terminal, OUT OF FLOW. In flow it appeared on the first queued message (up to 280px)
+          and vanished on delivery, and the terminal above gave up/took back those rows each
+          time: two pty resizes per message sent to a busy agent, and Codex replays its whole
+          transcript on every resize. Measured on 1.1.49: the list appearing took the pty
+          19 -> 14 rows, disappearing 14 -> 19. Out of flow, the composer's height, and so
+          the terminal's grid, no longer depends on the queue. (A fixed-height in-flow slot
+          was tried first: it clipped the second row's "send now" out of reach.) */}
       {queue.length > 0 && (
-        <div style={{
-          display: 'flex', flexDirection: 'column', gap: 4,
-          maxHeight: 280, overflowY: 'auto'
-        }}>
+        <div
+          data-queue-overlay
+          style={{
+            position: 'absolute', left: 0, right: 0, bottom: '100%', zIndex: 5,
+            display: 'flex', flexDirection: 'column', gap: 4,
+            maxHeight: 280, overflowY: 'auto', padding: 8,
+            background: 'var(--cth-cream-100)',
+            borderTop: '1px solid var(--cth-ink-700)',
+            boxShadow: '0 -2px 6px rgba(0,0,0,0.12)'
+          }}>
           {queue.map((m, i) => (
             <QueuedMessageRow
               key={m.id}
