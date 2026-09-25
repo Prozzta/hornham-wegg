@@ -56,6 +56,7 @@ import {
 const AGY_LEASE_HEARTBEAT_MS = 60 * 60 * 1000;
 import { AGY_STATUSLINE_SHIM } from './agyStatuslineShim';
 import { geminiHome } from './capacityScope';
+import { HiveCommitter, type GitResult } from './hiveCommitter';
 
 /** The subset of HarnessConfig the hive consumes for the default-MCP merge.
  *  Kept as a local shape so hive.ts never imports the foundation-owned config
@@ -404,6 +405,13 @@ export class HiveManager {
   }
 
   private readonly routerRuntime: RouterRuntime;
+  /** MESSAGE-LAG-152: every hive commit goes through here: coalesced, async, single-flight,
+   *  never on the main thread's critical path (see hiveCommitter.ts). */
+  private readonly committer = new HiveCommitter({
+    root: () => this.root(),
+    prepare: (root, git) => this.prepareRepo(root, git),
+    log: (line) => console.warn(line)
+  });
   private routerTimer: unknown = null;
   /** One non-recursive watcher per active outbox, keyed by its absolute path. */
   private readonly outboxWatchers = new Map<string, Pick<FSWatcher, 'close' | 'on'>>();
@@ -2908,7 +2916,9 @@ export class HiveManager {
     renameSync(tmp, p);
   }
 
-  // — git (single committer, retry + stale-lock recovery) —
+  // — git —
+  /** SYNCHRONOUS git, kept for exactly one call: `git init` when a hive is first created
+   *  (once per hive, ever). Every commit goes through the async committer instead. */
   private git(args: string[], cwd: string): { ok: boolean; out: string; err: string } {
     const res = spawnSync('git', ['-c', 'commit.gpgsign=false', '-c', 'user.name=Hive', '-c', 'user.email=hive@local', ...args], {
       cwd, encoding: 'utf8', timeout: 8000
@@ -2933,14 +2943,14 @@ export class HiveManager {
    * line alone reads as a fix while the repo goes on growing. The ledger stays
    * on disk, so the cost history the app reads is untouched.
    */
-  private untrackCostLedger(root: string): void {
+  private async untrackCostLedger(git: (args: string[]) => Promise<GitResult>): Promise<void> {
     if (this.untrackedCostLedger) return;
     this.untrackedCostLedger = true;
     // Probe before mutating: `rm --cached` on a repo that never tracked it
     // would still rewrite the index on every launch, inside the retry path.
-    const tracked = this.git(['ls-files', '--', 'cost-ledger.jsonl'], root);
+    const tracked = await git(['ls-files', '--', 'cost-ledger.jsonl']);
     if (!tracked.ok || !tracked.out.trim()) return;
-    this.git(['rm', '--cached', '-q', '--ignore-unmatch', '--', 'cost-ledger.jsonl'], root);
+    await git(['rm', '--cached', '-q', '--ignore-unmatch', '--', 'cost-ledger.jsonl']);
     console.warn('[hive] untracked the cost ledger from the hive repo');
   }
 
@@ -2960,7 +2970,7 @@ export class HiveManager {
    * `.codex` path from the index. The files stay on disk, so `codex --resume`
    * is unaffected; only their history stops.
    */
-  private untrackCodexHomes(root: string): void {
+  private async untrackCodexHomes(root: string, git: (args: string[]) => Promise<GitResult>): Promise<void> {
     if (this.untrackedCodexHomes) return;
     this.untrackedCodexHomes = true;
     const agentsDir = join(root, 'agents');
@@ -2970,34 +2980,32 @@ export class HiveManager {
     } catch { /* best-effort */ }
     // Probe before mutating: `rm --cached` on a clean repo would still rewrite
     // the index on every launch, and this runs inside the commit retry path.
-    const tracked = this.git(['ls-files', '--', 'agents/*/.codex'], root);
+    const tracked = await git(['ls-files', '--', 'agents/*/.codex']);
     if (!tracked.ok || !tracked.out.trim()) return;
-    this.git(['rm', '-r', '--cached', '-q', '--ignore-unmatch', '--', 'agents/*/.codex'], root);
+    await git(['rm', '-r', '--cached', '-q', '--ignore-unmatch', '--', 'agents/*/.codex']);
     console.warn('[hive] untracked previously-committed Codex homes from the hive repo');
   }
 
-  /** Commit all hive changes. No-op if there is nothing staged. */
-  commit(message: string): void {
-    const root = this.root();
-    if (!root || !existsSync(join(root, '.git'))) return;
-    this.untrackCostLedger(root);
-    this.untrackCodexHomes(root);
-    for (let attempt = 0; attempt < 5; attempt++) {
-      this.clearStaleLock(root);
-      const add = this.git(['add', '-A'], root);
-      const commit = this.git(['commit', '-q', '-m', message], root);
-      if (commit.ok) return;
-      if (/nothing to commit/i.test(commit.out + commit.err)) return;
-      if (!add.ok || /index\.lock/i.test(commit.err)) { sleepSync(50 * (attempt + 1)); continue; }
-      return; // a non-lock failure — give up quietly, the next mutation retries
-    }
+  /** The one-time index tidying, run by the committer (async, in its single flight) before
+   *  the process's first commit. */
+  private async prepareRepo(root: string, git: (args: string[]) => Promise<GitResult>): Promise<void> {
+    await this.untrackCostLedger(git);
+    await this.untrackCodexHomes(root, git);
   }
 
-  private clearStaleLock(root: string): void {
-    const lock = join(root, '.git', 'index.lock');
-    try {
-      if (existsSync(lock) && Date.now() - statSync(lock).mtimeMs > 10_000) rmSync(lock);
-    } catch { /* noop */ }
+  /**
+   * Ask for all hive changes to be committed. MESSAGE-LAG-152: this used to run
+   * `git add -A` + `git commit` synchronously, on Electron main, from the router's hot
+   * path (1.7-3.2 s per routed message, all IPC stalled). It is now a request: it returns at
+   * once, and the committer coalesces requests into one async commit. Nothing waits for it.
+   */
+  commit(message: string): void {
+    this.committer.request(message);
+  }
+
+  /** Commit everything requested so far (for quit). Never rejects. */
+  flushCommits(): Promise<void> {
+    return this.committer.flush();
   }
 }
 
