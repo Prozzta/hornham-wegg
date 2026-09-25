@@ -82,13 +82,42 @@ test('memory turned off in settings stays off however often it is polled', (t) =
   assert.equal(armed(memory), false);
 });
 
-test('daemonless MemPalace exposes mining unavailability without disabling search', (t) => {
+test('daemonless MemPalace exposes compatibility mining without disabling search', (t) => {
   const { memory } = managerWithCli(t, { bin: '/fake/bin/mempalace' });
 
-  memory.daemonUnavailable = 'MemPalace lacks daemon support; upgrade to 3.7 or newer to enable background mining';
+  memory.daemonUnavailable = 'MemPalace has no daemon: using one-shot mining; upgrade to 3.7.1 or newer for the low-cost daemon';
   const status = memory.status();
 
   assert.equal(status.active, true, 'the available CLI still supports recall');
-  assert.equal(status.miningAvailable, false);
-  assert.match(status.miningError, /upgrade to 3\.7/);
+  assert.equal(status.miningMode, 'one-shot');
+  assert.match(status.miningWarning, /one-shot mining/);
+});
+
+test('a diagnosed old daemon logs once and routes the mature job through one-shot mining', async (t) => {
+  const { memory, home } = managerWithCli(t, { bin: '/fake/bin/mempalace' });
+  const dir = path.join(home, 'hive', 'agents', 'old-cli');
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, 'memory.md'), 'remember this');
+  fs.writeFileSync(path.join(home, 'hive', 'registry.json'), JSON.stringify({ agents: { 'old-cli': {} } }));
+  memory.mineState = { version: 1, entries: {} };
+  memory.ensureDaemon = async () => false;
+  let oneShots = 0;
+  memory.mineOneShot = async () => { oneShots += 1; return true; };
+  const messages = [];
+  const originalError = console.error;
+  console.error = (message) => messages.push(message);
+  t.after(() => { console.error = originalError; });
+  memory.markDaemonUnavailable('MemPalace has no daemon: using one-shot mining; upgrade to 3.7.1 or newer for the low-cost daemon');
+  memory.markDaemonUnavailable('same diagnosis must not log twice');
+  const originalNow = Date.now;
+  let now = 1_000_000;
+  Date.now = () => now;
+  t.after(() => { Date.now = originalNow; });
+
+  await memory.mineNow();
+  now += 60_000;
+  await memory.mineNow();
+
+  assert.equal(messages.length, 1, 'compatibility warning is one-time');
+  assert.equal(oneShots, 1, 'changed memory is not silently lost on an old CLI');
 });

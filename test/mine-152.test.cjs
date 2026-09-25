@@ -112,13 +112,15 @@ test('bloat threshold and staged swap are safe, reversible filesystem operations
 test('watchdog policy is a 60-second no-progress daemon-stop backoff, while first boot gets grace', () => {
   const source = fs.readFileSync(path.join(__dirname, '..', 'src', 'main', 'memory.ts'), 'utf8');
   assert.match(source, /const MINE_WATCHDOG_MS = 60_000/);
-  assert.match(source, /\['mine', agentDir, '--wing', id, '--agent', id, '--daemon'\]/);
+  assert.match(source, /const args = \['mine', agentDir, '--wing', id, '--agent', id\]/);
   assert.match(source, /this\.stopDaemon\(\)/);
   assert.match(source, /PRIORITY_BELOW_NORMAL/);
   assert.match(source, /let lastProgress = Date\.now\(\)/);
-  assert.match(source, /DAEMON_STARTUP_TIMEOUT_MS = 10 \* 60_000/);
-  assert.match(source, /if \(!watchedOut\) this\.stopDaemon\(\)/);
+  assert.match(source, /DAEMON_STARTUP_TIMEOUT_MS = 60_000/);
+  assert.match(source, /if \(!watchedOut && daemon\) this\.stopDaemon\(\)/);
   assert.match(source, /code === 2 && \/\(\?:invalid choice\|unrecognized arguments\|daemon\)\/i\.test\(err\)/);
-  assert.match(source, /MemPalace lacks daemon support; upgrade to 3\.7 or newer to enable background mining/);
-  assert.match(source, /miningAvailable: this\.daemonUnavailable \? false : null/);
+  assert.match(source, /MemPalace has no daemon: using one-shot mining/);
+  assert.match(source, /DAEMON_RETRY_MS = 30 \* 60_000/);
+  assert.match(source, /return this\.daemonUnavailable \? this\.mineOneShot\(agentDir, id\) : false/);
+  assert.match(source, /if \(daemon\) args\.push\('--daemon'\)/);
 });

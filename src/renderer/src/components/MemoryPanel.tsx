@@ -10,6 +10,8 @@ interface MemoryStatus {
   palacePath: string | null;
   model: 'minilm' | 'embeddinggemma';
   bin: string | null;
+  miningMode: 'unknown' | 'daemon' | 'one-shot';
+  miningWarning: string | null;
 }
 
 type ModelId = 'minilm' | 'embeddinggemma';
@@ -67,6 +69,8 @@ export function MemoryPanel() {
     ? { dot: 'var(--cth-coral)', label: 'Not set up' }
     : !status.enabled
       ? { dot: 'var(--cth-ink-500)', label: 'Off' }
+      : status.miningMode === 'one-shot'
+        ? { dot: 'var(--cth-lemon)', label: 'On · compatibility mining' }
       : status.initialized
         ? { dot: 'var(--cth-mint)', label: 'On · ready' }
         : { dot: 'var(--cth-lemon)', label: 'On · getting ready…' };
@@ -117,6 +121,12 @@ export function MemoryPanel() {
                 </PixelButton>
               )}
             </div>
+
+            {status?.miningWarning && (
+              <div style={{ fontSize: 11, color: 'var(--cth-ink-700)', lineHeight: 1.45, background: 'var(--cth-cream-100)', padding: 8 }}>
+                {status.miningWarning}
+              </div>
+            )}
 
             {/* Not installed: show full self-sufficient setup so any machine can follow it. */}
             {!status?.available && (
