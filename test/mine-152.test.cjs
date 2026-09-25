@@ -117,4 +117,5 @@ test('watchdog policy is a 60-second no-progress daemon-stop backoff, while firs
   assert.match(source, /PRIORITY_BELOW_NORMAL/);
   assert.match(source, /let lastProgress = Date\.now\(\)/);
   assert.match(source, /DAEMON_STARTUP_TIMEOUT_MS = 10 \* 60_000/);
+  assert.match(source, /if \(!watchedOut\) this\.stopDaemon\(\)/);
 });

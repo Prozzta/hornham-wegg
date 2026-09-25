@@ -500,10 +500,14 @@ export class MemoryManager {
           clearTimeout(timer);
           if (code !== 0 || watchedOut) {
             if (!watchedOut) console.error(`[memory] mine ${id} exited ${code}: ${err.slice(-300)}`);
+            // A daemon crash/restart presents to its submit client as a
+            // non-zero exit. Forget the cached successful start so the bounded
+            // retry starts one fresh below-normal daemon.
+            if (!watchedOut) this.stopDaemon();
             resolve(false);
           } else resolve(true);
         });
-        proc.once('error', () => { clearTimeout(timer); resolve(false); });
+        proc.once('error', () => { clearTimeout(timer); this.stopDaemon(); resolve(false); });
       });
     });
   }
