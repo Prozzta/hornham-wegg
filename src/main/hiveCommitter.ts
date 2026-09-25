@@ -54,7 +54,7 @@ export const MESSAGE_LINES = 40;
 
 export const execFileGit: GitRunner = (args, cwd, timeoutMs) => new Promise((resolve) => {
   execFile('git', args, { cwd, timeout: timeoutMs, windowsHide: true, maxBuffer: 16 * 1024 * 1024, encoding: 'utf8' },
-    (error, stdout, stderr) => resolve({ ok: !error, out: stdout ?? '', err: stderr ?? (error ? String(error) : '') }));
+    (error, stdout, stderr) => resolve({ ok: !error, out: stdout ?? '', err: stderr || (error ? String(error) : '') }));
 });
 
 /** The message for one coalesced commit: the request itself when there was one, else a
@@ -99,6 +99,9 @@ export class HiveCommitter {
   private timer: unknown = null;
   private running: Promise<void> | null = null;
   private prepared = false;
+  /** When this process's committer started (wall clock): a lock older than this cannot be
+   *  from a git this process ran. */
+  private readonly startedAt = Date.now();
   private nextGcAt: number;
   private lastFailure: string | null = null;
   /** Counters for tests and diagnostics. */
@@ -179,6 +182,11 @@ export class HiveCommitter {
     if (!root || !existsSync(join(root, '.git'))) return;
     if (!this.prepared) {
       this.prepared = true;
+      // R1 (Jim): the 8 s quit bound can kill an in-flight git and leave index.lock behind.
+      // Before this process's FIRST git, a lock older than the process itself is such a
+      // leftover (no git of ours has run yet), so it is cleared even if it is under
+      // STALE_LOCK_MS old: a quick relaunch would otherwise fail its first commit.
+      clearStaleLock(root, this.startedAt);
       try { await this.deps.prepare?.(root, (args) => this.run([...HIVE_GIT_IDENTITY, ...args], root, COMMIT_TIMEOUT_MS)); }
       catch (e) { this.fail(`prepare: ${String(e)}`); }
     }
@@ -221,10 +229,13 @@ function firstLine(s: string): string {
   return (s.trim().split('\n')[0] ?? '').slice(0, 300);
 }
 
-/** A lock older than STALE_LOCK_MS belongs to a git that died; remove it (two small fs calls). */
-function clearStaleLock(root: string): void {
+/** A lock older than STALE_LOCK_MS belongs to a git that died; remove it (two small fs calls).
+ *  With `olderThan`, a lock last touched before that moment is removed too (see R1). */
+function clearStaleLock(root: string, olderThan?: number): void {
   const lock = join(root, '.git', 'index.lock');
   try {
-    if (existsSync(lock) && Date.now() - statSync(lock).mtimeMs > STALE_LOCK_MS) rmSync(lock);
+    if (!existsSync(lock)) return;
+    const mtime = statSync(lock).mtimeMs;
+    if (Date.now() - mtime > STALE_LOCK_MS || (olderThan !== undefined && mtime < olderThan)) rmSync(lock);
   } catch { /* noop */ }
 }

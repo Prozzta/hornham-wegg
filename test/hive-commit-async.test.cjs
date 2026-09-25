@@ -179,6 +179,63 @@ test('gc --auto: not before its first delay, then in the SAME single flight as c
   assert.match(gc.raw.join(' '), /-c gc.autoDetach=false gc/, 'gc stays in the foreground (inside the single flight)');
 });
 
+test('R1 (Jim): a lock left by a git killed at quit is cleared before the next process\'s FIRST commit, even when under 10 s old', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'hc-lock-'));
+  fs.mkdirSync(path.join(root, '.git'));
+  const lock = path.join(root, '.git', 'index.lock');
+  fs.writeFileSync(lock, '');
+  const twoSecondsAgo = new Date(Date.now() - 2_000);
+  fs.utimesSync(lock, twoSecondsAgo, twoSecondsAgo);            // the quick-relaunch case
+  const w = world({ root, deps: { git: (args) => Promise.resolve(fs.existsSync(lock)
+    ? { ok: false, out: '', err: "fatal: Unable to create 'index.lock': File exists." }
+    : { ok: true, out: '', err: '' }) } });
+  w.c.request('after relaunch'); await w.c.flush();
+  assert.equal(fs.existsSync(lock), false, 'the leftover lock is gone');
+  assert.equal(w.c.stats.commits, 1);
+  assert.deepEqual(w.logs, []);
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
+test('R1 (Jim): a FRESH lock that appeared after start is left alone (a live git), and a >10 s one is always recovered', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'hc-lock2-'));
+  fs.mkdirSync(path.join(root, '.git'));
+  const lock = path.join(root, '.git', 'index.lock');
+  const w = world({ root, deps: { git: () => Promise.resolve(fs.existsSync(lock)
+    ? { ok: false, out: '', err: "fatal: Unable to create 'index.lock': File exists." }
+    : { ok: true, out: '', err: '' }) } });
+  const future = new Date(Date.now() + 1_000);
+  fs.writeFileSync(lock, '');
+  fs.utimesSync(lock, future, future);                         // touched after this process started
+  w.c.request('while someone holds the index'); await w.c.flush();
+  assert.equal(fs.existsSync(lock), true, 'a fresh lock is never removed');
+  assert.equal(w.c.stats.commits, 0);
+  assert.deepEqual(w.logs, ['[hive] commit: index.lock held through every retry']);
+  const old = new Date(Date.now() - 11_000);
+  fs.utimesSync(lock, old, old);                               // its git died long ago
+  w.c.request('later'); await w.c.flush();
+  assert.equal(fs.existsSync(lock), false);
+  assert.equal(w.c.stats.commits, 1);
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
+test('N1 (Jim): a git that times out is logged with a reason, not a blank', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'hc-n1-'));
+  // `hash-object --stdin` waits on stdin, which execFile leaves open: a guaranteed timeout.
+  const res = await C.execFileGit(['hash-object', '--stdin'], dir, 300);
+  assert.equal(res.ok, false);
+  assert.notEqual(res.err.trim(), '', 'the error text stands in for the empty stderr');
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('R2 (Jim): a coalesced message lists at most MESSAGE_LINES requests plus one summary line', () => {
+  assert.equal(MESSAGE_LINES, 40);
+  const msg = coalescedMessage(Array.from({ length: 100 }, (_, i) => `m${i}`));
+  const bullets = msg.split('\n').filter((l) => l.startsWith('- '));
+  assert.equal(bullets.length, MESSAGE_LINES + 1);
+  assert.equal(bullets.at(-1), `- …and ${100 - MESSAGE_LINES} more`);
+  assert.equal(bullets[MESSAGE_LINES - 1], `- m${MESSAGE_LINES - 1}`);
+});
+
 test('coalescedMessage: one request is itself; many are listed and capped', () => {
   assert.equal(coalescedMessage(['hive: a']), 'hive: a');
   const many = Array.from({ length: MESSAGE_LINES + 3 }, (_, i) => `m${i}`);
