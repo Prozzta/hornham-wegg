@@ -3,7 +3,7 @@ import { spawn } from 'node:child_process';
 import {
   rmSync, existsSync, readFileSync, readdirSync, statSync, cpSync, writeFileSync,
   unlinkSync, mkdirSync, renameSync, createWriteStream, copyFileSync, lstatSync,
-  readlinkSync, symlinkSync
+  readlinkSync, symlinkSync, appendFileSync
 } from 'node:fs';
 import { randomBytes, createHash, timingSafeEqual } from 'node:crypto';
 import { join, resolve, sep, basename, dirname, isAbsolute } from 'node:path';
@@ -18,11 +18,20 @@ import { resolveCommand as resolveCliCommand, isSafeCommandName } from './shellE
 import { initAutoUpdater, abortPendingRestart } from './updater';
 import { RealtimeFloorWatcher } from './realtimeFloorWatcher';
 import {
-  readConfig, writeConfig, setAgentTokenCap, resetConfig, ensureHarnessHome, ensureClaudePermissionsAccepted,
-  modelForRole, OPS_STANDUP_MISSION, HEARTBEAT_MISSION, COMPACT_MAINTENANCE_MISSION, type HarnessConfig, type ScheduledMission
+  readConfig, writeConfig, setAgentTokenCap, setAgentUsageDisplay, setCapacityDisplayThreshold, resetConfig, ensureHarnessHome, ensureClaudePermissionsAccepted,
+  modelForHiveSpawn, OPS_STANDUP_MISSION, HEARTBEAT_MISSION, COMPACT_MAINTENANCE_MISSION, type HarnessConfig, type ScheduledMission
 } from './config';
-import { listDir, readFileText, readFileBinary, writeFileText, statAbs, expandTilde } from './fs';
+import {
+  runStandupTick, projectTasks,
+  type FloorState, type StandupDecision, type StandupSkipRecord
+} from './standupDelta';
+import { listDir, readFileText, readFileBinary, writeFileText, statAbs, expandTilde, samePath } from './fs';
 import { normalizeWeekly, weeklyDelayMs } from '../shared/weeklySchedule';
+import { isInputOrigin } from '../shared/inputOrigin';
+import { automaticDeliveryEligibility, isTerminalInputState } from '../shared/inputProvenance';
+import { isTerminalPromptState } from '../shared/promptState';
+import { AutomaticSubmitOwner, ADMISSION_CLASSES, INTERFERENCE_RESOLUTIONS, capacityGateOf, type AdmissionClass, type CapacityGate, type InterferenceResolution } from './automaticSubmit';
+import { buildOwnerDeps, ScreenReadingBroker } from './automaticSubmitWiring';
 import {
   getBranch, getStatus, getLog, getBranches, getAheadBehind, isRepo, getDiff, mainRepoRoot,
   addWorktree, removeWorktree, worktreeHasUnintegratedWork, worktreeIsGcSafe,
@@ -30,6 +39,23 @@ import {
 } from './git';
 import { HiveManager, type AgentMeta, type HiveMessage, type HiveTask } from './hive';
 import { HookServer } from './hooks';
+import { CapacityRuntime } from './capacityRuntime';
+import { CapacityStore, capacityStorePath } from './capacityPersistence';
+import type { CapacityNotifyIntent } from './capacityNotify';
+import { CapacityStripPresenter } from './capacityStrip';
+import { deliverCapacityToast, type CapacityToast } from './capacityToast';
+import { AGENT_IMPACT_PUSH, agentImpactOf, capacityStateNote, type AgentImpact } from '../shared/deliveryHold';
+import { AgentImpactPushGate, agentImpactPushOf } from './agentImpactPush';
+import { capacityDetailView } from './capacityDetail';
+import { CapacityDetailTicker } from './capacityDetailTick';
+import { CAPACITY_DETAIL_CHANNEL, CAPACITY_DETAIL_CLOSED, CAPACITY_DETAIL_PUSH, validateCapacityDetail, type ProviderCapacityDetailView } from '../shared/capacityDetail';
+import { AgentUsagePushGate, agentUsagePushOf, agentUsageView } from './capacityAgentUsage';
+import { CAPACITY_AGENT_USAGE, CAPACITY_AGENT_USAGE_PUSH, validateAgentUsageView } from '../shared/agentUsage';
+import { capacityDisplayThresholdOf } from '../shared/capacityThreshold';
+import {
+  CAPACITY_STRIP_CHANNEL, CAPACITY_STRIP_CURRENT, CAPACITY_NOTICE_DISMISS,
+  type CapacityStripCollection, type NoticeDelivery
+} from '../shared/capacityStrip';
 import { CircuitBreaker, type BreakerInput } from './breaker';
 import type { UsageProvider } from './usage';
 import { MemoryManager } from './memory';
@@ -66,7 +92,11 @@ import { validateBaseUrl, buildAuthHeaders, resolveUpstreamUrl, secretRefFor, IN
 import { RosterStore } from './roster';
 import { buildWorkerLaunch } from './workerLaunch';
 import { ControlRegistry } from './control';
-import { WorkerWakeWatchdog, type WorkerWakeFacts } from './workerWake';
+import { WorkerWakeWatchdog } from './workerWake';
+import { InboxWakeBridge } from './inboxWakeBridge';
+import { WakeStallWatch } from './wakeStall';
+import { newBreadcrumbMemory, shouldLogBreadcrumb } from './wakeBreadcrumb';
+import { WakeTelemetry } from './wakeTelemetry';
 import { inboxNudgeText } from '../shared/hiveNudge';
 import { fetchHireManifest, readHireManifestFiles } from './hire';
 import { parseHireDeepLink, type HireManifest } from '../shared/hire';
@@ -278,6 +308,9 @@ async function enableCodexRemoteForSpawn(
 /** Live PTY id → its hive agent id, recorded at spawn. The pty:kill handler only
  *  gets the PTY id, so this lets a closed tab archive the right registry agent. */
 const ptyToAgent = new Map<string, string>();
+/** ptyId -> the provider resolved for it at spawn. The submit owner asks this for
+ *  readiness and for abort capability; a PTY that is not in here is UNKNOWN to it. */
+const ptyProvider = new Map<string, AgentProvider>();
 /** PTY id → the spawn it should auto restart-and-continue into once a first-time
  *  CLI install finishes. The missing-CLI short-circuit runs the engine's installer
  *  in this PTY; when it exits cleanly the exit handler re-runs the SAME spawn (with
@@ -290,7 +323,13 @@ const hive = new HiveManager(
     const wc = liveWebContents();
     if (!wc) return false;
     try { wc.send(channel, payload); return true; } catch { return false; }
-  }
+  },
+  {},
+  // THE one place a hive is allowed to write the user's GLOBAL provider config
+  // (~/.gemini hooks, ~/.grok hooks, the Antigravity statusLine). Read fresh from
+  // config each time, so a home change takes effect without a restart; everywhere
+  // else a HiveManager is constructed, the default refuses. See mayWriteGlobalConfig.
+  (home) => samePath(home, readConfig().harnessHome)
 );
 // #7C — operator control state (pause/gate/steer/halt), read by the HookServer
 // when deciding hook returns.
@@ -316,7 +355,10 @@ const usageProvider: UsageProvider = telemetry;
 // enforces its decisions. Config read live so a settings change applies next beat.
 const breaker = new CircuitBreaker(() => {
   const c = readConfig();
-  return { ...(c.circuitBreaker ?? {}), costCapUsd: c.costCapUsd, costCapTokens: c.costCapTokens, agentTokenCaps: c.agentTokenCaps };
+  return {
+    ...(c.circuitBreaker ?? {}), costCapUsd: c.costCapUsd, costCapTokens: c.costCapTokens, agentTokenCaps: c.agentTokenCaps,
+    agentUsageDisplay: c.agentUsageDisplay
+  };
 });
 // Always-on beats (decoupled from the optional heartbeat): the live fleet snapshot
 // Michael reads + the breaker beat, so guardrails + monitoring work even when the
@@ -340,13 +382,172 @@ function standingGoalFromRoster(agentId: string): string | null {
   }
   return null;
 }
-// Worker inbox-wake watchdog (#151): finds idle workers with undrained inbox mail
-// and types the same guarded nudge the renderer would have (so a throttled
-// background window can't leave a worker parked on an unread inbox forever).
-// HookServer feeds it the hook stream so a permission/HITL prompt blocks nudges.
+// Inbox-wake coordinator (pre-M1 event-wake bridge; was the #151 worker watchdog). EVERY
+// agent, god included, is woken the same way: a durable delivery, a lifecycle or control
+// release edge, or the reconciliation beat asks `inboxWake.requestInboxWake`, which
+// claims one batch here and submits it through the one owner (CAPACITY_GATED). HookServer
+// feeds it the hook stream, so a permission/HITL prompt blocks wakes.
 const workerWake = new WorkerWakeWatchdog();
+// ─── DIAGNOSIS ONLY (branch diag-1.1.46-wake) ───────────────────────────────
+// The 1.1.46 packaged canary produced no wakes and could not say why, because every
+// breadcrumb on the wake path is console.log and a packaged Windows Electron app has
+// no console attached and no file sink: the output is discarded. These write to the
+// hive event log instead, which agents and the human already read, so ONE canary run
+// says which stage is inert. Remove with this branch.
+const wakeDiagSeen = newBreadcrumbMemory();
+// WAKE TELEMETRY (D8). Observability only — it counts, it never decides, and the wake path
+// never reads it. See wakeTelemetry.ts.
+const wakeTelemetry = new WakeTelemetry(Date.now());
+
+// THE STALL WATCHDOG (god's ruling A2). Decision in wakeStall.ts; this is the voice.
+const wakeStalls = new WakeStallWatch();
+
+/** Fold one refusal into the stall watch and say so, once, if it is a deadlock. */
+function noteWakeRefusal(agentId: string, why: string, inboxIds: number): void {
+  const stall = wakeStalls.note(agentId, why, inboxIds, Date.now());
+  if (!stall) return;
+  // Loud, durable, and it NAMES THE GUARD — the one thing the 1.1.46 post-mortem could
+  // not get out of the running app.
+  console.error(`[inbox-wake] STALL ${stall.agentId}: ${stall.inboxIds} message(s) undrained, refused as "${stall.why}" for ${Math.round(stall.stalledMs / 60000)}m`);
+  wakeDiag('stall', { agentId: stall.agentId, why: stall.why, inboxIds: stall.inboxIds, stalledMs: stall.stalledMs });
+}
+
+function wakeDiag(stage: string, fields: Record<string, unknown>): void {
+  // Counted FIRST, before the de-duplication below: the reconcile rows the log folds away
+  // are exactly the ones a stall is made of, so the counters must see every one.
+  try { wakeTelemetry.note(stage, fields, Date.now()); } catch { /* telemetry never decides */ }
+  try {
+    // The reconciliation cadences repeat every stage for every agent. Log one line per
+    // CHANGE there, so a 15-minute canary stays readable while every real transition is
+    // still captured. Event-path lines always log. The decision — and the reason the
+    // version of it that shipped in 1.1.48 suppressed nothing at all — is in
+    // wakeBreadcrumb.ts; this is only the voice.
+    if (!shouldLogBreadcrumb(wakeDiagSeen, stage, fields)) return;
+    hive.appendLog({ kind: 'wake', stage, ...fields });
+  } catch { /* the diagnosis must never break the path it is watching */ }
+}
+
+/** Built once the submit owner exists (below); null only during module start-up. */
+let inboxWake: InboxWakeBridge | null = null;
 // HookServer needs BOTH: Oscar's control registry (HITL pause/gate/steer/halt via
 // hook returns) AND Jim's breaker (feed recordToolUse on each PostToolUse).
+// L0 — provider allowance, keyed by provider-account/limit identity. Fed from
+// sources that already exist (the Claude status-line tick below; Codex rollout
+// events), never by polling a provider.
+//
+// The runtime owns the three parts together: it evaluates on a single timer armed
+// at the next instant a projection can change (never a poll), decides transitions
+// against the previous collection, and answers the admission question below. UI is
+// still a separate card.
+//
+// v1.1.45 unit #1: the DISPLAY projection. The presenter is downstream of every
+// decision above - it reads the collection after each publication and pushes a
+// display-ready, pool-level object on its own channel (never on control:snapshot).
+// v1.1.45 unit #8: the C2.8 threshold, from config. Loaded on first use (not at module
+// load, which can precede the Dev-isolated userData path) and then held here, so the strip
+// does not read the config file on every capacity event; the setter below updates it.
+let capacityDisplayThreshold: number | null = null;
+const capacityThresholdNow = (): number =>
+  (capacityDisplayThreshold ??= capacityDisplayThresholdOf(readConfig()));
+const capacityStrip = new CapacityStripPresenter({ weeklyThreshold: capacityThresholdNow });
+const providerCapacity = new CapacityRuntime({
+  deliver: (intents) => {
+    for (const intent of intents) {
+      console.log(`[capacity] ${intent.kind} ${intent.poolKey} ${intent.from}->${intent.to} (${intent.stateReason})`);
+      // §13 (unit #7): the presenter says whether and how this transition toasts; the
+      // delivery outcome (incl. STRIP_ONLY for the ones that do not) is recorded on the notice.
+      capacityStrip.noteIntent(intent, capacityToast(capacityStrip.toastFor(intent, providerCapacity.tracker.pool(intent.poolKey))));
+    }
+  },
+  // v1.1.46 integration: ONE onChange carries both followers - the CRIT-15-PRE impact push
+  // and the inbox-wake retry HINT (admission decides; the hint never submits by itself).
+  onChange: () => { pushCapacityStrip(); pushAgentUsage(); pushAgentImpact(); inboxWake?.onCapacityChange(); },
+  onAdmission: () => pushAgentImpact()
+});
+// L0-FUSION stage 5 - THE ONE OWNER of programmatic stage -> final revalidation -> Enter.
+// Main resolves the PTY, main holds it against other programmatic writers, and main's
+// final check sits next to main's Enter with nothing that can yield between them. See
+// automaticSubmit.ts for the transaction and automaticSubmitWiring.ts for what each of
+// its effects means here.
+const screenReadings = new ScreenReadingBroker((ptyId, requestId, needle) =>
+  ptyManager.sendToOwner(ptyId, 'autoSubmit:readScreen', { requestId, ptyId, needle }));
+const automaticSubmit = new AutomaticSubmitOwner(buildOwnerDeps({
+  pty: ptyManager,
+  capacity: providerCapacity,
+  ptyForAgent: (agentId) => ptyForAgent(agentId),
+  providerForPty: (ptyId) => ptyProvider.get(ptyId),
+  requestScreenReading: (ptyId, needle) => screenReadings.request(ptyId, needle),
+  onOutcome: (r) => {
+    // An outcome can raise an INTERFERED hold or settle one: the impact string moves.
+    pushAgentImpact();
+    if (r.outcome.kind === 'COMMITTED') return;
+    const why = 'reason' in r.outcome ? r.outcome.reason : '';
+    console.log(`[auto-submit] ${r.admissionClass} ${r.agentId} on ${r.ptyId ?? '-'}: ${r.outcome.kind} ${why}`);
+  }
+}));
+// Durable capacity observations (L0-TAIL). Restored BEFORE any live reading can
+// arrive, so ordering resolves naturally: every live observation is newer than the
+// one that crossed the restart and simply replaces it. `userData` is already the
+// Dev-isolated root by this point, so F1 holds with nothing special done here.
+// Restored pools are UNKNOWN/restored-unconfirmed, never the verdict they had.
+const capacityStore = new CapacityStore(
+  capacityStorePath(app.getPath('userData')),
+  providerCapacity.tracker
+);
+{
+  const restored = capacityStore.restore();
+  if (restored) console.log(`[capacity] restored ${restored} pool(s) from the durable store as UNKNOWN/unconfirmed`);
+}
+// The one wake path (plan section 3). Registered before the router starts, so no durable
+// delivery can land unobserved.
+inboxWake = new InboxWakeBridge({
+  coordinator: workerWake,
+  inboxIds: (agentId) => hive.inbox(agentId).map((m) => m.id).filter(Boolean),
+  facts: (agentId) => {
+    const ptyId = ptyForAgent(agentId);
+    if (!ptyId) return null;
+    const snap = control.snapshot(agentId);
+    return {
+      ptyId,
+      lastOutputAt: ptyManager.lastOutputAt(ptyId) ?? 0,
+      autoDeliveryPaused: snap.autoDeliveryPaused,
+      paused: snap.paused,
+      halted: snap.halted,
+      inhibited: automaticSubmit.inhibition(ptyId) !== null
+    };
+  },
+  // L0-FUSION stage 5: a wake starts a provider turn nobody asked for in this moment, so
+  // it is CAPACITY_GATED work through the one submit owner - admission, the READY gate,
+  // the prompt and human-draft guards, the final revalidation next to the Enter.
+  submit: (req) => automaticSubmit.submit(req),
+  text: (ids) => inboxNudgeText([...ids]),
+  setImmediate: (fn) => { setImmediate(fn); },
+  now: () => Date.now(),
+  log: (line) => console.log(line),
+  diag: (stage, fields) => {
+    wakeDiag(stage, fields);
+    // The watchdog sees EVERY refusal, not only the ones the log keeps: the sink folds
+    // repeated reconcile rows together, and a stall is made of exactly those repeats.
+    if (stage === 'no-claim') {
+      noteWakeRefusal(String(fields.agentId ?? ''), String(fields.why ?? ''), Number(fields.inboxIds ?? 0));
+    } else if (stage === 'claim') {
+      wakeStalls.clear(String(fields.agentId ?? ''));   // it moved; nothing is stuck
+    }
+  }
+});
+wakeDiag('bridge-built', { ok: !!inboxWake });
+hive.setDeliveryObserver(({ agentId, messageId }) => {
+  // Proves the observer is registered AND that deliver() reached it, independently of
+  // anything the bridge then decides.
+  wakeDiag('observer', { agentId, messageId, bridge: !!inboxWake });
+  inboxWake?.onDelivery(agentId, messageId);
+});
+// Only a RELEASE of a blocking state is a retry edge; applying pause/halt is not.
+control.setTransitionObserver((agentId, transition) => {
+  if (transition === 'UNPAUSED' || transition === 'RESUMED' || transition === 'AUTO_DELIVERY_RELEASED') {
+    inboxWake?.onControlRelease(agentId);
+  }
+});
 const hookServer = new HookServer(
   hive,
   () => liveWebContents(),
@@ -354,7 +555,31 @@ const hookServer = new HookServer(
   control,
   breaker,
   standingGoalFromRoster,
-  (agentId, event, message) => workerWake.noteHook(agentId, event, message)
+  // Observed BEFORE the hook response; the bridge defers any retry with setImmediate, so
+  // the Stop reply is never blocked and no turn is manufactured inside the hook.
+  (agentId, event, message, fullyIdle) => inboxWake?.onHook(agentId, event, message, fullyIdle),
+  (agentId, obs) => { providerCapacity.ingest(agentId, obs); capacityStore.scheduleSave(); },
+  // AGY 1.1.48 — ONE validated statusline tick, routed to its two consumers. Capacity
+  // first: the allowance pair is a provider fact and is true for the account whether or
+  // not any hive agent is behind the tick. Lifecycle second, and ONLY with an agent id —
+  // a tick from the user's own `agy` session says nothing about a floor worker, and the
+  // one thing it must never do is make somebody else's running turn look finished.
+  (agentId, tick) => {
+    providerCapacity.ingestAgyTick(agentId, {
+      accountScope: tick.observations[0].accountScope,
+      activeLimitId: tick.activeLimitId,
+      observations: tick.observations
+    });
+    capacityStore.scheduleSave();
+    if (!agentId) return;
+    // tick.readAt, NOT the delivery time: arrival through one socket is monotone, so a
+    // delivery time cannot show that one reading was taken before another (Jim, c4 audit).
+    inboxWake?.onProviderStatus(agentId, tick.lifecycle, tick.sessionId, tick.readAt);
+    // The renderer is TOLD the canonical status; it never re-derives one. Presentation
+    // only — main remains the sole submission authority, so a renderer that misses this
+    // push, or renders it late, cannot cause or prevent a single wake.
+    liveWebContents()?.send('hive:providerStatus', { agentId, status: tick.lifecycle });
+  }
 );
 const memory = new MemoryManager(
   () => readConfig().harnessHome,
@@ -498,7 +723,19 @@ function teardownPty(id: string): void {
   // 1) Archive the agent — retained + flagged; only live-PTY agents are active.
   const agentId = ptyToAgent.get(id);
   if (agentId) {
+    const leftProvider = ptyProvider.get(id);
     ptyToAgent.delete(id);
+    ptyProvider.delete(id);
+    // Pool membership completeness can change when an agent leaves.
+    pushCapacityStrip();
+    pushAgentUsage();
+    pushAgentImpact();
+    // AGY statusline lease: held only while an AGY agent is on the floor. When the last
+    // one goes, the user's global statusline goes back to them now - not at quit.
+    // (After the pushes: capacity censuses pin the delete-then-push adjacency.)
+    if (leftProvider === 'antigravity' && ![...ptyProvider.values()].includes('antigravity')) {
+      try { hive.agyAgentsGone(); } catch (e) { console.error('[hive] agyAgentsGone failed:', e); }
+    }
     // Drop watchdog state so a dead agent can't get nudged or leak its grace.
     try { workerWake.forget(agentId, id); } catch { /* best-effort */ }
     // Drop breaker state so a dead agent can't leak/zombie a tripped level.
@@ -691,6 +928,11 @@ function syncKeepAwake(): void {
 interface MissionTimer {
   timeout?: NodeJS.Timeout;
   interval?: NodeJS.Timeout;
+  /** TE0: this mission's dispatch, kept so `missions:runNow` can force a run past
+   *  the delta gate. The gate can only ever SUPPRESS, so without a force path an
+   *  operator who wants a standup right now has no way to ask for one. Absent for
+   *  a heartbeat, which self-schedules a beat rather than arming a fire. */
+  fire?: (forced?: boolean) => void;
 }
 
 /** Active scheduler timers keyed by mission id. */
@@ -705,6 +947,83 @@ function clearMissionTimers(): void {
     if (t.interval) clearInterval(t.interval);
   }
   missionTimers.clear();
+}
+
+/** Read the floor state the TE0 delta gate hashes.
+ *
+ *  Everything here is a local file read or an in-memory map — no model, no
+ *  network, and nothing the standup itself writes. See standupDelta.ts for the
+ *  rule: board.md and the task prose are god's OUTPUT, and coordination MTIMES are
+ *  disturbed by the dispatch itself (god's inbox, then his .done/memory/outbox as
+ *  he handles it, then every agent's files as the standup asks them to summarise
+ *  and compact). Hashing any of them makes the gate see a delta after every
+ *  standup and suppress nothing.
+ *
+ *  Never throws, but never silently guesses either: anything it could not read is
+ *  named in `unknown`, and an unknown floor dispatches. */
+function collectFloorState(): FloorState {
+  const unknown: string[] = [];
+  const agents: FloorState['agents'] = [];
+  let reg: ReturnType<typeof hive.registry> | null = null;
+  try { reg = hive.registry(); } catch { unknown.push('registry'); }
+  for (const [id, a] of Object.entries(reg?.agents ?? {})) {
+    if (a.archived) continue;
+    let actionableInbox = 0;
+    try {
+      // The SAME exclusion the heartbeat already uses. Counting the scheduler's
+      // own beats as floor activity would be the "hash your own exhaust" mistake
+      // — it is the dispatch we are deciding about that puts them there.
+      actionableInbox = hive.inbox(id).filter((msg) => !SYSTEM_SENDERS.has(msg.from)).length;
+    } catch {
+      // NOT zero. A zero here is indistinguishable from an empty inbox, so two
+      // failed reads in a row would hash identically and the gate would suppress
+      // on the strength of an observation that never happened.
+      unknown.push(`inbox:${id}`);
+    }
+    agents.push({
+      id,
+      onHold: !!a.onHold,
+      breaker: breaker.levelFor(id),
+      hasLivePty: !!ptyForAgent(id),
+      actionableInbox
+    });
+  }
+  const countDir = (label: string, p: string): number => {
+    try { return readdirSync(p).length; } catch (e) {
+      // ENOENT is a real answer — the directory does not exist, so nothing is
+      // queued. Anything else is a failure to observe.
+      if ((e as NodeJS.ErrnoException)?.code === 'ENOENT') return 0;
+      unknown.push(label);
+      return 0;
+    }
+  };
+  const root = hive.root();
+  if (!root) unknown.push('hive-root');
+  let tasks: FloorState['tasks'] = [];
+  try { tasks = projectTasks(hive.tasks()); } catch { unknown.push('tasks'); }
+  return {
+    agents,
+    tasks,
+    spawnRequests: root ? countDir('spawn-requests', join(root, 'spawn-requests')) : 0,
+    crashes: root ? countDir('crashes', join(root, 'crashes')) : 0,
+    unknown
+  };
+}
+
+/** Append the durable record of a SUPPRESSED standup.
+ *
+ *  Its own file, deliberately NOT log.jsonl: that file's mtime is an input to
+ *  isFloorQuiet(), so writing a skip there would keep the floor reading "busy"
+ *  forever and silently disable the heartbeat's re-engage. The heartbeat ships
+ *  disabled, which is exactly how that would have gone unnoticed. */
+function appendStandupSkip(record: StandupSkipRecord): void {
+  const root = hive.root();
+  if (!root) return;
+  try {
+    appendFileSync(join(root, 'standup-skips.jsonl'), JSON.stringify(record) + '\n', 'utf8');
+  } catch (e) {
+    console.error('[scheduler] skip record', record.missionId, e);
+  }
 }
 
 /** Rebuild the scheduler from persisted config: clear every existing timer,
@@ -727,15 +1046,41 @@ function syncMissions(): void {
     // with an adaptive cadence. Registered into the same missionTimers map so
     // clearMissionTimers() tears it down identically on quit/reset.
     if (m.kind === 'heartbeat') { armHeartbeat(m); continue; }
-    const fire = (): void => {
+    const fire = (forced = false): void => {
       try {
+        // TE0's gate state must be read FRESH, not taken from `m`. `m` is the
+        // snapshot syncMissions armed the timer with; nothing re-arms on a fire,
+        // so the closure's copy of lastDeltaFingerprint/lastDispatchAt would stay
+        // frozen at app-boot values for the life of the process and the gate would
+        // compare every tick against a fingerprint from hours ago. lastFiredAt has
+        // always been re-read for the same reason, a few lines down.
+        let gate: StandupDecision | null = null;
         // A 'compact' maintenance mission (maint-1) is compaction-ONLY: it carries
         // no dispatch body/target, so skip the hive.send and just fire auto-compact.
         // Gate on `kind!=='compact'` ALONE — that already excludes the compact mission;
         // we deliberately do NOT add `&& m.body`, so other (dispatch) missions keep
         // their prior behaviour, including the historical empty-body send (Pam N1).
         if (m.kind !== 'compact' && hive.enabled()) {
-          hive.send({ to: m.to, act: 'request', subject: m.label, body: m.body }, 'scheduler');
+          // TE0. Without a deltaGate on the mission this decides 'gate-off' and
+          // dispatches, so every mission that has not opted in is untouched.
+          // The decision, the send, the skip record and the stamp all live in
+          // runStandupTick so a test can drive real ticks against a fake floor —
+          // the only way to catch a defect that is about what a dispatch does to
+          // the NEXT collection.
+          gate = runStandupTick(m.id, {
+            readMission: () => (readConfig().missions ?? []).find((x) => x.id === m.id) ?? m,
+            collect: collectFloorState,
+            now: Date.now,
+            send: () => hive.send(
+              { to: m.to, act: 'request', subject: m.label, body: m.body }, 'scheduler'),
+            recordSkip: (rec) => appendStandupSkip(rec),
+            stamp: (patch) => {
+              const current = readConfig().missions ?? [];
+              writeConfig({
+                missions: current.map((x) => (x.id === m.id ? { ...x, ...patch } : x))
+              });
+            }
+          }, forced);
         }
         // Auto-compact: do NOT jam /compact into busy terminals. Hand it to the
         // renderer, which queues a /compact per agent (deduped — never two at
@@ -750,11 +1095,22 @@ function syncMissions(): void {
         if (m.autoCompact || m.kind === 'compact') {
           emitContextTrigger('compact', contextRule('compact'));
         }
-        const current = readConfig().missions ?? [];
-        const next = current.map((x) =>
-          x.id === m.id ? { ...x, lastFiredAt: Date.now() } : x
-        );
-        writeConfig({ missions: next });
+        // lastFiredAt is stamped on EVERY tick, suppressed ones included: it is the
+        // timer's clock, not a record of dispatches. syncMissions arms from
+        // `intervalMs - (now - lastFiredAt)`, so leaving it unstamped after a skip
+        // computes a zero delay on the next re-arm and spins the mission.
+        //
+        // For a GATED dispatch mission runStandupTick above has already stamped it
+        // (and, only on a real dispatch, the baseline and lastDispatchAt with it).
+        // This branch covers the ticks it never saw: a compact-only mission, or a
+        // dispatch mission while the hive is disabled.
+        if (!gate) {
+          const firedAt = Date.now();
+          const current = readConfig().missions ?? [];
+          writeConfig({
+            missions: current.map((x) => (x.id === m.id ? { ...x, lastFiredAt: firedAt } : x))
+          });
+        }
         // Let the SCHEDULES panel refresh its "last fired" without a reload (#2.3).
         try { liveWebContents()?.send('missions:updated'); } catch { /* window gone */ }
       } catch (e) {
@@ -762,6 +1118,9 @@ function syncMissions(): void {
       }
     };
     const entry: MissionTimer = {};
+    // Registered before either arming branch: a weekly mission returns early
+    // below, and it needs a run-now just as much as an interval one does.
+    entry.fire = fire;
     if (weekly) {
       // Weekly self-reschedules: there is no steady interval to settle into,
       // because the gap between two slots varies (Fri to Mon is not Mon to Wed,
@@ -964,6 +1323,25 @@ function ensureDefaultMissions(): void {
     });
   }
 
+  // TE0 MIGRATION: attach the delta gate to an ops standup that already exists.
+  // The seeding branch above is guarded by `opsStandupSeeded`, which is already
+  // true on every install that has ever launched — so without this, the gate
+  // would ship to new installs only and the machines actually paying for
+  // no-change standups would never get it. Runs at most once, and only fills a
+  // gate that is absent: an operator who later turns it off stays off.
+  const cfgGate = readConfig();
+  if (!cfgGate.standupDeltaGateSeeded) {
+    const missions = cfgGate.missions ?? [];
+    writeConfig({
+      missions: missions.map((m) =>
+        m.id === OPS_STANDUP_MISSION.id && !m.deltaGate
+          ? { ...m, deltaGate: OPS_STANDUP_MISSION.deltaGate }
+          : m
+      ),
+      standupDeltaGateSeeded: true
+    });
+  }
+
   // maint-1 RETIREMENT: `compact-maintenance` is no longer a mission. Scheduled
   // compaction is now the CONTEXT TRIGGER's job, so the operator has exactly one
   // control (a cadence + a pressure gate + an editable message) instead of two
@@ -1160,6 +1538,113 @@ function reengageGod(digest: string): void {
   hive.send({ to: 'god', act: 'request', subject: 'Heartbeat', body: digest }, 'heartbeat');
 }
 
+/**
+ * A native toast for a capacity transition (§13, unit #7), gated on the same notifications
+ * setting as every other toast. WHICH transitions toast, and their words, come from the
+ * presenter's `toastFor` (null = strip-only); this only delivers. Main-side only, so a
+ * closed or throttled window cannot swallow it.
+ */
+function capacityToast(toast: CapacityToast | null): NoticeDelivery {
+  return deliverCapacityToast(toast, {
+    notificationsOn: () => readConfig().notifications === true,
+    supported: () => Notification.isSupported(),
+    show: (t) => { new Notification({ title: t.title, body: t.body }).show(); }
+  });
+}
+
+/**
+ * Membership is KNOWN only while every running agent of this provider has produced a
+ * reading (and so has a pool). An agent with no reading yet might draw on any pool of
+ * its provider, and main does not guess which (design section 12: Membership unknown).
+ */
+function capacityMembershipKnown(provider: string): boolean {
+  for (const [ptyId, agentId] of ptyToAgent) {
+    if (ptyProvider.get(ptyId) === provider && !providerCapacity.hasPool(agentId)) return false;
+  }
+  return true;
+}
+
+function presentCapacityStrip(): CapacityStripCollection {
+  return capacityStrip.present({
+    snapshot: providerCapacity.snapshot(),
+    membersOf: (poolKey) => providerCapacity.membersOf(poolKey),
+    membershipKnown: capacityMembershipKnown,
+    freshUntil: (poolKey) => providerCapacity.tracker.freshUntil(poolKey),
+    now: Date.now()
+  });
+}
+
+let lastPushedCapacityStrip = -1;
+/**
+ * Re-project and push the pool collection to EVERY window (each has its own title
+ * bar). Pushes only when the collection revision moved. A projection that fails its
+ * own schema is logged and not sent; the renderer's expiry mask degrades what it has.
+ */
+function pushCapacityStrip(): void {
+  let collection: CapacityStripCollection;
+  try { collection = presentCapacityStrip(); }
+  catch (e) { console.warn('[capacity-strip]', e instanceof Error ? e.message : e); return; }
+  if (collection.collectionRevision === lastPushedCapacityStrip) return;
+  lastPushedCapacityStrip = collection.collectionRevision;
+  for (const w of allWindows) {
+    if (w.isDestroyed() || w.webContents.isDestroyed()) continue;
+    try { w.webContents.send(CAPACITY_STRIP_CHANNEL, collection); } catch { /* window tearing down */ }
+  }
+}
+
+const agentUsagePushGate = new AgentUsagePushGate();
+/**
+ * v1.1.45 unit #13 (crit 15): the Monitor 5H / Weekly lines are PUSHED, never polled. The
+ * rows for every agent whose persisted display is 5H or Weekly go to every window on their
+ * OWN channel (not control:snapshot, no pool identity), only when the rows changed. The
+ * owner's onChange carries time-driven FRESH -> STALE decay, so that pushes too.
+ */
+function pushAgentUsage(): void {
+  let push;
+  try {
+    push = agentUsagePushGate.next(agentUsagePushOf(readConfig().agentUsageDisplay, (agentId) => {
+      const poolKey = providerCapacity.poolKeyOf(agentId);
+      return poolKey ? providerCapacity.tracker.pool(poolKey) : null;
+    }, Date.now()));
+  } catch (e) { console.warn('[capacity-usage]', e instanceof Error ? e.message : e); return; }
+  if (!push) return;
+  for (const w of allWindows) {
+    if (w.isDestroyed() || w.webContents.isDestroyed()) continue;
+    try { w.webContents.send(CAPACITY_AGENT_USAGE_PUSH, push); } catch { /* window tearing down */ }
+  }
+}
+
+/** Agents a renderer has asked about via control:snapshot: the rows of the impact push. */
+const impactWatched = new Set<string>();
+const agentImpactPushGate = new AgentImpactPushGate();
+let impactPushing = false;
+let impactPushAgain = false;
+/**
+ * v1.1.45 CRIT-15-PRE: the agent-card impact is PUSHED, never polled (see agentImpactPush.ts
+ * for the events that call this). Re-entrant calls - reading an interference hold can retire
+ * one and settle its grant, which is itself an admission move - fold into one more pass.
+ */
+function pushAgentImpact(): void {
+  if (impactPushing) { impactPushAgain = true; return; }
+  impactPushing = true;
+  try {
+    for (let pass = 0; pass < 3; pass++) {
+      impactPushAgain = false;
+      let push;
+      try {
+        push = agentImpactPushGate.next(agentImpactPushOf(impactWatched, (agentId) => controlFactsOf(agentId).impact));
+      } catch (e) { console.warn('[agent-impact]', e instanceof Error ? e.message : e); return; }
+      if (push) {
+        for (const w of allWindows) {
+          if (w.isDestroyed() || w.webContents.isDestroyed()) continue;
+          try { w.webContents.send(AGENT_IMPACT_PUSH, push); } catch { /* window tearing down */ }
+        }
+      }
+      if (!impactPushAgain) return;
+    }
+  } finally { impactPushing = false; }
+}
+
 /** A native toast for breaker constrain/stop, gated on the notifications setting. */
 function breakerToast(title: string, body: string): void {
   if (!readConfig().notifications) return;
@@ -1283,10 +1768,14 @@ function writeFleetSnapshot(): void {
           lastTool: spans.length ? spans[spans.length - 1].tool : null,
           lastActiveSecAgo: u ? Math.round((now - u.ts) / 1000) : null,
           inboxBacklog: hive.inboxBacklog(id),
-          onHold: !!a.onHold
+          onHold: !!a.onHold,
+          // D8: this agent's wake history, next to the backlog it is supposed to drain.
+          // Those two numbers together are the whole question — mail waiting, and whether
+          // anything is waking to read it.
+          wake: wakeTelemetry.forAgent(id)
         };
       });
-    hive.writeFleetSnapshot({ ts: now, agents });
+    hive.writeFleetSnapshot({ ts: now, agents, wake: wakeTelemetry.snapshot(now) });
   } catch (e) {
     console.error('[fleet] snapshot failed:', e);
   }
@@ -1308,6 +1797,9 @@ function armHeartbeat(m: ScheduledMission): void {
       // waiting in god's inbox — the latter is independent of floor-quiet so a
       // worker's reply doesn't sit unread while other agents keep the floor busy.
       const actionable = godActionableInboxCount();
+      // Separates "the heartbeat timer is dead" from "it ran and its own conditions said
+      // nothing to send" — the 1.1.46 post-mortem could not tell those apart.
+      wakeDiag('heartbeat', { quiet: isFloorQuiet(quiet), actionable, baseMs: base });
       if (isFloorQuiet(quiet) || actionable > 0) {
         reengageGod(buildHeartbeatDigest(quiet, actionable));
         next = Math.round(base * 2.5);            // back off after re-engaging
@@ -2795,14 +3287,12 @@ async function spawnAgentCore(opts: AgentSpawnOptions, owner: Electron.WebConten
     // cross-session message to it came back "held for the recipient user's
     // approval" with no surface for anyone to ever grant that approval.
     const args = argsWithAutoModeFlag(opts.args ?? [], cfg.autoMode, provider);
-    // Model precedence: an explicit per-agent --model (from the renderer) wins;
-    // else the user's global defaultModel; else the role-based default tier. The
-    // GOD is special-cased: it has its own engine config (godProvider/godModel), so
-    // modelForRole resolves it and that wins over the worker-oriented defaultModel.
+    // Model precedence: an explicit renderer --model wins; otherwise the model
+    // recorded from this agent's Claude status line wins over app-wide defaults.
+    // This keeps separate agents' `/model` choices out of Claude's shared global
+    // settings file while retaining the existing god/worker fallback behavior.
     if (!args.includes('--model')) {
-      const m = opts.hive.isGod
-        ? modelForRole(opts.hive, cfg)
-        : cfg.defaultModel ?? modelForRole(opts.hive, cfg);
+      const m = modelForHiveSpawn(opts.hive, cfg, hive.lastModel(opts.hive.id));
       if (m) args.push('--model', m);
     }
     // Name the Remote Control session after the agent (Michael, Jim, Dev1…) so it
@@ -2902,9 +3392,14 @@ async function spawnAgentCore(opts: AgentSpawnOptions, owner: Electron.WebConten
   // live terminal means active — ensureAgent above already cleared `archived`.
   if (opts.hive?.id) {
     ptyToAgent.set(opts.id, opts.hive.id);
-    // Worker inbox-wake watchdog (#151): boot grace starts at spawn so the
-    // initial orientation prompt is never mistaken for an idle agent.
-    workerWake.noteSpawn(opts.id);
+    ptyProvider.set(opts.id, provider);
+    // A new agent with no reading yet makes its provider's membership unknown.
+    pushCapacityStrip();
+    pushAgentUsage();
+    pushAgentImpact();
+    // Inbox wake: boot grace starts at spawn so the initial orientation prompt is never
+    // mistaken for an idle agent; a new incarnation also releases a stale INTERFERED hold.
+    workerWake.noteSpawn(opts.id, Date.now(), opts.hive.id);
   }
   // Pre-accept Claude Code's bypass-mode warning + folder-trust dialog so the
   // agent (spawned with --permission-mode bypassPermissions) doesn't stall on an
@@ -2993,9 +3488,47 @@ async function spawnAgentCore(opts: AgentSpawnOptions, owner: Electron.WebConten
   // record matches what the registry and the PTY actually used.
   return { ...res, cwd: opts.cwd, ...(worktreePath ? { worktreePath } : {}), ...(resumeNotFound ? { resumeNotFound: true } : {}), ...(didResume ? { resumed: true } : {}), ...(seedPrompt ? { seedPrompt } : {}) };
 }
-ipcMain.handle('pty:write', (_evt, id: string, data: string) => {
+ipcMain.handle('pty:write', (_evt, id: string, data: string, origin: unknown) => {
   if (typeof id !== 'string' || typeof data !== 'string') return { ok: false, error: 'invalid args' };
-  return ptyManager.write(id, data);
+  // An unrecognised or missing origin is REFUSED, not defaulted. A write that
+  // cannot say who is behind it is a missing fact, and the fail-closed rule says a
+  // missing fact is UNKNOWN — never CONTROL, and never quietly HUMAN.
+  if (!isInputOrigin(origin)) return { ok: false, error: 'invalid origin' };
+  // L0-FUSION stage 5.3. PROGRAMMATIC belongs to the ONE submit owner, and the owner lives
+  // in THIS process: it writes through ptyManager directly and never crosses this channel.
+  // So a renderer that declares it is asking for a capability it no longer has. Refused
+  // HERE, structurally - not by the renderer promising not to: after this no automatic
+  // module holds a raw text+Enter capability at all (design section 10). HUMAN and
+  // CONTROL are what this channel is for.
+  if (origin === 'PROGRAMMATIC') return { ok: false, error: 'origin not permitted on this channel' };
+  return ptyManager.write(id, data, origin);
+});
+// L0-FUSION stage 3. The mirror is validated at the boundary and stored on the live
+// session; a malformed report is refused rather than stored as something it is not.
+ipcMain.handle('pty:inputState', (_evt, id: string, state: unknown) => {
+  if (typeof id !== 'string') return { ok: false, error: 'invalid args' };
+  if (!isTerminalInputState(state)) return { ok: false, error: 'invalid input state' };
+  return ptyManager.setInputState(id, state);
+});
+// Evaluated FRESH from the stored mirror on every ask - re-entrant by construction.
+// No caller may cache the answer across a guard; a TUI can change its mind in between.
+ipcMain.handle('pty:automaticDeliveryEligibility', (_evt, id: string) => {
+  if (typeof id !== 'string') return { eligible: false, reason: 'NO_STATE', detail: 'invalid args' };
+  return automaticDeliveryEligibility(ptyManager.inputState(id));
+});
+// L0-FUSION stage 5. Whose the prompt is (picker latch / human draft / settle), mirrored
+// for the same reason the provenance mirror is: main must READ it, before STAGE and inside
+// the critical section, and cannot if it lives only in the renderer. Validated at the
+// boundary; a malformed report is refused rather than stored as something it is not.
+ipcMain.handle('pty:promptState', (_evt, id: string, state: unknown) => {
+  if (typeof id !== 'string') return { ok: false, error: 'invalid args' };
+  if (!isTerminalPromptState(state)) return { ok: false, error: 'invalid prompt state' };
+  return ptyManager.setPromptState(id, state);
+});
+// The renderer's answer to `autoSubmit:readScreen`. A malformed answer, or one for an id
+// that is not pending, is no answer - the owner then holds the item rather than guess.
+ipcMain.on('autoSubmit:screenReading', (_evt, requestId: unknown, reading: unknown) => {
+  screenReadings.answer(requestId, reading);
 });
 ipcMain.handle('pty:resize', (_evt, id: string, cols: number, rows: number) => {
   if (typeof id !== 'string' || typeof cols !== 'number' || typeof rows !== 'number') return { ok: false, error: 'invalid args' };
@@ -3174,6 +3707,22 @@ ipcMain.handle('config:update', (_evt, patch: Partial<HarnessConfig>) => {
 ipcMain.handle('config:setAgentTokenCap', (_evt, agentId: unknown, tokenCap: unknown) =>
   setAgentTokenCap(agentId, tokenCap)
 );
+// v1.1.45 unit #8: set the capacity-display threshold. Invalid input throws and changes
+// nothing. A valid one takes effect LIVE: the strip is re-projected and pushed at once
+// (a presentation-only change: no domain revision moves).
+ipcMain.handle('config:setCapacityDisplayThreshold', (_evt, value: unknown) => {
+  const next = setCapacityDisplayThreshold(value);
+  capacityDisplayThreshold = capacityDisplayThresholdOf(next);
+  pushCapacityStrip();
+  return next;
+});
+// v1.1.45 CAPUI-MONITOR: persist an agent's Monitor line. The breaker reads config live,
+// so a 5H / Weekly choice exempts the agent from the budget on the very next beat.
+ipcMain.handle('config:setAgentUsageDisplay', (_evt, agentId: unknown, display: unknown) => {
+  const next = setAgentUsageDisplay(agentId, display);
+  pushAgentUsage();
+  return next;
+});
 ipcMain.handle('config:ensureHome', (_evt, path: unknown) => {
   if (typeof path !== 'string' || path.length === 0) return { ok: false, error: 'invalid path' };
   return ensureHarnessHome(path);
@@ -3222,6 +3771,7 @@ ipcMain.handle('config:changeHome', async (_evt, payload: unknown) => {
   try { stopEphemeralWorkerWatcher(); } catch (e) { console.error('[changeHome] stopWorkerWatcher:', e); }
   try { integrationBroker.stop(); } catch (e) { console.error('[changeHome] broker.stop:', e); }
   try { hive.stopRouter(); } catch (e) { console.error('[changeHome] stopRouter:', e); }
+  try { hive.stopAgyStatusline(); } catch (e) { console.error('[changeHome] stopAgyStatusline:', e); }
   try { hookServer.stop(); } catch (e) { console.error('[changeHome] hookServer.stop:', e); }
   try { stopSlackServer(); } catch (e) { console.error('[changeHome] slack.stop:', e); }
   try { stopWebhookServer(); } catch (e) { console.error('[changeHome] webhook.stop:', e); }
@@ -3432,6 +3982,15 @@ ipcMain.handle('hive:tasks', () => hive.tasks());
 ipcMain.handle('hive:log', (_evt, n: unknown) => hive.logTail(typeof n === 'number' ? n : 200));
 ipcMain.handle('hive:memory', (_evt, id: unknown) => (typeof id === 'string' ? hive.memory(id) : ''));
 ipcMain.handle('hive:inbox', (_evt, id: unknown) => (typeof id === 'string' ? hive.inbox(id) : []));
+// The renderer's 4s inbox HINT (plan A, god's ruling). It is a TRIGGER, never a producer:
+// it carries no decision and no payload, and it reaches the terminal only through the one
+// main-owned path, with main's one claim and its one stable request id. That is the whole
+// point - the renderer poll that 1.1.45 relied on is back as a cadence, without the second
+// submitter that would make two request ids for one inbox edge and so two turns.
+ipcMain.handle('hive:requestInboxWake', (_evt, id: unknown) => {
+  if (typeof id !== 'string' || !id) return false;
+  return !!inboxWake?.requestInboxWake(id, 'renderer', 'reconcile');
+});
 // Voice read-layer: recent message CONTENT (inbox/outbox bodies), REDACTED
 // main-side by hive.voiceMessages(). The renderer/voice layer never sees a raw
 // body — secrets are stripped here, before the result crosses IPC.
@@ -3713,6 +4272,7 @@ function teardownAndQuit(): void {
   try { stopEphemeralWorkerWatcher(); } catch (e) { console.error('[quit] stopWorkerWatcher:', e); }
   try { integrationBroker.stop(); } catch (e) { console.error('[quit] broker.stop:', e); }
   try { hive.stopRouter(); } catch (e) { console.error('[quit] stopRouter:', e); }
+  try { hive.stopAgyStatusline(); } catch (e) { console.error('[quit] stopAgyStatusline:', e); }
   try { hookServer.stop(); } catch (e) { console.error('[quit] hookServer.stop:', e); }
   try { telemetry.stop(); } catch (e) { console.error('[quit] telemetry.stop:', e); }
   try { stopSlackServer(); } catch (e) { console.error('[quit] slack.stop:', e); }
@@ -3774,6 +4334,7 @@ ipcMain.handle('app:resetAll', () => {
   try { stopEphemeralWorkerWatcher(); } catch (e) { console.error('[reset] stopWorkerWatcher:', e); }
   try { integrationBroker.stop(); } catch (e) { console.error('[reset] broker.stop:', e); }
   try { hive.stopRouter(); } catch (e) { console.error('[reset] stopRouter:', e); }
+  try { hive.stopAgyStatusline(); } catch (e) { console.error('[reset] stopAgyStatusline:', e); }
   try { hookServer.stop(); } catch (e) { console.error('[reset] hookServer.stop:', e); }
   try { telemetry.stop(); } catch (e) { console.error('[reset] telemetry.stop:', e); }
   try { stopSlackServer(); } catch (e) { console.error('[reset] slack.stop:', e); }
@@ -3900,6 +4461,7 @@ ipcMain.handle('control:autoDelivery', (_evt, agentId: unknown, paused: unknown)
   const current = new Set(readConfig().autoDeliveryPausedAgents ?? []);
   if (on) current.add(agentId); else current.delete(agentId);
   writeConfig({ autoDeliveryPausedAgents: Array.from(current).sort() });
+  pushAgentImpact();
   return control.snapshot(agentId);
 });
 ipcMain.handle('control:resume', (_evt, agentId: unknown) => {
@@ -3922,8 +4484,212 @@ ipcMain.handle('control:halt', (_evt, agentId: unknown) => {
   control.halt(agentId);
   return control.snapshot(agentId);
 });
-ipcMain.handle('control:snapshot', (_evt, agentId: unknown) =>
-  typeof agentId === 'string' ? control.snapshot(agentId) : null);
+// v1.1.45 unit #1 - the pool-level capacity collection, pulled by a (re)loaded window.
+// Re-projected on the spot (a no-op revision-wise when nothing changed), so a window
+// that loads before the first publication still gets the restored pools.
+ipcMain.handle(CAPACITY_STRIP_CURRENT, () => {
+  try { return presentCapacityStrip(); }
+  catch (e) { console.warn('[capacity-strip]', e instanceof Error ? e.message : e); return null; }
+});
+// v1.1.45 CAPUI-MONITOR - one agent's 5h + weekly USAGE for its Monitor line, on its OWN
+// channel (never control:snapshot, which carries no pool data). The pool is the one the
+// agent's own readings landed in; no reading means text, never a guessed figure.
+// v1.1.45 unit #4 - the provider DETAIL view for one pool, asked for only while the panel is
+// open. Its OWN scoped channel: not control:snapshot, and not the strip object (C2.9). Built
+// from the same tracker snapshot, at the same revision, as the strip it was opened from.
+function capacityDetailViewOf(poolId: string): ProviderCapacityDetailView | null {
+  const pool = providerCapacity.snapshot().pools.find((p) => capacityStrip.poolIdOf(p.poolKey) === poolId);
+  if (!pool) return null;
+  let presentation: CapacityStripCollection['pools'][number]['presentation'] | null = null;
+  try { presentation = presentCapacityStrip().pools.find((p) => p.poolId === poolId)?.presentation ?? null; }
+  catch { presentation = null; }
+  const members = providerCapacity.membersOf(pool.poolKey);
+  const view = capacityDetailView({
+    pool, poolId, poolLabel: capacityStrip.labelOf(pool), presentation,
+    members, membershipKnown: capacityMembershipKnown(pool.provider),
+    statusNote: capacityStatusNote(members), now: Date.now()
+  });
+  const errors = validateCapacityDetail(view);
+  if (errors.length) { console.warn('[capacity-detail] refused:', errors.slice(0, 3).join('; ')); return null; }
+  return view;
+}
+// v1.1.46 A2 - the age note ticks while the panel stays open on a STALE pool: a main-side
+// time edge re-pushes the SAME projection once a minute (capacityDetailTick.ts). Armed by the
+// panel's own ask (open and every crit-17 re-ask), stopped by its close, by the window going,
+// and by the pool no longer being stale. No renderer clock (crit 15).
+const capacityDetailTicker = new CapacityDetailTicker({
+  staleSince: (poolId) => {
+    const pool = providerCapacity.snapshot().pools.find((p) => capacityStrip.poolIdOf(p.poolKey) === poolId);
+    return pool && pool.freshness === 'STALE' ? pool.observedAt : null;
+  },
+  push: (windowId, poolId) => {
+    const wc = BrowserWindow.getAllWindows().map((w) => w.webContents).find((c) => c.id === windowId);
+    if (!wc || wc.isDestroyed()) { capacityDetailTicker.closed(windowId); return; }
+    const view = capacityDetailViewOf(poolId);
+    if (!view) { capacityDetailTicker.closed(windowId); return; }
+    try { wc.send(CAPACITY_DETAIL_PUSH, view); } catch { capacityDetailTicker.closed(windowId); }
+  },
+  now: () => Date.now(),
+  setTimer: (fn, ms) => setTimeout(fn, ms),
+  clearTimer: (h) => clearTimeout(h as ReturnType<typeof setTimeout>)
+});
+ipcMain.handle(CAPACITY_DETAIL_CHANNEL, (evt, poolId: unknown) => {
+  if (typeof poolId !== 'string') return null;
+  const view = capacityDetailViewOf(poolId);
+  if (view) capacityDetailTicker.opened(evt.sender.id, poolId);
+  else capacityDetailTicker.closed(evt.sender.id, poolId);
+  return view;
+});
+ipcMain.on(CAPACITY_DETAIL_CLOSED, (evt, poolId: unknown) => {
+  if (typeof poolId === 'string') capacityDetailTicker.closed(evt.sender.id, poolId);
+});
+
+/**
+ * The composer's OWN words for what admission is doing on a pool (Jim's obsolete-item #1:
+ * the post-reset probe and probe-spent states must read the same in the details panel as in
+ * the composer). Asked through a member agent with the same non-spending probe and the same
+ * gate the per-agent snapshot uses; null when the pool has no member or nothing to say.
+ */
+function capacityStatusNote(members: readonly string[]): string | null {
+  const agentId = members[0];
+  if (!agentId) return null;
+  const probed = providerCapacity.admission.probe(agentId, 'ORDINARY_TURN');
+  const gate = capacityGateOf(probed,
+    probed.poolKey ? providerCapacity.tracker.pool(probed.poolKey)?.freshness ?? null : null,
+    undefined,
+    probed.poolKey ? providerCapacity.tracker.resetOutlook(probed.poolKey) : null);
+  return capacityStateNote(gate.evidence);
+}
+
+ipcMain.handle(CAPACITY_AGENT_USAGE, (_evt, agentId: unknown) => {
+  if (typeof agentId !== 'string') return null;
+  const poolKey = providerCapacity.poolKeyOf(agentId);
+  const view = agentUsageView(poolKey ? providerCapacity.tracker.pool(poolKey) : null, Date.now());
+  const errors = validateAgentUsageView(view);
+  if (errors.length) { console.warn('[capacity-usage] refused:', errors.slice(0, 3).join('; ')); return null; }
+  return view;
+});
+// A person dismissed a capacity notice. Recorded in MAIN, so a reload cannot reopen it.
+ipcMain.handle(CAPACITY_NOTICE_DISMISS, (_evt, noticeId: unknown) => {
+  if (typeof noticeId !== 'string' || !capacityStrip.dismissNotice(noticeId)) return false;
+  pushCapacityStrip();
+  return true;
+});
+ipcMain.handle('control:snapshot', (_evt, agentId: unknown) => {
+  if (typeof agentId !== 'string') return null;
+  // Asked about once, pushed from then on (CRIT-15-PRE): the impact push serves this agent.
+  impactWatched.add(agentId);
+  const f = controlFactsOf(agentId);
+  return { ...f.snap, capacityHold: f.gate.holds, capacityEvidence: f.gate.evidence, interfered: f.interfered, impact: f.impact };
+});
+
+/** The snapshot's settled facts for one agent - the ONE computation behind both the
+ *  control:snapshot answer and the impact push, so the two can never disagree. */
+function controlFactsOf(agentId: string) {
+  // L0-SEAM on the renderer's automatic queued dispatch. That path already consults
+  // this snapshot and already has a no-penalty early return for a held agent, so the
+  // gate costs no send attempt and drops no queued message - which the other
+  // candidate seam, refusing the pty write, would do after three attempts.
+  //
+  // It PROBES rather than admits: this handler runs on every queue tick, and admitting
+  // would spend the epoch's single recovery turn on the question.
+  //
+  // L0-UNKNOWN (the human's REVISED ruling, option ii - `UNKNOWN_POLICY` in
+  // automaticSubmit.ts is the mapping in force; the first ruling, option B, which held
+  // every UNKNOWN, is superseded). The flag used to be `verdict === 'REFUSE'`, one
+  // of the four places UNKNOWN proceeded by an inequality nobody chose. It now comes
+  // through the ONE resolver and the ONE ratified mapping, so this hint and the submit
+  // owner cannot disagree - and the EVIDENCE rides along undissolved, because the ruling
+  // requires "no pool" (outside capacity gating), "held for want of evidence" and
+  // "allowed" to stay three different things for anything that shows them.
+  const probed = providerCapacity.admission.probe(agentId, 'ORDINARY_TURN');
+  const gate = capacityGateOf(probed,
+    probed.poolKey ? providerCapacity.tracker.pool(probed.poolKey)?.freshness ?? null : null,
+    undefined,
+    probed.poolKey ? providerCapacity.tracker.resetOutlook(probed.poolKey) : null);
+  // INTERFERED, read from the one owner (stage 5.4b). It is reported, never decided, here.
+  const heldPty = ptyForAgent(agentId);
+  const held = heldPty ? automaticSubmit.inhibition(heldPty) : null;
+  const interfered = held ? { requestId: held.requestId, reason: held.reason, at: held.at } : null;
+  const snap = control.snapshot(agentId);
+  const impact = agentImpactFor(snap.autoDeliveryPaused, gate, interfered !== null, probed.poolKey);
+  return { snap, gate, interfered, impact };
+}
+
+/**
+ * v1.1.45 unit #5 - the agent-card impact, from the SAME settled facts the snapshot above
+ * reports. The pool is named with the strip's own label and nothing else is taken from
+ * the pool: a label and the tracker state word, never a figure, a window or a reset.
+ */
+function agentImpactFor(
+  autoDeliveryPaused: boolean,
+  gate: CapacityGate,
+  interfered: boolean,
+  poolKey: string | null
+): AgentImpact | null {
+  const pool = poolKey ? providerCapacity.tracker.pool(poolKey) : null;
+  return agentImpactOf({
+    interfered,
+    autoDeliveryPaused,
+    capacityHold: gate.holds,
+    capacityEvidence: gate.evidence,
+    poolState: pool?.state ?? null,
+    poolLabel: pool ? capacityStrip.labelOf(pool) : null
+  });
+}
+
+/**
+ * L0-FUSION stage 5.3 - THE ONE DOOR for programmatic text+Enter from a renderer.
+ *
+ * The renderer chooses WHICH message and WHEN to ask, and acknowledges a queue item on a
+ * reported COMMIT. That is all it does. It names an AGENT, never a PTY - main resolves the
+ * terminal, so a request can no longer spend one agent's grant on another's prompt. It
+ * holds no ticket, no capacity state, no ordering, no readiness polling and no settlement:
+ * the renderer's write chain, its `typeAndSubmit` order and the capacity ticket IPC
+ * (`capacity:beginAutoDelivery` / `markAutoDeliveryWriting` / `settleAutoDelivery`) are
+ * REMOVED, not wrapped. A window that is reloaded or closed mid-delivery now costs
+ * nothing: every step and the settle happen here, and the outcome is recorded against
+ * the request id for a caller that comes back and asks again.
+ *
+ * Resolves with what HAPPENED; it never rejects for a delivery reason.
+ */
+ipcMain.handle('autoSubmit:submit', (_evt, req: unknown) => {
+  const r = (req && typeof req === 'object' ? req : {}) as Record<string, unknown>;
+  if (typeof r.requestId !== 'string' || !r.requestId || typeof r.agentId !== 'string' || !r.agentId
+    || typeof r.text !== 'string' || !r.text
+    || typeof r.admissionClass !== 'string' || !(ADMISSION_CLASSES as readonly string[]).includes(r.admissionClass)) {
+    return { kind: 'REJECTED', reason: 'BAD_REQUEST' };
+  }
+  const settleMs = typeof r.settleMs === 'number' && r.settleMs >= 0 && r.settleMs <= 10_000 ? r.settleMs : undefined;
+  return automaticSubmit.submit({
+    requestId: r.requestId, agentId: r.agentId, admissionClass: r.admissionClass as AdmissionClass,
+    text: r.text, settleMs
+  });
+});
+
+/**
+ * L0-FUSION stage 5.4b - A HUMAN RESOLVES AN INTERFERED HOLD.
+ *
+ * The only caller is a person's click in the composer, and the person SAYS HOW (human
+ * ruling, option B): 'SEND_AGAIN' - the message was not handled, re-admit it through the
+ * one owner with every gate - or 'ALREADY_HANDLED' - they dealt with it themselves, never
+ * type it again. There is NO DEFAULT: a call that does not name one of the two is refused
+ * and the hold stays, because the ambiguity of a bare "resolved" is exactly what produced
+ * duplicate deliveries. Nothing here looks at the prompt to guess. It types nothing, clears
+ * nothing and sends no Enter. There is deliberately no timer, no expiry and no main-side
+ * caller: automation does not get to decide a human's text is finished.
+ */
+ipcMain.handle('autoSubmit:resolveInterference', (_evt, agentId: unknown, how: unknown) => {
+  if (typeof agentId !== 'string' || !agentId) return false;
+  if (typeof how !== 'string' || !(INTERFERENCE_RESOLUTIONS as readonly string[]).includes(how)) return false;
+  const ptyId = ptyForAgent(agentId);
+  const resolved = ptyId ? automaticSubmit.resolveInterference(ptyId, how as InterferenceResolution) : false;
+  pushAgentImpact();
+  // The two human rulings stay distinct: SEND_AGAIN re-runs every guard, ALREADY_HANDLED
+  // resolves the ids with no further submit.
+  if (resolved) inboxWake?.onInterferenceResolved(agentId, how as InterferenceResolution);
+  return resolved;
+});
 
 // ─── IPC: scheduled missions (recurring auto-dispatch) ──────────────────────
 ipcMain.handle('missions:list', () => readConfig().missions ?? []);
@@ -3937,11 +4703,43 @@ ipcMain.handle('missions:save', (_evt, missions) => {
     (readConfig().missions ?? []).map((m) => [m.id, m] as const)
   );
   const merged = incoming.map((m) => {
-    const prevLastFired = persistedById.get(m.id)?.lastFiredAt ?? 0;
+    const prev = persistedById.get(m.id);
+    const prevLastFired = prev?.lastFiredAt ?? 0;
     const lastFiredAt = Math.max(m.lastFiredAt ?? 0, prevLastFired) || undefined;
-    return { ...m, lastFiredAt };
+    // TE0's two fields are scheduler-owned for exactly the same reason, and the
+    // renderer never sets them at all — so they are taken from the persisted
+    // record outright rather than max()'d. Without this, any save from the
+    // Schedules panel would drop the delta baseline and the next tick would
+    // dispatch on 'no-baseline': not dangerous (the gate fails open by design),
+    // but it would quietly undo the saving every time the user edits a schedule.
+    return {
+      ...m,
+      lastFiredAt,
+      lastDeltaFingerprint: prev?.lastDeltaFingerprint,
+      lastDispatchAt: prev?.lastDispatchAt
+    };
   });
   writeConfig({ missions: merged });
+  syncMissions();
+  return { ok: true };
+});
+/** TE0's force path: run a mission NOW, past the delta gate.
+ *
+ *  The gate only ever suppresses, so this is the other half of it — an operator
+ *  who wants a standup on a floor that has not moved needs a way to say so, and
+ *  before TE0 there was no run-now control at all.
+ *
+ *  Re-syncs afterwards because `fire()` stamps lastFiredAt, which is what the
+ *  Schedules row derives "next" from; without it the panel would advertise a next
+ *  run the timer was never going to honour. syncMissions re-arms every mission
+ *  from its own lastFiredAt, so nothing else's partially-elapsed interval moves. */
+ipcMain.handle('missions:runNow', (_evt, missionId: unknown) => {
+  const id = typeof missionId === 'string' ? missionId : '';
+  const entry = missionTimers.get(id);
+  // No entry means disabled or unknown; no `fire` means a heartbeat, which beats
+  // on its own adaptive cadence and has no dispatch to force.
+  if (!entry?.fire) return { ok: false, error: 'mission is not armed for dispatch' };
+  entry.fire(true);
   syncMissions();
   return { ok: true };
 });
@@ -4419,7 +5217,7 @@ registerRealtimeActionIpc({
   trackDispatch: (d) => { try { completionWatcher.track({ ...d, kind: 'dispatch' }); } catch { /* watcher unavailable */ } },
   // ── v0.3.4 full-control extensions ──
   controlResume: (id) => control.resume(id),
-  controlAutoDelivery: (id, paused) => control.pauseAutoDelivery(id, paused),
+  controlAutoDelivery: (id, paused) => { control.pauseAutoDelivery(id, paused); pushAgentImpact(); },
   controlGateTool: (id, toolName, on) => control.gateTool(id, toolName, on),
   setArchived: (id, archived) => {
     if (!hive.enabled()) return { ok: false, error: 'hive disabled' };
@@ -5011,6 +5809,11 @@ function bootstrapHiveServices(): void {
   // reply still belongs in the history.
   if ((readConfig().webhookTriggers ?? []).length > 0) startWebhookDoneObserver();
   hookServer.start();
+  // AGY 1.1.48 - prepare Antigravity statusline capture. This TAKES nothing: the lease
+  // on the user's global statusline is taken on the first AGY spawn and released when
+  // the last AGY agent leaves. Startup only gives back a lease a dead run left behind.
+  // After hookServer.start(), so a locator always names a listening pipe. Stable only.
+  hive.startAgyStatusline();
   // Bind the telemetry collector BEFORE the renderer spawns any agent, then point
   // the hive at it so every subsequent spawn is instrumented. Best-effort — a bind
   // failure just leaves telemetry off (transcript reconciler stays). No breaker.start():
@@ -5025,71 +5828,26 @@ function bootstrapHiveServices(): void {
   armAlwaysOnBeats();
 }
 
-/** Cadence of the worker inbox-wake watchdog (#151). Well under the renderer's
- *  own nudge cooldown so a throttled window is caught within ~15s of a stall. */
+/** Cadence of the inbox-wake RECONCILIATION beat. Events wake agents; this finds what a
+ *  lost callback or a restart missed. Unchanged in the pre-M1 bridge. */
 const WORKER_WAKE_POLL_MS = 15_000;
 let workerWakeTimer: ReturnType<typeof setInterval> | null = null;
 
-/** Type the renderer's guarded nudge into one worker's PTY — text first, Enter a
- *  tick later (the exact submitToPty pattern: a single-chunk write would land the
- *  "\r" inside the input box and never submit). Best-effort + never throws. */
-function nudgeWorker(ptyId: string, ids: string[] = []): void {
-  // Same text the renderer queues (#187's inboxNudgeText), so the two wake paths
-  // produce byte-identical nudges: the queue's one-pending rule recognises either
-  // via isInboxNudge, and a watchdog nudge names its ids so the agent can still
-  // tell "I filed this last turn" from "woken for nothing".
-  const wrote = ptyManager.write(ptyId, inboxNudgeText(ids));
-  if (!wrote.ok) { console.warn(`[worker-wake] write failed for ${ptyId}: ${wrote.error}`); return; }
-  setTimeout(() => {
-    try {
-      const submitted = ptyManager.write(ptyId, '\r');
-      if (!submitted.ok) console.warn(`[worker-wake] submit failed for ${ptyId}: ${submitted.error}`);
-    } catch (e) { console.error('[worker-wake] submit threw:', e); }
-  }, 140);
-}
-
-/** Main-process inbox-wake beat (issue #151, fix A): the renderer's idle nudge
- *  (useHive.ts) is the only path that wakes a worker parked on an undrained
- *  inbox — and it lives on a setInterval in the renderer, which a throttled or
- *  occluded window stops honoring. This beat is the renderer-INDEPENDENT fallback:
- *  it gathers live-worker facts (PTY quiescence, inbox depth, control flags) and
- *  lets WorkerWakeWatchdog.decide apply the exact renderer guards (idle-only,
- *  post-boot-grace, not paused/halted, no pending HITL, cooldown), then types the
- *  same nudge the renderer would have. God is never a candidate (its heartbeat
- *  path already re-engages it). */
+/** Inbox-wake RECONCILIATION (pre-M1 bridge). Every live, non-archived agent - god
+ *  included, with no exclusion - goes through the SAME `requestInboxWake` the events use,
+ *  in reconcile mode (PTY quiescence may stand in for a missed Stop, rate-limited per
+ *  agent). There is no second submit implementation here. */
 function runWorkerWakeBeat(): void {
-  if (!hive.enabled()) return;
+  if (!hive.enabled() || !inboxWake) return;
   const reg = hive.registry();
-  if (!reg?.agents || !reg.godId) return;
-  const now = Date.now();
-  const facts: WorkerWakeFacts[] = [];
-  for (const [agentId, a] of Object.entries(reg.agents)) {
-    if (agentId === reg.godId || a?.archived) continue;
-    const ptyId = ptyForAgent(agentId);
-    if (!ptyId) continue;
-    const snap = control.snapshot(agentId);
-    facts.push({
-      agentId,
-      isGod: agentId === reg.godId,
-      ptyId,
-      lastOutputAt: ptyManager.lastOutputAt(ptyId) ?? 0,
-      inboxIds: hive.inbox(agentId).map((message) => message.id).filter(Boolean),
-      autoDeliveryPaused: snap.autoDeliveryPaused,
-      paused: snap.paused,
-      halted: snap.halted
-    });
-  }
-  for (const agentId of workerWake.decide(facts, now)) {
-    const ptyId = ptyForAgent(agentId);
-    if (!ptyId) continue;
-    // Re-read at delivery time, not from the facts snapshot: the agent may have
-    // drained the mail during the beat, and a nudge naming ids it already filed
-    // is the exact staleness #187 exists to stop.
-    const ids = hive.inbox(agentId).map((m) => m.id).filter(Boolean);
-    if (!ids.length) { console.log(`[worker-wake] ${agentId} drained before delivery, skipping`); continue; }
-    console.log(`[worker-wake] nudging ${agentId} on ${ptyId} (${ids.length} pending)`);
-    nudgeWorker(ptyId, ids);
-  }
+  if (!reg?.agents) return;
+  const live = Object.entries(reg.agents)
+    .filter(([agentId, a]) => !a?.archived && ptyForAgent(agentId))
+    .map(([agentId]) => agentId);
+  // Proves the 15s beat is ARMED and running at all, and over how many agents. This alone
+  // separates "armAlwaysOnBeats never ran" from "it ran and every claim was refused".
+  wakeDiag('beat', { live: live.length, agents: live.join(',') });
+  inboxWake.reconcileAll(live);
 }
 
 /** (Re)arm the always-on beats (decoupled from the optional heartbeat): the live
@@ -5105,6 +5863,7 @@ function armAlwaysOnBeats(): void {
   breakerBeatTimer = setInterval(() => { try { runBreakerBeat(300_000); } catch (e) { console.error('[breaker beat]', e); } }, 30_000);
   if (workerWakeTimer) clearInterval(workerWakeTimer);
   workerWakeTimer = setInterval(() => { try { runWorkerWakeBeat(); } catch (e) { console.error('[worker-wake beat]', e); } }, WORKER_WAKE_POLL_MS);
+  wakeDiag('beats-armed', { cadenceMs: WORKER_WAKE_POLL_MS });
   runWorkerWakeBeat(); // catch-up on arm — power-resume re-arms and drains the backlog
 }
 
@@ -5304,6 +6063,19 @@ app.on('before-quit', (e) => {
     mainWindow.focus();
     mainWindow.webContents.send('app:closeRequested', { ptyCount: count });
   }
+});
+
+// The last chance to flush a coalesced capacity write. `before-quit` can be
+// preventDefault-ed by the running-terminals warning above, so the flush hangs off
+// `will-quit`, which only fires once the quit is actually going ahead.
+app.on('will-quit', () => {
+  capacityStore.saveNow();
+  capacityDetailTicker.stopAll();
+  // AGY statusline lease. `before-quit` only routes through teardownAndQuit when
+  // terminals are open, so an ordinary quit with none would otherwise leave the user's
+  // statusline pointing at Munder while Munder is closed. Idempotent: a no-op when the
+  // teardown path already released it.
+  try { hive.stopAgyStatusline(); } catch (e) { console.error('[will-quit] stopAgyStatusline:', e); }
 });
 
 app.on('window-all-closed', () => {

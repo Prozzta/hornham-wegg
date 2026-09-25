@@ -1,6 +1,6 @@
 import { readdir, lstat, open, realpath, stat } from 'node:fs/promises';
 import type { FileHandle } from 'node:fs/promises';
-import { constants } from 'node:fs';
+import { constants, realpathSync } from 'node:fs';
 import { basename, dirname, isAbsolute, join, normalize, relative, resolve, sep } from 'node:path';
 import { homedir } from 'node:os';
 import { imageMimeForPath } from '../shared/imageTypes';
@@ -363,4 +363,36 @@ export async function statAbs(p: string): Promise<{ exists: boolean; isFile: boo
   } catch {
     return { exists: false, isFile: false, path: abs };
   }
+}
+
+/**
+ * Are these two paths the same location on this machine?
+ *
+ * WHY IT EXISTS (AGY-HOOKS-GLOBAL-GUARD). Some installers write the USER'S GLOBAL config
+ * - `~/.gemini/config/hooks.json`, `~/.grok/hooks/…`, the Antigravity `statusLine` - and
+ * those writes are only ever legitimate for the one hive the app is actually configured
+ * to run. Deciding that means comparing a hive home against the configured one, and a
+ * string compare is not good enough: a trailing separator, a `~`, or a difference of case
+ * on Windows would all read as "a different home" and quietly re-enable the write.
+ *
+ * Case is folded only where the filesystem folds it, the same rule `capacityScope` uses.
+ * Symlinks are resolved where they resolve; an unresolvable path falls back to its
+ * normalized self, so a home that does not exist yet still compares sanely.
+ */
+export function samePath(a: string | null | undefined, b: string | null | undefined): boolean {
+  if (typeof a !== 'string' || typeof b !== 'string') return false;
+  const norm = (p: string): string | null => {
+    const abs = expandTilde(p);
+    if (!abs || !isAbsolute(abs)) return null;
+    // `expandTilde` has already resolved this to an absolute, normalized path - trailing
+    // separators and `..` segments included - so the only normalization left to do is
+    // the one it cannot do: follow symlinks. (Two earlier mutants, a trailing-separator
+    // trim and a second `resolve`, both survived because they were dead code.)
+    let out = abs;
+    try { out = realpathSync(out); } catch { /* not created yet: the normalized path stands */ }
+    return process.platform === 'win32' || process.platform === 'darwin' ? out.toLowerCase() : out;
+  };
+  const x = norm(a);
+  const y = norm(b);
+  return x !== null && y !== null && x === y;
 }

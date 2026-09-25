@@ -112,6 +112,13 @@ export interface HarnessConfig {
   /** Per-agent total-token ceiling, keyed by agent id. Overrides the floor budget
    *  for that agent's meter and trips the breaker for it alone. */
   agentTokenCaps?: Record<string, number>;
+  /** v1.1.45 CAPUI-MONITOR: what each agent's first Monitor line shows. Absent = 'budget'.
+   *  'fiveHour' / 'weekly' show that provider window's usage AND exempt the agent from the
+   *  budget limits (see src/shared/agentUsage.ts). Claude/Codex agents only. */
+  agentUsageDisplay?: Record<string, 'budget' | 'fiveHour' | 'weekly'>;
+  /** v1.1.45 unit #8 (C2.8): the capacity-display threshold, an integer 1-99 (default 15).
+   *  Display only: it gates the strip's Weekly reveal and the 5h/Weekly reset hints. */
+  capacityWeeklyDisplayThreshold?: number;
   autoDeliveryPausedAgents?: string[];
   maxTurns?: number;
   circuitBreaker?: CircuitBreakerConfig;
@@ -168,7 +175,10 @@ export interface ModelOption {
 // happens to choose, which the UI cannot show and the user cannot predict. The
 // harness default is marked ` · default` instead, and it names a real model.
 export const AGENT_MODELS: ModelOption[] = [
+  { id: 'claude-fable-5-1', label: 'Fable 5.1' },
   { id: 'claude-fable-5', label: 'Fable 5' },
+  { id: 'claude-opus-5-5', label: 'Opus 5.5' },
+  { id: 'claude-opus-5-5[1m]', label: 'Opus 5.5 · 1M' },
   { id: 'claude-opus-5', label: 'Opus 5 · 1M' },
   { id: 'claude-opus-4-8', label: 'Opus 4.8' },
   { id: 'claude-opus-4-8[1m]', label: 'Opus 4.8 · 1M' },

@@ -33,7 +33,20 @@ export type UpdateStatus =
 
 export type UpdateAction = 'none' | 'check' | 'download' | 'restart' | 'open-release' | 'manual';
 
-export const REPO = 'chaitanyagiri/munder-difflin';
+/** THE ONLY place the app's release home is named. Every update feed, release
+ *  lookup, installer download URL, "view release" link and the Settings hero
+ *  fetch is derived from this one constant, so the app can never be repointed
+ *  half-way — one file saying Prozzta while another still says upstream.
+ *
+ *  It is the human's own repository, and deliberately NOT the upstream project
+ *  this app was forked from. The packaged app must only ever look for, fetch or
+ *  offer a build from here. Prozzta/hornham-wegg publishes no GitHub releases,
+ *  so the updater finds nothing and stays dormant, which is the intended safe
+ *  state until a release is published there on purpose.
+ *
+ *  (The git remote named `upstream` is the dev-time cherry-pick library and is
+ *  not a runtime path; nothing in the running app reads it.) */
+export const REPO = 'Prozzta/hornham-wegg';
 
 /** The installer for THIS machine in the release tagged v{version}, by the
  *  names electron-builder.yml produces. Used when a status carries no

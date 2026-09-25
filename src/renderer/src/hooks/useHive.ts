@@ -11,16 +11,15 @@ import {
 import {
   clearCommandForProvider,
   compactionCommandForProvider,
-  remoteControlCommandForProvider,
-  terminalReadyToReceive
+  remoteControlCommandForProvider
 } from '../../../shared/providerAutomation';
 import { DEFAULT_CONTEXT_TRIGGER, type ContextRule } from '../../../shared/triggers';
 import type { AgentProvider } from '../../../shared/agentProvider';
 import { bridgeOf, providerPreset } from '../../../shared/agentProvider';
 import { isDurableRole, preferredAgentRole, roleForHiveSpawn } from '../../../shared/agentRole';
-import { inboxNudgeText } from '../../../shared/hiveNudge';
 import { acquireTerminal, resetTerminal, isTerminalAutomationSafe } from '@/components/terminalPool';
 import { canDeliverToAgent, deliverWithAcknowledgement, checkPrecondition } from './queueDelivery';
+import type { AutoSubmitOutcome } from '../../../preload';
 import { OFFICE_CAST, DEFAULT_CHARACTER } from '@/scene/office/cast';
 
 const GOD_ID = 'god';
@@ -46,7 +45,7 @@ const QUIESCE_POLL_MS = 4000;
 const BOOT_GRACE_MS = 35_000;
 // Delay before typing a one-time TUI protocol seed into a fresh worker (3b) —
 // long enough for the TUI to finish painting and surface any permission prompt.
-// submitToPty additionally waits for the terminal's readiness handshake.
+// Main's submit owner additionally waits for the terminal's readiness handshake.
 const SEED_BOOT_MS = 12_000;
 
 /** Hive-aware / hooks-bridge engines get standing goals via HookServer
@@ -80,79 +79,51 @@ const INITIAL_GOD_PROMPT = [
   'Then begin orchestrating: triage requests, delegate work to the team, and keep everyone unblocked. You are fully autonomous — there is no approval queue, so handle tool-permission prompts in this session yourself (the human can approve them remotely from their phone).'
 ].join('\n');
 
-// Per-pty submission chain. Every submitToPty for a given pty is appended here so
-// two callers (e.g. the boot sequence's /remote-control and the inbox-wake nudge)
-// can NEVER interleave their text + Enter — which jammed them onto one line and
-// produced "Unknown command: /remote-control<next prompt>".
-const writeChains = new Map<string, Promise<void>>();
-const readyPids = new Map<string, number>();
+// L0-FUSION stage 5.3 — THE RENDERER NO LONGER TYPES PROGRAMMATICALLY AT ALL.
+//
+// This file used to own a whole submit path: a per-pty promise chain (`writeChains`) that
+// ordered text+Enter, a readiness poll, the `typeAndSubmit` order, and a capacity ticket
+// it asked main to mint, mark and settle. Every one of those is REMOVED, not wrapped. The
+// one main-owned submit transaction (`src/main/automaticSubmit.ts`) now resolves the PTY,
+// asks capacity, waits for readiness, stages, holds the TUI gap, re-checks everything next
+// to the Enter, and settles — for every class of programmatic message — and it serializes
+// them per terminal, so two callers can still never jam their text and Enter together.
+//
+// What stays HERE is exactly the renderer's one job: choosing WHICH message to deliver
+// and WHEN to ask, and acknowledging a queue item on a reported COMMIT. And main's
+// `pty:write` now REFUSES a renderer write that declares origin PROGRAMMATIC, so this is
+// not a convention this file keeps — it is a capability it no longer has.
 
-async function waitForTerminalReady(
-  ptyId: string,
-  provider: AgentProvider,
-  timeoutMs = 30_000
-): Promise<void> {
-  const started = Date.now();
-  while (Date.now() - started < timeoutMs) {
-    const live = await window.cth.listPtys();
-    const pty = live.find((entry) => entry.id === ptyId);
-    if (!pty) throw new Error(`PTY exited before becoming ready: ${ptyId}`);
-    if (readyPids.get(ptyId) === pty.pid) return;
-    if (terminalReadyToReceive(pty.hasOutput, Date.now() - started, provider)) {
-      readyPids.set(ptyId, pty.pid);
-      return;
-    }
-    await new Promise((resolve) => setTimeout(resolve, 100));
-  }
-  throw new Error(`PTY did not become ready within ${timeoutMs}ms: ${ptyId}`);
+let autoSubmitSeq = 0;
+/** A one-off request id, for a message that has no stable id of its own (boot prompts). */
+function oneOffRequestId(kind: string, agentId: string): string {
+  return `${kind}:${agentId}:${Date.now()}:${(autoSubmitSeq += 1)}`;
 }
 
+const BOOT_PROMPT_RETRY_MS = 1500;
+const BOOT_PROMPT_MAX_ATTEMPTS = 40;
+
 /**
- * Type a line into an agent's Claude Code TUI and actually submit it.
+ * Hand a BOOT-SEQUENCE prompt (remote-control, seed, orientation) to main, and keep
+ * asking while main says "not now".
  *
- * Writing the text and the carriage return in a single chunk makes the TUI
- * treat the whole thing as a paste, so the "\r" lands as a newline inside the
- * input box instead of submitting — the command just sits there as text. We
- * send the text first, then the Enter as a separate keystroke a tick later so
- * the prompt is registered and executed. Idle autonomous agents thus act on a
- * dispatched instruction on their own.
- *
- * Submissions to the same pty are serialized (and each settles for `settleMs`
- * after Enter) so concurrent callers can't jam their input together.
- *
- * The text is wrapped in bracketed-paste markers (ESC[200~ … ESC[201~) so the
- * TUI treats it as ONE paste: embedded newlines land as literal newlines in the
- * input box. Without them, every "\n" in a multi-line message acted as Enter —
- * the message submitted line-by-line in fragments (the agent saw only the last
- * chunk). The closing Enter, sent a tick later, submits the whole block. (#24) */
-function submitToPty(
-  ptyId: string,
-  text: string,
-  provider: AgentProvider,
-  settleMs = 250
-): Promise<void> {
-  const prev = writeChains.get(ptyId) ?? Promise.resolve();
-  const next = prev.catch(() => { /* a failed prior write must not stall the chain */ }).then(async () => {
-    await waitForTerminalReady(ptyId, provider);
-    // Bracketed paste (ESC[200~ … ESC[201~) only matters for MULTI-LINE text, so a
-    // stray "\n" doesn't submit early (#24). Single-line text (nudges, slash
-    // commands) is sent raw — some TUIs (Antigravity's agy) treat the paste
-    // markers as literal input and never submit, so skipping them is more robust.
-    const payload = text.includes('\n') ? `\x1b[200~${text}\x1b[201~` : text;
-    // writePty NEVER rejects for a dead pty — it resolves { ok:false, error:
-    // 'no pty: …' } — so an unchecked await here made every failed delivery look
-    // successful (the queue-drain then destroyed the message it had already
-    // popped, #36). Surface the failure as a rejection; the chain itself is
-    // immune (the prev.catch above absorbs it for the next writer).
-    const wrote = await window.cth.writePty(ptyId, payload);
-    if (!wrote?.ok) throw new Error(wrote?.error ?? `pty write failed: ${ptyId}`);
-    await new Promise((r) => setTimeout(r, 140));
-    const submitted = await window.cth.writePty(ptyId, '\r');
-    if (!submitted?.ok) throw new Error(submitted?.error ?? `pty write failed: ${ptyId}`);
-    await new Promise((r) => setTimeout(r, settleMs));
-  });
-  writeChains.set(ptyId, next);
-  return next;
+ * A REFUSED or ABORTED outcome left NOTHING on the prompt — the terminal was not ready, a
+ * human was typing, a picker was open — so asking again is free and is the right thing:
+ * a spawn needs its orientation. The SAME request id is reused, so however the retries
+ * interleave the prompt is delivered at most once. Anything else (INTERFERED, FAILED,
+ * REJECTED) is final and throws, exactly as a dead PTY used to.
+ */
+async function submitBootPrompt(agentId: string, text: string, settleMs?: number): Promise<void> {
+  const requestId = oneOffRequestId('boot', agentId);
+  for (let attempt = 0; attempt < BOOT_PROMPT_MAX_ATTEMPTS; attempt += 1) {
+    const outcome = await window.cth.autoSubmit({ requestId, agentId, admissionClass: 'BOOT_SEQUENCE', text, settleMs });
+    if (outcome.kind === 'COMMITTED') return;
+    if (outcome.kind !== 'REFUSED' && outcome.kind !== 'ABORTED') {
+      throw new Error(`boot prompt for ${agentId} not delivered: ${outcome.kind}`);
+    }
+    await new Promise((r) => setTimeout(r, BOOT_PROMPT_RETRY_MS));
+  }
+  throw new Error(`boot prompt for ${agentId} not delivered: still refused after ${BOOT_PROMPT_MAX_ATTEMPTS} attempts`);
 }
 
 /** Wrap a user message as an enrich task for the assistant. The assistant's
@@ -275,28 +246,11 @@ function passesContextPressure(a: Agent, rule: ContextRule): boolean {
  *   3. wakes idle agents that have unread inbox messages so collaboration
  *      doesn't stall while an agent sits at its prompt.
  */
+/** The renderer inbox-hint cadence: 1.1.45's 4s poll, kept as a TRIGGER only. Faster than
+ *  main's 15s reconciliation beat, so an idle agent picks its mail up promptly. */
+const INBOX_HINT_MS = 4_000;
+
 export function useHive(config: HarnessConfig | null): void {
-  // Per-agent dedup for the inbox-wake nudge: every inbox message id we have
-  // already nudged this agent about. A SET, not a high-water mark.
-  //
-  // This used to hold one string — the lexicographically largest id in the inbox,
-  // read as "the newest". Message ids are usually `<timestamp>-<rand>`, so that
-  // held, but an agent may set its own `id` in the outbox JSON and the hive keeps
-  // it verbatim (hive.ts normalize: `partial.id ?? ...`). One such id in god's
-  // inbox — `dev15-progress-canvas-v4` — sorts above EVERY `2026-*` timestamp and
-  // never drains, so the "newest" id was frozen on it: Michael was nudged once per
-  // app launch and then never again, however much real mail piled up behind it.
-  // Tracking the ids we have seen has no such ordering assumption, and it keeps
-  // the property the high-water mark was there for: draining removes ids from the
-  // INBOX without adding anything new, so a drain still produces no nudge.
-  //
-  // Note what this set does NOT do: it never shrinks. Ids accumulate for the life
-  // of the window (a restart clears it), because forgetting an id we have already
-  // nudged for would re-nudge the moment that message reappeared in a listing. The
-  // cost is a few tens of bytes per message, which for a 24/7 floor is real but
-  // negligible next to a stalled agent. Evicting ids that have left the inbox would
-  // bound it exactly; deliberately not done here to keep this fix minimal.
-  const nudged = useRef<Record<string, Set<string>>>({});
   // Per-agent context size at the last auto-/compact queued. See the latch note
   // in the context-trigger effect: an idle agent's token count is frozen, so
   // without this the pressure gate re-fires on the identical number every cycle.
@@ -441,14 +395,14 @@ export function useHive(config: HarnessConfig | null): void {
           if (remoteCommand) {
             // settleMs pauses the chain ~1.5s after /remote-control before the
             // orientation prompt (fresh spawns only) is submitted next.
-            await submitToPty(GOD_PTY, remoteCommand, godProvider, REMOTE_CONTROL_SETTLE_MS);
+            await submitBootPrompt(GOD_ID, remoteCommand, REMOTE_CONTROL_SETTLE_MS);
           }
           if (!cancelled && !resumedGod) {
             // A type-into-tui god (Crush) can't ride its hive protocol on argv, so the
             // main process hands it back as seedPrompt — type it FIRST (identity), then
-            // the orientation kick. Serialized via writeChains so they can't jam. (ondev-b)
-            if (res.seedPrompt) await submitToPty(GOD_PTY, res.seedPrompt, godProvider);
-            await submitToPty(GOD_PTY, INITIAL_GOD_PROMPT, godProvider);
+            // the orientation kick. Serialized by main's submit owner so they can't jam. (ondev-b)
+            if (res.seedPrompt) await submitBootPrompt(GOD_ID, res.seedPrompt);
+            await submitBootPrompt(GOD_ID, INITIAL_GOD_PROMPT);
           }
         } catch { /* PTY may have died during startup */ }
         finally { bootGraceUntil.current[GOD_ID] = 0; }
@@ -487,11 +441,22 @@ export function useHive(config: HarnessConfig | null): void {
         // Antigravity (agy): the model is being called — it's thinking/working.
         if (!breakerArmed) updateAgent(e.agentId, { status: 'working', action: 'thinking' });
       } else if (e.event === 'PostInvocation') {
-        // agy's per-turn boundary. Unlike Claude, agy's Stop fires only on process
-        // EXIT, so without this an agy worker would never register as idle and the
-        // inbox-wake nudge (idle-only) could never reach it — its mail would sit
-        // undrained. Treat it as idle; a follow-up tool/turn re-sets working.
-        if (!breakerArmed) updateAgent(e.agentId, { status: 'idle', action: 'idle', carrying: undefined });
+        // AGY 1.1.48 — PostInvocation IS NO LONGER IDLE, here or anywhere.
+        //
+        // It is agy's per-invocation boundary, not its per-TURN boundary: one turn that
+        // calls tools makes several invocations, so this fires repeatedly mid-turn. It
+        // was read as idle because agy's Stop fires only on process EXIT and something
+        // had to make a worker reachable — but the price was a floor display that said
+        // "idle" in the middle of a tool chain, and the split-brain in the 1.1.47 stall,
+        // where the UI showed idle while main correctly refused with lifecycle-active.
+        //
+        // The replacement is the native statusline status pushed on hive:providerStatus
+        // below, which is the provider's own answer rather than our inference. No status
+        // It is now treated exactly like PostToolUse — the conservative reading that a
+        // turn is still in progress between invocations — and only the native tick ends
+        // it. Asserting idle from a boundary we know fires mid-turn is the one reading
+        // that cannot be recovered from; asserting working merely waits.
+        if (!breakerArmed) updateAgent(e.agentId, { status: 'working' });
       } else if (e.event === 'Stop' || e.event === 'SubagentStop') {
         // A blocked Stop means the agent is being re-engaged to process its
         // inbox — it's NOT idle, so keep it working until it genuinely stops.
@@ -527,6 +492,31 @@ export function useHive(config: HarnessConfig | null): void {
           // Idle notification — responded, nothing to do. Linger, don't flag.
           updateAgent(e.agentId, { status: 'idle', action: 'idle', carrying: undefined });
         }
+      }
+    });
+  }, []);
+
+  // 2a-bis) The CANONICAL provider-native status (AGY 1.1.48). Main classifies one
+  //     version-validated statusline tick and pushes the result; this displays it.
+  //     Nothing is parsed or inferred here, and nothing here authorises a wake — main
+  //     owns submission, and it reached the same conclusion from the same tick before
+  //     this push was sent. The breaker keeps precedence, as it does over hook events.
+  useEffect(() => {
+    return window.cth.onHiveProviderStatus((e) => {
+      const { updateAgent, agents } = useStore.getState();
+      const self = agents.find((a) => a.id === e.agentId);
+      if (!self) return;
+      const blevel = breakerLevel.current[e.agentId];
+      if (blevel === 'constrained' || blevel === 'stopped') return;
+      if (e.status === 'idle') {
+        updateAgent(e.agentId, { status: 'idle', action: 'idle', carrying: undefined });
+      } else if (e.status === 'running') {
+        updateAgent(e.agentId, { status: 'working' });
+      } else {
+        // A confirmation prompt is genuinely blocked on a person. Same split the
+        // Notification branch makes: only god escalates to the human, a worker reads
+        // as waiting on god rather than on you.
+        updateAgent(e.agentId, { status: self.isGod ? 'blocked' : 'waiting', carrying: undefined });
       }
     });
   }, []);
@@ -658,57 +648,30 @@ export function useHive(config: HarnessConfig | null): void {
     return () => clearInterval(iv);
   }, [config?.onboardingComplete]);
 
-  // 3) Wake agents holding unread inbox messages. The assistant is send-only
-  //    (it never receives inbox mail), so it's excluded.
+  // 3) The renderer inbox HINT. Main is still the ONLY producer of inbox wakes: this
+  //    loop carries no payload and makes no decision, it just asks main to look, and
+  //    main re-reads the inbox, applies every guard, takes its ONE claim under its ONE
+  //    stable request id and submits through the ONE owner. A hint is not a submitter,
+  //    and that distinction is the whole design: two submitters would make two request
+  //    ids for the same inbox edge, and the owner — which is idempotent on requestId —
+  //    would serialize them into two real turns.
   //
-  //    QUEUES the nudge rather than typing it. This loop used to write straight
-  //    into the terminal, which made it the one automatic writer that could land
-  //    on top of whatever the user was typing — its text fused onto the user's
-  //    half-written line and the pair got submitted as one garbled prompt. Going
-  //    through the queue means effect #4 owns every decision about when a
-  //    terminal may be typed into: idle, off cooldown, past boot grace, delivery
-  //    not paused, and no user draft in the way. One gate, one place, and this
-  //    loop stops needing prompt logic of its own. /compact (effect #6) has
-  //    always worked this way.
+  //    WHY IT IS BACK. 1.1.45's 4s poll was the only thing waking workers; C3 deleted it
+  //    in the same release that made main the producer, so when main's claim refused
+  //    (the SessionStart cold-boot deadlock) there was no producer left and the packaged
+  //    floor stalled silently. This restores the 4s CADENCE — an independent trigger,
+  //    faster than the 15s beat — without restoring the second submitter.
+  //
+  //    It cannot mask a main-side decision bug, by construction: if main refuses, poking
+  //    it more often changes nothing. That is what the stall watchdog in main is for.
   useEffect(() => {
     if (!config?.onboardingComplete) return;
-    const iv = setInterval(async () => {
-      const agents = useStore.getState().agents.filter((a) => a.ptyId);
-      for (const a of agents) {
-        try {
-          const inbox = await window.cth.hiveInbox(a.id);
-          // Nudge on any id we have not nudged for yet (#130's per-id Set).
-          // Draining shrinks the set and introduces nothing new, so this POLL
-          // stays quiet; a genuinely new message fires regardless of how its id
-          // happens to sort.
-          //
-          // That reasoning covers the poll only — it does NOT survive the gap
-          // between enqueue and delivery, which is why the nudge carries an
-          // 'inbox-nonempty' precondition that the drain re-checks before typing.
-          // Without it: mail lands and queues a nudge, the already-awake agent
-          // drains the whole inbox in that same turn, and the nudge is typed into
-          // an empty inbox afterwards — a wasted turn, and the most expensive one
-          // on the floor when the agent is god.
-          const seen = nudged.current[a.id] ?? (nudged.current[a.id] = new Set());
-          const fresh = inbox.filter((m) => m.id && !seen.has(m.id));
-          if (fresh.length) {
-            // Name the ids: the nudge is queued now and typed whenever the agent
-            // next goes idle, so it can arrive long after the agent drained and
-            // filed this very mail. Carrying the ids is what lets it tell
-            // "already handled" from "woken for nothing". The queue keeps only
-            // one nudge pending per agent (see enqueueMessage), so a suppressed
-            // copy's ids stay unnamed — hence the text points at the pending
-            // inbox as the authority rather than at the list.
-            useStore.getState().enqueueMessage(
-              a.id,
-              inboxNudgeText(fresh.map((m) => m.id)),
-              { precondition: 'inbox-nonempty' }
-            );
-            for (const m of fresh) seen.add(m.id);
-          }
-        } catch { /* ignore */ }
+    const iv = setInterval(() => {
+      for (const a of useStore.getState().agents) {
+        if (!a.ptyId) continue;
+        void window.cth.hiveRequestInboxWake(a.id).catch(() => { /* main decides; a hint may be dropped */ });
       }
-    }, 4000);
+    }, INBOX_HINT_MS);
     return () => clearInterval(iv);
   }, [config?.onboardingComplete]);
 
@@ -746,11 +709,7 @@ export function useHive(config: HarnessConfig | null): void {
             useStore.getState().updateAgent(a.id, { seedPrompt: seed });
             return;
           }
-          submitToPty(
-            ptyId,
-            withStandingGoal(live, seed),
-            inferAgentProvider(live.command, live.provider)
-          )
+          submitBootPrompt(live.id, withStandingGoal(live, seed))
             .catch(() => { /* pty may have died */ });
         }, SEED_BOOT_MS);
       }
@@ -806,6 +765,13 @@ export function useHive(config: HarnessConfig | null): void {
       // the queue with no escape hatch at all. Idle/draft/picker safety below
       // still applies to manual messages; only the pause is bypassed.
       if (control?.autoDeliveryPaused && !next.manual) return { sent: false };
+      // Provider capacity refuses an automatic turn on this agent's pool. MAIN
+      // decides this — the flag arrives computed and is never derived here — and the
+      // message stays at the head of the queue: this early return costs no send
+      // attempt, so a limited provider delays work instead of destroying it. `manual`
+      // bypasses it for the same reason it bypasses the pause: a person pressing
+      // "send now" is not an automatic start.
+      if (control?.capacityHold && !next.manual) return { sent: false };
       // Hold queued messages until the target finishes its boot sequence.
       if ((bootGraceUntil.current[target.id] ?? 0) >= now) return { sent: false };
       // The user owns the prompt: a draft they are writing, or a menu they
@@ -829,17 +795,30 @@ export function useHive(config: HarnessConfig | null): void {
       inFlight.add(flightKey);
       lastFlush.current[target.id] = now;
       try {
+        // MAIN DELIVERS; this only asks. `manual` ("send now") is USER_RELEASED: a person
+        // asked for it, so main does not ask capacity — it still serializes, still
+        // revalidates immediately before Enter, and still stops on human interference.
+        // Everything else is CAPACITY_GATED and gets main's full fail-closed gate.
+        //
+        // The request id is the queue item's OWN id, stable for as long as the item lives.
+        // Main delivers an id AT MOST ONCE: a refusal frees it for the next ask, a COMMIT
+        // is remembered — so a reload between main's Enter and this acknowledgement can
+        // no longer type the message twice.
+        let outcome: AutoSubmitOutcome;
+        try {
+          outcome = await window.cth.autoSubmit({
+            requestId: `queue:${srcId}:${next.id}`,
+            agentId: target.id,
+            admissionClass: next.manual ? 'USER_RELEASED' : 'CAPACITY_GATED',
+            // `instruction` (when present) is the authoritative text to type into
+            // the PTY; UI/card surfaces continue to show the readable `text`.
+            text: withStandingGoal(target, wrap ? wrap(next) : (next.instruction ?? next.text))
+          });
+        } catch (e) {
+          outcome = { kind: 'FAILED', reason: `ipc: ${String(e)}` };
+        }
         const sent = await deliverWithAcknowledgement(
-          // `instruction` (when present) is the authoritative text to type into
-          // the PTY; UI/card surfaces continue to show the readable `text`.
-          () => submitToPty(
-            target.ptyId!,
-            withStandingGoal(
-              target,
-              wrap ? wrap(next) : (next.instruction ?? next.text)
-            ),
-            inferAgentProvider(target.command, target.provider)
-          ),
+          async () => { if (outcome.kind !== 'COMMITTED') throw new Error(outcome.kind); },
           () => {
             removeQueuedMessage(srcId, next.id);
             // Zero the gauge on a DELIVERED /clear — the new session's context
@@ -858,16 +837,41 @@ export function useHive(config: HarnessConfig | null): void {
           delete sendFailures[next.id];
           return { sent: true, message: next };
         }
-        // Failed write (dead/crashed pty the store still thinks is idle): retry
-        // on the next cooldown-spaced flush, but only MAX_SEND_ATTEMPTS times —
-        // then drop LOUDLY so the loss is diagnosable. (#113/#36)
+        // NOT DELIVERED, AND NOTHING OF OURS IS ON THE PROMPT (REFUSED / ABORTED): main
+        // declined before typing, or typed and verifiably erased. That is "not now", not
+        // a failure — capacity held it, a human owns the line, the terminal cannot be
+        // proven safe — so the item simply stays queued and costs no send attempt.
+        if (outcome.kind === 'REFUSED' || outcome.kind === 'ABORTED') return { sent: false };
+        // HUMAN_HANDLED: a person resolved an INTERFERED hold on THIS message with "already
+        // handled - drop". Main recorded that against the id; it is never typed again. The
+        // composer normally removes the row itself - this is the backstop for a copy that
+        // was asked for again before it did. It is not a delivery: no send side-effects.
+        if (outcome.kind === 'HUMAN_HANDLED') {
+          delete sendFailures[next.id];
+          removeQueuedMessage(srcId, next.id);
+          console.warn(`[queue-drain] message ${next.id} for ${target.id} dropped: a person marked it already handled`);
+          return { sent: false };
+        }
+        // INTERFERED: a human wrote onto our staged text. Main sent no Enter and cleared
+        // nothing, and it now refuses automatic delivery to that terminal until a human
+        // resolves it. The item is HELD — never retried into the prompt, never dropped.
+        // It is SHOWN as held by the composer, which reads the hold from main's control
+        // snapshot (`interfered`) rather than from a flag kept here: main owns the hold,
+        // and a copy in this window would outlive the terminal it was raised on.
+        if (outcome.kind === 'INTERFERED') {
+          console.warn(`[queue-drain] message ${next.id} for ${target.id} is HELD: a human typed after it was staged (${outcome.reason})`);
+          return { sent: false };
+        }
+        // FAILED / REJECTED: the terminal died under the message, or the request was
+        // malformed. Retry on the next cooldown-spaced flush, but only MAX_SEND_ATTEMPTS
+        // times — then drop LOUDLY so the loss is diagnosable. (#113/#36)
         const attempts = (sendFailures[next.id] ?? 0) + 1;
         sendFailures[next.id] = attempts;
         if (attempts >= MAX_SEND_ATTEMPTS) {
           delete sendFailures[next.id];
           removeQueuedMessage(srcId, next.id);
           console.warn(
-            `[queue-drain] dropping message ${next.id} for ${target.id} after ${attempts} failed pty writes ` +
+            `[queue-drain] dropping message ${next.id} for ${target.id} after ${attempts} failed deliveries ` +
             `("${next.text.slice(0, 80)}${next.text.length > 80 ? '…' : ''}")`
           );
         }

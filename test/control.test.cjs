@@ -55,3 +55,50 @@ test('whitespace-only steers are ignored and never fill the queue', () => {
   assert.equal(control.snapshot('dev9').pendingSteers, 1);
   assert.equal(control.takeSteer('dev9'), 'real guidance');
 });
+
+// ─── Pre-M1 event-wake bridge: observable release transitions, unchanged snapshots ─────
+
+test('the transition observer reports REAL changes only; a setter given its current value is silent', () => {
+  const control = new ControlRegistry();
+  const seen = [];
+  control.setTransitionObserver((id, t, snap) => seen.push([id, t, snap.paused, snap.halted, snap.autoDeliveryPaused]));
+  control.pause('a', false);                  // already unpaused
+  control.resume('a');                        // nothing to resume
+  control.pauseAutoDelivery('a', false);
+  assert.deepEqual(seen, [], 'no change, no emission');
+  control.pause('a', true);
+  control.pause('a', true);
+  control.halt('a');
+  control.halt('a');
+  control.resume('a');
+  control.pauseAutoDelivery('a', true);
+  control.pauseAutoDelivery('a', false);
+  assert.deepEqual(seen, [
+    ['a', 'PAUSED', true, false, false],
+    ['a', 'HALTED', true, true, false],
+    ['a', 'RESUMED', false, false, false],
+    ['a', 'AUTO_DELIVERY_PAUSED', false, false, true],
+    ['a', 'AUTO_DELIVERY_RELEASED', false, false, false]
+  ]);
+});
+
+test('replaceAutoDeliveryPauses reports only the ids that changed', () => {
+  const control = new ControlRegistry();
+  control.pauseAutoDelivery('a', true);
+  control.pauseAutoDelivery('b', true);
+  const seen = [];
+  control.setTransitionObserver((id, t) => seen.push(`${id}:${t}`));
+  control.replaceAutoDeliveryPauses(['b', 'c']);
+  assert.deepEqual(seen.sort(), ['a:AUTO_DELIVERY_RELEASED', 'c:AUTO_DELIVERY_PAUSED']);
+});
+
+test('the observer changes no snapshot: the exact v1.1.45 shape, and a throwing observer is contained', () => {
+  const control = new ControlRegistry();
+  control.setTransitionObserver(() => { throw new Error('observer bug'); });
+  control.pause('a', true);
+  control.gateTool('a', 'Bash', true);
+  control.steer('a', 'note');
+  assert.deepEqual(control.snapshot('a'),
+    { paused: true, halted: false, autoDeliveryPaused: false, gatedTools: ['Bash'], pendingSteers: 1 });
+  assert.deepEqual(Object.keys(control.snapshot('zzz')), ['paused', 'halted', 'autoDeliveryPaused', 'gatedTools', 'pendingSteers']);
+});

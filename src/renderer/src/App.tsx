@@ -15,6 +15,9 @@ import { HivePicker } from '@/components/HivePicker';
 import { QuitWarningModal, type ClosingTimeState } from '@/components/QuitWarningModal';
 import { CompletionToast } from '@/realtime/CompletionToast';
 import { UpdateToast } from '@/components/UpdateToast';
+import { CapacityStrip } from '@/components/CapacityStrip';
+import { CapacityDetailPanel } from '@/components/CapacityDetailPanel';
+import { CapacityLimitBanner } from '@/components/CapacityLimitBanner';
 import { UpdateBadge } from '@/components/UpdateBadge';
 import { useAppTheme, toggleAppTheme } from '@/design/theme';
 import { SettingsModal, type Section as SettingsSection } from '@/components/SettingsModal';
@@ -288,13 +291,11 @@ export function App() {
         {/* v0.3.7: the version is no longer inert text — it doubles as the
             update control (check / download / restart to update). */}
         <UpdateBadge />
-        <span style={{
-          fontFamily: 'var(--cth-font-ui)',
-          fontSize: 13,
-          color: 'var(--cth-ink-500)'
-        }}>
-          {config.autoMode ? 'auto mode on' : 'auto mode off'}
-        </span>
+        {/* v1.1.45: provider capacity, one inline group per pool (design of record C2).
+            One fixed line that scrolls when it overflows, so it never grows the bar. It
+            took the place of the old display-only "auto mode on/off" label (removed at the
+            strip review; the autoMode setting itself is untouched, in Settings > General). */}
+        <CapacityStrip />
         {/* v0.3.4: theme + fullscreen live HERE (top right), not buried in the
             terminal header — and the theme darkens the whole app, terminals
             included (design/theme.ts + tokens.css dark block). */}
@@ -386,6 +387,8 @@ export function App() {
         <div style={{ flex: 1, minHeight: 0, minWidth: 0, position: 'relative' }}>
           <OfficeFloor />
           <MemoryPanel />
+          <CapacityDetailPanel />
+          <CapacityLimitBanner />
           {agentCount === 0 && godStatus === 'booting' && <MichaelBooting />}
           {agentCount === 0 && godStatus !== 'booting' && (
             <div style={{

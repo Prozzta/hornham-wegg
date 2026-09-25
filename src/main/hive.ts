@@ -20,7 +20,9 @@
  */
 import {
   existsSync, mkdirSync, readFileSync, writeFileSync, renameSync,
-  readdirSync, statSync, rmSync, appendFileSync, symlinkSync, copyFileSync, chmodSync
+  readdirSync, statSync, rmSync, appendFileSync, symlinkSync, copyFileSync, chmodSync,
+  openSync, readSync, closeSync,
+  watch, type FSWatcher
 } from 'node:fs';
 import { join, dirname, isAbsolute } from 'node:path';
 import { homedir } from 'node:os';
@@ -45,6 +47,15 @@ import { selectBroadcastTargets } from '../shared/broadcast';
 import { preferredAgentRole } from '../shared/agentRole';
 import { mergeTaskLedger } from '../shared/taskLedger';
 import { expandTilde } from './fs';
+import {
+  AgyStatuslineOwner, PROCESS_STARTED_AT, buildStatuslineCommand, newOwnerToken, osLiveness,
+  recoverStatuslineLeftovers, removeStatuslineLocator, writeStatuslineLocator, type StatuslineEnv
+} from './agyStatuslineOwnership';
+
+/** How often a live instance refreshes its statusline lease (see LEASE_STALE_MS). */
+const AGY_LEASE_HEARTBEAT_MS = 60 * 60 * 1000;
+import { AGY_STATUSLINE_SHIM } from './agyStatuslineShim';
+import { geminiHome } from './capacityScope';
 
 /** The subset of HarnessConfig the hive consumes for the default-MCP merge.
  *  Kept as a local shape so hive.ts never imports the foundation-owned config
@@ -163,6 +174,10 @@ export interface RegistryAgent extends AgentMeta {
    *  resume after a crash/restart) AND the cost accounting/dedup key on every
    *  AgentUsageSample / cost-ledger row. */
   sessionId?: string;
+  /** Most recent Claude model id reported by this agent's status line. This is
+   *  per-agent because Claude Code's global settings file cannot preserve
+   *  independent `/model` choices across a hive. */
+  model?: string;
   /** Whether `cwd` is actually usable for a (re)spawn — i.e. an ABSOLUTE path
    *  that exists as a directory. Computed + persisted at spawn so the roster
    *  reliably exposes each worker's environment validity. A non-absolute fragment
@@ -196,6 +211,19 @@ export interface SpawnInjection {
 }
 
 const HOP_CAP = 12;
+/**
+ * Agents normally write mail atomically, but the protocol also permits ordinary
+ * file writers. A poll can see one of those files between its create and close;
+ * give it a few later polls to become valid JSON before declaring it rejected.
+ */
+const OUTBOX_PARSE_RETRY_LIMIT = 3;
+const OUTBOX_PARSE_RETRY_DEBOUNCE_MS = 250;
+const OUTBOX_FRESH_WRITE_GRACE_MS = 1_000;
+
+/** First window logTail() reads off the end of log.jsonl. Sized so the default 200 rows
+ *  (~170 B each on this floor) land in one read with room to spare; it quadruples from
+ *  here if a caller asks for more than fits, so a large `n` still works, just not for free. */
+const LOG_TAIL_WINDOW_BYTES = 256 * 1024;
 
 function sleepSync(ms: number): void {
   const sab = new SharedArrayBuffer(4);
@@ -292,6 +320,31 @@ export function redactSecrets(text: unknown): string {
 
 // ─── HiveManager ────────────────────────────────────────────────────────────
 
+/** Pre-M1 event-wake bridge: one successful, durable inbox write (see `deliver()`). */
+export interface InboxDelivery {
+  agentId: string;
+  messageId: string;
+}
+
+/**
+ * The router's effects, injectable so a test can drive the event path with no timer at
+ * all. `watch` is only a LATENCY HINT: its callback never carries meaning (no filename,
+ * no count), it only asks for one authoritative whole-tree scan.
+ */
+export interface RouterRuntime {
+  watch: (dir: string, onHint: () => void) => Pick<FSWatcher, 'close' | 'on'>;
+  setImmediate: (fn: () => void) => void;
+  setInterval: (fn: () => void, ms: number) => unknown;
+  clearInterval: (handle: unknown) => void;
+}
+
+const NODE_ROUTER_RUNTIME: RouterRuntime = {
+  watch: (dir, onHint) => watch(dir, { persistent: false }, () => onHint()),
+  setImmediate: (fn) => { setImmediate(fn); },
+  setInterval: (fn, ms) => setInterval(fn, ms),
+  clearInterval: (h) => clearInterval(h as NodeJS.Timeout)
+};
+
 export class HiveManager {
   /**
    * @param getHome  Lazily resolve harnessHome so the hive follows config changes.
@@ -301,10 +354,69 @@ export class HiveManager {
    */
   constructor(
     private getHome: () => string | null,
-    private emit?: (channel: string, payload: unknown) => boolean | void
-  ) {}
+    private emit?: (channel: string, payload: unknown) => boolean | void,
+    routerRuntime: Partial<RouterRuntime> = {},
+    /**
+     * May THIS hive write the user's GLOBAL provider config? See `mayWriteGlobalConfig`.
+     *
+     * DEFAULT-CLOSED, AND THAT IS THE POINT. A HiveManager built anywhere other than the
+     * app's one live instance - a probe, a test, a script - refuses every global write
+     * without having to know it should. Only `index.ts` supplies the real predicate.
+     */
+    private isLiveHarnessHome: (home: string) => boolean = () => false
+  ) {
+    this.routerRuntime = { ...NODE_ROUTER_RUNTIME, ...routerRuntime };
+  }
 
-  private routerTimer: NodeJS.Timeout | null = null;
+  /**
+   * The one gate in front of every write to the USER'S GLOBAL provider config:
+   * `~/.gemini/config/hooks.json` and `~/.gemini/antigravity-cli/hooks.json`
+   * (`installAgyHooks`), `~/.grok/hooks/munder-hive.json` (`installGrokHooks`), and the
+   * Antigravity `statusLine` lease (`startAgyStatusline`). Everything else this class
+   * writes lives under the hive root or an agent directory and is not affected.
+   *
+   * WHY IT EXISTS. These files are global and single-valued: whoever writes them last
+   * owns the user's Antigravity and Grok integrations. On 2026-09-23 a scratch probe
+   * built a HiveManager on a temp hive without redirecting HOME, and `installAgyHooks`
+   * pointed the human's real `~/.gemini` hooks at a directory that was then deleted -
+   * breaking hook delivery for the live floor AND for the user's own `agy` sessions.
+   * Nothing was malicious and nothing was wrong with the probe's intent: the writer was
+   * simply reachable from any HiveManager at all.
+   *
+   * So a global write now needs BOTH: this hive's home is the one the app is configured
+   * to run (not a temp dir, not a second hive), and we are not the dev build (which has
+   * its own pipe and would silently re-point Stable's agents at it). A refusal is named
+   * and logged, never silent - the same shape as the existing dev-isolation skip.
+   */
+  private mayWriteGlobalConfig(what: string): boolean {
+    if (DEV_ISOLATION) {
+      console.warn(`[dev-isolation] skipping global ${what} install (would re-point Stable agents)`);
+      return false;
+    }
+    const home = this.getHome();
+    if (!home || !this.isLiveHarnessHome(home)) {
+      console.warn(`[hive] refusing to write global ${what} config: ${home ? 'not the live harness home' : 'no home'}`);
+      try { this.appendLog({ kind: 'global-config-skipped', what, reason: home ? 'not-live-home' : 'no-home' }); }
+      catch { /* a hive we may not write to may have nowhere to log either */ }
+      return false;
+    }
+    return true;
+  }
+
+  private readonly routerRuntime: RouterRuntime;
+  private routerTimer: unknown = null;
+  /** One non-recursive watcher per active outbox, keyed by its absolute path. */
+  private readonly outboxWatchers = new Map<string, Pick<FSWatcher, 'close' | 'on'>>();
+  /** Parse failures awaiting the next polling debounce, keyed by full outbox path. */
+  private readonly outboxParseRetries = new Map<string, { attempts: number; retryAfter: number }>();
+  /** A rejected file whose archival is temporarily locked has already notified its sender. */
+  private readonly outboxRejectNotices = new Map<string, string | null>();
+  /** A delivered file whose normal archive failed must never be delivered twice. */
+  private readonly outboxDeliveredArchives = new Map<string, string | null>();
+  /** At most one queued scan; hints arriving in the same turn coalesce into it. */
+  private routeQueued = false;
+  /** Bumped by start/stop, so a scan queued before a stop never runs after it. */
+  private routerGeneration = 0;
 
   /** The embedded OTLP collector's loopback URL, set by the main process once the
    *  collector is bound (telemetry.ts). null = telemetry off → no OTel env is
@@ -358,6 +470,15 @@ export class HiveManager {
   enabled(): boolean {
     return this.root() !== null;
   }
+  /** L0 — the per-agent CODEX_HOME, when this agent actually has one.
+   *  Existence of the directory IS the discriminator: installCodexHooks creates it
+   *  only for Codex workers, so no roster lookup is needed to tell a Codex agent
+   *  from a Claude one. Returns null otherwise. */
+  codexHomeFor(id: string): string | null {
+    const home = join(this.agentDir(id), '.codex');
+    return existsSync(home) ? home : null;
+  }
+
   private agentDir(id: string): string {
     return join(this.root()!, 'agents', id);
   }
@@ -525,6 +646,14 @@ export class HiveManager {
    *  dead agent never leaks an orphan loopback listener. */
   private proxyChildren = new Map<string, ChildProcess>();
 
+  /** AGY 1.1.48 - this run's lease on Antigravity's global statusline, or null when it
+   *  was never started (dev isolation, no hive) or has been stopped. */
+  private agyStatusline: AgyStatuslineOwner | null = null;
+  /** The owner token the locator was last written with, so a new lease rewrites it. */
+  private agyLocatorToken: string | null = null;
+  /** The lease heartbeat, running only while a lease is held. */
+  private agyHeartbeat: NodeJS.Timeout | null = null;
+
   // — bootstrap —
 
   /** Create the hive skeleton + git repo if missing. Idempotent. */
@@ -636,6 +765,8 @@ export class HiveManager {
     const dir = this.agentDir(meta.id);
     mkdirSync(join(dir, 'inbox', '.done'), { recursive: true });
     mkdirSync(join(dir, 'outbox', '.sent'), { recursive: true });
+    // A newly hired agent's outbox is watched at once, not at the next reconciliation.
+    if (this.routerTimer) this.refreshOutboxWatchers();
 
     // Resolve role BEFORE writing identity.md. A restart passes the floor
     // roster's `description`, which can be a status caption ("on standby").
@@ -765,15 +896,17 @@ export class HiveManager {
         env.HIVE_SOCK = sock;
         try {
           if (desc.kind === 'hooks') {
-            // MUNDER_DEV=1: the agy and grok bridges write GLOBAL hook files
-            // (~/.gemini/…/hooks.json, ~/.grok/hooks/munder-hive.json) whose
-            // socket is THIS process's pipe — installing them from a dev build
-            // would silently re-point Stable's Antigravity/Grok agents at the
-            // dev hive. Skipped in dev; those two providers lose hive parity
-            // in dev only (the renderer's idle inbox nudge still delivers).
+            // The agy and grok bridges write GLOBAL config (~/.gemini/…/hooks.json,
+            // ~/.grok/hooks/munder-hive.json) whose socket is THIS process's pipe, so
+            // both go through `mayWriteGlobalConfig` — which refuses for a dev build and
+            // for any hive that is not the configured one. The refusal lives INSIDE each
+            // installer, so a future caller cannot route around it.
             if (desc.shim === 'agy') {
-              if (DEV_ISOLATION) console.warn('[dev-isolation] skipping global Antigravity hook install (would re-point Stable agents)');
-              else this.installAgyHooks();
+              this.installAgyHooks();
+              // The statusline lease is checked immediately before every interactive
+              // AGY spawn: a user may have replaced it since startup, and then capture
+              // stays off for this run rather than being forced back over their choice.
+              this.reconcileAgyStatusline();
             }
             else if (desc.shim === 'codex') {
               const codex = this.installCodexHooks(dir);
@@ -815,8 +948,7 @@ export class HiveManager {
               env.GEMINI_CLI_SYSTEM_SETTINGS_PATH = this.installGeminiHooks(dir);
             }
             else if (desc.shim === 'grok') {
-              if (DEV_ISOLATION) console.warn('[dev-isolation] skipping global Grok hook install (would re-point Stable agents)');
-              else this.installGrokHooks();
+              this.installGrokHooks();
             }
           } else if (desc.kind === 'proxy') {
             // Stable per-spawn session id, stamped on every synthesized payload so
@@ -1052,10 +1184,52 @@ export class HiveManager {
     } catch { /* best-effort — never crash a hook handler */ }
   }
 
+  /**
+   * Persist only a Claude `/model` divergence from the current app default.
+   * Returning to the default removes the pin, so Settings model changes continue
+   * to reach agents that have not deliberately selected another model.
+   */
+  recordModel(agentId: string, model: string, appDefault: string | undefined): void {
+    const root = this.root();
+    const next = model.trim();
+    if (!root || !next) return;
+    try {
+      const reg = this.registry();
+      const agent = reg.agents[agentId];
+      // Status payload shapes are shared by provider bridges. Only a real Claude
+      // agent may turn one into a Claude CLI argument on a later respawn.
+      if (!agent || agent.provider !== 'claude') return;
+      // `[1m]` selects a different context window and must remain a real pin.
+      // Only harmless whitespace/case differences are equivalent to the default.
+      const key = next.toLowerCase();
+      const defaultKey = appDefault?.trim().toLowerCase() ?? '';
+      if (defaultKey && key === defaultKey) {
+        if (!agent.model) return;
+        delete agent.model;
+        agent.lastSeen = Date.now();
+        this.atomicWriteJson(join(root, 'registry.json'), reg);
+        this.appendLog({ kind: 'model', agentId, model: null });
+        this.commit(`hive: model default ${agentId}`);
+        return;
+      }
+      if (agent.model?.trim().toLowerCase() === key) return;
+      agent.model = next;
+      agent.lastSeen = Date.now();
+      this.atomicWriteJson(join(root, 'registry.json'), reg);
+      this.appendLog({ kind: 'model', agentId, model: next });
+      this.commit(`hive: model ${agentId}`);
+    } catch { /* best-effort â€” never crash a status line */ }
+  }
+
   /** The last known session_id for an agent, or undefined. Used to build a
    *  `claude --resume <id>` spawn so a restarted agent resumes its thread. */
   lastSession(agentId: string): string | undefined {
     return this.registry().agents[agentId]?.sessionId;
+  }
+
+  /** The per-agent Claude model last reported by its status line. */
+  lastModel(agentId: string): string | undefined {
+    return this.registry().agents[agentId]?.model;
   }
 
   /** Claude Code settings that route every relevant hook through the shim, plus
@@ -1419,7 +1593,25 @@ export class HiveManager {
     const inbox = join(this.agentDir(toId), 'inbox');
     if (!existsSync(inbox)) return false; // unknown recipient — the caller reports it
     this.atomicWriteJson(join(inbox, `${msg.id}.json`), msg);
+    // THE successful-delivery edge (pre-M1 event-wake bridge): only after the durable write.
+    // An observer failure can never turn a written delivery into a routing failure.
+    // DIAGNOSIS ONLY (diag-1.1.46-wake): a durable write with NO observer registered is the
+    // one failure the message log cannot show - it looks identical to a delivered message.
+    if (!this.deliveryObserver) {
+      try { this.appendLog({ kind: 'wake', stage: 'observer-missing', agentId: toId, messageId: msg.id }); } catch { /* noop */ }
+    }
+    try { this.deliveryObserver?.({ agentId: toId, messageId: msg.id }); } catch (e) {
+      try { this.appendLog({ kind: 'wake', stage: 'observer-threw', agentId: toId, error: String(e) }); } catch { /* noop */ }
+    }
     return true;
+  }
+
+  private deliveryObserver: ((delivery: InboxDelivery) => void) | null = null;
+  /** Observe every durable inbox write, after it lands (direct and bounced to god alike).
+   *  Never fires for a missing inbox or a terminal handoff. Separate from
+   *  `setRoutedObserver`, whose targets are routing INTENT, not proof of a write. */
+  setDeliveryObserver(cb: ((delivery: InboxDelivery) => void) | null): void {
+    this.deliveryObserver = cb;
   }
 
   /** Inject a message directly (used by the orchestrator / UI / tests). */
@@ -1572,15 +1764,136 @@ export class HiveManager {
 
   // — router: drain outboxes → inboxes —
 
-  /** Poll-based router. Cheap and robust vs fs.watch quirks on macOS. */
+  /**
+   * HYBRID router (pre-M1 event-wake bridge). The FILES are authoritative: an fs.watch
+   * callback on any outbox only schedules one whole-tree `routeOnce()`, and the existing
+   * interval stays as reconciliation (it also repairs lost or broken watchers). Starting
+   * runs one immediate catch-up scan, so a restart or power-resume routes what waited.
+   */
   startRouter(intervalMs = 1500): void {
     if (this.routerTimer || !this.enabled()) return;
-    this.routerTimer = setInterval(() => {
-      try { this.routeOnce(); } catch { /* keep the loop alive */ }
+    this.routerGeneration++;
+    this.routerTimer = this.routerRuntime.setInterval(() => {
+      try { this.refreshOutboxWatchers(); this.routeOnce(); } catch { /* keep the loop alive */ }
     }, intervalMs);
+    try { this.refreshOutboxWatchers(); this.routeOnce(); } catch { /* the interval retries */ }
   }
   stopRouter(): void {
-    if (this.routerTimer) { clearInterval(this.routerTimer); this.routerTimer = null; }
+    if (this.routerTimer) { this.routerRuntime.clearInterval(this.routerTimer); this.routerTimer = null; }
+    this.routerGeneration++;
+    this.routeQueued = false;
+    for (const w of this.outboxWatchers.values()) { try { w.close(); } catch { /* already closed */ } }
+    this.outboxWatchers.clear();
+  }
+
+  /** Watch every active agent's outbox; close watchers whose directory is gone or archived. */
+  refreshOutboxWatchers(): void {
+    const root = this.root();
+    const want = new Set<string>();
+    const agentsDir = root ? join(root, 'agents') : null;
+    if (agentsDir && existsSync(agentsDir)) {
+      const agents = this.registry().agents;
+      for (const id of readdirSync(agentsDir)) {
+        if (agents[id]?.archived) continue;
+        const outbox = join(agentsDir, id, 'outbox');
+        if (existsSync(outbox)) want.add(outbox);
+      }
+    }
+    for (const [dir, w] of this.outboxWatchers) {
+      if (want.has(dir)) continue;
+      try { w.close(); } catch { /* already closed */ }
+      this.outboxWatchers.delete(dir);
+    }
+    for (const dir of want) {
+      if (this.outboxWatchers.has(dir)) continue;
+      try {
+        const w = this.routerRuntime.watch(dir, () => this.scheduleRouteOnce());
+        // A broken watcher is dropped; the next reconciliation re-attaches it.
+        const drop = (): void => {
+          if (this.outboxWatchers.get(dir) !== w) return;
+          this.outboxWatchers.delete(dir);
+          try { w.close(); } catch { /* already closed */ }
+        };
+        w.on('error', drop);
+        w.on('close', drop);
+        this.outboxWatchers.set(dir, w);
+      } catch { /* unwatchable now: the interval scan still routes it */ }
+    }
+  }
+
+  /** The directories currently watched (diagnostics and tests). */
+  watchedOutboxes(): string[] {
+    return [...this.outboxWatchers.keys()].sort();
+  }
+
+  /** Coalesce every hint in this turn into ONE authoritative scan (event scheduling, not a timer). */
+  private scheduleRouteOnce(): void {
+    if (this.routeQueued || !this.routerTimer) return;
+    this.routeQueued = true;
+    const generation = this.routerGeneration;
+    this.routerRuntime.setImmediate(() => {
+      if (generation !== this.routerGeneration) return;
+      this.routeQueued = false;
+      if (!this.routerTimer) return;
+      try { this.routeOnce(); } catch { /* the interval retries */ }
+    });
+  }
+
+  /** Stable enough to recognise an unchanged file after a rejected-file archive fails. */
+  private outboxFingerprint(full: string): string | null {
+    try {
+      const stat = statSync(full);
+      return `${stat.size}:${stat.mtimeMs}`;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * The single terminal path for malformed or unroutable outbox files. It always
+   * reports the failure to the sender and floor; an archive failure is remembered
+   * by fingerprint so an unchanged locked file cannot spam the log or its sender.
+   */
+  private rejectOutboxFile(
+    outbox: string,
+    full: string,
+    from: string,
+    file: string,
+    reason: 'parse-failed' | 'route-failed',
+    detail: string,
+    error: unknown
+  ): boolean {
+    let archived = false;
+    try {
+      renameSync(full, join(outbox, '.sent', `bad-${file}`));
+      archived = true;
+    } catch (archiveError) {
+      this.appendLog({ kind: 'outbox-reject-archive-failed', from, file, reason, detail, error: String(archiveError) });
+    }
+    const notice = this.normalize({
+      to: from,
+      act: 'inform',
+      subject: `[outbox rejected — ${detail}] ${file}`,
+      body: `The hive router rejected this outbox file: ${detail}. It${archived ? ' was archived' : ' could not be archived yet'} as bad-${file}; rewrite and resend it if it is still needed.`
+    }, 'system');
+    const notified = this.deliver(notice, from);
+    this.emitMessage(notice, notified ? [from] : []);
+    this.appendLog({ kind: 'outbox-rejected', from, file, reason, detail, error: String(error), notified, archived });
+    if (!archived) this.outboxRejectNotices.set(full, this.outboxFingerprint(full));
+    return true;
+  }
+
+  /** Archive after delivery; a transient archive lock is never a route failure. */
+  private archiveDeliveredOutbox(outbox: string, full: string, from: string, file: string): boolean {
+    try {
+      renameSync(full, join(outbox, '.sent', file));
+      this.outboxDeliveredArchives.delete(full);
+      return true;
+    } catch (error) {
+      this.outboxDeliveredArchives.set(full, this.outboxFingerprint(full));
+      this.appendLog({ kind: 'outbox-archive-failed', from, file, error: String(error) });
+      return false;
+    }
   }
 
   routeOnce(): number {
@@ -1589,26 +1902,94 @@ export class HiveManager {
     const agentsDir = join(root, 'agents');
     if (!existsSync(agentsDir)) return 0;
     let routed = 0;
+    let rejected = 0;
+    let archived = 0;
+    const liveOutboxFiles = new Set<string>();
     for (const id of readdirSync(agentsDir)) {
       const outbox = join(agentsDir, id, 'outbox');
       if (!existsSync(outbox)) continue;
       for (const f of readdirSync(outbox)) {
         if (!f.endsWith('.json')) continue;
         const full = join(outbox, f);
+        liveOutboxFiles.add(full);
+        const deliveredFingerprint = this.outboxDeliveredArchives.get(full);
+        if (deliveredFingerprint !== undefined) {
+          if (deliveredFingerprint === this.outboxFingerprint(full)) {
+            archived += Number(this.archiveDeliveredOutbox(outbox, full, id, f));
+            continue;
+          }
+          // The sender replaced the stranded file, so route the new payload normally.
+          this.outboxDeliveredArchives.delete(full);
+        }
+        const priorRejection = this.outboxRejectNotices.get(full);
+        if (priorRejection !== undefined) {
+          if (priorRejection === this.outboxFingerprint(full)) continue;
+          this.outboxRejectNotices.delete(full);
+        }
+        let partial: Partial<HiveMessage>;
         try {
-          const partial = JSON.parse(readFileSync(full, 'utf8')) as Partial<HiveMessage>;
+          partial = JSON.parse(readFileSync(full, 'utf8')) as Partial<HiveMessage>;
+        } catch (error) {
+          // A non-atomic writer may still be streaming this file. Leave it in
+          // place for subsequent polling passes; only a bounded failure becomes
+          // a visible rejection.
+          const now = Date.now();
+          try {
+            if (now - statSync(full).mtimeMs < OUTBOX_FRESH_WRITE_GRACE_MS) continue;
+          } catch {
+            continue; // writer removed or replaced it; a later scan sees the new state
+          }
+          const prior = this.outboxParseRetries.get(full);
+          // fs.watch can report several chunks of one write in the same turn.
+          // They are hints, not independent retries: wait before re-reading.
+          if (prior && now < prior.retryAfter) continue;
+          const attempts = (prior?.attempts ?? 0) + 1;
+          if (attempts < OUTBOX_PARSE_RETRY_LIMIT) {
+            this.outboxParseRetries.set(full, { attempts, retryAfter: now + OUTBOX_PARSE_RETRY_DEBOUNCE_MS });
+            this.appendLog({ kind: 'outbox-parse-retry', from: id, file: f, attempts });
+            continue;
+          }
+          this.outboxParseRetries.delete(full);
+          rejected += Number(this.rejectOutboxFile(
+            outbox, full, id, f,
+            'parse-failed',
+            `malformed JSON after ${attempts} attempts`,
+            error
+          ));
+          continue;
+        }
+        this.outboxParseRetries.delete(full);
+        try {
+          if (!partial || typeof partial !== 'object') throw new Error('unroutable: message must be an object');
+          if (partial.to !== undefined && typeof partial.to !== 'string') throw new Error('unroutable: to must be a string');
           const msg = this.normalize(partial, id);
           msg.from = id; // sender is authoritative — the owning directory
           this.routeMessage(msg);
-          renameSync(full, join(outbox, '.sent', f)); // archive, don't reprocess
           routed++;
-        } catch {
-          // malformed file — quarantine so we don't spin on it
-          try { renameSync(full, join(outbox, '.sent', `bad-${f}`)); } catch { /* noop */ }
+        } catch (error) {
+          // A parsed payload that cannot route is terminal too: keep it visible,
+          // rather than retrying it forever on every watcher hint and poll.
+          const reason = error instanceof Error ? error.message : String(error);
+          rejected += Number(this.rejectOutboxFile(outbox, full, id, f, 'route-failed', reason, error));
+          continue;
         }
+        this.archiveDeliveredOutbox(outbox, full, id, f);
       }
     }
-    if (routed > 0) this.commit(`hive: routed ${routed} message(s)`);
+    // A file removed by its writer or routed successfully must not leave a stale
+    // retry count that could punish a later file reusing the same name.
+    for (const full of this.outboxParseRetries.keys()) {
+      if (!liveOutboxFiles.has(full)) this.outboxParseRetries.delete(full);
+    }
+    for (const full of this.outboxRejectNotices.keys()) {
+      if (!liveOutboxFiles.has(full)) this.outboxRejectNotices.delete(full);
+    }
+    for (const full of this.outboxDeliveredArchives.keys()) {
+      if (!liveOutboxFiles.has(full)) this.outboxDeliveredArchives.delete(full);
+    }
+    if (routed > 0 || rejected > 0 || archived > 0) {
+      this.commit(`hive: routed ${routed} message(s), rejected ${rejected}, archived ${archived}`);
+    }
     return routed;
   }
 
@@ -1815,6 +2196,7 @@ export class HiveManager {
   private installAgyHooks(): void {
     const root = this.root();
     if (!root) return;
+    if (!this.mayWriteGlobalConfig('Antigravity hook')) return;
     const shim = join(root, 'bin', 'agy-hook.cjs');
     mkdirSync(join(root, 'bin'), { recursive: true });
     writeFileSync(shim, AGY_HOOK_SHIM, 'utf8');
@@ -1845,6 +2227,129 @@ export class HiveManager {
         writeFileSync(p, JSON.stringify(existing, null, 2), 'utf8');
       } catch { /* best-effort per file */ }
     }
+  }
+
+  // — AGY statusline ownership (1.1.48) —
+  //
+  // hive.ts only INVOKES the lease at startup, before an interactive AGY spawn, and on
+  // shutdown. Every decision about the user's settings lives in agyStatuslineOwnership.ts.
+
+  /** Path of the endpoint locator a user's own AGY statusline reads. */
+  private agyLocatorPath(root: string): string {
+    return join(root, 'state', 'agy-statusline-endpoint.json');
+  }
+
+  /**
+   * Startup: write the shim and give back any lease a dead run left behind - but TAKE
+   * nothing; the lease is taken on the first AGY spawn. Stable only.
+   *
+   * MUNDER_DEV=1 never touches the real Gemini home - the same reason the dev build does
+   * not install the global AGY hooks: its pipe is the DEV pipe, and a dev build that
+   * leased the user's statusline would point every personal AGY session at it.
+   */
+  startAgyStatusline(): void {
+    if (this.agyStatusline) return;
+    if (DEV_ISOLATION) {
+      this.appendLog({ kind: 'agy-statusline', code: 'dev-isolation' });
+      return;
+    }
+    // The lease writes the user's GLOBAL Antigravity settings, so it answers to the same
+    // gate as the hook installers: never from a hive that is not the configured one.
+    if (!this.mayWriteGlobalConfig('Antigravity statusline')) return;
+    const root = this.root();
+    if (!root) return;
+    try {
+      const shim = join(root, 'bin', 'agy-statusline.cjs');
+      mkdirSync(join(root, 'bin'), { recursive: true });
+      writeFileSync(shim, AGY_STATUSLINE_SHIM, 'utf8');
+      const locator = this.agyLocatorPath(root);
+      const launcher = this.nodeLauncher();
+      // AGY passes quote characters literally, so the command is UNQUOTED - which is only
+      // possible when no path in it contains whitespace. Checked once, here, with a
+      // representative token: if the answer is no, this run never leases at all.
+      if (!launcher || !buildStatuslineCommand(launcher, shim, '0'.repeat(32), locator)) {
+        this.appendLog({ kind: 'agy-statusline', code: 'unsafe-command-path' });
+        return;
+      }
+      const env: StatuslineEnv = {
+        geminiHome: geminiHome(),
+        // The exact installed string, owner token included, is the ownership identity.
+        commandFor: (token) => buildStatuslineCommand(launcher, shim, token, locator) as string,
+        pid: process.pid,
+        processStartedAt: PROCESS_STARTED_AT,
+        now: () => Date.now(),
+        randomToken: newOwnerToken,
+        liveness: osLiveness,
+        sleep: sleepSync,
+        report: (code) => this.appendLog({ kind: 'agy-statusline', code })
+      };
+      this.agyStatusline = new AgyStatuslineOwner(env);
+      // STARTUP TAKES NOTHING. A Munder start with no AGY agent does not touch the user's
+      // global AGY settings; the lease is taken on the first AGY spawn. What startup DOES
+      // do is give back a value a crashed or killed earlier run left installed.
+      recoverStatuslineLeftovers(env);
+    } catch (e) {
+      // Telemetry. It never blocks startup.
+      console.error('[hive] AGY statusline start failed:', e);
+    }
+  }
+
+  /** Just before an AGY spawn: confirm (or take) the lease, keep the locator in step with
+   *  its token, and keep the lease's heartbeat running while one is held. */
+  reconcileAgyStatusline(): void {
+    const owner = this.agyStatusline;
+    const root = this.root();
+    const sock = this.sockPath();
+    if (!owner || !root || !sock) return;
+    try {
+      const on = owner.ensure();
+      const token = owner.ownerToken();
+      const locator = this.agyLocatorPath(root);
+      if (on && token && token !== this.agyLocatorToken) {
+        writeStatuslineLocator(locator, {
+          sock, pid: process.pid, processStartedAt: PROCESS_STARTED_AT, token, createdAt: Date.now()
+        });
+        this.agyLocatorToken = token;
+      } else if (!on && this.agyLocatorToken) {
+        removeStatuslineLocator(locator, this.agyLocatorToken);
+        this.agyLocatorToken = null;
+      }
+      // A live instance proves it is alive hourly, so its lease never ages out from under
+      // it - and a crashed one's lease does, whatever its recycled pid says.
+      if (owner.holdsLease() && !this.agyHeartbeat) {
+        this.agyHeartbeat = setInterval(() => {
+          try { this.agyStatusline?.heartbeat(); } catch { /* telemetry */ }
+        }, AGY_LEASE_HEARTBEAT_MS);
+        this.agyHeartbeat.unref?.();
+      }
+    } catch (e) {
+      console.error('[hive] AGY statusline reconcile failed:', e);
+    }
+  }
+
+  /** Release the lease and withdraw the locator, keeping the owner so a later AGY spawn
+   *  can lease again. Idempotent. */
+  private releaseAgyLease(): void {
+    const root = this.root();
+    try {
+      if (root && this.agyLocatorToken) removeStatuslineLocator(this.agyLocatorPath(root), this.agyLocatorToken);
+    } catch { /* best effort */ }
+    this.agyLocatorToken = null;
+    if (this.agyHeartbeat) { clearInterval(this.agyHeartbeat); this.agyHeartbeat = null; }
+    try { this.agyStatusline?.release(); } catch (e) { console.error('[hive] AGY statusline release failed:', e); }
+  }
+
+  /** The last AGY agent has left the floor: the user's statusline goes back to them now,
+   *  not at quit. The next AGY spawn takes a fresh lease. */
+  agyAgentsGone(): void {
+    this.releaseAgyLease();
+  }
+
+  /** Quit / reset / change of home: release (restoring the prior value if this was the
+   *  last live Munder instance) and forget the owner. Idempotent. */
+  stopAgyStatusline(): void {
+    this.releaseAgyLease();
+    this.agyStatusline = null;
   }
 
   /** Official Google Gemini CLI lifecycle bridge. Gemini's hook payload is
@@ -2133,6 +2638,7 @@ export class HiveManager {
   private installGrokHooks(): void {
     const root = this.root();
     if (!root) return;
+    if (!this.mayWriteGlobalConfig('Grok hook')) return;
     try {
       const shim = join(root, 'bin', 'grok-hook.cjs');
       mkdirSync(join(root, 'bin'), { recursive: true });
@@ -2278,11 +2784,62 @@ export class HiveManager {
         + 'Route work to someone on this list before spawning anyone new.';
     } catch { return null; }
   }
+  /**
+   * The last `n` events, read from the END of the log rather than through all of it.
+   *
+   * THE 1.1.49 CRAWL. This used to be
+   *   readFileSync(whole file).trim().split('\n')
+   * to return 200 lines. It is called on the ELECTRON MAIN PROCESS - by `hive:log`, which
+   * the Command Center's Activity tab polls every 3 SECONDS, and by the heartbeat digest -
+   * so its cost is time the main thread is BLOCKED: no IPC, no PTY pumping, no wake path.
+   * Against the 61 MB log this floor had actually grown, one call measured 328 ms and
+   * allocated the file three times over (the string, the trimmed copy, a 380,900-element
+   * array) to keep 60 rows. Polled every 3s that is ~11% of wall-clock with main frozen,
+   * and it gets monotonically worse as the log grows, in EVERY app built on this hive -
+   * which is why a second one appearing was enough to tip the first into "crawl".
+   *
+   * Now it reads a bounded window off the tail and grows it only if `n` lines are not in
+   * it, so cost tracks what was ASKED FOR, not what the file happens to weigh. Output is
+   * byte-identical to reading the whole file; the test pins that, including the case where
+   * the window splits a line.
+   */
   logTail(n = 200): unknown[] {
     const root = this.root();
     if (!root || !existsSync(join(root, 'log.jsonl'))) return [];
-    const lines = readFileSync(join(root, 'log.jsonl'), 'utf8').trim().split('\n').filter(Boolean);
-    return lines.slice(-n).map((l) => { try { return JSON.parse(l); } catch { return { raw: l }; } });
+    const file = join(root, 'log.jsonl');
+    const parse = (l: string): unknown => { try { return JSON.parse(l); } catch { return { raw: l }; } };
+    if (n <= 0) return [];
+    try {
+      const size = statSync(file).size;
+      if (size === 0) return [];
+      let fd: number | null = null;
+      try {
+        fd = openSync(file, 'r');
+        // Grow the window until it holds n+1 line starts (so we know the first line in it
+        // is whole) or we have read the entire file.
+        for (let want = Math.min(size, LOG_TAIL_WINDOW_BYTES); ; want = Math.min(size, want * 4)) {
+          const from = size - want;
+          const buf = Buffer.alloc(want);
+          readSync(fd, buf, 0, want, from);
+          let text = buf.toString('utf8');
+          // A window that starts mid-file almost certainly starts mid-LINE. Drop that
+          // fragment: keeping it would hand back a corrupt row, and JSON.parse failing on
+          // it would surface as a bogus {raw} event rather than an error anyone notices.
+          if (from > 0) {
+            const nl = text.indexOf('\n');
+            if (nl === -1) { if (want >= size) return []; continue; }
+            text = text.slice(nl + 1);
+          }
+          const lines = text.split('\n').filter(Boolean);
+          if (lines.length >= n || want >= size) return lines.slice(-n).map(parse);
+        }
+      } finally { if (fd !== null) closeSync(fd); }
+    } catch {
+      // Any read problem falls back to the whole-file path: correctness over speed, and a
+      // log small enough to be unreadable this way is small enough for it not to matter.
+      const lines = readFileSync(file, 'utf8').trim().split('\n').filter(Boolean);
+      return lines.slice(-n).map(parse);
+    }
   }
 
   private listMessages(dir: string): HiveMessage[] {
@@ -2678,7 +3235,13 @@ process.stdin.on('end', () => {
     transcript_path: agy.transcriptPath,
     cwd: Array.isArray(agy.workspacePaths) ? agy.workspacePaths[0] : undefined,
     tool_name: tc.name,
-    tool_input: tc.args
+    tool_input: tc.args,
+    // agy's OWN terminal qualifier on Stop. The shim used to drop it, which is how a
+    // mid-chain Stop looked exactly like the end of a turn. Only a real boolean is
+    // forwarded - anything else stays undefined, which keeps the Claude reading.
+    // Both spellings are read because only one of them has been measured.
+    fully_idle: typeof agy.fullyIdle === 'boolean' ? agy.fullyIdle
+      : (typeof agy.fully_idle === 'boolean' ? agy.fully_idle : undefined)
   };
   let resp = '';
   const done = () => {

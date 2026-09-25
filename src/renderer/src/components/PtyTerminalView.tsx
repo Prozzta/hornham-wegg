@@ -331,7 +331,10 @@ export function PtyTerminalView({ ptyId, onStreamData, onUserPrompt, onToggleFul
       });
     if (paths.length === 0) return;
     // Trailing space separates consecutive drops and lets the user keep typing.
-    void window.cth.writePty(ptyId, paths.join(' ') + ' ');
+    // HUMAN: a drop is a user gesture, and xterm has no drop listener of its own
+    // (zero hits in its sources) — so this site we own is the ONLY place the
+    // provenance can be declared. Constraint (v).
+    void window.cth.writePty(ptyId, paths.join(' ') + ' ', 'HUMAN');
   };
 
   const zoom = (delta: number) => setTerminalFontSize(getTerminalFontSize() + delta);

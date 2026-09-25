@@ -46,8 +46,11 @@ npm run dev        # live-reloading Electron build
 
 1. **Keep the type-checker green:** `npm run typecheck` (runs both the node and
    web TS projects). This is the de-facto CI gate.
-2. **Run the tests:** `npm run test:focused` (the core suite), or
-   `node --test test/*.test.cjs` to run everything in `test/`.
+2. **Run the tests:** `npm run test:focused` — it runs every `test/*.test.cjs`.
+   Narrow it with substring filters: `npm run test:focused -- wake canary`.
+   Don't invoke `node --test test/*.test.cjs` yourself: that relies on the shell
+   expanding the glob, which cmd.exe does not do (and Node only expands it itself
+   from Node 21), so on Windows it runs **zero** tests while looking like a run.
 3. **Confirm a production build works:** `npm run build`.
 4. **Match the aesthetic.** Any new UI **must** derive from the design tokens in
    [`DESIGN.md`](./DESIGN.md) / `src/renderer/src/design/tokens.ts` — no ad-hoc

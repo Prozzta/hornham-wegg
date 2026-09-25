@@ -1,0 +1,433 @@
+'use strict';
+
+/**
+ * The hidden condensation call (src/main/hiddenClaude.ts).
+ *
+ * WHAT WENT WRONG IN v1.1.46. Every agent's hidden condensation ran in the same
+ * harness-home cwd, so every one of them wrote into the same Claude project directory.
+ * The runner spawned an interactive PTY with no session id, waited 3.5 s of TUI silence,
+ * then read back whichever `.jsonl` in that directory had the newest mtime (admitting
+ * anything touched within 5 s BEFORE its own spawn). Two independent hazards: silence is
+ * not turn completion, and the newest file is not necessarily this session's. The log
+ * shows the result - 820 `condense-abort` records and zero successes - and the dangerous
+ * half is not the aborts, it is that a plausible summary belonging to ANOTHER AGENT could
+ * be captured and written into this one's memory.
+ *
+ * The primary regression below reproduces BOTH races on a fake clock, with a decoy
+ * transcript on disk that is newer than the (initially absent) real one. It is red on the
+ * v1.1.46 protocol and green only once directory scanning and silence-completion are gone.
+ */
+const { test } = require('node:test');
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
+const { EventEmitter } = require('node:events');
+const loadTs = require('./load-ts.cjs');
+
+const { runHiddenClaude, readEnvelope, describeExitFailure, API_KEY_ENV, GATEWAY_TOKEN_ENV, GATEWAY_URL_ENV } = loadTs('src/main/hiddenClaude.ts');
+
+const UUID = '11111111-1111-4111-8111-111111111111';
+/** The v1.1.46 silence boundary. Nothing may complete on it any more. */
+const OLD_IDLE_MS = 3500;
+
+/** A fake child process: EventEmitter streams, a recorded stdin, no real process. */
+function fakeChild({ pid = 4242 } = {}) {
+  const child = new EventEmitter();
+  child.pid = pid;
+  child.stdout = new EventEmitter();
+  child.stderr = new EventEmitter();
+  child.stdout.setEncoding = () => {};
+  child.stderr.setEncoding = () => {};
+  child.stdin = { written: '', ended: false, end(data) { if (data) this.written += data; this.ended = true; } };
+  child.killed = false;
+  child.kill = () => { child.killed = true; };
+  return child;
+}
+
+/** A controllable clock: timers fire only when the test advances it. */
+function fakeClock() {
+  let now = 0;
+  let seq = 0;
+  const timers = new Map();
+  return {
+    get now() { return now; },
+    setTimeout(fn, ms) { const id = ++seq; timers.set(id, { at: now + ms, fn }); return id; },
+    clearTimeout(id) { timers.delete(id); },
+    advance(ms) {
+      const target = now + ms;
+      for (;;) {
+        const due = [...timers.entries()].filter(([, t]) => t.at <= target).sort((a, b) => a[1].at - b[1].at)[0];
+        if (!due) break;
+        timers.delete(due[0]);
+        now = due[1].at;
+        due[1].fn();
+      }
+      now = target;
+    },
+    get pending() { return timers.size; }
+  };
+}
+
+/** Harness: a real cwd, a fake child, a fake clock, and a recording of the spawn call. */
+function harness({ cwd, uuid = UUID } = {}) {
+  const clock = fakeClock();
+  const child = fakeChild();
+  const calls = [];
+  const killed = [];
+  const deps = {
+    spawn: (file, args, options) => { calls.push({ file, args, options }); return child; },
+    randomUUID: () => uuid,
+    setTimeout: (fn, ms) => clock.setTimeout(fn, ms),
+    clearTimeout: (t) => clock.clearTimeout(t),
+    ensureKilled: (pid) => killed.push(pid)
+  };
+  return { clock, child, calls, killed, deps, cwd: cwd || os.tmpdir() };
+}
+
+function envelope(overrides = {}) {
+  return JSON.stringify({
+    type: 'result',
+    session_id: UUID,
+    is_error: false,
+    result: '{"condensed":"the real summary","hoist":[]}',
+    structured_output: { condensed: 'the real summary', hoist: [] },
+    ...overrides
+  });
+}
+
+/** A temp dir with a DECOY transcript newer than anything this session writes. */
+function decoyProject() {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'hidden-claude-'));
+  const decoy = path.join(root, 'other-session.jsonl');
+  fs.writeFileSync(decoy, `${JSON.stringify({
+    type: 'assistant',
+    message: { content: [{ type: 'text', text: '{"condensed":"ANOTHER AGENT\'S SUMMARY","hoist":[]}' }] }
+  })}\n`);
+  // Newer than now, so an mtime sort would always prefer it.
+  const future = new Date(Date.now() + 60_000);
+  fs.utimesSync(decoy, future, future);
+  return { root, decoy };
+}
+
+test('THE REGRESSION: a newer decoy transcript plus output delivered after the old silence window', async () => {
+  const { root, decoy } = decoyProject();
+  const h = harness({ cwd: root });
+  const decoyBefore = fs.statSync(decoy).atimeMs;
+
+  const p = runHiddenClaude('condense this memory', { model: 'claude-haiku-4-5', cwd: root }, h.deps);
+
+  let settled = false;
+  p.then(() => { settled = true; });
+
+  // Output arrives in chunks, with the tail deliberately after the 3.5 s boundary that
+  // v1.1.46 treated as "the turn is over".
+  const body = envelope();
+  h.child.stdout.emit('data', body.slice(0, 20));
+  h.clock.advance(OLD_IDLE_MS + 1000);
+  await Promise.resolve();
+  assert.equal(settled, false, 'v1.1.46 captured here; completion must now wait for the stream to close');
+
+  h.child.stdout.emit('data', body.slice(20));
+  h.child.emit('exit', 0, null);
+  await Promise.resolve();
+  assert.equal(settled, false, "'exit' is not 'close' - the last bytes can still be in flight");
+
+  h.child.emit('close', 0, null);
+  const r = await p;
+
+  assert.equal(r.ok, true, r.error);
+  assert.deepEqual(r.structuredOutput, { condensed: 'the real summary', hoist: [] });
+  assert.equal(r.sessionId, UUID);
+  // The decoy must never have been opened: correctness here is ownership, not recency.
+  assert.equal(fs.statSync(decoy).atimeMs, decoyBefore, "the other session's transcript was read");
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
+test('THE REGRESSION, second half: argv owns one session and the prompt goes on stdin', () => {
+  const h = harness();
+  runHiddenClaude('the whole prompt, including memory text', { model: 'claude-haiku-4-5', cwd: h.cwd, jsonSchema: { type: 'object' } }, h.deps);
+  const { args } = h.calls[0];
+  const flat = args.join(' ');
+
+  assert.equal(args.filter((a) => a === '--session-id').length, 1, 'exactly one session id');
+  assert.equal(args[args.indexOf('--session-id') + 1], UUID);
+  assert.ok(args.includes('--print'), 'print mode');
+  assert.equal(args[args.indexOf('--output-format') + 1], 'json');
+  assert.equal(args[args.indexOf('--json-schema') + 1], '{"type":"object"}');
+  // The prompt must never be visible in argv (Windows length limit; argv is world-readable).
+  assert.ok(!flat.includes('the whole prompt'), 'the prompt must not reach argv');
+  assert.equal(h.child.stdin.written, 'the whole prompt, including memory text');
+  assert.equal(h.child.stdin.ended, true, 'stdin must be closed or the child waits forever');
+});
+
+test('close drains stdout: bytes emitted after exit are still parsed', async () => {
+  const h = harness();
+  const p = runHiddenClaude('x', { model: 'm', cwd: h.cwd }, h.deps);
+  const body = envelope();
+  h.child.stdout.emit('data', body.slice(0, body.length - 5));
+  h.child.emit('exit', 0, null);
+  h.child.stdout.emit('data', body.slice(body.length - 5));   // the tail, after exit
+  h.child.emit('close', 0, null);
+  const r = await p;
+  assert.equal(r.ok, true, r.error);
+  assert.equal(r.structuredOutput.condensed, 'the real summary');
+});
+
+test('a timeout kills the tree once and ignores the close that follows', async () => {
+  const h = harness();
+  const p = runHiddenClaude('x', { model: 'm', cwd: h.cwd, timeoutMs: 1000 }, h.deps);
+  h.clock.advance(1001);
+  const r = await p;
+  assert.equal(r.ok, false);
+  assert.match(r.error, /timed out/);
+  assert.equal(h.child.killed, true);
+  assert.deepEqual(h.killed, [4242], 'the descendant sweep runs exactly once');
+
+  // A late close must not resolve a second time or overwrite the verdict.
+  h.child.stdout.emit('data', envelope());
+  h.child.emit('close', 0, null);
+  assert.equal((await p).error, r.error);
+});
+
+test('oversized stdout is killed and refused rather than truncated into a summary', async () => {
+  const h = harness();
+  const p = runHiddenClaude('x', { model: 'm', cwd: h.cwd }, h.deps);
+  h.child.stdout.emit('data', 'x'.repeat(1024 * 1024 + 1));
+  const r = await p;
+  assert.equal(r.ok, false);
+  assert.match(r.error, /stdout exceeded/);
+  assert.equal(h.child.killed, true);
+});
+
+test('a nonzero exit reports the code and a BOUNDED stderr tail, never the payload', async () => {
+  const h = harness();
+  const p = runHiddenClaude('secret memory text', { model: 'm', cwd: h.cwd }, h.deps);
+  h.child.stderr.emit('data', `${'noise\n'.repeat(4000)}the real reason\n`);
+  h.child.emit('close', 3, null);
+  const r = await p;
+  assert.equal(r.ok, false);
+  assert.match(r.error, /claude exited 3/);
+  assert.ok(r.error.length < 700, `the error must stay bounded, got ${r.error.length}`);
+  assert.ok(!r.error.includes('secret memory text'), 'the prompt must never reach an error string');
+});
+
+test('a spawn error is a stable failure, not a throw into the reflect loop', async () => {
+  const h = harness();
+  const p = runHiddenClaude('x', { model: 'm', cwd: h.cwd }, h.deps);
+  h.child.emit('error', new Error('spawn claude ENOENT'));
+  const r = await p;
+  assert.equal(r.ok, false);
+  assert.match(r.error, /ENOENT/);
+});
+
+test('an empty prompt and a missing cwd are refused before anything is spawned', async () => {
+  const h = harness();
+  assert.equal((await runHiddenClaude('   ', { model: 'm', cwd: h.cwd }, h.deps)).error, 'empty prompt');
+  const gone = path.join(os.tmpdir(), 'definitely-not-here-9d2f1');
+  assert.match((await runHiddenClaude('x', { model: 'm', cwd: gone }, h.deps)).error, /cwd does not exist/);
+  assert.equal(h.calls.length, 0);
+});
+
+// ─── the envelope, which is the only thing allowed to become a summary ───
+
+test('readEnvelope rejects a session id that is not the one we generated', () => {
+  const r = readEnvelope(envelope({ session_id: '99999999-9999-4999-8999-999999999999' }), UUID);
+  assert.equal(r.ok, false);
+  assert.equal(r.error, 'session id mismatch');
+});
+
+test('readEnvelope tolerates an ABSENT session id - the fixed argv still owns the session', () => {
+  const body = JSON.parse(envelope());
+  delete body.session_id;
+  assert.equal(readEnvelope(JSON.stringify(body), UUID).ok, true);
+});
+
+test('readEnvelope refuses everything that is not exactly one JSON object', () => {
+  for (const [stdout, why] of [
+    ['', 'empty'],
+    ['   \n ', 'whitespace'],
+    ['not json at all', 'prose'],
+    ['[{"result":"{}"}]', 'an array'],
+    ['"a string"', 'a bare string'],
+    [`prose before ${envelope()}`, 'a valid envelope with a prefix'],
+    [`${envelope()} trailing prose`, 'a valid envelope with a suffix'],
+    ['```json\n' + envelope() + '\n```', 'a fenced envelope']
+  ]) {
+    assert.equal(readEnvelope(stdout, UUID).ok, false, `must refuse ${why}`);
+  }
+});
+
+test('readEnvelope refuses an envelope that reports its own error', () => {
+  const r = readEnvelope(envelope({ is_error: true, subtype: 'error_during_execution' }), UUID);
+  assert.equal(r.ok, false);
+  assert.match(r.error, /error_during_execution/);
+});
+
+// ─── the billing guard (Dwight's caveat) ───
+
+/** Run one spawn with a controlled environment, and hand back what the child was given. */
+function envFor(set, opts = {}) {
+  const h = harness();
+  const before = {};
+  for (const [k, v] of Object.entries(set)) { before[k] = process.env[k]; if (v === null) delete process.env[k]; else process.env[k] = v; }
+  try {
+    runHiddenClaude('x', { model: 'm', cwd: h.cwd, ...opts }, h.deps);
+  } finally {
+    for (const k of Object.keys(set)) { if (before[k] === undefined) delete process.env[k]; else process.env[k] = before[k]; }
+  }
+  return h.calls[0].options.env;
+}
+
+test('the API key is ALWAYS stripped - it overrides a subscription silently', () => {
+  const env = envFor({ ANTHROPIC_API_KEY: 'sk-inherited' }, { env: { ANTHROPIC_API_KEY: 'sk-from-opts', MEMPALACE_PALACE_PATH: 'C:/palace' } });
+  assert.ok(!('ANTHROPIC_API_KEY' in env), 'stripping must happen AFTER the merge, or opts.env puts it back');
+  assert.equal(env.MEMPALACE_PALACE_PATH, 'C:/palace', 'the rest of opts.env still merges');
+  assert.ok(env.PATH, 'and the resolved shell PATH is preserved');
+});
+
+test('the bearer token is stripped when there is NO base URL - a bare override', () => {
+  const env = envFor({ ANTHROPIC_AUTH_TOKEN: 'sk-token', ANTHROPIC_BASE_URL: null });
+  assert.ok(!(GATEWAY_TOKEN_ENV in env), 'on its own the token overrides a subscription like a key');
+});
+
+test('the bearer token is KEPT when a base URL is set - a configured gateway is deliberate', () => {
+  const env = envFor({ ANTHROPIC_AUTH_TOKEN: 'sk-token', ANTHROPIC_BASE_URL: 'https://gateway.example/v1' });
+  assert.equal(env[GATEWAY_TOKEN_ENV], 'sk-token', 'stripping it would send this one call somewhere the user did not choose');
+  assert.equal(env[GATEWAY_URL_ENV], 'https://gateway.example/v1');
+  assert.ok(!('ANTHROPIC_API_KEY' in env), 'the API key strip stays unconditional either way');
+});
+
+test('a gateway configured through opts.env counts too - the check reads the MERGED env', () => {
+  const env = envFor({ ANTHROPIC_AUTH_TOKEN: 'sk-token', ANTHROPIC_BASE_URL: null },
+    { env: { ANTHROPIC_BASE_URL: 'https://gateway.example/v1' } });
+  assert.equal(env[GATEWAY_TOKEN_ENV], 'sk-token');
+});
+
+test('the strip list names the ONE unconditional credential, and nothing it cannot justify', () => {
+  // ANTHROPIC_API_KEY_HELPER was in this list and is gone: `apiKeyHelper` is a settings
+  // field, not an environment variable, so naming it here asserted something we had no
+  // evidence for - and a helper configured in settings is not reachable from a child env
+  // anyway. Routing flags (Bedrock/Vertex) stay untouched for the same reason the
+  // gateway token does: a configured deployment is a choice, not an override.
+  assert.deepEqual([...API_KEY_ENV], ['ANTHROPIC_API_KEY']);
+  assert.equal(GATEWAY_TOKEN_ENV, 'ANTHROPIC_AUTH_TOKEN');
+  assert.equal(GATEWAY_URL_ENV, 'ANTHROPIC_BASE_URL');
+});
+
+// ─── source-level pins: the deleted protocol must stay deleted ───
+
+test('PIN: the newest-mtime transcript scan is gone from the condensation path', () => {
+  const src = fs.readFileSync(path.resolve(__dirname, '..', 'src/main/hiddenClaude.ts'), 'utf8');
+  const code = src.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '');
+  for (const gone of ['extractLastAssistantText', 'projectDir', 'readdirSync', 'node-pty', 'idleMs', 'mtime']) {
+    assert.ok(!code.includes(gone), `${gone} must not come back - a dormant fallback is a regression waiting to happen`);
+  }
+  assert.ok(code.includes("'close'"), 'completion is the close event');
+});
+
+
+// ─── the failure breadcrumb (condense-packaged-fail) ─────────────────────────
+//
+// THE REAL FAILURE THIS ENCODES. Packaged 1.1.47, 2026-09-23: god's condensation
+// logged exactly `Error: claude exited 1` and nothing else. Reproduced by hand with
+// the identical argv and a 944,569-byte prompt: exit 1 after 2,775 ms, stderr EMPTY,
+// and the entire explanation sitting on STDOUT, which the close handler discarded:
+//   terminal_reason 'prompt_too_long', api_error_status 400,
+//   result 'Prompt is too long · the request is ~313578 tokens (limit 200000)…'
+// Four words reached the log where a precise, actionable cause was available.
+
+/** The captured envelope, trimmed to the fields that carry the diagnosis. */
+const REFUSED = JSON.stringify({
+  type: 'result',
+  session_id: UUID,
+  is_error: true,
+  subtype: 'success',
+  terminal_reason: 'prompt_too_long',
+  api_error_status: 400,
+  result: 'Prompt is too long \u00b7 the request is ~313578 tokens (limit 200000)'
+});
+
+test('describeExitFailure: a refused prompt names itself instead of "exited 1"', () => {
+  const msg = describeExitFailure(1, REFUSED, '');
+  assert.match(msg, /claude exited 1/, 'keeps the exit code');
+  assert.match(msg, /prompt_too_long/, 'THE regression: terminal_reason must survive');
+  assert.match(msg, /api 400/, 'the HTTP status distinguishes a refusal from a crash');
+  assert.match(msg, /~313578 tokens \(limit 200000\)/, 'and the CLI\u2019s own sentence');
+});
+
+test('describeExitFailure: stdout is used even though stderr is EMPTY', () => {
+  // The v1.1.47 code read the stderr tail alone. With print mode that is nothing.
+  const msg = describeExitFailure(1, REFUSED, '');
+  assert.notEqual(msg, 'claude exited 1', 'the whole bug in one assertion');
+});
+
+test('describeExitFailure: falls back to stderr when stdout is not an envelope', () => {
+  const msg = describeExitFailure(127, 'not json at all', 'claude: command not found');
+  assert.match(msg, /claude exited 127/);
+  assert.match(msg, /command not found/, 'a non-print failure still reports its stderr');
+});
+
+test('describeExitFailure: a null exit code is reported, not swallowed', () => {
+  assert.match(describeExitFailure(null, '', ''), /claude exited null/);
+});
+
+test('breadcrumb: a non-zero exit carries diag with the resolved argv and exit code', async () => {
+  const h = harness();
+  const p = runHiddenClaude('condense this', { model: 'm', cwd: h.cwd }, h.deps);
+  h.child.stdout.emit('data', REFUSED);
+  h.child.emit('close', 1);
+  const r = await p;
+
+  assert.equal(r.ok, false);
+  assert.ok(r.diag, 'a failure MUST explain itself');
+  assert.equal(r.diag.exitCode, 1);
+  assert.ok(r.diag.argv.includes('--print'), 'the exact argv, for a rejected-flag diagnosis');
+  assert.ok(r.diag.argv.includes('--json-schema') === false || r.diag.argv.length > 0);
+  assert.equal(r.diag.promptBytes, Buffer.byteLength('condense this', 'utf8'));
+  assert.equal(r.diag.terminalReason, 'prompt_too_long', 'lifted from the envelope');
+  assert.equal(r.diag.apiErrorStatus, 400);
+  assert.match(r.diag.stdoutTail, /prompt_too_long/, 'the stream the old code threw away');
+});
+
+test('breadcrumb: env is reported as KEY NAMES ONLY - never a value', async () => {
+  const h = harness();
+  const SECRET = 'sk-ant-do-not-log-me';
+  const p = runHiddenClaude('x', {
+    model: 'm', cwd: h.cwd,
+    env: { ANTHROPIC_BASE_URL: 'https://gw.example', ANTHROPIC_AUTH_TOKEN: SECRET, MEMPALACE_PALACE_PATH: '/p' }
+  }, h.deps);
+  h.child.emit('close', 1);
+  const r = await p;
+
+  const blob = JSON.stringify(r.diag);
+  assert.ok(r.diag.envKeys.includes('ANTHROPIC_AUTH_TOKEN'), 'the KEY is the evidence');
+  assert.ok(!blob.includes(SECRET), 'and the VALUE must never appear anywhere in the breadcrumb');
+  assert.ok(!blob.includes('https://gw.example'), 'a base URL is configuration, still not ours to log');
+  assert.deepEqual([...r.diag.envKeys], [...r.diag.envKeys].sort(), 'sorted, so two breadcrumbs diff cleanly');
+});
+
+test('breadcrumb: a TIMEOUT is explained too, and snapshots before the kill', async () => {
+  const h = harness();
+  const p = runHiddenClaude('x', { model: 'm', cwd: h.cwd, timeoutMs: 180000 }, h.deps);
+  h.child.stdout.emit('data', 'partial output so far');
+  h.clock.advance(180000);
+  const r = await p;
+
+  assert.equal(r.error, 'hidden session timed out');
+  assert.ok(r.diag, 'the timeout that told us nothing on the floor now says how long and how far it got');
+  assert.equal(r.diag.exitCode, null, 'no exit code exists - the child was killed');
+  assert.equal(r.diag.stdoutBytes, 'partial output so far'.length, 'how much the child had produced');
+  assert.ok(r.diag.durationMs >= 0);
+});
+
+test('breadcrumb: a SUCCESS carries no diag - there is nothing to explain', async () => {
+  const h = harness();
+  const p = runHiddenClaude('x', { model: 'm', cwd: h.cwd }, h.deps);
+  h.child.stdout.emit('data', envelope());
+  h.child.emit('close', 0);
+  const r = await p;
+
+  assert.equal(r.ok, true);
+  assert.equal(r.diag, undefined, 'breadcrumbs are for failures; a success must stay quiet');
+});

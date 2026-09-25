@@ -8,8 +8,12 @@ import { CostHud } from '@/realtime/CostHud';
 import { AccentColorName } from '@/design/tokens';
 import { OfficeCharacterName } from '@/scene/office/cast';
 import { AgentNameEditor } from './AgentNameEditor';
+import { impactBadge } from './agentImpactView';
+import { useAgentImpact } from '../hooks/useAgentImpact';
 
 export interface AgentCardProps {
+  /** Hive agent id: reads main's impact string for this agent (v1.1.45 unit #5). */
+  agentId?: string;
   name: string;
   character: OfficeCharacterName;
   accent: AccentColorName;
@@ -54,12 +58,15 @@ const fmtK = (n: number): string => `${Math.round(n / 1000)}k`;
  * and a slim gauge pinned to the bottom edge. Nothing overlaps anything.
  */
 export function AgentCard({
-  name, character, accent, status, ptyId, project, action, progress = 0,
+  agentId, name, character, accent, status, ptyId, project, action, progress = 0,
   contextTokens, contextLimit, selected, isGod, onClick, onRename,
   doingCount = 0, onTaskNoteClick, draggable, note, onEditNote
 }: AgentCardProps) {
   const [hover, setHover] = useState(false);
   const typing = useHasTerminalDraft(ptyId);
+  // A held agent must never read as idle (C2.11 crit 13): main's impact replaces the
+  // resting badge and the context line. A working agent and a user draft are unchanged.
+  const held = impactBadge(typing ? 'typing' : status, useAgentImpact(agentId));
   // IDENTITY and SELECTION are two different things, and conflating them is why
   // selecting Michael appeared to do nothing.
   //
@@ -123,7 +130,7 @@ export function AgentCard({
     .filter(Boolean).join(', ') || 'none';
 
   // One context line: what it's DOING while working, WHERE it lives while idle.
-  const infoLine = (status !== 'idle' && action) ? action : project;
+  const infoLine = held.impactText ?? ((status !== 'idle' && action) ? action : project);
   const noteFirstLine = (note ?? '').split('\n').find((l) => l.trim()) ?? '';
 
   return (
@@ -224,7 +231,7 @@ export function AgentCard({
                   it was allowed to shrink, the browser resolved the overflow by
                   eating the NAME instead. Truncation should land on the longest,
                   most redundant thing, not on the identity. */}
-              <PixelBadge status={typing ? 'typing' : status} style={{ flexShrink: 0 }} />
+              <PixelBadge status={held.status} label={held.label} style={{ flexShrink: 0 }} />
             </div>
 
             {/* Context line: action while working, repo while idle. */}

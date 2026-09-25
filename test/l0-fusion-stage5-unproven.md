@@ -1,0 +1,130 @@
+# L0-FUSION stage 5+ — what ships UNPROVEN, UNMEASURED or UNDECIDED
+
+**READ WITH `l0-fusion-stage5-successor-mapping.md` (corrected).** Wherever an older line below says a grant or a
+turn is "returned" at INTERFERED or after a failed Enter, that is HISTORY: since stage 5.6 (the human's option B and
+Michael's G1b ruling, both 2026-09-20) such a grant is HELD as possibly launched until a person resolves it or the
+terminal dies. The mapping's "Correction" section is the current statement.
+
+One place, so that nothing on it is mistaken for done. Written at stage 5.5a. Each item says
+what IS known, what is not, and what would settle it. Nothing here is a claim of safety.
+
+## Undecided — with the human. Nothing is built for any of these.
+
+1. **(c1) stale after a numerically spent window, known reset passed.** Held forever; shown
+   as `SPENT_RESET_PASSED`; "send now" is the only exit. god recommends a separate explicit
+   post-reset state with one re-probe. No exit is built.
+   **RULED at stage 5.7: "1a".** Built as the admission state POST_RESET_PROBE: one probe per
+   passed reset, keyed to the reading and the reset, under every gate; the tracker still
+   publishes UNKNOWN. `SPENT_RESET_PASSED` is retired as a displayed label. No longer open.
+2. **(c2) a refusal with no known reset time.** Held forever; shown as
+   `LIMITED_NO_KNOWN_RESET`. No exit is built.
+   **RULED at stage 5.7: "2a" - it stays held.** Nothing added. Its wording names "send
+   now" in the hint itself, pinned in the wording module and on the rendered page.
+3. **L0-S5-RESOLVED-UX — duplicate delivery after "resolved".** If the human presses Enter on
+   our staged payload THEMSELVES and then clicks "resolved", the message is still queued and
+   is delivered again; the gate cannot see it because the prompt is empty by then. Measured:
+   while text is still on the prompt the gate does refuse (`PROMPT_DRAFT`, harness arm `int`).
+   **RULED at stage 5.6: option B.** Two actions, "send queued message" / "already handled -
+   drop", no default, nothing inferred from an empty prompt. Built and tested; no longer open.
+4. **INTERFERED returns the recovery turn while the payload is still on the prompt**
+   (successor mapping, GAP 1b). The ticket design failed toward ALREADY LAUNCHED where
+   evidence ran out; the owner fails toward NOT LAUNCHED on every INTERFERED except
+   `ENTER_WRITE_FAILED`. Same fact pattern as item 3; should be ruled with it.
+   **RULED at stage 5.6 (god):** the grant is held as possibly launched until a person
+   resolves. Built with a new admission state, because a merely unconfirmed reservation is
+   abandoned after 60 s. No longer open. What it COSTS is now item 13b below.
+
+## Unmeasured
+
+5. **Multi-line erase, for every provider.** A multi-line payload is sent as one bracketed
+   paste. Every MEASURED clear (`claude`, `codex`, `antigravity`: Ctrl-U, 900 ms) was
+   measured with a SINGLE-LINE marker. Whether Ctrl-U erases a multi-line bracketed paste in
+   each TUI is not measured. The design fails closed if it does not - the differential
+   oracle reports `ERASE_NOT_VERIFIED` and the prompt is held for a person (harness arm
+   `abn`) - so the cost of being wrong is a held prompt, not a wrong submit. Antigravity is
+   the specific suspect: its capture repaints the prompt row in a way the others do not.
+   *Settled by:* a multi-line capture per provider replayed through `tui-clear-matrix.ts`.
+6. **Live provider TUIs.** The clear matrix replays CAPTURES. A capture is a fixture: a
+   provider release can change what Ctrl-U does and no test here would notice until someone
+   re-captures. The MEASURED rows are true as of their capture, not as of today.
+7. **The capacity-freshness measurement** behind the revised L0-UNKNOWN ruling (85.5 % stale,
+   ~24 % of mail held under option B) has MODERATE confidence by Dwight's own qualification:
+   no provider/account filtering, whole-record `json.loads`. The ruling did not depend on
+   the second decimal; nobody should quote it as if it did.
+8. **`NO_STATE` is unreachable in production** as far as I can find (an agent with no reading
+   maps to no pool = `NO_POOL`). It has a policy cell and tests, and no way to occur.
+
+## Unproven
+
+9. **`pty.ts` against a real node-pty process.** The fused harness restates `pty.ts`'s
+   accounting as a double (node-pty cannot load in a page). Narrowed at 5.5a: the real owner
+   now runs through the real wiring against the REAL `PtyManager` under node
+   (`automatic-submit-wiring.test.cjs`, `REAL PtyManager: …`), so the generation, the
+   timestamp and the incarnation it decides on are the production ones. What is still a
+   fake is the OS process behind the session: no test spawns node-pty, so "node-pty accepted
+   the bytes" is only ever simulated.
+10. **The IPC line, end to end, in a running app.** `autoSubmit:submit`,
+    `autoSubmit:resolveInterference`, `pty:promptState` and `autoSubmit:readScreen` are each
+    pinned statically on both sides and exercised with the hop replaced by a function call.
+    No test sends them through Electron IPC between a real main and a real renderer.
+11. **The composer click** was listed by god as an item to record here. It is no longer
+    unproven: stage 5.4d (`4e1ac8e0`) mounts the production composer and resolves through a
+    TRUSTED Chromium click. What remains unproven about it is item 10, not the click.
+12. **Grant return on every non-COMMIT outcome, in one place** (successor mapping, GAP 1).
+    CLOSED at stage 5.6: `everyOutcomeAccountsForItsGrant` enumerates nine outcomes.
+13. **A recovery turn can be held for up to 30 s** by a submission waiting at READY
+    (`READY_TIMEOUT_MS`), because ADMIT precedes READY. Tested to be returned on timeout;
+    not tested is whether 30 s of a RECOVERING pool's only turn is acceptable. It is the
+    same order as the ticket TTL it replaces.
+13b. **An unresolved INTERFERED keeps a RECOVERING pool's only turn in suspense for as long
+    as nobody resolves it** - hours, if the person has walked away - so no other agent on
+    that pool is probed in that epoch. That is the ruling working as ruled (fail toward
+    ALREADY LAUNCHED), not a defect; it ends with a resolution, the terminal's death, or a
+    new epoch. Whether a floor with one shared pool can afford it is not measured.
+13c. **An INTERFERED post-reset probe whose terminal dies can strand its pool.** Ruling (b)
+    spends a held grant when its terminal dies, because nobody can say whether Enter was
+    pressed. For a RECOVERING turn that is harmless (the epoch ends on its reset). The
+    post-reset probe is keyed to the READING: if no turn actually ran, no reading arrives,
+    the key never changes, and the pool sits at POST_RESET_PROBE_SPENT until a fresh reading
+    from ANY agent on the pool, or a "send now". **Accepted by Michael, not fixed:** returning
+    the probe on terminal death would trade a visible, recoverable hold for a possible
+    second probe, which is the direction A15 says not to fail in. It is a TESTED FACT
+    (`aDeadTerminalSpendsTheProbeAndOnlyAFreshReadingLiftsIt`, with the mutant that returns
+    the probe), and because this state therefore cannot be promised to end by itself its
+    hint names "send now" on the page. Narrow path: spent window + stale + reset passed +
+    a human interferes with the one probe + that terminal dies before anyone resolves it.
+14. **The callee census has a stated limit:** a PTY smuggled in under an allowlisted
+    non-PTY receiver NAME is invisible to a census of names. The no-alias check, the
+    node-pty-importer check and the refusal of `write` taken as a value stand in its way;
+    they do not close it.
+
+## Disclosed defect in earlier pins' tests (found and fixed at 5.5a)
+
+15. **The comment stripper used by my absence checks was two regexes, and it had a blind
+    spot.** A `google/*` inside a line comment in `src/main/index.ts` opened a fake block
+    comment that swallowed lines 3030-3428 - 399 lines, including the `pty:write` handler.
+    Every ABSENCE check over `index.ts` from `811c5279` to `4e1ac8e0` was therefore looking
+    at a file with a hole in it. PRESENCE checks were unaffected (they would have failed).
+    Replaced with a parser-based stripper (`test/read-source.cjs` `codeOnly`); all 78
+    affected tests were re-run against the whole file and **none had been hiding a
+    violation**. The callee census does not strip at all: it walks the TypeScript AST.
+
+## Retained residuals
+
+16. **The Windows one-column residual** from `636b0482` is retained unchanged.
+17. **`hiddenClaude`** spends turns with no capacity admission. Its own card
+    (L0-HIDDENCLAUDE); declared at the site; not in this contract.
+18. **Line endings.** The repo has `core.autocrlf=true` and no `.gitattributes`; every stage-5
+    pin is verified in a fresh CRLF checkout because of it. Its own card.
+
+## Not validated
+
+19. **The validator is down.** As of this note no validator has signed `a1d31313`,
+    `818e6e82`, `6d01797e`, `f9f155fa`, `2073142c`, `4e1ac8e0` or this pin. L0-FUSION-BUILD
+    does not close until they are, and the deletion half of stage 5.5 waits for a signature
+    on `l0-fusion-stage5-successor-mapping.md`.
+    **UPDATE (stage 5.5 deletion commit):** the validator came back; every pin through `a5ec055b` is validated
+    without caveat, the mapping was SIGNED at `2a50e62e`, and **the deletion half is DONE** - the 30 transitional
+    tests and the five dead `CapacityRuntime` methods are gone together, and a test holds the five names absent
+    from all of `src`. What stays unproven from that work is exactly one thing: row 30's closure half (GAP 2), held
+    BY CONSTRUCTION because no closure-work caller exists.

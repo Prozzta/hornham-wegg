@@ -14,10 +14,14 @@ import { createServer, type Server } from 'node:net';
 import { existsSync, rmSync } from 'node:fs';
 import { Notification, type WebContents } from 'electron';
 import type { HiveManager } from './hive';
-import type { HarnessConfig } from './config';
+import { modelForHiveSpawn, type HarnessConfig } from './config';
 import type { ControlRegistry } from './control';
 import type { CircuitBreaker } from './breaker';
 import { estimateCostUsd } from './pricing';
+import { classifyAgyStatusLine, normalizeClaudeStatusLine, type AgyStatusTick } from './capacityNormalize';
+import { agyAccountScope, claudeAccountScope } from './capacityScope';
+import { CodexRolloutCapacitySource } from './codexRolloutCapacity';
+import type { CapacityObservation } from '../shared/providerCapacity';
 
 interface HookPayload {
   hook_event_name?: string;
@@ -26,6 +30,13 @@ interface HookPayload {
   transcript_path?: string;
   /** Status-line payloads only: the session's live context accounting. */
   context_window?: { total_input_tokens?: number; context_window_size?: number };
+  /** Status-line payloads only: the subscription's rolling allowance windows
+   *  (`five_hour`, `seven_day`, possibly model-family windows). The shim already
+   *  forwards the WHOLE status JSON, so this field has always arrived here — it was
+   *  simply not declared, and therefore dropped. Typed as unknown because the
+   *  schema is the provider's and may grow; shape checking lives in the
+   *  normaliser, which is pure and tested. */
+  rate_limits?: unknown;
   cwd?: string;
   tool_name?: string;
   tool_input?: unknown;
@@ -36,14 +47,27 @@ interface HookPayload {
   /** Notification hook text, e.g. "Claude is waiting for your input" (idle) vs a
    *  permission request. Used to tell "needs you" from "just done / lingering". */
   message?: string;
-  /** CostSample payloads only (synthesized by the proxy-bridge sidecar for
-   *  qwen). Raw token counts for one response, fed to the cost ledger. */
-  model?: string;
+  /** Status payloads carry Claude's model object; CostSample uses a string. */
+  model?: string | { id?: unknown };
   input?: number;
   output?: number;
   cache_read?: number;
   cache_creation?: number;
+  /** AgyStatusLine envelopes only: Antigravity's statusline payload, forwarded whole by
+   *  the statusline shim. NEVER logged, retained or re-sent - it carries the account's
+   *  email. The normaliser reads the fields it needs and everything else is dropped. */
+  agy_status?: unknown;
+  /** AgyStatusLine envelopes only: when the SHIM read the status, on this machine's
+   *  clock. Untrusted input - the normaliser clamps it to the receipt time. */
+  read_at?: unknown;
+  /** Antigravity `Stop` only: the provider's own terminal qualifier, preserved by the
+   *  agy hook shim. Claude never sends it, so absent must keep meaning "terminal" -
+   *  only an explicit `false` refuses the Stop. Never a capacity or account fact. */
+  fully_idle?: boolean;
 }
+
+/** How many distinct {version, driftCode} pairs are counted before they share one bucket. */
+const AGY_DRIFT_KEYS_MAX = 32;
 
 export class HookServer {
   private server: Server | null = null;
@@ -58,6 +82,9 @@ export class HookServer {
    *  get_agent_detail / list_agents) can report "how full is each agent's context"
    *  without depending on a renderer round-trip. */
   private contextById = new Map<string, { tokens: number; limit: number; ts: number }>();
+  /** L0 — Codex allowance, read from the rollout a Codex worker is already writing.
+   *  Holds only a per-home cache (newest rollout path + last mtime seen). */
+  private codexCapacity = new CodexRolloutCapacitySource();
 
   constructor(
     private hive: HiveManager,
@@ -71,11 +98,39 @@ export class HookServer {
     /** Standing goal text for an agent (from the durable roster). Optional so
      *  tests can omit it; when set, injected on SessionStart / UserPromptSubmit. */
     private getStandingGoal?: (agentId: string) => string | null,
-    /** Optional observer of every hook boundary (agentId, event, message). The
-     *  worker inbox-wake watchdog (workerWake.ts) feeds on this to learn when an
-     *  agent is parked on a permission/HITL prompt so it never types into it. */
-    private onEvent?: (agentId: string | undefined, event: string, message: string | undefined) => void
+    /** Optional OBSERVER of every hook boundary (agentId, event, message), called
+     *  synchronously BEFORE this server returns its hook response. It must not submit
+     *  or block: the inbox-wake bridge only records lifecycle/HITL state here and defers
+     *  any retry with setImmediate, so the response (Stop included) is unchanged. */
+    private onEvent?: (agentId: string | undefined, event: string, message: string | undefined, fullyIdle?: boolean) => void,
+    /** L0 — provider allowance observed on the status line. Optional so the server
+     *  runs unchanged where no tracker is wired (tests, and any build without L0).
+     *  HookServer deliberately does not hold the tracker: it hands over a
+     *  normalised observation and knows nothing about states, thresholds or pools. */
+    private onCapacity?: (agentId: string | null, obs: CapacityObservation) => void,
+    /** AGY 1.1.48 - one COHERENT Antigravity statusline tick: both family observations
+     *  plus the canonical lifecycle. `agentId` is null for a user's own session. Optional
+     *  and unwired in a build with no capacity runtime, in which case a tick is
+     *  normalised, counted if it drifts, and otherwise dropped.
+     *
+     *  ONE CALLBACK CARRIES BOTH the allowance pair and the lifecycle, because they are
+     *  one indivisible reading: the tick that says which family is active is the same
+     *  tick that says whether the turn is running. Splitting it into a capacity callback
+     *  and a lifecycle callback would let a build accept half of a reading, and "the half
+     *  that parsed is exactly as suspect as the half that did not" is the rule this
+     *  normaliser is already built on. HookServer still knows nothing about pools, wake
+     *  or admission; it hands over the canonical record and the caller routes it. */
+    private onAgyTick?: (agentId: string | null, tick: AgyStatusTick) => void
   ) {}
+
+  /** Bounded drift tally, keyed `version|driftCode`. Fixed-string keys only: the payload
+   *  that drifted is never stored, so this can be read out or logged safely. */
+  private agyDrift = new Map<string, number>();
+
+  /** A snapshot of the drift tally (diagnostics, tests). */
+  agyDriftCounts(): Record<string, number> {
+    return Object.fromEntries(this.agyDrift);
+  }
 
   start(): void {
     const sock = this.hive.sockPath();
@@ -108,6 +163,55 @@ export class HookServer {
     try { if (sock && existsSync(sock)) rmSync(sock); } catch { /* noop */ }
   }
 
+  /** Read this agent's Codex allowance, if it is a Codex worker and anything moved. */
+  private observeCodexCapacity(agentId: string, event: string): void {
+    try {
+      const home = this.hive.codexHomeFor(agentId);
+      if (!home) return;
+      const obs = this.codexCapacity.observe(home, { rescan: event === 'SessionStart' });
+      // The agent is carried with the reading: a pool key is a provider fact, and
+      // which agents draw on it can only be learned from readings that arrived.
+      if (obs) this.onCapacity?.(agentId, obs);
+    } catch { /* telemetry must never break a hook boundary */ }
+  }
+
+  /**
+   * One Antigravity statusline envelope. Always answers `{}`.
+   *
+   * A refused tick changes NOTHING - not the last good pool, not the lifecycle - and
+   * is counted under its fixed drift code. The raw payload goes no further than the
+   * normaliser: it is not logged, not stored, and not passed on.
+   */
+  private handleAgyStatus(p: HookPayload): unknown {
+    try {
+      const c = classifyAgyStatusLine({
+        payload: p.agy_status,
+        accountScope: agyAccountScope(),
+        receivedAt: Date.now(),
+        readAt: p.read_at
+      });
+      if (!c.ok) {
+        // The boot tick is refused by design (N-1 b); it is not drift worth counting.
+        if (c.driftCode === 'authenticating') return {};
+        const key = `${c.version ?? '-'}|${c.driftCode}`;
+        const bucket = this.agyDrift.has(key) || this.agyDrift.size < AGY_DRIFT_KEYS_MAX ? key : 'overflow';
+        const n = (this.agyDrift.get(bucket) ?? 0) + 1;
+        this.agyDrift.set(bucket, n);
+        // First sighting of each kind only: a drifting build ticks after every render. To
+        // the event log as well as the console, because log.jsonl is where a drift after an
+        // AGY upgrade gets noticed - and the row is the fixed code and version, nothing else.
+        if (n === 1) {
+          console.warn('[agy-statusline] drift', { version: c.version, driftCode: c.driftCode });
+          try { this.hive.appendLog({ kind: 'agy-statusline-drift', version: c.version, driftCode: c.driftCode }); } catch { /* best effort */ }
+        }
+        return {};
+      }
+      const agentId = typeof p.agent_id === 'string' && p.agent_id ? p.agent_id : null;
+      this.onAgyTick?.(agentId, c.tick);
+    } catch { /* telemetry must never break the pipe */ }
+    return {};
+  }
+
   /** The transcript file of an agent's CURRENT session, if any hook has fired. */
   transcriptPath(agentId: string): string | undefined {
     return this.transcriptPaths.get(agentId);
@@ -122,10 +226,26 @@ export class HookServer {
   private handle(p: HookPayload): unknown {
     const agentId = p.agent_id ?? undefined;
     const event = p.hook_event_name ?? 'Unknown';
-    this.onEvent?.(agentId, event, p.message);
+    // AGY statusline telemetry is not a hook boundary, and it is handled BEFORE
+    // everything else here: before the lifecycle observer (a tick is not a hook event
+    // and must not be mistaken for one), before transcript capture, and before the
+    // halt gate, the breaker and session recording. It can arrive with agent_id null
+    // from a session nobody spawned, and none of that machinery is for it.
+    if (event === 'AgyStatusLine') return this.handleAgyStatus(p);
+    this.onEvent?.(agentId, event, p.message, typeof p.fully_idle === 'boolean' ? p.fully_idle : undefined);
     if (agentId && typeof p.transcript_path === 'string' && p.transcript_path) {
       this.transcriptPaths.set(agentId, p.transcript_path);
     }
+
+    // L0 — Codex has no status line. It stamps its rate-limit snapshot onto the
+    // token_count event of every turn in the rollout it is already writing, so the
+    // hook boundary we are standing on IS the event-driven refresh: by the time a
+    // hook fires, the turn that produced a fresh snapshot has been written. Reading
+    // it costs a stat on an unchanged file and a short tail read on a changed one,
+    // and it makes no provider request of any kind. Non-Codex agents cost one
+    // existence check. Session boundaries force a rescan, because a new session
+    // means a new rollout file rather than an append to the old one.
+    if (agentId && this.onCapacity) this.observeCodexCapacity(agentId, event);
 
     // Status-line payloads carry the session's EXACT context accounting —
     // current tokens AND the real window size (200k vs 1M, which nothing else
@@ -134,10 +254,22 @@ export class HookServer {
     // statusLine shim, not a real hook boundary — it must never trip the
     // HALT gate or feed the breaker's loop detector below. The early return
     // also (deliberately) skips recordSession for status ticks: a statusLine
-    // payload's session_id adds nothing the real hooks don't already record,
-    // and telemetry should never write to the registry. transcript_path IS
-    // still captured above, where every payload shape benefits from it.
+    // payload's session_id adds nothing the real hooks don't already record.
+    // The model is the exception: it is the authoritative per-agent `/model`
+    // observation and must survive a restart. transcript_path IS still captured
+    // above, where every payload shape benefits from it.
     if (event === 'Status') {
+      const statusModel = typeof p.model === 'object' && p.model !== null && typeof p.model.id === 'string'
+        ? p.model.id.trim()
+        : '';
+      if (agentId && statusModel) {
+        const agent = this.hive.registry().agents[agentId];
+        // Do not let a bridged provider's display model become a future Claude
+        // argv. `recordModel` repeats this gate at the persistence boundary.
+        if (agent?.provider === 'claude') {
+          this.hive.recordModel(agentId, statusModel, modelForHiveSpawn(agent, this.getConfig()));
+        }
+      }
       const cw = p.context_window;
       if (agentId && cw && typeof cw.total_input_tokens === 'number'
         && typeof cw.context_window_size === 'number' && cw.context_window_size > 0) {
@@ -153,6 +285,25 @@ export class HookServer {
           tokens: cw.total_input_tokens,
           limit: cw.context_window_size
         });
+      }
+      // L0 — the same payload carries the SUBSCRIPTION's rolling allowance
+      // windows, which is a different quantity from the context accounting above:
+      // context is per session and per agent, allowance is shared at account scope
+      // across every session drawing on it. This is the supported machine-readable
+      // pre-limit signal for a Claude subscription, and it arrives here for free on
+      // a status tick that is already happening — no poll, no extra request, and no
+      // credential is touched. Guarded so a payload without the field, or with a
+      // shape we do not recognise, changes nothing.
+      if (p.rate_limits !== undefined && this.onCapacity) {
+        try {
+          const now = Date.now();
+          const obs = normalizeClaudeStatusLine({
+            rateLimits: p.rate_limits,
+            accountScope: claudeAccountScope(),
+            receivedAt: now
+          });
+          if (obs) this.onCapacity(agentId ?? null, obs);
+        } catch { /* telemetry must never break a status tick */ }
       }
       return {};
     }
@@ -177,6 +328,7 @@ export class HookServer {
     // accounting schema uniform). Pure telemetry — never feeds the loop detector.
     if (event === 'CostSample') {
       if (agentId && p.session_id) {
+        const model = typeof p.model === 'string' ? p.model : '';
         const input = p.input ?? 0;
         const output = p.output ?? 0;
         const cacheRead = p.cache_read ?? 0;
@@ -189,8 +341,8 @@ export class HookServer {
           output,
           cacheRead,
           cacheCreation,
-          model: p.model ?? '',
-          usd: estimateCostUsd(p.model, {
+          model,
+          usd: estimateCostUsd(model, {
             inputTokens: input,
             outputTokens: output,
             cacheReadTokens: cacheRead,
@@ -221,8 +373,9 @@ export class HookServer {
       if (p.stop_hook_active) { this.emit(agentId, event, p); return {}; }
       // Never turn unread hive mail into a forced continuation at Stop. That old
       // path bypassed terminal-draft/HITL safety and could spend credits while a
-      // user was answering a question. Inbox files remain durable; the renderer
-      // wakes the agent later through its guarded idle-only delivery path.
+      // user was answering a question. Inbox files remain durable; main's inbox-wake
+      // bridge treats this Stop as a retry EDGE and wakes the agent after this response,
+      // through the one guarded submit owner. This return stays non-blocking.
       this.notify(agentId ?? 'Agent', 'finished — idle');
       this.emit(agentId, event, p);
       return {};

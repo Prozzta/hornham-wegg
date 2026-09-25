@@ -90,3 +90,9 @@ export async function checkPrecondition(
     return 'send';
   }
 }
+
+// L0-FUSION stage 5.3: `typeAndSubmit` - the renderer's ask -> payload -> pause -> Enter
+// order - lived here and is REMOVED. The renderer no longer types programmatically at all;
+// the one main-owned submit transaction (src/main/automaticSubmit.ts) owns that order, the
+// final check next to the Enter, and the settle. What remains in this module is what the
+// renderer still decides: whether to ask, and that it acknowledges only on a COMMIT.

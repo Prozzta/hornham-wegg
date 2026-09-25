@@ -28,3 +28,12 @@ docs/media/MunderDifflin*.mp4
 
 # blog theme previews (local only)
 docs/blog-preview-*/
+# L0-FUSION mutant census scratch (test/automatic-submit.test.cjs); removed on exit, ignored in case of a crash
+test/.mutants/
+test/.mutants-delivery-hold/
+test/.mutants-capacity-runtime/
+test/.mutants-capacity-runtime-adm/
+test/.mutants-capacity-runtime-own/
+test/.mutants-dev-isolation-capacity/
+test/electron-harness/.mutant-run-*.cjs
+test/.mutants-pool-timer/

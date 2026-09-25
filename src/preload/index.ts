@@ -1,10 +1,20 @@
 import { contextBridge, ipcRenderer, webUtils, type IpcRendererEvent } from 'electron';
 import type { AgentProvider } from '../shared/agentProvider';
+import type { InputOrigin } from '../shared/inputOrigin';
+import type { Eligibility, TerminalInputState } from '../shared/inputProvenance';
+import type { TerminalPromptState } from '../shared/promptState';
 import type { HireManifest } from '../shared/hire';
 export type { HireManifest } from '../shared/hire';
 import type { IntegrationRecord, IntegrationTemplate } from '../shared/integrations';
 export type { IntegrationRecord, IntegrationTemplate } from '../shared/integrations';
 import type { UpdateStatus } from '../shared/updateState';
+import type { CapacityStripCollection } from '../shared/capacityStrip';
+import type { AgentImpact, AgentImpactPush } from '../shared/deliveryHold';
+import type { AgentUsagePush, AgentUsageView } from '../shared/agentUsage';
+import type { ProviderCapacityDetailView } from '../shared/capacityDetail';
+export type { ProviderCapacityDetailView } from '../shared/capacityDetail';
+export type { AgentUsagePush, AgentUsageView } from '../shared/agentUsage';
+export type { CapacityStripCollection } from '../shared/capacityStrip';
 export type { UpdateStatus } from '../shared/updateState';
 import type { ToolStatus } from '../shared/toolCatalog';
 export type { ToolStatus } from '../shared/toolCatalog';
@@ -310,6 +320,13 @@ export interface HarnessConfig {
   costCapUsd?: number;
   costCapTokens?: number;
   agentTokenCaps?: Record<string, number>;
+  /** v1.1.45 CAPUI-MONITOR: what each agent's first Monitor line shows. Absent = 'budget'.
+   *  'fiveHour' / 'weekly' show that provider window's usage AND exempt the agent from the
+   *  budget limits (see src/shared/agentUsage.ts). Claude/Codex agents only. */
+  agentUsageDisplay?: Record<string, 'budget' | 'fiveHour' | 'weekly'>;
+  /** v1.1.45 unit #8 (C2.8): the capacity-display threshold, an integer 1-99 (default 15).
+   *  Display only: it gates the strip's Weekly reveal and the 5h/Weekly reset hints. */
+  capacityWeeklyDisplayThreshold?: number;
   autoDeliveryPausedAgents?: string[];
   maxTurns?: number;
   circuitBreaker?: CircuitBreakerConfig;
@@ -482,9 +499,54 @@ export interface ClosingTimeEvent {
 }
 
 /** Per-agent operator-control state (#7C.1–7C.3). */
+/**
+ * L0-FUSION stage 5.3 - what the main-owned submit transaction reports. `COMMITTED` is
+ * the ONLY outcome a queue item may be acknowledged on. `REFUSED`, `ABORTED` and `FAILED`
+ * left nothing of ours on any live prompt: keep the item and ask again (the same id is
+ * fine). `INTERFERED` means a human wrote onto our staged text: the item is HELD, nothing
+ * was cleared or sent, and automatic delivery to that terminal is inhibited until a human
+ * resolves it. The renderer decides nothing here - it is told.
+ */
+export type AutoSubmitClass = 'CAPACITY_GATED' | 'USER_RELEASED' | 'BOOT_SEQUENCE';
+export type AutoSubmitOutcome =
+  | { kind: 'COMMITTED' }
+  | { kind: 'REFUSED'; reason: string; detail?: string }
+  | { kind: 'ABORTED'; detail: string }
+  | { kind: 'INTERFERED'; reason: string; detail?: string }
+  | { kind: 'FAILED'; reason: string }
+  | { kind: 'REJECTED'; reason: string }
+  /** A person resolved an INTERFERED hold on this message with "already handled". It is
+   *  never typed again; the queue drops it. */
+  | { kind: 'HUMAN_HANDLED' };
+
+/** How a person resolves an INTERFERED hold. No default exists - see main's handler. */
+export type InterferenceResolution = 'SEND_AGAIN' | 'ALREADY_HANDLED';
+
 export interface AgentControlSnapshot {
+  /**
+   * Provider capacity refuses an ORDINARY automatic turn for this agent's pool.
+   * Computed in MAIN at the IPC boundary from the admission seam; never derived on
+   * this side. Separate from `autoDeliveryPaused`, which means a person paused the
+   * agent and is rendered as such — this one gates automatic delivery and is shown as
+   * a capacity hold, in the words of `capacityEvidence` (shared/deliveryHold.ts).
+   */
+  capacityHold?: boolean;
+  /**
+   * L0-FUSION stage 5.4b - an unresolved INTERFERED on this agent's terminal, or null. A
+   * human typed onto automation's staged text: main sent no Enter, cleared nothing, and
+   * refuses every programmatic delivery to that terminal until a HUMAN resolves it
+   * (`autoSubmit:resolveInterference`). Read from the one owner; it has no timer.
+   */
+  interfered?: { requestId: string; reason: string; at: number } | null;
+  /** Why (L0-UNKNOWN ruling, state invariant): 'NO_POOL' = outside capacity gating, NEVER
+   *  "available"; 'STALE_AFTER_HEALTHY' proceeds but is NOT healthy; 'RECOVERING' is a
+   *  post-reset re-probe and is NOT healthy; the rest are held. Computed in main through
+   *  the one resolver; never derived here. */
+  capacityEvidence?: 'NO_POOL' | 'FRESH_HEALTHY' | 'STALE_AFTER_HEALTHY' | 'FRESH_NOT_HEALTHY' | 'STALE_AFTER_LIMITED' | 'STALE_AFTER_UNHEALTHY' | 'RECOVERING' | 'NO_STATE' | 'INDETERMINATE' | 'UNCLASSIFIED' | 'POST_RESET_PROBE' | 'POST_RESET_PROBE_SPENT' | 'LIMITED_NO_KNOWN_RESET';
   paused: boolean;
   halted: boolean;
+  /** v1.1.45 unit #5: main's agent-card impact string while a hold is real, else null. */
+  impact?: AgentImpact | null;
   autoDeliveryPaused: boolean;
   gatedTools: string[];
   pendingSteers: number;
@@ -568,10 +630,37 @@ const api = {
    *  into — the renderer stores that, not the raw `~/…` the user typed. */
   spawnPty: (opts: SpawnPtyOptions): Promise<{ ok: boolean; error?: string; cwd?: string; worktreePath?: string; resumeNotFound?: boolean; resumed?: boolean; seedPrompt?: string }> =>
     ipcRenderer.invoke('pty:spawn', opts),
-  writePty: (id: string, data: string): Promise<{ ok: boolean; error?: string }> =>
-    ipcRenderer.invoke('pty:write', id, data),
+  /** `origin` is REQUIRED: every writer declares who is behind the bytes
+   *  (`shared/inputOrigin.ts`). Main advances the PTY's human-input generation
+   *  only for HUMAN, and refuses a write whose origin it does not recognise. */
+  writePty: (id: string, data: string, origin: InputOrigin): Promise<{ ok: boolean; error?: string }> =>
+    ipcRenderer.invoke('pty:write', id, data, origin),
   resizePty: (id: string, cols: number, rows: number): Promise<{ ok: boolean; error?: string }> =>
     ipcRenderer.invoke('pty:resize', id, cols, rows),
+  /** L0-FUSION stage 3: the renderer mirrors xterm's own provenance facts for one
+   *  terminal (mouse tracking mode, DOM attachment, self-test) to main, on change. */
+  reportTerminalInputState: (id: string, state: TerminalInputState): Promise<{ ok: boolean; error?: string }> =>
+    ipcRenderer.invoke('pty:inputState', id, state),
+  /** L0-FUSION stage 5: whose the prompt is (picker latch / human draft / settle),
+   *  mirrored to main on change so the main-owned submit transaction can READ it before
+   *  STAGE and inside its critical section. Not provenance; see shared/promptState.ts. */
+  reportTerminalPromptState: (id: string, state: TerminalPromptState): Promise<{ ok: boolean; error?: string }> =>
+    ipcRenderer.invoke('pty:promptState', id, state),
+  /** L0-FUSION stage 5: main asks this renderer to READ A RENDERED SCREEN for the submit
+   *  owner's erase verification. The renderer answers with `answerScreenReading`; it
+   *  decides nothing, and silence is read by main as "no reading", never as "erased". */
+  onScreenReadRequest: (cb: (req: { requestId: string; ptyId: string; needle: string }) => void): (() => void) => {
+    const listener = (_e: IpcRendererEvent, req: { requestId: string; ptyId: string; needle: string }) => cb(req);
+    ipcRenderer.on('autoSubmit:readScreen', listener);
+    return () => ipcRenderer.removeListener('autoSubmit:readScreen', listener);
+  },
+  answerScreenReading: (requestId: string, reading: { onPromptRow: boolean; screenCount: number } | null): void => {
+    ipcRenderer.send('autoSubmit:screenReading', requestId, reading);
+  },
+  /** May automatic delivery arm on this terminal RIGHT NOW? Evaluated fresh in main on
+   *  every call from the mirrored state; never cached. */
+  automaticDeliveryEligibility: (id: string): Promise<Eligibility> =>
+    ipcRenderer.invoke('pty:automaticDeliveryEligibility', id),
   redrawPty: (id: string): Promise<{ ok: boolean; error?: string }> =>
     ipcRenderer.invoke('pty:redraw', id),
   killPty: (id: string): Promise<{ ok: boolean; error?: string }> =>
@@ -649,6 +738,23 @@ const api = {
   /** Set or clear one per-agent token ceiling against main's latest config. */
   setAgentTokenCap: (agentId: string, tokenCap?: number): Promise<HarnessConfig> =>
     ipcRenderer.invoke('config:setAgentTokenCap', agentId, tokenCap),
+  /** v1.1.45 CAPUI-MONITOR: persist an agent's Monitor line; 5H/Weekly also exempt it from the budget. */
+  setAgentUsageDisplay: (agentId: string, display: 'budget' | 'fiveHour' | 'weekly'): Promise<HarnessConfig> =>
+    ipcRenderer.invoke('config:setAgentUsageDisplay', agentId, display),
+  /** v1.1.45 unit #8: set the capacity-display threshold (1-99). Rejects invalid input; the stored value stays. */
+  setCapacityDisplayThreshold: (value: number): Promise<HarnessConfig> =>
+    ipcRenderer.invoke('config:setCapacityDisplayThreshold', value),
+  /** v1.1.45 CAPUI-MONITOR: one agent's 5h + weekly usage, on its OWN channel (not control:snapshot).
+   *  Literal channel name: a test pins it to CAPACITY_AGENT_USAGE in src/shared/agentUsage.ts. */
+  capacityAgentUsage: (agentId: string): Promise<AgentUsageView | null> =>
+    ipcRenderer.invoke('capacity:agentUsage', agentId),
+  /** Push (unit #13): every 5H / Weekly agent's usage rows, on their OWN channel. The
+   *  invoke above stays for the mount-time initial state. */
+  onAgentUsage: (cb: (push: AgentUsagePush) => void): (() => void) => {
+    const listener = (_e: IpcRendererEvent, payload: AgentUsagePush) => cb(payload);
+    ipcRenderer.on('capacity:agentUsagePush', listener);
+    return () => ipcRenderer.removeListener('capacity:agentUsagePush', listener);
+  },
   ensureHarnessHome: (path: string): Promise<{ ok: boolean; error?: string }> =>
     ipcRenderer.invoke('config:ensureHome', path),
   /** Change the harness home folder. 'move' copies the existing hive + palace
@@ -751,6 +857,9 @@ const api = {
   hiveLog: (n?: number): Promise<unknown[]> => ipcRenderer.invoke('hive:log', n ?? 200),
   hiveMemory: (id: string): Promise<string> => ipcRenderer.invoke('hive:memory', id),
   hiveInbox: (id: string): Promise<HiveMessage[]> => ipcRenderer.invoke('hive:inbox', id),
+  /** Ask MAIN to consider waking this agent. A hint with no payload and no decision:
+   *  main re-reads the inbox, applies every guard and owns the claim. Never a submit. */
+  hiveRequestInboxWake: (id: string): Promise<boolean> => ipcRenderer.invoke('hive:requestInboxWake', id),
   /** Voice read-layer: recent message CONTENT (inbox/outbox bodies), REDACTED in
    *  main. Pass { id } for one message, { agentId } to scope to one mailbox, or
    *  {} for the whole floor. Backs Realtime Michael's get_messages. The renderer
@@ -802,7 +911,9 @@ const api = {
   /** Condense agent memory.md files (the janitor's missing half). With an id,
    *  condense that agent on demand; without, run a full threshold scan. Returns
    *  the per-agent outcomes ({ id, condensed, reason, oldBytes?, newBytes? }). */
-  reflectNow: (id?: string): Promise<Array<{ id: string; condensed: boolean; reason: string; oldBytes?: number; newBytes?: number }>> =>
+  // `passes` > 1 means an oversized file was dug out across several calls; `oldBytes`
+  // is then the size before the FIRST pass, not the last. GATE-4 asserts on it.
+  reflectNow: (id?: string): Promise<Array<{ id: string; condensed: boolean; reason: string; oldBytes?: number; newBytes?: number; passes?: number }>> =>
     ipcRenderer.invoke('memory:reflectNow', id),
 
   // ─── Enterprise Knowledge Graph (multimodal context for agents) ───────────
@@ -860,6 +971,44 @@ const api = {
     ipcRenderer.on('hive:contextUpdate', listener);
     return () => ipcRenderer.removeListener('hive:contextUpdate', listener);
   },
+  /** The CANONICAL provider-native lifecycle for one agent (AGY 1.1.48), classified in
+   *  main from a version-validated statusline tick. The renderer displays it and does
+   *  not parse, re-derive or second-guess it: raw provider status never crosses this
+   *  boundary, and nothing the renderer does with this value authorises a submission. */
+  onHiveProviderStatus: (
+    cb: (e: { agentId: string; status: 'idle' | 'running' | 'waiting_for_confirmation' }) => void
+  ): (() => void) => {
+    const listener = (_e: IpcRendererEvent, payload: { agentId: string; status: 'idle' | 'running' | 'waiting_for_confirmation' }) => cb(payload);
+    ipcRenderer.on('hive:providerStatus', listener);
+    return () => ipcRenderer.removeListener('hive:providerStatus', listener);
+  },
+  // --- Provider capacity, pool level (v1.1.45 unit #1) ---------------------------
+  // Channel names are literals because this preload imports no runtime values; a
+  // test pins them to the constants in src/shared/capacityStrip.ts.
+  /** Push: the complete-replace pool collection, on its OWN channel (not control:snapshot). */
+  onCapacityStrip: (cb: (collection: CapacityStripCollection) => void): (() => void) => {
+    const listener = (_e: IpcRendererEvent, payload: CapacityStripCollection) => cb(payload);
+    ipcRenderer.on('capacity:strip', listener);
+    return () => ipcRenderer.removeListener('capacity:strip', listener);
+  },
+  /** Pull the current collection - a reloaded window subscribes after main may have pushed. */
+  capacityStripCurrent: (): Promise<CapacityStripCollection | null> =>
+    ipcRenderer.invoke('capacity:stripCurrent'),
+  /** Record, in main, that a person dismissed a capacity notice. */
+  capacityDismissNotice: (noticeId: string): Promise<boolean> =>
+    ipcRenderer.invoke('capacity:dismissNotice', noticeId),
+  /** v1.1.45 unit #4: one pool's provider DETAIL view, on its OWN channel, only while the panel is open. */
+  capacityDetail: (poolId: string): Promise<ProviderCapacityDetailView | null> =>
+    ipcRenderer.invoke('capacity:detail', poolId),
+  /** v1.1.46 A2: main re-pushes the open STALE pool's detail once a minute (a main-side time
+   *  edge, never a renderer clock). Literal channel names: a test pins them to
+   *  CAPACITY_DETAIL_PUSH / CAPACITY_DETAIL_CLOSED in src/shared/capacityDetail.ts. */
+  onCapacityDetailPush: (cb: (view: ProviderCapacityDetailView) => void): (() => void) => {
+    const listener = (_e: IpcRendererEvent, payload: ProviderCapacityDetailView) => cb(payload);
+    ipcRenderer.on('capacity:detailPush', listener);
+    return () => ipcRenderer.removeListener('capacity:detailPush', listener);
+  },
+  capacityDetailClosed: (poolId: string): void => ipcRenderer.send('capacity:detailClosed', poolId),
   onHiveMessage: (cb: (e: HiveRouteEvent) => void): (() => void) => {
     const listener = (_e: IpcRendererEvent, payload: HiveRouteEvent) => cb(payload);
     ipcRenderer.on('hive:message', listener);
@@ -1037,6 +1186,33 @@ const api = {
   /** Read an agent's current control snapshot. */
   controlSnapshot: (agentId: string): Promise<AgentControlSnapshot | null> =>
     ipcRenderer.invoke('control:snapshot', agentId),
+  /** CRIT-15-PRE: every watched agent's impact, PUSHED by main on its own channel. The
+   *  snapshot above stays for the mount-time initial state. Literal channel name: a test
+   *  pins it to AGENT_IMPACT_PUSH in src/shared/deliveryHold.ts. */
+  onAgentImpact: (cb: (push: AgentImpactPush) => void): (() => void) => {
+    const listener = (_e: IpcRendererEvent, payload: AgentImpactPush) => cb(payload);
+    ipcRenderer.on('control:agentImpactPush', listener);
+    return () => ipcRenderer.removeListener('control:agentImpactPush', listener);
+  },
+  /**
+   * L0-FUSION stage 5.3 - ask MAIN to type a message into an agent's terminal and submit
+   * it. The one door for programmatic text+Enter: the renderer names the agent and the
+   * admission class, and main owns everything else - the PTY, capacity, readiness, the
+   * order, the final check next to the Enter, and the settle. `requestId` is the message's
+   * own stable id: it is delivered AT MOST ONCE however many times it is asked. Resolves
+   * with what happened; never rejects for a delivery reason.
+   */
+  autoSubmit: (req: { requestId: string; agentId: string; admissionClass: AutoSubmitClass; text: string; settleMs?: number }): Promise<AutoSubmitOutcome> =>
+    ipcRenderer.invoke('autoSubmit:submit', req),
+  /**
+   * L0-FUSION stage 5.4b - A HUMAN says the prompt that was interfered with is dealt with.
+   * The only way an INTERFERED hold ends while its terminal lives. Call it from a person's
+   * click and from nowhere else: no timer, no retry loop, no automation may decide that a
+   * human's text no longer matters. Types nothing, clears nothing, sends no Enter. The
+   * person says HOW (option B): 'SEND_AGAIN' or 'ALREADY_HANDLED'. There is no default.
+   */
+  resolveInterference: (agentId: string, how: InterferenceResolution): Promise<boolean> =>
+    ipcRenderer.invoke('autoSubmit:resolveInterference', agentId, how),
   /** Subscribe to gate/deny events (a tool was blocked); returns unsubscribe fn. */
   onApprovalRequest: (cb: (e: { agentId: string; tool?: string; reason?: string }) => void): (() => void) => {
     const listener = (_e: IpcRendererEvent, payload: { agentId: string; tool?: string; reason?: string }) => cb(payload);
@@ -1061,6 +1237,9 @@ const api = {
   listMissions: (): Promise<ScheduledMission[]> => ipcRenderer.invoke('missions:list'),
   saveMissions: (missions: ScheduledMission[]): Promise<{ ok: boolean }> =>
     ipcRenderer.invoke('missions:save', missions),
+  /** TE0: dispatch this mission NOW, past its delta gate. */
+  runMissionNow: (missionId: string): Promise<{ ok: boolean; error?: string }> =>
+    ipcRenderer.invoke('missions:runNow', missionId),
   /** Fires when the scheduler stamps a mission's lastFiredAt (a beat/dispatch),
    *  so the SCHEDULES panel can refresh "last fired" without a reload. */
   onMissionsUpdated: (cb: () => void): (() => void) => {

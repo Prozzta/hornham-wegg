@@ -255,3 +255,72 @@ export function terminalReadyToReceive(
   }
   return hasOutput !== false && elapsedMs >= terminalReadySettleMs(provider);
 }
+
+/**
+ * L0-FUSION section 8 — can an automatically staged payload be UN-TYPED on this
+ * provider's TUI, as MEASURED? The main-owned submit transaction stages nothing for
+ * automatic delivery on a provider that answers UNKNOWN: a late capacity refusal would
+ * otherwise leave text on the prompt that nothing can verifiably remove.
+ *
+ *   MEASURED  a row exists in the committed clear matrix
+ *             (`test/provider-clear-matrix.test.cjs`, captures in
+ *             `test/electron-harness/scenarios/tui-clear-matrix.ts`): from the staged
+ *             state production creates, the control removed the text from the prompt
+ *             row AND from the screen, and a harmless key did not.
+ *   UNKNOWN   everything else. "Unmeasurable is UNKNOWN evidence, not a residual that
+ *             can be declared passing" (Dwight 17.3).
+ *
+ * `null` never means "we did not check" here either — but unlike the context-command
+ * table above, NOT HAVING MEASURED is itself the answer, and it fails closed.
+ *
+ * A TOTAL RECORD, for the reason the context-command table is one: adding a provider
+ * does not compile until somebody has decided, and "decided" defaults to UNKNOWN.
+ *
+ * WHAT THE TWO MEASURED ROWS DO AND DO NOT COVER. Single-line payloads, at boot and
+ * composer-idle, on the captured versions (claude 2.1.270, codex 0.154.0). MULTI-LINE
+ * payloads are NOT measured. The owner does not take this table's word for an erase in
+ * any case: every ABORT is verified on the live screen, differentially, and anything
+ * short of positive verification is held as INTERFERED rather than settled.
+ *
+ * `antigravity` WAS UNKNOWN BY MEASUREMENT - the capture aborted on its trust dialog
+ * without a keystroke, twice - and stayed UNKNOWN until the human trusted one scratch
+ * folder BY HAND (the tool never answers a dialog and was not taught to). Oscar then
+ * captured it four times with the same tool, and all four were REPLAYED through the xterm
+ * matrix before the row was flipped: marker on the prompt row, gone from the prompt row AND
+ * the screen after Ctrl-U, a harmless key leaves it in place, mouse tracking 'none' at boot
+ * and after staging+clear. Same limits as the other rows: single-line, composer-idle, the
+ * installed version. agy is ALSO known to treat bracketed-paste markers as literal input
+ * (useHive history, #24), so its MULTI-LINE behaviour is not merely unmeasured but
+ * suspect - and the owner verifies every abort on the live screen regardless.
+ */
+export type AutomaticAbortCapability =
+  | { kind: 'MEASURED'; clearControl: string; settleMs: number }
+  | { kind: 'UNKNOWN' };
+
+const ABORT_UNKNOWN: AutomaticAbortCapability = { kind: 'UNKNOWN' };
+
+/** Ctrl-U, the control the capture tool sent (`test/tools/termmatrix-capture.cjs`), and
+ *  the quiesce IT waited before reading the screen. `clearTerminalDraft`'s incumbent
+ *  300 ms is NOT used: nothing measured it, and a settle that is too short reads a
+ *  screen mid-repaint and holds a perfectly good abort as unverified. */
+const MEASURED_CTRL_U: AutomaticAbortCapability = { kind: 'MEASURED', clearControl: '\x15', settleMs: 900 };
+
+const AUTOMATIC_ABORT_CAPABILITY: Record<AgentProvider, AutomaticAbortCapability> = {
+  claude: MEASURED_CTRL_U,
+  codex: MEASURED_CTRL_U,
+  grok: ABORT_UNKNOWN,
+  kimi: ABORT_UNKNOWN,
+  gemini: ABORT_UNKNOWN,
+  antigravity: MEASURED_CTRL_U,
+  qwen: ABORT_UNKNOWN,
+  opencode: ABORT_UNKNOWN,
+  crush: ABORT_UNKNOWN,
+  pi: ABORT_UNKNOWN,
+  copilot: ABORT_UNKNOWN,
+  cursor: ABORT_UNKNOWN,
+  custom: ABORT_UNKNOWN
+};
+
+export function automaticAbortCapability(provider: AgentProvider): AutomaticAbortCapability {
+  return AUTOMATIC_ABORT_CAPABILITY[provider] ?? ABORT_UNKNOWN;
+}

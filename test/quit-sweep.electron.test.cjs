@@ -34,8 +34,15 @@ const path = require('node:path');
 const { spawn, execFileSync } = require('node:child_process');
 
 if (process.platform !== 'win32') {
-  console.log('  ok  (non-win32: the synchronous quit sweep is Windows-only — POSIX quits HUP the group via pty closure)');
-  process.exit(0);
+  // Exact mirror of test/proc-kill.test.cjs: that one is inert on win32, this one off it.
+  // A bare `process.exit(0)` reported as `ok 1` with nothing said; announce it instead so
+  // the summary shows a skip rather than a pass. Not a failure — the sweep really is
+  // Windows-only.
+  require('./tools/inert.cjs').announceInert(
+    'the synchronous Windows quit sweep',
+    'non-win32: the synchronous quit sweep is Windows-only — POSIX quits HUP the group via pty closure'
+  );
+  return;
 }
 
 // From plain Node (not inside Electron), the electron package exports the

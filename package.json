@@ -1,6 +1,6 @@
 {
   "name": "munder-difflin",
-  "version": "0.4.5",
+  "version": "1.1.49",
   "private": true,
   "description": "Clones for you and your team, working 24/7 — a free, local-first multi-agent harness that turns the CLI coding agent you already run into a clone of you, coordinating an office of agents on your machine.",
   "main": "out/main/index.js",
@@ -8,7 +8,7 @@
   "homepage": "https://munderdiffl.in/",
   "repository": {
     "type": "git",
-    "url": "https://github.com/chaitanyagiri/munder-difflin.git"
+    "url": "https://github.com/Prozzta/hornham-wegg.git"
   },
   "scripts": {
     "dev": "electron-vite dev",
@@ -20,7 +20,7 @@
     "typecheck:node": "tsc --noEmit -p tsconfig.node.json",
     "typecheck:web": "tsc --noEmit -p tsconfig.web.json",
     "typecheck": "npm run typecheck:node && npm run typecheck:web",
-    "test:focused": "node --test test/*.test.cjs",
+    "test:focused": "node test/tools/run-tests.cjs",
     "check:links": "node tools/check-release-links.cjs",
     "dist": "npm run build && electron-builder",
     "dist:mac": "npm run build && electron-builder --mac",

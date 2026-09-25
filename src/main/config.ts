@@ -12,6 +12,8 @@ import {
 } from '../shared/agentProvider';
 import { defaultMcpDefaults } from '../shared/mcpCatalog';
 import { MAX_AGENT_TOKEN_CAP } from '../shared/tokenCaps';
+import { isAgentUsageDisplay } from '../shared/agentUsage';
+import { parseCapacityDisplayThreshold } from '../shared/capacityThreshold';
 import { expandTilde, normalizeHiveHome } from './fs';
 import type { IntegrationRecord } from '../shared/integrations';
 import {
@@ -58,6 +60,19 @@ export interface ScheduledMission {
    *  inbox/outbox mtimes, any PTY output) has moved in this many ms. Default
    *  ~5 min. NOT derived from registry.status (which never transitions in main). */
   quietThresholdMs?: number;
+  /** TE0: suppress this mission's dispatch while the floor is provably unchanged.
+   *  ABSENT ⇒ OFF ⇒ the pre-TE0 unconditional dispatch, so every mission that does
+   *  not opt in keeps its exact prior behaviour. See main/standupDelta.ts for what
+   *  "unchanged" hashes, and for the two rules that make the answer trustworthy. */
+  deltaGate?: { enabled: boolean };
+  /** Scheduler-owned, like `lastFiredAt`: the floor fingerprint as of the last
+   *  DISPATCHED run, and when that was. `lastFiredAt` cannot stand in for the
+   *  latter — it advances on suppressed ticks too (it has to, or the timer
+   *  re-arms with zero delay). `lastDispatchAt` no longer gates anything: it is
+   *  read only to report how long a suppressed floor has been quiet, which under
+   *  the gate's RULE 3 is an unbounded span and therefore worth reporting. */
+  lastDeltaFingerprint?: string;
+  lastDispatchAt?: number;
 }
 
 /** The built-in hourly ops standup: god reviews who's doing what + whether tasks
@@ -77,7 +92,14 @@ export const OPS_STANDUP_MISSION: ScheduledMission = {
     'next step, then compact and resume from the same point — so terminal ' +
     'contexts stay bounded without losing work. The compaction is queued and ' +
     'runs when an agent is idle, so it never interrupts work mid-step.)',
-  enabled: true
+  enabled: true,
+  // TE0. A standup whose only finding is "nothing changed" still costs a full
+  // model turn over god's whole session prefix, because the dispatch wakes him.
+  // The gate answers that question locally instead. There is NO periodic
+  // fallback: a provably unchanged floor may go indefinitely without a standup,
+  // which is the owner's ruling and the whole point of the gate. Stall detection
+  // is the HEARTBEAT's job, not this mission's — see standupDelta.ts RULE 3.
+  deltaGate: { enabled: true }
   // NO autoCompact. Compaction belongs to contextTrigger.compact and nothing else.
   // This flag used to live here as well, which meant a default install asked for
   // compaction on TWO cadences — hourly from this standup and 2-hourly from the
@@ -228,6 +250,12 @@ export interface HarnessConfig {
   /** One-time guard for the built-in heartbeat mission (mirrors opsStandupSeeded
    *  so a user who deletes the heartbeat doesn't get it re-added every boot). */
   heartbeatSeeded?: boolean;
+  /** TE0 one-time guard: has the delta gate been attached to an ALREADY-SEEDED
+   *  ops standup? Without this migration the gate would reach new installs only —
+   *  `opsStandupSeeded` is already true on every existing install, so the seeding
+   *  branch never runs again and the mission would keep its pre-TE0 shape forever.
+   *  Set once; a user who then turns the gate off keeps it off. */
+  standupDeltaGateSeeded?: boolean;
   /** maint-1 guard for the dedicated auto-compact maintenance mission. UNLIKE the
    *  two above, this does NOT suppress re-add forever: once seeded (flag set), a
    *  later delete makes the mission reappear DISABLED on next boot (compaction is
@@ -247,6 +275,13 @@ export interface HarnessConfig {
    *  tokens exceed its cap the breaker trips that agent alone (independent of the
    *  floor budget). Set from each agent's card in the Command Center. */
   agentTokenCaps?: Record<string, number>;
+  /** v1.1.45 CAPUI-MONITOR: what each agent's first Monitor line shows. Absent = 'budget'.
+   *  'fiveHour' / 'weekly' show that provider window's usage AND exempt the agent from the
+   *  budget limits (see src/shared/agentUsage.ts). Claude/Codex agents only. */
+  agentUsageDisplay?: Record<string, 'budget' | 'fiveHour' | 'weekly'>;
+  /** v1.1.45 unit #8 (C2.8): the capacity-display threshold, an integer 1-99 (default 15).
+   *  Display only: it gates the strip's Weekly reveal and the 5h/Weekly reset hints. */
+  capacityWeeklyDisplayThreshold?: number;
   /** Agent ids whose automatic inbox/queue delivery is paused. Pending messages
    *  stay durable until the operator explicitly resumes delivery. */
   autoDeliveryPausedAgents?: string[];
@@ -712,6 +747,32 @@ export function setAgentTokenCap(agentId: unknown, tokenCap: unknown): HarnessCo
   });
 }
 
+/** Set one agent's Monitor line (Budget / 5H / Weekly) against the latest config on disk.
+ *
+ * The same read-modify-write in main as `setAgentTokenCap`, for the same reason: the
+ * renderer holds snapshots. 'budget' is the default, so it is stored as ABSENT; only an
+ * explicit 5H or Weekly choice is written, and only that exempts the agent from the
+ * budget. An unknown value is refused rather than stored, so it can never be read later
+ * as an exemption. */
+export function setAgentUsageDisplay(agentId: unknown, display: unknown): HarnessConfig {
+  if (typeof agentId !== 'string' || agentId.trim().length === 0 || !isAgentUsageDisplay(display)) {
+    throw new Error('invalid agent usage display');
+  }
+  const current = readConfig();
+  const agentUsageDisplay = { ...(current.agentUsageDisplay ?? {}) };
+  if (display === 'budget') delete agentUsageDisplay[agentId];
+  else agentUsageDisplay[agentId] = display;
+  return persistConfig({ ...current, agentUsageDisplay });
+}
+
+/** Set the capacity-display threshold (C2.8). An integer 1-99 or it is REFUSED: the stored
+ * value is left exactly as it was, and nothing is clamped into range. */
+export function setCapacityDisplayThreshold(value: unknown): HarnessConfig {
+  const t = parseCapacityDisplayThreshold(value);
+  if (t === null) throw new Error('invalid capacity display threshold');
+  return persistConfig({ ...readConfig(), capacityWeeklyDisplayThreshold: t });
+}
+
 /** Wipe the persisted config back to first-run defaults so the app boots into
  *  onboarding again. Used by the "reset & start over" flow. */
 export function resetConfig(): HarnessConfig {
@@ -757,6 +818,21 @@ export function modelForRole(
   const hay = `${meta.role ?? ''} ${(meta.capabilities ?? []).join(' ')}`.toLowerCase();
   if (/\b(triage|rout|verif|lint|format|summar|classif|label)/.test(hay)) return MODEL_HELPER;
   return MODEL_WORKER;
+}
+
+/** Resolve a hive Claude spawn model. A saved per-agent `/model` choice is
+ * authoritative over app-wide defaults; an explicit argv `--model` is handled
+ * by the caller before it calls this helper. */
+export function modelForHiveSpawn(
+  meta: RoleHint,
+  config: Pick<HarnessConfig, 'defaultModel' | 'godProvider' | 'godModel'>,
+  persistedModel?: string
+): string | undefined {
+  const saved = persistedModel?.trim();
+  if (saved) return saved;
+  return meta.isGod
+    ? modelForRole(meta, config)
+    : config.defaultModel ?? modelForRole(meta, config);
 }
 
 /** Ensure harnessHome exists on disk. Expands `~` first — the onboarding wizard

@@ -13,6 +13,7 @@
  * unmount — the rendered content moves with it, so the terminal is always
  * visible immediately, no repaint required.
  */
+import { createPoolTimer } from './poolTimer';
 import { useEffect, useState } from 'react';
 import { Terminal } from '@xterm/xterm';
 import { FitAddon } from '@xterm/addon-fit';
@@ -21,6 +22,13 @@ import { Unicode11Addon } from '@xterm/addon-unicode11';
 import {
   classifyPathToken, isPathToken, pathTokenMatcher, stripPathToken, type PathAction
 } from '@shared/terminalPaths';
+import {
+  attachInputOrigin, classifyOutbound, markHumanOrigin, resetInputWindow,
+  runInputOriginSelfTest, type ProbeConsumer
+} from './inputOrigin';
+import type { InputOrigin } from '@shared/inputOrigin';
+import { sameInputState, type TerminalInputState } from '@shared/inputProvenance';
+import type { PromptBlock } from '@shared/promptState';
 import {
   createTerminalRecoveryState,
   normalizePtyChunk,
@@ -45,8 +53,15 @@ export interface TerminalEntry {
   fit: FitAddon;
   /** The element xterm renders into; views re-parent this in/out of the DOM. */
   host: HTMLDivElement;
-  /** xterm is only `open()`ed once its host is first attached to the document. */
+  /** xterm is `open()`ed at ACQUIRE time, into a host that is NOT yet in the document
+   *  (see acquireTerminal). Attaching only re-parents that host into a view. */
   opened: boolean;
+  /** Has this terminal ever been in the document — i.e. has it ever had a RENDERED
+   *  screen? Distinct from `opened` since the acquire-time attach: every pooled
+   *  terminal is opened, so `opened` no longer answers "is the screen evidence of
+   *  anything". Only `promptLineHasText` needs that distinction, and it is the one
+   *  place where getting it wrong hands a user's prompt to automation. */
+  everAttached: boolean;
   exited: boolean;
   /** Stream subscriptions to tear down on dispose. */
   unsub: Array<() => void>;
@@ -75,9 +90,25 @@ export interface TerminalEntry {
    * prompt (Ctrl-U, a respawn reset) has to clear both or the next keystroke
    * resurrects the deleted text as a phantom draft. */
   lineBuf: string;
-  /** Bumped every time this pty is respawned under the same id. Late events from
-   * the OLD process carry the generation they were registered under, so they can
-   * be recognised and dropped instead of corrupting the replacement. */
+  /** L0-FUSION stage 3. While set, the NEXT byte xterm emits is handed here instead of
+   *  written to the pty - the self-test's swallow. One-shot; cleared by the onData
+   *  handler the moment it fires. */
+  inputOriginProbe?: ProbeConsumer;
+  /** Last provenance state reported to main, so we report only on change. */
+  inputStateReported?: TerminalInputState;
+  /** Last prompt block main ACKED, and the incarnation it was ACKED under - so the
+   *  mirror reports on change and re-reports to every new incarnation. */
+  promptStateReported?: PromptBlock;
+  promptStateReportedGen?: number;
+  promptStateInFlight?: boolean;
+  /** Self-test outcome for this incarnation; 'unknown' until it has run. */
+  inputSelfTest: 'unknown' | 'pass' | 'fail';
+  /** The INCARNATION TOKEN. Bumped on every establish (open/reset/relaunch) and on
+   * dispose, so a live pty session under this id owns exactly one value. Every async
+   * bit of input provenance - self-test probes, its timeout, its completion, and each
+   * report retry - captures the generation it began under and drops the instant that
+   * value moves on (Dwight 24.3), so a late callback can neither clear a newer probe,
+   * mutate a newer entry, nor report stale state under a REUSED ptyId (a fail-open). */
   generation: number;
   webgl?: WebglAddon;
 }
@@ -109,7 +140,7 @@ export function notifyThemeChangeAll(theme: 'light' | 'dark'): void {
 function notifyThemeChange(ptyId: string, theme: 'light' | 'dark'): void {
   const entry = pool.get(ptyId);
   if (!entry || entry.exited || !entry.themeNotify) return;
-  window.cth.writePty(ptyId, `\x1b[?997;${theme === 'dark' ? 1 : 2}n`);
+  window.cth.writePty(ptyId, `\x1b[?997;${theme === 'dark' ? 1 : 2}n`, 'CONTROL');
 }
 
 /** Get (or lazily create) the persistent terminal for a pty. Theme/font are
@@ -141,7 +172,15 @@ export function acquireTerminal(ptyId: string, theme?: ThemeMap, fontSize = 14):
     // actual background — so it also rescues low-contrast coloured *text* on the
     // cream paper. Untouched for already-high-contrast cells (the dark theme).
     minimumContrastRatio: 4.5,
-    allowProposedApi: true
+    allowProposedApi: true,
+    // L0-FUSION rev 13 row 12, accepted by the human as REMOVAL rather than a gate.
+    // xterm's default is true (typings/xterm.d.ts:43-44): alt+click sends cursor-
+    // movement sequences to the running program as human input, from a mouseup
+    // listener on the DOCUMENT (SelectionService.ts:492-493 -> :711) - outside
+    // term.element and therefore invisible to inputOrigin. A gate would leave a
+    // producer we cannot see and must remember to keep refusing; turning it off
+    // deletes the case. USER-VISIBLE: alt+click no longer moves the prompt cursor.
+    altClickMovesCursor: false
   });
   const fit = new FitAddon();
   term.loadAddon(fit);
@@ -152,8 +191,6 @@ export function acquireTerminal(ptyId: string, theme?: ThemeMap, fontSize = 14):
   term.loadAddon(new Unicode11Addon());
   term.unicode.activeVersion = '11';
   registerMarkdownLinkProvider(term, ptyId);
-  // NOTE: don't open() yet — xterm needs its host connected to the document to
-  // measure correctly. We open on first attach (see attachTerminal).
 
   const entry: TerminalEntry = {
     ptyId,
@@ -161,6 +198,7 @@ export function acquireTerminal(ptyId: string, theme?: ThemeMap, fontSize = 14):
     fit,
     host,
     opened: false,
+    everAttached: false,
     exited: false,
     unsub: [],
     recovery: createTerminalRecoveryState(),
@@ -172,6 +210,7 @@ export function acquireTerminal(ptyId: string, theme?: ThemeMap, fontSize = 14):
     inputDirtyAt: 0,
     automationSettleUntil: 0,
     lineBuf: '',
+    inputSelfTest: 'unknown',
     generation: 0
   };
 
@@ -207,6 +246,11 @@ export function acquireTerminal(ptyId: string, theme?: ThemeMap, fontSize = 14):
   entry.unsub.push(window.cth.onPtyRelaunch(ptyId, () => {
     entry.exited = false;
     try { term.reset(); } catch { /* not yet open */ }
+    // Same-id respawn: main has a fresh session at NO_STATE and the old window may be
+    // mid-drain. Clear the transient window and re-run state + self-test for the new
+    // incarnation, or eligibility stays NO_STATE forever (Dwight 23.3).
+    resetInputWindow(ptyId);
+    establishInputProvenance(entry);
   }));
 
   // ── Copy / paste ──────────────────────────────────────────────────────────
@@ -241,11 +285,27 @@ export function acquireTerminal(ptyId: string, theme?: ThemeMap, fontSize = 14):
    *  preload), so this degrades to the previous behaviour rather than to nothing. */
   const pasteClipboard = (): void => {
     if (entry.exited) return;
+    // PROVENANCE, EXPLICITLY, ON BOTH PATHS. `term.paste()` is a public method that
+    // makes xterm emit data with NO DOM paste event (browser/Terminal.ts:890-891 ->
+    // Clipboard.ts:54), so the DOM half of inputOrigin cannot see it. The sync path
+    // happens to run inside the keydown that invoked us, so it would classify HUMAN
+    // by accident; the async fallback runs in a .then() long after that keydown, so
+    // it would classify CONTROL - a user's paste read as not-human, on the exact
+    // compatibility path built to be taken silently on an older preload (L0-FUSION
+    // rev 11 dimension 2; the human's constraint ii). Both are marked here, at code
+    // we own with known provenance, immediately before the call that emits.
     try {
       const text = window.cth.readClipboardSync?.();
-      if (typeof text === 'string') { if (text) term.paste(text); return; }
+      if (typeof text === 'string') {
+        if (text) { markHumanOrigin(ptyId, 'paste-sync'); term.paste(text); }
+        return;
+      }
     } catch { /* fall through to the async path */ }
-    void window.cth.readClipboard().then((t) => { if (t) term.paste(t); });
+    void window.cth.readClipboard().then((t) => {
+      if (!t || entry.exited) return;
+      markHumanOrigin(ptyId, 'paste-async');
+      term.paste(t);
+    });
   };
   term.attachCustomKeyEventHandler((ev) => {
     if (ev.type !== 'keydown') return true;
@@ -291,7 +351,7 @@ export function acquireTerminal(ptyId: string, theme?: ThemeMap, fontSize = 14):
     const hex = index === 11 ? map?.background : map?.foreground;
     const rgb = hex && parseHexColor(hex);
     if (!rgb) return false;                  // unknown colour: stay silent rather than lie
-    window.cth.writePty(ptyId, `\x1b]${index};${oscColorBody(rgb)}\x1b\\`);
+    window.cth.writePty(ptyId, `\x1b]${index};${oscColorBody(rgb)}\x1b\\`, 'CONTROL');
     return true;
   };
   term.parser.registerOscHandler(10, oscColorReply(10));
@@ -302,6 +362,12 @@ export function acquireTerminal(ptyId: string, theme?: ThemeMap, fontSize = 14):
   // its panels from that answer keeps them until something tells it to repaint,
   // which is why flipping the app theme left OpenCode's boxes in the old colours.
   // Return false so xterm still applies the mode itself; we are only listening.
+  // Any DEC private mode set/reset MAY have changed mouse tracking. We do not decode
+  // which - xterm does, and `term.modes` is its answer - we only schedule a re-read
+  // after xterm has applied the mode (the handler returns false so it does). This is
+  // the runtime, re-entrant half of the human's rule: the mirror follows the TUI.
+  term.parser.registerCsiHandler({ prefix: '?', final: 'h' }, () => { scheduleInputStateReport(entry); return false; });
+  term.parser.registerCsiHandler({ prefix: '?', final: 'l' }, () => { scheduleInputStateReport(entry); return false; });
   term.parser.registerCsiHandler({ prefix: '?', final: 'h' }, (params) => {
     if (params.includes(2031)) {
       entry.themeNotify = true;
@@ -328,7 +394,19 @@ export function acquireTerminal(ptyId: string, theme?: ThemeMap, fontSize = 14):
   // path resets it too.
   term.onData((data) => {
     if (entry.exited) return;
-    window.cth.writePty(ptyId, data);
+    // Self-test swallow, CORRELATED: the probe is offered this byte's origin and data
+    // and returns true only if it is the byte it awaits, in which case it is consumed
+    // and never reaches the pty. An unrelated byte (return false) falls through to be
+    // classified and written normally, so the probe cannot eat real input.
+    if (entry.inputOriginProbe && entry.inputOriginProbe(classifyOutbound(ptyId, data), data)) {
+      return;
+    }
+    // THE ONE CLASSIFICATION POINT (L0-FUSION rev 13 section 13.2). Everything xterm
+    // emits — keystrokes, pastes, IME, AND the terminal's own protocol replies —
+    // arrives here on one callback with no origin attached. `classifyOutbound`
+    // answers from the human window that `inputOrigin.ts` owns; nothing here
+    // guesses from the bytes.
+    window.cth.writePty(ptyId, data, classifyOutbound(ptyId, data));
     // A lone Escape or Ctrl-C closes interactive pickers. Arrow-key escape
     // sequences must NOT clear the block while the user navigates a picker.
     if (data === '\x1b' || data === '\x03') {
@@ -371,9 +449,37 @@ export function acquireTerminal(ptyId: string, theme?: ThemeMap, fontSize = 14):
     // Re-stamped on every keystroke, so the staleness clock measures time since
     // the user last touched the draft — not since they started it.
     if (entry.inputDirty) entry.inputDirtyAt = Date.now();
+    // The draft or the picker latch may just have changed: tell main (deduped on ACK).
+    reportPromptState(entry);
   });
 
   pool.set(ptyId, entry);
+
+  // ── ACQUIRE-TIME DETACHED ATTACH ─────────────────────────────────────────
+  // Open xterm NOW, into `host` while it is still outside the document, so the input
+  // provenance DOM half is wired for EVERY acquired terminal instead of only the ones a
+  // view has shown. App.tsx pre-warms one terminal per agent (App.tsx: acquireTerminal per
+  // live agent), so before this the unviewed majority reported `inputOriginAttached: false`
+  // and could never become eligible however long they ran. Human ruling: "GO WITH DETACHED".
+  //
+  // THE PRICE, MEASURED ON THIS BUILD, NOT ASSUMED — ONE GRID COLUMN. xterm's Viewport reads
+  // the scrollbar width ONCE, in its constructor, from offsetWidth (Viewport.ts:70). Detached
+  // that is 0, so it keeps the 15px FALLBACK for this terminal's whole life, while a terminal
+  // opened attached measures the platform's real bar (17px on this Windows box). FitAddon
+  // subtracts it, so for the same 640px host a detached-opened terminal proposes 78 columns
+  // where an attached-opened one proposes 77 — and no later fit or reflow re-measures it. The
+  // cost is one column of grid, and one pixel of the last column under the scrollbar, on
+  // platforms whose bar is not 15px, for every terminal opened before its first view.
+  //
+  // The OFFSCREEN variant deletes that cost (a real offsetWidth measures the real bar) and was
+  // DECLINED, because it buys the column back with three behaviour changes: fit() stops being
+  // a no-op before first view, so the relaunch paths here that fit-then-spawn would size the
+  // pty to a phantom box and repaint on first view; the helper textarea becomes reachable by
+  // Tab; and every pooled terminal adds a live "Terminal input" textbox to the accessibility
+  // tree with nothing on screen. Detached keeps fit() inert, which is what those paths rely on.
+  openTerminalOnce(entry);
+  promptMirror.sync(pool.size);
+  ensureScreenReadResponder();
   return entry;
 }
 
@@ -408,8 +514,8 @@ const ECHO_GRACE_MS = 1000;
  *  arrive" bug. xterm already holds the rendered screen, so read it instead of
  *  trusting the count.
  *
- *  Returns null when the screen is not evidence of anything: the terminal has not
- *  been opened, the row is missing, or the last keystroke is too recent for the
+ *  Returns null when the screen is not evidence of anything: the terminal has never
+ *  been RENDERED, the row is missing, or the last keystroke is too recent for the
  *  echo to have landed. Deliberately only ever used to CLEAR a phantom, never to
  *  invent a draft: "empty" drops the block, while "has text" or "don't know"
  *  falls back to the keystroke model and keeps it. The asymmetry matters because
@@ -417,7 +523,12 @@ const ECHO_GRACE_MS = 1000;
  *  automation and fuses a message onto what the user is writing, where a wrong
  *  "has text" only parks a queued message until the draft expires. */
 function promptLineHasText(entry: TerminalEntry, now = Date.now()): boolean | null {
-  if (!entry.opened || entry.exited) return null;
+  // NOT `!entry.opened`. Since the acquire-time detached attach every pooled terminal is
+  // opened, including ones no view has ever shown, and such a terminal's buffer is EMPTY
+  // while its keystroke model may not be - so reading it would return "empty" and DROP the
+  // block, the one mistake this predicate is built never to make. `everAttached` is the
+  // property `opened` used to stand for here: has this screen ever existed to be read.
+  if (!entry.everAttached || entry.exited) return null;
   // Too soon after the last keystroke for the echo to have landed — the buffer
   // is showing us the past, so it cannot clear anything.
   if (entry.inputDirtyAt && now - entry.inputDirtyAt < ECHO_GRACE_MS) return null;
@@ -480,6 +591,111 @@ function releasePickerBlock(entry: TerminalEntry): void {
   entry.automationBlocked = false;
   entry.automationBlockedAt = 0;
   entry.automationSettleUntil = Date.now() + 500;
+  reportPromptState(entry);
+}
+
+// ── THE PROMPT MIRROR (L0-FUSION stage 5) ──────────────────────────────────────────
+// The picker latch, the human draft and the settle window live on the pool entry, and
+// until stage 5 only the renderer's own queue drain could consult them. The main-owned
+// submit transaction must read them IN MAIN (design section 5.3: before STAGE and again
+// inside its critical section), and the main-process worker wake typed with no view of
+// them at all. So the block this module already computes is mirrored, exactly as
+// computed - including the half-hour expiry of an untouched draft or picker, so main and
+// the composer never disagree about why a message is waiting.
+//
+// SAME DISCIPLINE AS THE PROVENANCE MIRROR: the cache is set only on main's ACK, a
+// rejected report is retried on the next tick rather than recorded as delivered, and a
+// terminal main has never heard from stays UNKNOWN, which main refuses for automatic
+// delivery. It is NOT an interference or erase oracle - `inputDirty` only ever sees
+// keystrokes xterm saw, so it is blind to automatically staged text by construction.
+
+/** Several of the block's inputs change with no event at all - a settle window ending,
+ *  a draft or picker going stale, the echo grace elapsing - so the mirror is re-derived
+ *  on a slow tick as well as on every input. One timer for the whole pool. */
+const PROMPT_MIRROR_TICK_MS = 500;
+/** ABSENT while the pool is empty, PRESENT from the first terminal, EXACTLY ONE at any size
+ *  (poolTimer.ts). It used to start once and never stop - 7,200 empty callbacks an hour. */
+const promptMirror = createPoolTimer(() => {
+  for (const entry of pool.values()) reportPromptState(entry);
+}, PROMPT_MIRROR_TICK_MS);
+
+function currentPromptBlock(entry: TerminalEntry): PromptBlock {
+  return terminalAutomationBlock(automationStateOf(entry));
+}
+
+function reportPromptState(entry: TerminalEntry): void {
+  if (entry.exited) return;
+  const block = currentPromptBlock(entry);
+  const gen = entry.generation;
+  // `undefined` = nothing ACKED for this incarnation yet, so even `null` (free) is news.
+  if (entry.promptStateReportedGen === gen && entry.promptStateReported === block) return;
+  if (entry.promptStateInFlight) return; // the tick re-derives; never queue a stale value
+  const p = window.cth.reportTerminalPromptState?.(entry.ptyId, { block });
+  if (!p) return; // no bridge (harness): main stays UNKNOWN, the fail-closed answer
+  entry.promptStateInFlight = true;
+  void p.then((r) => {
+    entry.promptStateInFlight = false;
+    if (r && r.ok && entry.generation === gen) {
+      entry.promptStateReported = block;
+      entry.promptStateReportedGen = gen;
+    }
+    // Not ACKED (no session yet, bridge error) or superseded: the next tick re-sends.
+  }).catch(() => { entry.promptStateInFlight = false; });
+}
+
+/**
+ * THE ERASE ORACLE (design section 5.1) - what the RENDERED SCREEN says about `needle`.
+ *
+ *   onPromptRow  is it on the row at `buffer.active.baseY + buffer.active.cursorY`?
+ *                Where the cursor sits is which line is the prompt.
+ *   screenCount  how many visible rows contain it, prompt row included.
+ *
+ * The main-owned submit transaction asks this twice around a clear and compares: it must
+ * first SEE its text on the prompt row, and afterwards find it gone from that row AND
+ * fewer times on the screen. This function only READS. It never consults `inputDirty` or
+ * `hasTerminalDraft` - both are blind to automatically staged text - and it is never
+ * asked whether a human typed.
+ *
+ * Null = the screen is not evidence: no such terminal, it has exited, or the buffer could
+ * not be read. Main treats null as "no reading" and holds the item.
+ */
+export function readScreenForNeedle(ptyId: string, needle: string): { onPromptRow: boolean; screenCount: number } | null {
+  const entry = pool.get(ptyId);
+  if (!entry || entry.exited || !entry.opened || !needle) return null;
+  try {
+    const buf = entry.term.buffer.active;
+    const promptLine = buf.getLine(buf.baseY + buf.cursorY);
+    if (!promptLine) return null;
+    let screenCount = 0;
+    for (let y = 0; y < entry.term.rows; y += 1) {
+      const line = buf.getLine(buf.baseY + y);
+      if (line && line.translateToString(true).includes(needle)) screenCount += 1;
+    }
+    return { onPromptRow: promptLine.translateToString(true).includes(needle), screenCount };
+  } catch {
+    return null;
+  }
+}
+
+/** Answer main's screen-reading requests for terminals in THIS renderer's pool. Wired
+ *  once, on the first acquire (by then the preload bridge exists); a bridge without the
+ *  method (the Electron harness stub) simply never asks. */
+let screenReadResponderInstalled = false;
+function ensureScreenReadResponder(): void {
+  if (screenReadResponderInstalled) return;
+  screenReadResponderInstalled = true;
+  window.cth?.onScreenReadRequest?.((req) => {
+    if (!req || typeof req.requestId !== 'string') return;
+    const entry = typeof req.ptyId === 'string' ? pool.get(req.ptyId) : undefined;
+    if (!entry) { window.cth.answerScreenReading(req.requestId, null); return; }
+    // Read only after xterm has parsed everything already queued for this terminal: an
+    // empty write is ordered behind pending PTY output (the same public FIFO barrier the
+    // provenance self-test uses), so the reading reflects the repaint a clear provoked
+    // rather than the frame before it.
+    entry.term.write('', () => {
+      window.cth.answerScreenReading(req.requestId, readScreenForNeedle(req.ptyId, String(req.needle ?? '')));
+    });
+  });
 }
 
 /** Why queue delivery is currently held back for this pty, or null if it isn't.
@@ -503,7 +719,9 @@ export function clearTerminalDraft(ptyId: string): string {
   // again. Ctrl-U is not undoable in a TUI, so silently discarding it was data
   // loss every time an abandoned-looking draft turned out to be a real one.
   const discarded = entry.lineBuf;
-  void window.cth.writePty(ptyId, '\x15');
+  // HUMAN: this runs only because the user pressed the composer's own button —
+  // explicit provenance at a site we own, not inferred from the byte.
+  void window.cth.writePty(ptyId, '\x15', 'HUMAN');
   entry.inputDirty = false;
   entry.inputDirtyAt = 0;
   // Reset our model of the line too. Leaving it set made the very next keystroke
@@ -517,6 +735,7 @@ export function clearTerminalDraft(ptyId: string): string {
   // got garbage. The latch is released by a real Enter/Esc/Ctrl-C, or it expires.
   // Let the TUI repaint the cleared line before automation types into it.
   entry.automationSettleUntil = Date.now() + 300;
+  reportPromptState(entry);
   return discarded;
 }
 
@@ -529,7 +748,8 @@ export function clearTerminalDraft(ptyId: string): string {
 export function dismissTerminalPicker(ptyId: string): void {
   const entry = pool.get(ptyId);
   if (!entry || entry.exited) return;
-  void window.cth.writePty(ptyId, '\x1b');
+  // HUMAN for the same reason as clearTerminalDraft: user-initiated, site we own.
+  void window.cth.writePty(ptyId, '\x1b', 'HUMAN');
   releasePickerBlock(entry);
 }
 
@@ -600,15 +820,116 @@ function releaseWebglRenderer(entry: TerminalEntry): void {
   entry.needsRendererRepaint = true;
 }
 
-/** Re-parent a pty's terminal into `container`, opening xterm on first attach. */
+/** The provenance facts main needs, read from xterm's OWN public `modes` - never from a
+ *  regex over the bytes. `attached` is true only after open(); before that the DOM half
+ *  has nothing to attach to and every byte would read CONTROL. */
+function currentInputState(entry: TerminalEntry): TerminalInputState {
+  return {
+    mouseTrackingMode: entry.term.modes.mouseTrackingMode,
+    inputOriginAttached: entry.opened,
+    selfTest: entry.inputSelfTest
+  };
+}
+
+/** Retry backoff for a mirror report that main did not accept - e.g. the renderer
+ *  attached and reported BEFORE main had created the session (`no pty`). Bounded: if
+ *  the bridge is permanently down the terminal stays NO_STATE, which is fail-closed. */
+const INPUT_STATE_RETRY_MS = [100, 250, 500, 1000, 2000];
+
+/** Mirror to main. The local cache is set only AFTER main ACKS the exact state, never
+ *  before: Dwight 23.3 - caching on send meant a report lost to a transient failure or
+ *  a pre-session race was recorded as delivered and never retried, leaving main at
+ *  NO_STATE forever while the renderer believed it had reported. A rejected or thrown
+ *  report is retried on a bounded backoff; a newer state supersedes it (the dedupe
+ *  below re-sends whenever the live state differs from the last ACKED one).
+ *  Optional-chained: the Electron harness stubs `window.cth` without this method, and a
+ *  missing bridge must not throw inside xterm's parser - it simply leaves main NO_STATE,
+ *  the fail-closed answer, not a silent pass. */
+function reportInputState(entry: TerminalEntry, gen: number, attempt = 0): void {
+  if (entry.exited || entry.generation !== gen) return;   // disposed or superseded incarnation: drop
+  const state = currentInputState(entry);
+  if (sameInputState(entry.inputStateReported, state)) return;   // already ACKED this exact state
+  const p = window.cth.reportTerminalInputState?.(entry.ptyId, state);
+  if (!p) return;   // no bridge (harness): nothing to ACK, nothing to retry
+  void p.then((r) => {
+    if (entry.exited || entry.generation !== gen) return;   // incarnation ended while we waited: publish nothing
+    if (r && r.ok) { entry.inputStateReported = state; return; }   // cache ONLY on ACK
+    scheduleReportRetry(entry, gen, attempt);
+  }).catch(() => scheduleReportRetry(entry, gen, attempt));
+}
+
+function scheduleReportRetry(entry: TerminalEntry, gen: number, attempt: number): void {
+  // Superseded (a newer establish bumped generation) or disposed (exited) -> stop; a
+  // permanently-down bridge exhausts the backoff and the terminal stays NO_STATE.
+  if (entry.exited || entry.generation !== gen || attempt >= INPUT_STATE_RETRY_MS.length) return;
+  setTimeout(() => reportInputState(entry, gen, attempt + 1), INPUT_STATE_RETRY_MS[attempt]);
+}
+
+/** Establish input provenance for THIS live incarnation: report the attached-but-
+ *  unproven state at once (so main is not left at NO_STATE for a terminal that exists),
+ *  then run the self-test and report the proven result. Called at first open AND after
+ *  every same-id respawn - Dwight 23.3: a reused entry that never re-ran this left the
+ *  new main session UNKNOWN forever. */
+function establishInputProvenance(entry: TerminalEntry): void {
+  if (!entry.opened || entry.exited) return;
+  // Bumping the generation cancels any in-flight prior run: its gen-guarded setProbe/
+  // clearProbe become no-ops (a late timeout cannot clear THIS run's probe) and its
+  // result-publish is dropped (a late completion cannot publish as this incarnation).
+  const gen = ++entry.generation;
+  entry.inputSelfTest = 'unknown';
+  entry.inputStateReported = undefined;   // the new session has no prior state; force a fresh report
+  entry.inputOriginProbe = undefined;     // drop any probe a superseded run left installed
+  reportInputState(entry, gen);
+  void runInputOriginSelfTest(
+    entry.ptyId, entry.term,
+    (consumer) => { if (entry.generation === gen) entry.inputOriginProbe = consumer; },
+    () => { if (entry.generation === gen) entry.inputOriginProbe = undefined; }
+  ).then((r) => {
+    if (entry.exited || entry.generation !== gen) return;   // a newer incarnation (or dispose) owns the entry now
+    entry.inputSelfTest = r; reportInputState(entry, gen);
+  }).catch(() => {
+    if (entry.exited || entry.generation !== gen) return;
+    entry.inputSelfTest = 'fail'; reportInputState(entry, gen);
+  });
+}
+
+/** Read `term.modes` AFTER xterm has applied the DEC mode the parser just saw. A CSI
+ *  handler runs before xterm's own, so reading inside it would see the previous mode. */
+function scheduleInputStateReport(entry: TerminalEntry): void {
+  // The live mouse-mode mirror: report under the CURRENT generation, read at fire
+  // time, so it is never dropped as stale yet is still incarnation-guarded if the
+  // terminal was disposed between the mode change and this microtask.
+  queueMicrotask(() => reportInputState(entry, entry.generation));
+}
+
+/** Open xterm ONCE for this entry and wire the input-provenance DOM half.
+ *
+ *  Called at ACQUIRE time, against a host that is not in the document yet — that is the
+ *  whole point of the acquire-time attach, and acquireTerminal carries the priced cost.
+ *  attachTerminal calls it again, so an entry whose acquire-time open did not happen (a
+ *  future caller building an entry another way) still opens on first view rather than
+ *  never; for the normal entry it is a no-op because `opened` is already true.
+ *
+ *  THIS GUARD IS LOAD-BEARING FOR INPUT PROVENANCE, not only for WebGL. xterm creates
+ *  `term.element` and `term.textarea` INSIDE open() (browser/Terminal.ts:444), so the
+ *  provenance listeners can only be attached after it, and only once: a second open()
+ *  would recreate the element and orphan them with no error and no symptom except that
+ *  human input silently stops being seen. `attachInputOrigin` lives INSIDE this guard and
+ *  must move with it if it is ever relaxed. (L0-FUSION rev 11 dimension 7.) */
+function openTerminalOnce(entry: TerminalEntry): void {
+  if (entry.opened) return;
+  entry.term.open(entry.host);
+  entry.opened = true;
+  entry.unsub.push(attachInputOrigin(entry.ptyId, entry.term));
+  establishInputProvenance(entry);
+}
+
+/** Re-parent a pty's terminal into `container`. xterm is already open (acquire time,
+ *  detached); the open below is the fallback described in openTerminalOnce. */
 export function attachTerminal(entry: TerminalEntry, container: HTMLElement): void {
   container.appendChild(entry.host);
-  if (!entry.opened) {
-    // open() must come first — the WebGL addon can only load onto an opened
-    // terminal, and xterm needs its host in the document to measure the cell.
-    entry.term.open(entry.host);
-    entry.opened = true;
-  }
+  entry.everAttached = true;   // from here the rendered screen is evidence (promptLineHasText)
+  openTerminalOnce(entry);
   leaseWebglRenderer(entry);
   // PTY startup output can arrive before this pooled terminal subscribes.
   // Request one same-size redraw after open/subscription even when fit() later
@@ -732,17 +1053,28 @@ export function resetTerminal(
       entry.term.reset();
     }
   } catch { /* not yet open */ }
+  // A reset is a new process on the same entry - re-establish provenance for it, the
+  // same as the relaunch path, or the new session stays NO_STATE (Dwight 23.3).
+  resetInputWindow(ptyId);
+  establishInputProvenance(entry);
 }
 
 /** Tear down a pty's terminal (call when the agent/pty is gone for good). */
 export function disposeTerminal(ptyId: string): void {
   const entry = pool.get(ptyId);
   if (!entry) return;
+  // A dispose ENDS the incarnation (Dwight 24.3). Marking exited and bumping the
+  // generation makes every outstanding self-test completion and report retry a no-op
+  // the instant it fires, so none can report stale state under a later REUSED ptyId.
+  entry.exited = true;
+  entry.generation++;
+  entry.inputOriginProbe = undefined;
   entry.unsub.forEach((u) => { try { u(); } catch { /* noop */ } });
   try { entry.webgl?.dispose(); } catch { /* noop */ }
   try { entry.term.dispose(); } catch { /* noop */ }
   entry.host.remove();
   pool.delete(ptyId);
+  promptMirror.sync(pool.size); // the last terminal takes the timer with it
 }
 
 // ─── v0.3.4: ⌘-click a path in terminal output ──────────────────────────────

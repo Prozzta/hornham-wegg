@@ -109,6 +109,13 @@ test('model picker options stay provider-specific', () => {
   assert.deepEqual(modelsForProvider('custom'), []);
 });
 
+test('Claude picker offers the verified Opus 5.5 and Fable 5.1 ids', () => {
+  const ids = modelsForProvider('claude').map((model) => model.id);
+  assert.ok(ids.includes('claude-fable-5-1'));
+  assert.ok(ids.includes('claude-opus-5-5'));
+  assert.ok(ids.includes('claude-opus-5-5[1m]'));
+});
+
 test('Command Center model choices round-trip provider and model', () => {
   const encoded = encodeProviderModel('antigravity', 'Gemini 3.1 Pro (High)');
   assert.deepEqual(
