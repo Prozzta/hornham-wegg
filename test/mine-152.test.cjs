@@ -97,7 +97,9 @@ test('fingerprints ignore timestamp-only changes, while content changes reset de
 test('bloat threshold and staged swap are safe, reversible filesystem operations', (t) => {
   assert.equal(rebuild.rebuildNeeded(562 * 1024 * 1024, 3795), true, 'the observed 562MB/3795 palace crosses 10x');
   assert.equal(rebuild.rebuildNeeded(6 * 1024 * 1024, 3795), false, 'a compact ~6MB palace is left alone');
-  assert.equal(rebuild.repairStatusEmbeddingCount('SQLite embeddings: 3,795\nHNSW: 3795'), 3795);
+  // The REAL MemPalace 3.7.1 report (per-collection blocks), not an invented one-liner.
+  const realStatus = fs.readFileSync(path.join(__dirname, 'fixtures', 'mempalace', 'repair-status-3.7.1.txt'), 'utf8');
+  assert.equal(rebuild.repairStatusEmbeddingCount(realStatus), 3795, 'drawers 3,317 + closets 478');
   const root = home(t);
   const palace = path.join(root, 'palace');
   const staged = `${palace}.stage`;
@@ -109,18 +111,17 @@ test('bloat threshold and staged swap are safe, reversible filesystem operations
   assert.equal(fs.readFileSync(path.join(backup, 'old'), 'utf8'), 'old', 'old palace is retained, never deleted');
 });
 
-test('watchdog policy is a 60-second no-progress daemon-stop backoff, while first boot gets grace', () => {
+test('mine policy: daemon jobs judged by job state + wall caps (no silence watchdog), while first boot gets grace', () => {
   const source = fs.readFileSync(path.join(__dirname, '..', 'src', 'main', 'memory.ts'), 'utf8');
-  assert.match(source, /const MINE_WATCHDOG_MS = 60_000/);
+  // MINE-152 X2 (Jim): 60 s of stdout silence killed every mine on a real palace and
+  // stopped the daemon each time. Superseded by the job-state wait (mine-152-blockers).
+  assert.doesNotMatch(source, /MINE_WATCHDOG_MS|lastProgress|watchedOut/);
   assert.match(source, /const args = \['mine', agentDir, '--wing', id, '--agent', id\]/);
-  assert.match(source, /this\.stopDaemon\(\)/);
+  assert.match(source, /\[\.\.\.args, '--daemon', '--background'\]/);
   assert.match(source, /PRIORITY_BELOW_NORMAL/);
-  assert.match(source, /let lastProgress = Date\.now\(\)/);
   assert.match(source, /DAEMON_STARTUP_TIMEOUT_MS = 10 \* 60_000/);
-  assert.match(source, /if \(!watchedOut && daemon\) this\.stopDaemon\(\)/);
   assert.match(source, /code === 2 && \/\(\?:invalid choice\|unrecognized arguments\|daemon\)\/i\.test\(err\)/);
   assert.match(source, /MemPalace has no daemon: using one-shot mining/);
   assert.match(source, /DAEMON_RETRY_MS = 30 \* 60_000/);
   assert.match(source, /return this\.daemonUnavailable \? this\.mineOneShot\(agentDir, id\) : false/);
-  assert.match(source, /if \(daemon\) args\.push\('--daemon'\)/);
 });
