@@ -81,3 +81,14 @@ test('memory turned off in settings stays off however often it is polled', (t) =
   assert.equal(status.enabled, false, '…but the user said no');
   assert.equal(armed(memory), false);
 });
+
+test('daemonless MemPalace exposes mining unavailability without disabling search', (t) => {
+  const { memory } = managerWithCli(t, { bin: '/fake/bin/mempalace' });
+
+  memory.daemonUnavailable = 'MemPalace lacks daemon support; upgrade to 3.7 or newer to enable background mining';
+  const status = memory.status();
+
+  assert.equal(status.active, true, 'the available CLI still supports recall');
+  assert.equal(status.miningAvailable, false);
+  assert.match(status.miningError, /upgrade to 3\.7/);
+});

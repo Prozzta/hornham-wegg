@@ -118,4 +118,7 @@ test('watchdog policy is a 60-second no-progress daemon-stop backoff, while firs
   assert.match(source, /let lastProgress = Date\.now\(\)/);
   assert.match(source, /DAEMON_STARTUP_TIMEOUT_MS = 10 \* 60_000/);
   assert.match(source, /if \(!watchedOut\) this\.stopDaemon\(\)/);
+  assert.match(source, /code === 2 && \/\(\?:invalid choice\|unrecognized arguments\|daemon\)\/i\.test\(err\)/);
+  assert.match(source, /MemPalace lacks daemon support; upgrade to 3\.7 or newer to enable background mining/);
+  assert.match(source, /miningAvailable: this\.daemonUnavailable \? false : null/);
 });

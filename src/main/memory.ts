@@ -66,6 +66,10 @@ export interface MemoryStatus {
   palacePath: string | null;
   model: EmbeddingModel;
   bin: string | null;
+  /** Null until the first daemon attempt; false means reads still work but
+   * background mining is intentionally unavailable on this CLI version. */
+  miningAvailable: boolean | null;
+  miningError: string | null;
 }
 
 // Scan cheaply every 30s, but give each changed memory.md a full quiet minute
@@ -134,6 +138,8 @@ export class MemoryManager {
   /** Changes awaiting their quiet period. One queue serializes all writes. */
   private readonly pendingMines = new Map<string, PendingMine>();
   private daemonStart: Promise<boolean> | null = null;
+  private daemonUnavailable: string | null = null;
+  private daemonUnavailableLogged = false;
   private rebuilding = false;
   /** Log a stalled job once, then retry after backoff without a log storm. */
   private readonly watchdogLogged = new Set<string>();
@@ -203,7 +209,9 @@ export class MemoryManager {
       initialized: !!palace && existsSync(palace),
       palacePath: palace,
       model: this.model(),
-      bin: this.bin()
+      bin: this.bin(),
+      miningAvailable: this.daemonUnavailable ? false : null,
+      miningError: this.daemonUnavailable
     };
   }
 
@@ -443,15 +451,31 @@ export class MemoryManager {
       const bin = this.bin();
       if (!bin) { resolve(false); return; }
       let proc: ReturnType<typeof spawn>;
+      let err = '';
       try { proc = spawn(bin, ['daemon', 'start'], { env: this.childEnv(), stdio: ['ignore', 'ignore', 'pipe'] }); }
       catch { resolve(false); return; }
       // The daemon's child inherits this on Windows; on POSIX it keeps model
       // maintenance below Electron and active CLI work. Best-effort only.
       try { if (proc.pid) setPriority(proc.pid, osConstants.priority.PRIORITY_BELOW_NORMAL); } catch { /* platform policy */ }
+      proc.stderr?.on('data', (d) => { err += d.toString(); });
       const timer = setTimeout(() => { try { proc.kill('SIGTERM'); } catch { /* gone */ } resolve(false); }, DAEMON_STARTUP_TIMEOUT_MS);
       timer.unref?.();
-      proc.once('close', (code) => { clearTimeout(timer); resolve(code === 0); });
-      proc.once('error', () => { clearTimeout(timer); resolve(false); });
+      proc.once('close', (code) => {
+        clearTimeout(timer);
+        if (code === 0) { this.daemonUnavailable = null; resolve(true); return; }
+        // argparse uses exit 2 for an unknown `daemon` subcommand. Do not retry
+        // that incompatible CLI every two minutes: mining is off, but search
+        // remains active and status tells the user precisely why.
+        if (code === 2 && /(?:invalid choice|unrecognized arguments|daemon)/i.test(err)) {
+          this.daemonUnavailable = 'MemPalace lacks daemon support; upgrade to 3.7 or newer to enable background mining';
+          if (!this.daemonUnavailableLogged) {
+            this.daemonUnavailableLogged = true;
+            console.error(`[memory] ${this.daemonUnavailable}`);
+          }
+        } else this.daemonStart = null; // transient start failure: bounded retry may recover
+        resolve(false);
+      });
+      proc.once('error', () => { clearTimeout(timer); this.daemonStart = null; resolve(false); });
     });
     return this.daemonStart;
   }
