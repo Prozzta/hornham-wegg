@@ -846,7 +846,8 @@ export class HookServer {
     let steer: string | null = null;
     // Not for a subagent's hook: the one-shot steer is meant for the agent itself, and a
     // subagent consuming it would lose it (HOOK-BROKER audit N1).
-    if ((event === 'UserPromptSubmit' || event === 'PostToolUse') && agentId && this.control && !fromSubagent) {
+    // Nor for a one-way hook: its reply is never read, so a steer taken there is lost (P4 audit Y1).
+    if ((event === 'UserPromptSubmit' || event === 'PostToolUse') && agentId && this.control && !fromSubagent && p.transport !== 'pipe-oneway') {
       steer = this.control.takeSteer(agentId) ?? null;
     }
 

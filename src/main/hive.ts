@@ -2277,7 +2277,8 @@ export class HiveManager {
       hooks: [{ type: 'command', command: this.nodeRunUnquoted(shim, event), timeout: 0 }]
     });
     // HOOK-BROKER P4: the observational events go one-way (cheap); the ones that must be able to
-    // answer (a PreToolUse deny, a PreInvocation steer, a Stop block) keep the shim.
+    // answer (a PreToolUse deny, a PostToolUse steer, a Stop block) keep the shim. PostToolUse is
+    // AGY's ONLY steer carrier (it has no UserPromptSubmit), so it must stay answering (P4 audit Y1).
     const oneway = this.writeAgyOneway();
     const cheap = (event: string, matcher?: string) => ({
       ...(matcher ? { matcher } : {}),
@@ -2285,7 +2286,7 @@ export class HiveManager {
     });
     const group = {
       PreToolUse: [tool('PreToolUse')],
-      PostToolUse: [oneway ? cheap('PostToolUse', '*') : tool('PostToolUse')],
+      PostToolUse: [tool('PostToolUse')],
       PreInvocation: [plain('PreInvocation')],
       PostInvocation: [oneway ? cheap('PostInvocation') : plain('PostInvocation')],
       Stop: [plain('Stop')]
