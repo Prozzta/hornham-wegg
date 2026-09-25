@@ -26,6 +26,9 @@ import type { CapacityObservation } from '../shared/providerCapacity';
 interface HookPayload {
   hook_event_name?: string;
   agent_id?: string | null;
+  /** CODEX-HOOK-AGENTID: the provider's OWN agent id, when it sent one that is not the hive's
+   *  (a Codex or Claude subagent). The shim stamps agent_id with the hive id regardless. */
+  provider_agent_id?: string | null;
   session_id?: string;
   transcript_path?: string;
   /** Status-line payloads only: the session's live context accounting. */
@@ -236,9 +239,17 @@ export class HookServer {
     // halt gate, the breaker and session recording. It can arrive with agent_id null
     // from a session nobody spawned, and none of that machinery is for it.
     if (event === 'AgyStatusLine') return this.handleAgyStatus(p);
-    this.onEvent?.(agentId, event, p.message, typeof p.fully_idle === 'boolean' ? p.fully_idle : undefined,
-      typeof p.turn_id === 'string' && p.turn_id ? p.turn_id : undefined);
-    if (agentId && typeof p.transcript_path === 'string' && p.transcript_path) {
+    // CODEX-HOOK-AGENTID: a SUBAGENT's hook belongs to this agent (the halt gate, the breaker,
+    // the activity feed all apply), but it does not describe the agent's OWN session: its
+    // session id, transcript and turn are the subagent's. So it never records the session or
+    // transcript, never drives the wake lifecycle (a subagent's late tool hook would re-open
+    // a finished turn), and a subagent's Stop is not this agent's Stop.
+    const fromSubagent = typeof p.provider_agent_id === 'string' && p.provider_agent_id !== '';
+    if (!fromSubagent) {
+      this.onEvent?.(agentId, event, p.message, typeof p.fully_idle === 'boolean' ? p.fully_idle : undefined,
+        typeof p.turn_id === 'string' && p.turn_id ? p.turn_id : undefined);
+    }
+    if (agentId && !fromSubagent && typeof p.transcript_path === 'string' && p.transcript_path) {
       this.transcriptPaths.set(agentId, p.transcript_path);
     }
 
@@ -323,7 +334,7 @@ export class HookServer {
 
     // Capture the Claude Code session id for idempotent --resume + cost dedup
     // (Lane A #6.6a). Cheap: recordSession writes only when it changes.
-    if (agentId && p.session_id) this.hive.recordSession(agentId, p.session_id);
+    if (agentId && p.session_id && !fromSubagent) this.hive.recordSession(agentId, p.session_id);
 
     // CostSample — synthesized by the proxy-bridge sidecar (qwen) on every
     // response with usage. Persist it to the SAME cost ledger as Claude's OTel
@@ -373,6 +384,11 @@ export class HookServer {
       this.breaker?.recordCompactEnd(agentId);
     }
 
+    if ((event === 'Stop' || event === 'SubagentStop') && agentId && fromSubagent) {
+      // Not emitted: the renderer reads any Stop/SubagentStop as THIS agent going idle (and
+      // clears its breaker), and the agent itself is still working.
+      return {};
+    }
     if ((event === 'Stop' || event === 'SubagentStop') && agentId) {
       // Respect any upstream Stop hook that already re-entered this boundary.
       if (p.stop_hook_active) { this.emit(agentId, event, p); return {}; }

@@ -3160,7 +3160,7 @@ write there become searchable by every agent. You don't run \`mine\` yourself.
 // A minimal pipe: read the hook payload on stdin, tag it with this agent's id,
 // forward it to the hive's UDS, and relay the response back to `claude`. All the
 // real logic lives in the main process (HookServer). Never blocks a stop on error.
-const HOOK_SHIM = `#!/usr/bin/env node
+export const HOOK_SHIM = `#!/usr/bin/env node
 'use strict';
 const net = require('net');
 const isStatus = process.argv.includes('--status');
@@ -3170,7 +3170,11 @@ process.stdin.on('data', (d) => { data += d; });
 process.stdin.on('end', () => {
   let payload = {};
   try { payload = JSON.parse(data || '{}'); } catch (_) {}
-  if (!payload.agent_id) payload.agent_id = process.env.AGENT_ID || null;
+  // CODEX-HOOK-AGENTID: the hive's own id always wins. A provider may put ITS agent_id in
+  // the payload (a Codex or Claude subagent); that value is kept as provider_agent_id.
+  const hiveId = process.env.AGENT_ID || null;
+  if (payload.agent_id && payload.agent_id !== hiveId) payload.provider_agent_id = payload.agent_id;
+  payload.agent_id = hiveId || payload.agent_id || null;
   const sock = process.env.HIVE_SOCK;
   if (isStatus) {
     // Status-line mode: Claude Code pipes the session status JSON (incl.
@@ -3295,7 +3299,8 @@ var AUTO = process.env.HIVE_AUTO_APPROVE === '1';
 function post(payload) {
   try {
     if (!SOCK) return;
-    payload.agent_id = payload.agent_id || AGENT;
+    if (payload.agent_id && payload.agent_id !== AGENT) payload.provider_agent_id = payload.agent_id;
+    payload.agent_id = AGENT || payload.agent_id || null;
     var c = net.createConnection(SOCK, function () { try { c.end(JSON.stringify(payload) + '\\n'); } catch (e) {} });
     c.on('error', function () {});
   } catch (e) {}
@@ -3332,7 +3337,8 @@ const AGENT = process.env.AGENT_ID || null;
 function post(payload) {
   try {
     if (!SOCK) return;
-    payload.agent_id = payload.agent_id || AGENT;
+    if (payload.agent_id && payload.agent_id !== AGENT) payload.provider_agent_id = payload.agent_id;
+    payload.agent_id = AGENT || payload.agent_id || null;
     const c = createConnection(SOCK, () => { try { c.end(JSON.stringify(payload) + '\\n'); } catch (e) {} });
     c.on('error', () => {});
   } catch (e) {}
