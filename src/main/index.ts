@@ -4285,7 +4285,7 @@ function teardownAndQuit(): void {
   try { telemetry.stop(); } catch (e) { console.error('[quit] telemetry.stop:', e); }
   try { stopSlackServer(); } catch (e) { console.error('[quit] slack.stop:', e); }
   try { stopWebhookServer(); } catch (e) { console.error('[quit] webhook.stop:', e); }
-  try { memory.stop(); } catch (e) { console.error('[quit] memory.stop:', e); }
+  try { memory.stop({ quitting: true }); } catch (e) { console.error('[quit] memory.stop:', e); }
   try { reflector.stop(); } catch (e) { console.error('[quit] reflector.stop:', e); }
   try { persist.close(); } catch (e) { console.error('[quit] persist.close:', e); }
   try { hive.stopAllProxyBridges(); } catch (e) { console.error('[quit] stopAllProxyBridges:', e); }
@@ -6084,6 +6084,9 @@ app.on('will-quit', () => {
   // statusline pointing at Munder while Munder is closed. Idempotent: a no-op when the
   // teardown path already released it.
   try { hive.stopAgyStatusline(); } catch (e) { console.error('[will-quit] stopAgyStatusline:', e); }
+  // MINE-152: kill any mempalace mine/repair tree and stop the resident daemon (bounded,
+  // synchronous). Every quit path passes here; a second call is a no-op.
+  try { memory.stop({ quitting: true }); } catch (e) { console.error('[will-quit] memory.stop:', e); }
 });
 
 app.on('window-all-closed', () => {

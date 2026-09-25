@@ -26,7 +26,7 @@ function agent(root, id, body) {
   return dir;
 }
 
-test('one debounced daemon job covers thirty one-minute memory appends', async (t) => {
+test('thirty one-minute memory appends cost a few debounced jobs, bounded by the max wait and the per-agent cap', async (t) => {
   const root = home(t);
   const dir = agent(root, 'live', '0\n');
   const memory = new MemoryManager(() => root, () => ({ enabled: true, model: 'minilm' }));
@@ -43,9 +43,9 @@ test('one debounced daemon job covers thirty one-minute memory appends', async (
     await memory.mineNow();
     now += 60_000;
   }
-  assert.equal(jobs, 0, 'each fresh append resets the quiet window before any job is submitted');
-  await memory.mineNow();
-  assert.equal(jobs, 1, 'exactly one mature job reaches the daemon');
+  // MINE-152 blocker (4): the quiet window no longer restarts forever. A stream that never
+  // goes quiet is mined 10 min after its first change, then at most once per 10 min.
+  assert.ok(jobs >= 1 && jobs <= 3, `30 minutes of appends: ${jobs} jobs (0 was starvation; one per append was churn)`);
 });
 
 test('archived agents are never queued and persisted fingerprints survive restart', async (t) => {
@@ -116,7 +116,7 @@ test('watchdog policy is a 60-second no-progress daemon-stop backoff, while firs
   assert.match(source, /this\.stopDaemon\(\)/);
   assert.match(source, /PRIORITY_BELOW_NORMAL/);
   assert.match(source, /let lastProgress = Date\.now\(\)/);
-  assert.match(source, /DAEMON_STARTUP_TIMEOUT_MS = 60_000/);
+  assert.match(source, /DAEMON_STARTUP_TIMEOUT_MS = 10 \* 60_000/);
   assert.match(source, /if \(!watchedOut && daemon\) this\.stopDaemon\(\)/);
   assert.match(source, /code === 2 && \/\(\?:invalid choice\|unrecognized arguments\|daemon\)\/i\.test\(err\)/);
   assert.match(source, /MemPalace has no daemon: using one-shot mining/);
