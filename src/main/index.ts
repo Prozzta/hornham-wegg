@@ -595,7 +595,8 @@ const hookServer = new HookServer(
 hive.setHookBroker({ urlFor: (id) => hookServer.hookUrl(id), mcpFor: (id) => hookServer.mcpEndpoint(id), revoke: (id) => hookServer.revokeHookToken(id) });
 const memory = new MemoryManager(
   () => readConfig().harnessHome,
-  () => { const c = readConfig(); return { enabled: c.semanticMemory !== false, model: c.embeddingModel ?? 'minilm' }; }
+  () => { const c = readConfig(); return { enabled: c.semanticMemory !== false, model: c.embeddingModel ?? 'minilm' }; },
+  (event) => hive.appendLog(event)
 );
 // Enterprise Knowledge Graph — file-backed store + agent CLI (default OFF).
 const knowledge = new KnowledgeManager();

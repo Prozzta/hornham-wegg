@@ -2277,8 +2277,9 @@ export class HiveManager {
       hooks: [{ type: 'command', command: this.nodeRunUnquoted(shim, event), timeout: 0 }]
     });
     // HOOK-BROKER P4: the observational events go one-way (cheap); the ones that must be able to
-    // answer (a PreToolUse deny, a PostToolUse steer, a Stop block) keep the shim. PostToolUse is
-    // AGY's ONLY steer carrier (it has no UserPromptSubmit), so it must stay answering (P4 audit Y1).
+    // answer (a PreToolUse deny, a PreInvocation steer, a Stop block) keep the shim. A steer is
+    // never taken by a one-way hook (P4 audit Y1); AGY's documented injection point is
+    // PreInvocation (`injectSteps`), which fires before every model call.
     const oneway = this.writeAgyOneway();
     const cheap = (event: string, matcher?: string) => ({
       ...(matcher ? { matcher } : {}),
@@ -2286,7 +2287,7 @@ export class HiveManager {
     });
     const group = {
       PreToolUse: [tool('PreToolUse')],
-      PostToolUse: [tool('PostToolUse')],
+      PostToolUse: [oneway ? cheap('PostToolUse', '*') : tool('PostToolUse')],
       PreInvocation: [plain('PreInvocation')],
       PostInvocation: [oneway ? cheap('PostInvocation') : plain('PostInvocation')],
       Stop: [plain('Stop')]
@@ -3369,6 +3370,9 @@ process.stdin.on('end', () => {
       if (r.decision === 'block') out = { decision: 'block', reason: r.reason, stopReason: r.reason, systemMessage: r.reason };
       else if (r.hookSpecificOutput && r.hookSpecificOutput.permissionDecision === 'deny') out = { decision: 'deny', reason: r.hookSpecificOutput.permissionDecisionReason };
       else if (r.continue === false) out = { decision: 'block', stopReason: r.stopReason };
+      // PreInvocation's documented output (agy hooks.md): injectSteps. A userMessage persists in
+      // the conversation (an ephemeralMessage lasts one model call); an operator steer must stick.
+      else if (event === 'PreInvocation' && r.hookSpecificOutput && r.hookSpecificOutput.additionalContext) out = { injectSteps: [{ userMessage: r.hookSpecificOutput.additionalContext }] };
       else if (r.hookSpecificOutput && r.hookSpecificOutput.additionalContext) out = { systemMessage: r.hookSpecificOutput.additionalContext };
     } catch (_) {}
     if (out) { try { process.stdout.write(JSON.stringify(out)); } catch (_) {} }

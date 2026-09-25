@@ -356,6 +356,7 @@ export interface MemoryStatus {
   bin: string | null;
   miningMode: 'unknown' | 'daemon' | 'one-shot';
   miningWarning: string | null;
+  swapPending?: { attempts: number; max: number; nextAt: number } | null;
 }
 
 /** Enterprise Knowledge Graph — corpus status, one document, and a search hit. */

@@ -846,8 +846,10 @@ export class HookServer {
     let steer: string | null = null;
     // Not for a subagent's hook: the one-shot steer is meant for the agent itself, and a
     // subagent consuming it would lose it (HOOK-BROKER audit N1).
-    // Nor for a one-way hook: its reply is never read, so a steer taken there is lost (P4 audit Y1).
-    if ((event === 'UserPromptSubmit' || event === 'PostToolUse') && agentId && this.control && !fromSubagent && p.transport !== 'pipe-oneway') {
+    // Nor for a one-way hook: its reply is never read, so a steer taken there is lost (P4 audit Y1);
+    // it stays queued for the next answering hook. PreInvocation is AGY's (it has no
+    // UserPromptSubmit): its documented injection point, before every model call.
+    if ((event === 'UserPromptSubmit' || event === 'PostToolUse' || event === 'PreInvocation') && agentId && this.control && !fromSubagent && p.transport !== 'pipe-oneway') {
       steer = this.control.takeSteer(agentId) ?? null;
     }
 

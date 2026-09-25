@@ -13,7 +13,7 @@
  *
  * Runs in the Electron main process.
  */
-import { existsSync, readdirSync, readFileSync, writeFileSync, rmSync } from 'node:fs';
+import { existsSync, readdirSync, readFileSync, writeFileSync, rmSync, statSync, type Dirent } from 'node:fs';
 import { basename, dirname, join } from 'node:path';
 import { spawn, spawnSync, type ChildProcess, type SpawnOptions } from 'node:child_process';
 import { constants as osConstants, setPriority } from 'node:os';
@@ -69,6 +69,8 @@ export interface MemoryStatus {
   /** `one-shot` is compatible but costs more than the resident daemon. */
   miningMode: 'unknown' | 'daemon' | 'one-shot';
   miningWarning: string | null;
+  /** A verified palace rebuild waiting to be swapped in (the live palace was in use). */
+  swapPending: { attempts: number; max: number; nextAt: number } | null;
 }
 
 // Scan cheaply every 30s, but give each changed memory.md a full quiet minute
@@ -194,7 +196,7 @@ export class MemoryManager {
   /** Instance copy so a test can shorten the first-boot grace. */
   private daemonStartupTimeoutMs = DAEMON_STARTUP_TIMEOUT_MS;
   /** X8: a verified staged palace whose swap failed; retried on quiet ticks (bounded). */
-  private pendingSwap: { staged: string; stagingReadAt: number; attempts: number; nextAt: number } | null = null;
+  private pendingSwap: { staged: string; stagingReadAt: number; attempts: number; nextAt: number; deferLogged?: boolean } | null = null;
   /** N3: agent -> a daemon job still running when the pass stopped waiting for it (the 60-min
    *  cap). The next pass re-waits THAT job instead of submitting a duplicate for the same wing. */
   private readonly jobsInFlight = new Map<string, string>();
@@ -203,8 +205,15 @@ export class MemoryManager {
 
   constructor(
     private getHome: () => string | null,
-    private getSettings: () => MemorySettings
+    private getSettings: () => MemorySettings,
+    /** log.jsonl: the palace repair/swap/reclaim and mine deferral are visible in a packaged
+     *  build (the console is not). */
+    private appendLog: (event: Record<string, unknown>) => void = () => {}
   ) {}
+
+  private logEvent(event: Record<string, unknown>): void {
+    try { this.appendLog(event); } catch { /* best effort */ }
+  }
 
   palacePath(): string | null {
     const h = this.getHome();
@@ -268,6 +277,7 @@ export class MemoryManager {
       model: this.model(),
       bin: this.bin(),
       miningMode: this.daemonUnavailable ? 'one-shot' : this.daemonStart ? 'daemon' : 'unknown',
+      swapPending: this.pendingSwap ? { attempts: this.pendingSwap.attempts, max: SWAP_RETRY_MAX, nextAt: this.pendingSwap.nextAt } : null,
       miningWarning: this.daemonUnavailable
     };
   }
@@ -424,7 +434,10 @@ export class MemoryManager {
     // the BLOATED palace (measured live: still running after 6 min), keep its files open and
     // starve the retry, and its result would be mined again after the swap anyway. The wait is
     // bounded (SWAP_RETRY_MAX), after which the rebuild is dropped and mining resumes.
-    if (this.pendingSwap) return;
+    if (this.pendingSwap) {
+      if (!this.pendingSwap.deferLogged) { this.pendingSwap.deferLogged = true; this.logEvent({ kind: 'mine-deferred', reason: 'palace-swap-pending' }); }
+      return;
+    }
     const agentsDir = join(home, 'hive', 'agents');
     if (!existsSync(agentsDir)) return;
     let ids: string[];
@@ -539,16 +552,20 @@ export class MemoryManager {
         this.reapRebuildSiblings('backup', (stamp) => stamp < this.startedAt);
         return;
       }
+      const repairStartedAt = Date.now();
+      this.logEvent({ kind: 'palace-repair-start', palaceBytes: dirBytes(palace), indexBytes: dataLevel0Bytes(palace), rows: count });
+      const done = (outcome: string): void => this.logEvent({ kind: 'palace-repair-done', outcome, ms: Date.now() - repairStartedAt });
       const stamp = String(Date.now());
       const staged = `${palace}.mempalace-rebuild-${stamp}`;
       const backup = `${palace}.mempalace-backup-${stamp}`;
       const discardStaged = (): void => { try { rmSync(staged, { recursive: true, force: true }); } catch { /* retried by nothing; harmless */ } };
       const built = await this.runRaw(bin, ['--palace', staged, 'repair', '--mode', 'from-sqlite', '--source', palace, '--yes', '--no-backup']);
-      if (this.mineStopped) { discardStaged(); return; }
-      if (!built.ok) { discardStaged(); console.error('[memory] palace rebuild staging failed; live palace left untouched'); return; }
+      if (this.mineStopped) { discardStaged(); done('stopped'); return; }
+      if (!built.ok) { discardStaged(); done('build-failed'); console.error('[memory] palace rebuild staging failed; live palace left untouched'); return; }
       const verified = await this.runRaw(bin, ['--palace', staged, 'repair-status']);
       if (!sameCollectionCounts(counts, repairStatusCounts(verified.output))) {
         discardStaged();
+        done('verify-failed');
         console.error('[memory] palace rebuild verification failed; live palace left untouched');
         return;
       }
@@ -559,22 +576,25 @@ export class MemoryManager {
       // Windows cannot rename a directory whose files a process holds open: a resident
       // daemon (from this or an earlier session) would make the swap fail. Stop it first.
       await this.stopDaemon();
-      if (this.mineStopped) { discardStaged(); return; }
-      if (!this.trySwap(palace, staged, stagingReadAt, backup)) {
-        // X8: ANY reader holding the live palace (an agent's search, a wake-up, a mine by
-        // another app) makes the rename fail, and on the live floor that is exactly the boot
-        // window. Keep the VERIFIED rebuild and retry on quiet ticks instead of throwing away
-        // 60-80 s of work and repeating it every launch.
-        this.pendingSwap = { staged, stagingReadAt, attempts: 1, nextAt: Date.now() + SWAP_RETRY_MS };
-        console.error('[memory] palace rebuild swap failed (the live palace is in use); keeping the verified rebuild and retrying');
-      }
+      if (this.mineStopped) { discardStaged(); done('stopped'); return; }
+      if (this.trySwap(palace, staged, stagingReadAt, backup, 1)) { done('swapped'); return; }
+      // X8: ANY reader holding the live palace (an agent's search, a wake-up, a mine by
+      // another app) makes the rename fail, and on the live floor that is exactly the boot
+      // window. Keep the VERIFIED rebuild and retry on quiet ticks instead of throwing away
+      // 60-80 s of work and repeating it every launch.
+      this.pendingSwap = { staged, stagingReadAt, attempts: 1, nextAt: Date.now() + SWAP_RETRY_MS };
+      done('swap-pending');
+      this.logEvent({ kind: 'palace-swap-pending', attempt: 1, max: SWAP_RETRY_MAX });
+      console.error('[memory] palace rebuild swap failed (the live palace is in use); keeping the verified rebuild and retrying');
     } finally { this.rebuilding = false; }
   }
 
   /** Swap a verified staged palace in; on success forget the fingerprints the old palace
    *  took after the staging read (they are mined again). */
-  private trySwap(palace: string, staged: string, stagingReadAt: number, backup = `${palace}.mempalace-backup-${Date.now()}`): boolean {
+  private trySwap(palace: string, staged: string, stagingReadAt: number, backup = `${palace}.mempalace-backup-${Date.now()}`, attempt = 1): boolean {
+    const bytesBefore = dirBytes(palace);
     if (!swapStagedPalace(palace, staged, backup)) return false;
+    this.logEvent({ kind: 'palace-swap-done', attempt, bytesBefore, bytesAfter: dirBytes(palace), backup });
     console.log(`[memory] rebuilt bloated palace; previous palace retained at ${backup}`);
     this.invalidateMinedSince(stagingReadAt);
     return true;
@@ -591,15 +611,17 @@ export class MemoryManager {
     try {
       await this.stopDaemon();
       if (this.mineStopped) return;
-      if (this.trySwap(palace, ps.staged, ps.stagingReadAt)) { this.pendingSwap = null; return; }
+      if (this.trySwap(palace, ps.staged, ps.stagingReadAt, undefined, ps.attempts + 1)) { this.pendingSwap = null; return; }
       ps.attempts += 1;
       if (ps.attempts >= SWAP_RETRY_MAX) {
         try { rmSync(ps.staged, { recursive: true, force: true }); } catch { /* N2 reaps it next start */ }
         this.pendingSwap = null;
+        this.logEvent({ kind: 'palace-swap-abandoned', attempts: ps.attempts });
         console.error(`[memory] the live palace stayed in use through ${SWAP_RETRY_MAX} swap attempts; discarded the rebuild (the next launch tries again)`);
         return;
       }
       ps.nextAt = Date.now() + SWAP_RETRY_MS;
+      this.logEvent({ kind: 'palace-swap-pending', attempt: ps.attempts, max: SWAP_RETRY_MAX });
     } finally { this.rebuilding = false; }
   }
 
@@ -620,7 +642,10 @@ export class MemoryManager {
       if (!Number.isFinite(stamp) || !select(stamp) || full === this.pendingSwap?.staged) continue;
       try { rmSync(full, { recursive: true, force: true }); removed += 1; } catch { /* in use: next start */ }
     }
-    if (removed) console.log(`[memory] reclaimed ${removed} old palace ${kind} dir(s)`);
+    if (removed) {
+      console.log(`[memory] reclaimed ${removed} old palace ${kind} dir(s)`);
+      this.logEvent({ kind: 'palace-reclaim', what: kind, removed });
+    }
     return removed;
   }
 
@@ -918,4 +943,20 @@ export class MemoryManager {
     if (wing) args.push('--wing', wing);
     return this.runCli(args, 'wake-up');
   }
+}
+
+/** Total bytes under a directory (the palace: a few hundred files). 0 when unreadable. */
+function dirBytes(dir: string): number {
+  let total = 0;
+  const walk = (d: string): void => {
+    let es: Dirent[];
+    try { es = readdirSync(d, { withFileTypes: true }); } catch { return; }
+    for (const e of es) {
+      const f = join(d, e.name);
+      if (e.isDirectory()) walk(f);
+      else { try { total += statSync(f).size; } catch { /* gone */ } }
+    }
+  };
+  walk(dir);
+  return total;
 }

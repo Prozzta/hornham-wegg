@@ -12,6 +12,7 @@ interface MemoryStatus {
   bin: string | null;
   miningMode: 'unknown' | 'daemon' | 'one-shot';
   miningWarning: string | null;
+  swapPending?: { attempts: number; max: number; nextAt: number } | null;
 }
 
 type ModelId = 'minilm' | 'embeddinggemma';
@@ -121,6 +122,12 @@ export function MemoryPanel() {
                 </PixelButton>
               )}
             </div>
+
+            {status?.swapPending && (
+              <div style={{ fontSize: 11, color: 'var(--cth-ink-700)', lineHeight: 1.45, background: 'var(--cth-cream-100)', padding: 8 }}>
+                A rebuilt, smaller palace is waiting to be swapped in: the palace is in use (try {status.swapPending.attempts} of {status.swapPending.max}). Mining resumes after.
+              </div>
+            )}
 
             {status?.miningWarning && (
               <div style={{ fontSize: 11, color: 'var(--cth-ink-700)', lineHeight: 1.45, background: 'var(--cth-cream-100)', padding: 8 }}>
