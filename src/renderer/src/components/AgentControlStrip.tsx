@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useRef, useState, type CSSProperties } from 'react';
 import { PixelButton } from './PixelButton';
 import { AgentHoldButton } from './AgentHoldButton';
 
@@ -23,6 +23,12 @@ import { AgentHoldButton } from './AgentHoldButton';
  * answering you — so that distinction now lives in its tooltip rather than in
  * the layout.
  */
+/** One line, never wraps, never grows its row: a status sentence that does not fit is cut
+ *  with an ellipsis and read in full from its tooltip. */
+const STATUS_TEXT: CSSProperties = {
+  fontSize: 11, lineHeight: '14px', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', minWidth: 0
+};
+
 interface Snapshot {
   paused: boolean;
   halted: boolean;
@@ -74,7 +80,7 @@ export function AgentControlStrip({ agentId }: { agentId: string }) {
       padding: '6px 8px', background: 'var(--cth-paper-100)',
       borderBottom: '1px solid var(--cth-ink-300)', flexShrink: 0
     }}>
-      <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 6, minWidth: 0, overflow: 'hidden' }}>
         {/* Neither of these kills anything, and the old two-word labels never
             said so — the difference is WHEN the agent stops and whether it keeps
             its session. Say the consequence on the button, the detail on hover. */}
@@ -105,11 +111,14 @@ export function AgentControlStrip({ agentId }: { agentId: string }) {
         <AgentHoldButton agentId={agentId} />
         {/* v0.3.4: the auto-delivery switch moved to the god's Command Center
             header — ONE floor-wide control instead of a per-agent toggle. */}
+        {/* CODEX-REDRAW-151: status text is ONE line that never wraps (ellipsis, the whole
+            sentence on hover). Wrapping in the narrow sidebar grew this strip, shrank the
+            terminal below it, and Codex replays its whole transcript on every grid change. */}
         {snap?.autoDeliveryPaused && (
-          <span style={{ fontSize: 11, color: 'var(--cth-ink-500)' }}>queued messages held (whole floor)</span>
+          <span title="queued messages held (whole floor)" style={{ ...STATUS_TEXT, color: 'var(--cth-ink-500)' }}>queued messages held (whole floor)</span>
         )}
-        {snap?.halted && <span style={{ fontSize: 11, color: 'var(--cth-coral)' }}>stopping after this step…</span>}
-        {!!snap?.pendingSteers && <span style={{ fontSize: 11, color: 'var(--cth-ink-500)' }}>{snap.pendingSteers} note{snap.pendingSteers === 1 ? '' : 's'} waiting</span>}
+        {snap?.halted && <span title="stopping after this step…" style={{ ...STATUS_TEXT, color: 'var(--cth-coral)' }}>stopping after this step…</span>}
+        {!!snap?.pendingSteers && <span title={`${snap.pendingSteers} note${snap.pendingSteers === 1 ? '' : 's'} waiting`} style={{ ...STATUS_TEXT, color: 'var(--cth-ink-500)' }}>{snap.pendingSteers} note{snap.pendingSteers === 1 ? '' : 's'} waiting</span>}
       </div>
       <div style={{ display: 'flex', gap: 6 }}>
         <input
@@ -132,7 +141,21 @@ export function AgentControlStrip({ agentId }: { agentId: string }) {
           >send</span>
         </PixelButton>
       </div>
-      {note && <span style={{ fontSize: 11, color: 'var(--cth-ink-500)' }}>{note}</span>}
+      {/* CODEX-REDRAW-151: the confirmation flash used to be an in-flow line that appeared
+          for 1.8 s after EVERY click here and wrapped onto 2-3 lines in the sidebar: the
+          terminal below lost those rows and got them back, two full Codex transcript replays
+          per click (measured on 1.1.50: 17 -> 14 -> 17 rows). It now sits in a zero-height
+          anchor that is always present and floats over the top of what follows. */}
+      <div data-transient-anchor style={{ position: 'relative', height: 0 }}>
+        {note && (
+          <span role="status" style={{
+            position: 'absolute', top: 0, right: 0, zIndex: 20, maxWidth: '100%',
+            ...STATUS_TEXT, padding: '2px 6px', pointerEvents: 'none',
+            color: 'var(--cth-ink-700)', background: 'var(--cth-paper-100)',
+            boxShadow: 'inset 0 0 0 1px var(--cth-ink-300)'
+          }}>{note}</span>
+        )}
+      </div>
     </div>
   );
 }

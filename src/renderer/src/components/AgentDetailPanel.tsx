@@ -219,14 +219,20 @@ export function AgentDetailPanel({ agent }: AgentDetailPanelProps) {
         )}
       </div>
 
-      {openTerminalError && (
-        <div style={{
-          fontSize: 12, color: 'var(--cth-coral)',
-          padding: '2px 8px',
-          background: 'var(--cth-coral-light)',
-          whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis'
-        }}>{openTerminalError}</div>
-      )}
+      {/* CODEX-REDRAW-151: a zero-height anchor that is always there, so the error floats
+          over what follows instead of pushing the terminal down a row (a grid change, and a
+          full transcript replay for a Codex agent). */}
+      <div data-transient-anchor style={{ position: 'relative', height: 0 }}>
+        {openTerminalError && (
+          <div role="alert" title={openTerminalError} style={{
+            position: 'absolute', top: 0, left: 0, right: 0, zIndex: 20,
+            fontSize: 12, color: 'var(--cth-coral)',
+            padding: '2px 8px',
+            background: 'var(--cth-coral-light)',
+            whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis'
+          }}>{openTerminalError}</div>
+        )}
+      </div>
 
       {/* #7C — operator control (pause / halt / steer) for live agents */}
       {isReal && <AgentControlStrip agentId={agent.id} />}

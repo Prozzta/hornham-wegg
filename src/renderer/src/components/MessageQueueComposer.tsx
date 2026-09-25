@@ -219,8 +219,10 @@ export function MessageQueueComposer({ agent }: MessageQueueComposerProps) {
           color: 'var(--cth-ink-700)', textAlign: 'center'
         }}>DROP TO ATTACH</span>
       )}
-      {/* Header: label, count, status, clear-all */}
-      <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+      {/* Header: label, count, status, clear-all. CODEX-REDRAW-151: a FIXED height. Its
+          contents come and go with delivery state (count, hold choices, "recover prompt"),
+          and a row that grows shrinks the terminal above: one Codex transcript replay each. */}
+      <div data-fixed-row style={{ display: 'flex', alignItems: 'center', gap: 8, height: 18, minHeight: 18, minWidth: 0, overflow: 'hidden', flexShrink: 0 }}>
         <span style={{
           fontFamily: 'var(--cth-font-display)',
           fontSize: 9, lineHeight: '12px',
@@ -238,7 +240,7 @@ export function MessageQueueComposer({ agent }: MessageQueueComposerProps) {
           <span
             title={status.title}
             style={{
-              fontSize: 12,
+              fontSize: 12, minWidth: 0,
               color: idle ? 'var(--cth-ink-700)' : 'var(--cth-ink-500)',
               whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis'
             }}
@@ -276,7 +278,7 @@ export function MessageQueueComposer({ agent }: MessageQueueComposerProps) {
               ? "Close the picker this agent has open so queued messages can be delivered"
               : "Move the leftover text on this agent's prompt into this box so queued messages can be delivered"}
             style={{
-              border: 'none', background: 'transparent', cursor: 'pointer', padding: 0,
+              border: 'none', background: 'transparent', cursor: 'pointer', padding: 0, whiteSpace: 'nowrap', flexShrink: 0,
               fontFamily: 'var(--cth-font-ui)', fontSize: 12,
               color: 'var(--cth-ink-900)', textDecoration: 'underline'
             }}
@@ -329,14 +331,20 @@ export function MessageQueueComposer({ agent }: MessageQueueComposerProps) {
         </div>
       )}
 
-      {/* Free Flow recording / transcription status (entry point A) */}
-      {ffHint && (
-        <span style={{
-          fontSize: 12, lineHeight: '16px',
-          color: ff.error && !(ffMine && ff.status !== 'idle') ? 'var(--cth-coral)' : 'var(--cth-ink-500)',
-          whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis'
-        }}>{ffHint}</span>
-      )}
+      {/* Free Flow recording / transcription status (entry point A). CODEX-REDRAW-151: it
+          cycles recording -> transcribing -> done, so it floats in a zero-height anchor that
+          is always present instead of adding and removing a line under the terminal. */}
+      <div data-transient-anchor style={{ position: 'relative', height: 0 }}>
+        {ffHint && (
+          <span role="status" style={{
+            position: 'absolute', top: 0, right: 0, zIndex: 20, maxWidth: '100%', pointerEvents: 'none',
+            padding: '0 6px', background: 'var(--cth-cream-100)',
+            fontSize: 12, lineHeight: '16px',
+            color: ff.error && !(ffMine && ff.status !== 'idle') ? 'var(--cth-coral)' : 'var(--cth-ink-500)',
+            whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis'
+          }}>{ffHint}</span>
+        )}
+      </div>
 
       {/* Attached files/images — chips with a remove 'x', above the textarea. */}
       {attachments.length > 0 && (
