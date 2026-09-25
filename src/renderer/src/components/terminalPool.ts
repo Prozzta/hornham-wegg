@@ -14,6 +14,7 @@
  * visible immediately, no repaint required.
  */
 import { createPoolTimer } from './poolTimer';
+import { TERMINAL_SCROLLBACK_LINES } from './terminalScrollback';
 import { createPtyResizeCoalescer, type Grid, type PtyResizeCoalescer } from './ptyResizeCoalescer';
 import { useEffect, useState } from 'react';
 import { Terminal } from '@xterm/xterm';
@@ -163,7 +164,7 @@ export function acquireTerminal(ptyId: string, theme?: ThemeMap, fontSize = 14):
     lineHeight: 1.0,
     cursorBlink: true,
     cursorStyle: 'block',
-    scrollback: 100000,
+    scrollback: TERMINAL_SCROLLBACK_LINES,
     // Guarantee legible text no matter what colors a running program sets.
     // When a program paints a coloured cell background (e.g. a git-diff add line
     // with a green bg, or a yellow-highlighted line) while leaving the default
