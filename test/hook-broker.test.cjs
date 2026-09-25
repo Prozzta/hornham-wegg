@@ -200,6 +200,12 @@ test('(8) a listener error re-listens on the SAME port; persistent failure takes
   assert.equal(s.hookBrokerPort(), null, 'down after the retries');
   assert.equal(s.hookUrl(A), null, 'new spawns get no URL, i.e. command hooks');
   assert.ok(rec.logs.some((l) => l.kind === 'hook-broker-down'), 'logged');
+  // It keeps trying: once the port is free again it comes back on it, and URLs work again.
+  await new Promise((r) => blocker.close(r));
+  for (let i = 0; i < 400 && s.hookBrokerPort() === null; i++) await new Promise((r) => setTimeout(r, 5));
+  assert.equal(s.hookBrokerPort(), port, 'recovered on the same port (running agents URLs are valid again)');
+  assert.ok(rec.logs.some((l) => l.kind === 'hook-broker-up'));
+  assert.equal((await post(s.hookUrl(A), { hook_event_name: 'Stop' })).status, 200);
 });
 
 test('(9) NO_PROXY carries loopback, merged with any existing value', async (t) => {
@@ -231,7 +237,7 @@ test('the pipe path is stamped too (transport pipe, the same per-agent seq)', as
   const last = rec.handled.at(-1);
   assert.equal(last.transport, 'pipe', 'never trusted from the sender');
   assert.equal(last.seq, 2);
-  assert.deepEqual(s.transportCountsNow()[A], { http: 1, pipe: 1 });
+  assert.deepEqual(s.transportCountsNow()[A], { http: 1, pipe: 1, mcp: 0 });
 });
 
 test('N1/N2: a subagent hook never consumes the agent\'s steer; under HALT a subagent Stop is not emitted', async (t) => {

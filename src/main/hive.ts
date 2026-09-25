@@ -57,6 +57,7 @@ const AGY_LEASE_HEARTBEAT_MS = 60 * 60 * 1000;
 import { AGY_STATUSLINE_SHIM } from './agyStatuslineShim';
 import { geminiHome } from './capacityScope';
 import { HiveCommitter, type GitResult } from './hiveCommitter';
+import { codexMcpHookToml, MCP_HOOK_EVENTS, type McpHookEvent } from './codexHookMcp';
 
 /** The subset of HarnessConfig the hive consumes for the default-MCP merge.
  *  Kept as a local shape so hive.ts never imports the foundation-owned config
@@ -256,6 +257,15 @@ function shortRand(): string {
  *  scratch state, and it stays on disk (so resume still works) either way. */
 const MINE_IGNORE_LINES = ['settings.json', 'cursor.json', 'inbox/', 'outbox/', '.codex/'];
 
+/** HOOK-BROKER: what the hive asks the in-process hook endpoint for at spawn. */
+export interface HookBroker {
+  /** A Claude agent's HTTP hook URL (fresh token), or null: command hooks. */
+  urlFor(agentId: string): string | null;
+  /** P3: a Codex agent's MCP endpoint + the token its mcp_tool hooks carry, or null. */
+  mcpFor?(agentId: string): { url: string; token: string } | null;
+  revoke(agentId: string): void;
+}
+
 /** HOOK-BROKER: how long Claude waits for an HTTP hook (seconds). A hung app never holds an
  *  agent longer than this, and a failed HTTP hook is non-blocking in Claude. */
 export const HOOK_HTTP_TIMEOUT_S = 30;
@@ -420,8 +430,8 @@ export class HiveManager {
    *  never on the main thread's critical path (see hiveCommitter.ts). */
   /** HOOK-BROKER: the in-process HTTP hook endpoint (HookServer), injected by main. Null in
    *  tests and until wired; every spawn then writes command hooks exactly as before. */
-  private hookBroker: { urlFor(agentId: string): string | null; revoke(agentId: string): void } | null = null;
-  setHookBroker(broker: { urlFor(agentId: string): string | null; revoke(agentId: string): void } | null): void {
+  private hookBroker: HookBroker | null = null;
+  setHookBroker(broker: HookBroker | null): void {
     this.hookBroker = broker;
   }
 
@@ -939,7 +949,7 @@ export class HiveManager {
               this.reconcileAgyStatusline();
             }
             else if (desc.shim === 'codex') {
-              const codex = this.installCodexHooks(dir);
+              const codex = this.installCodexHooks(dir, meta.id);
               // F1 fail-closed: provisioning refused, so this agent must not start.
               if (codex.refusal) return { args: [], env: {}, refusal: codex.refusal };
               env.CODEX_HOME = codex.home;
@@ -2459,7 +2469,7 @@ export class HiveManager {
    *
    *  Returns the CODEX_HOME path for the caller to put in the worker's env, or a
    *  refusal the caller must honour. */
-  private installCodexHooks(dir: string): { home: string; refusal?: string } {
+  private installCodexHooks(dir: string, agentId?: string): { home: string; refusal?: string } {
     const home = join(dir, '.codex');
     try {
       mkdirSync(home, { recursive: true });
@@ -2541,8 +2551,16 @@ export class HiveManager {
       if (shim) {
         const events = ['PreToolUse', 'PostToolUse', 'Stop', 'SubagentStop',
           'SessionStart', 'UserPromptSubmit', 'PreCompact', 'PostCompact'];
+        // HOOK-BROKER P3: with the broker up, the two high-volume tool hooks become mcp_tool
+        // calls into the in-app MCP endpoint (0 processes). Every other event keeps the
+        // command shim, and with no endpoint everything is the command shim, as before.
+        // Hook trust is not written: this spawn passes --dangerously-bypass-hook-trust.
+        const mcp = agentId ? this.hookBroker?.mcpFor?.(agentId) ?? null : null;
+        const mcpToml = mcp ? codexMcpHookToml(mcp.url, mcp.token) : null;
         config += '\n# --- munder-hive lifecycle hooks (auto-generated; do not edit) ---\n';
+        if (mcpToml) config += mcpToml.server;
         for (const ev of events) {
+          if (mcpToml && (MCP_HOOK_EVENTS as readonly string[]).includes(ev)) { config += mcpToml.hook(ev as McpHookEvent); continue; }
           config += `\n[[hooks.${ev}]]\n[[hooks.${ev}.hooks]]\ntype = "command"\ncommand = '${this.nodeRunUnquoted(shim)}'\ntimeout = 30\n`;
         }
       }
