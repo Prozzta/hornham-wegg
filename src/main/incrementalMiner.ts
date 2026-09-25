@@ -13,6 +13,8 @@ export interface MemoryFingerprint {
   mtimeMs: number;
   size: number;
   sha256: string;
+  /** Completion timestamp. It caps vector delete/reinsert churn per file. */
+  minedAt?: number;
 }
 
 export interface MineState {

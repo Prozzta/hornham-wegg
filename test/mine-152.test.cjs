@@ -66,6 +66,11 @@ test('archived agents are never queued and persisted fingerprints survive restar
   await first.mineNow();
   assert.deepEqual(mined, ['live']);
   assert.ok(fs.existsSync(miner.mineStatePath(root)), 'successful fingerprint is durable');
+  for (let i = 0; i < 30; i++) {
+    now += 60_000;
+    await first.mineNow();
+  }
+  assert.deepEqual(mined, ['live'], 'unchanged scans submit no more jobs, so they cannot grow the index');
 
   const restarted = new MemoryManager(() => root, () => ({ enabled: true, model: 'minilm' }));
   restarted.bin = () => 'mempalace';
@@ -104,10 +109,12 @@ test('bloat threshold and staged swap are safe, reversible filesystem operations
   assert.equal(fs.readFileSync(path.join(backup, 'old'), 'utf8'), 'old', 'old palace is retained, never deleted');
 });
 
-test('watchdog policy is a 60-second daemon-stop backoff, never the old ten-minute wait', () => {
+test('watchdog policy is a 60-second no-progress daemon-stop backoff, while first boot gets grace', () => {
   const source = fs.readFileSync(path.join(__dirname, '..', 'src', 'main', 'memory.ts'), 'utf8');
   assert.match(source, /const MINE_WATCHDOG_MS = 60_000/);
   assert.match(source, /\['mine', agentDir, '--wing', id, '--agent', id, '--daemon'\]/);
   assert.match(source, /this\.stopDaemon\(\)/);
   assert.match(source, /PRIORITY_BELOW_NORMAL/);
+  assert.match(source, /let lastProgress = Date\.now\(\)/);
+  assert.match(source, /DAEMON_STARTUP_TIMEOUT_MS = 10 \* 60_000/);
 });

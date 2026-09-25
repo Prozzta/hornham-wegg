@@ -74,12 +74,17 @@ export interface MemoryStatus {
 // memory discovery for the old ten-minute interval.
 const MINE_INTERVAL_MS = 30_000;
 const MINE_DEBOUNCE_MS = 60_000;
+/** A changed drawer can still require a vector replacement; cap that churn. */
+const MINE_PER_AGENT_MIN_MS = 600_000;
 // Ceiling for the quarantine backoff below. Low on purpose: a memory is not
 // searchable until it has been mined, and the reaper already handles the disk,
 // so there is nothing here worth making recall half an hour stale for.
 const MINE_BACKOFF_MAX_MS = 1_800_000;
 const MINE_WATCHDOG_MS = 60_000;
 const MINE_RETRY_MS = 120_000;
+/** First daemon boot may load/download an embedding model before it can emit a
+ * job-progress line, so it gets a deliberately separate, generous cap. */
+const DAEMON_STARTUP_TIMEOUT_MS = 10 * 60_000;
 /** mempalace's device "auto" picks the CoreML execution provider on Apple
  *  Silicon, and CoreML runs the quantized embeddinggemma ONNX graph partially
  *  (330/1647 nodes) with fp16 partitions that overflow → EVERY vector comes
@@ -320,6 +325,9 @@ export class MemoryManager {
           continue; // unchanged across restart too â€” no daemon job
         }
         queueChangedMemory(this.pendingMines, id, fingerprint, now, MINE_DEBOUNCE_MS);
+        const pending = this.pendingMines.get(id);
+        const last = this.mineState.entries[id]?.minedAt ?? 0;
+        if (pending) pending.quietUntil = Math.max(pending.quietUntil, last + MINE_PER_AGENT_MIN_MS);
       }
       for (const id of readyMineIds(this.pendingMines, now)) {
         if (archived.has(id)) { this.pendingMines.delete(id); continue; }
@@ -327,7 +335,7 @@ export class MemoryManager {
         if (!pending) continue;
         const ok = await this.mineAgent(join(agentsDir, id), id);
         if (ok) {
-          this.mineState.entries[id] = pending.fingerprint;
+          this.mineState.entries[id] = { ...pending.fingerprint, minedAt: Date.now() };
           saveMineState(home, this.mineState);
           this.pendingMines.delete(id);
           this.watchdogLogged.delete(id);
@@ -440,7 +448,7 @@ export class MemoryManager {
       // The daemon's child inherits this on Windows; on POSIX it keeps model
       // maintenance below Electron and active CLI work. Best-effort only.
       try { if (proc.pid) setPriority(proc.pid, osConstants.priority.PRIORITY_BELOW_NORMAL); } catch { /* platform policy */ }
-      const timer = setTimeout(() => { try { proc.kill('SIGTERM'); } catch { /* gone */ } resolve(false); }, MINE_WATCHDOG_MS);
+      const timer = setTimeout(() => { try { proc.kill('SIGTERM'); } catch { /* gone */ } resolve(false); }, DAEMON_STARTUP_TIMEOUT_MS);
       timer.unref?.();
       proc.once('close', (code) => { clearTimeout(timer); resolve(code === 0); });
       proc.once('error', () => { clearTimeout(timer); resolve(false); });
@@ -466,22 +474,27 @@ export class MemoryManager {
         let proc: ReturnType<typeof spawn>;
         try {
           proc = spawn(bin, ['mine', agentDir, '--wing', id, '--agent', id, '--daemon'], {
-            env: this.childEnv(), stdio: ['ignore', 'ignore', 'pipe']
+            env: this.childEnv(), stdio: ['ignore', 'pipe', 'pipe']
           });
         } catch { resolve(false); return; }
         let err = '';
-        proc.stderr?.on('data', (d) => { err += d.toString(); });
+        let lastProgress = Date.now();
+        const progress = () => { lastProgress = Date.now(); };
+        proc.stdout?.on('data', progress);
+        proc.stderr?.on('data', (d) => { err += d.toString(); progress(); });
         let watchedOut = false;
-        const timer = setTimeout(() => {
+        const timer = setInterval(() => {
+          if (Date.now() - lastProgress < MINE_WATCHDOG_MS) return;
           watchedOut = true;
+          clearInterval(timer);
           if (!this.watchdogLogged.has(id)) {
             this.watchdogLogged.add(id);
-            console.error(`[memory] mine ${id} stalled for ${MINE_WATCHDOG_MS / 1000}s; stopping daemon and backing off`);
+            console.error(`[memory] mine ${id} made no progress for ${MINE_WATCHDOG_MS / 1000}s; stopping daemon and backing off`);
           }
           try { proc.kill('SIGTERM'); } catch { /* gone */ }
           ensureKilled(proc.pid);
           this.stopDaemon();
-        }, MINE_WATCHDOG_MS);
+        }, 5_000);
         timer.unref?.();
         proc.once('close', (code) => {
           clearTimeout(timer);
