@@ -98,4 +98,8 @@ test('RENDERED R-1: a failed "open terminal" floats its error WITHOUT taking the
   assert.equal(r.tabsDuring, r.tabsBefore, 'the terminal area did not move while the error showed (no grid change)');
   assert.equal(r.alertShownAfter, false, 'the error clears with the button state, not on the next attempt');
   assert.equal(r.tabsAfter, r.tabsBefore);
+  // D3: the thrown path (openTerminalAt rejects) shows, stays click-through, and clears too.
+  assert.equal(r.thrownAlertShown, true, 'a thrown failure shows the error as well');
+  assert.deepEqual(r.thrownButtons.filter((b) => b.hits.some((h) => h !== 'button')), [], 'and does not trap the controls');
+  assert.equal(r.thrownAlertShownAfter, false, 'and clears after 4 s like the ok:false path');
 });

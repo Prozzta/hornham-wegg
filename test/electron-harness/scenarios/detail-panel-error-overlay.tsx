@@ -65,6 +65,14 @@ window.__harnessRun = async () => {
     await sleep(4200); // past the 4 s reset
     out.alertShownAfter = !!document.querySelector('[role="alert"]');
     out.tabsAfter = tabsBottom();
+    // D3 (Jim): the THROWN failure path must clear too, not only the ok:false one.
+    extra.openTerminalAt = () => Promise.reject(new Error('THROWN: ' + ERR));
+    termBtn?.click();
+    await sleep(500);
+    out.thrownAlertShown = !!document.querySelector('[role="alert"]');
+    out.thrownButtons = probe();
+    await sleep(4200);
+    out.thrownAlertShownAfter = !!document.querySelector('[role="alert"]');
     window.harness.report({ ok: true, ...out });
   } catch (e) {
     window.harness.report({ ok: false, error: String((e as Error)?.stack ?? e), ...out });
