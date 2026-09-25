@@ -1,0 +1,21 @@
+
+=======================================================
+  MemPalace Repair -- Status
+=======================================================
+
+  Palace: C:/hive/palace.mempalace-rebuild-1
+
+  [drawers]
+    sqlite count:   3,317
+    hnsw count:     3,000
+    divergence:     317
+    status:         OK
+    note:           HNSW 3,000 / sqlite 3,317 (within flush-lag tolerance)
+
+  [closets]
+    sqlite count:   478
+    hnsw count:     (no flushed metadata yet)
+    status:         UNKNOWN
+    note:           HNSW capacity unavailable: metadata has not been flushed; leaving vector search enabled
+
+

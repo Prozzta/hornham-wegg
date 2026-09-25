@@ -23,7 +23,7 @@ import {
   archivedAgentIds, fingerprintMemory, loadMineState, queueChangedMemory,
   readyMineIds, sameFingerprint, saveMineState, type MineState, type PendingMine
 } from './incrementalMiner';
-import { dataLevel0Bytes, rebuildNeeded, repairStatusEmbeddingCount, swapStagedPalace } from './palaceRebuild';
+import { carryEmbedderRecord, dataLevel0Bytes, rebuildNeeded, repairStatusCounts, repairStatusEmbeddingCount, sameCollectionCounts, swapStagedPalace } from './palaceRebuild';
 
 /** Non-memory files `mempalace mine` must not ingest: the Claude Code hooks
  *  config (a large JSON blob that swamps the wake-up digest), the cursor, raw
@@ -83,7 +83,31 @@ const MINE_PER_AGENT_MIN_MS = 600_000;
 // searchable until it has been mined, and the reaper already handles the disk,
 // so there is nothing here worth making recall half an hour stale for.
 const MINE_BACKOFF_MAX_MS = 1_800_000;
-const MINE_WATCHDOG_MS = 60_000;
+/** MINE-152 X2: mines are judged by the daemon's job state and wall caps, NEVER by
+ *  output silence (a big palace keeps a mine silent for many minutes).
+ *  - a short CLI client (submit, jobs, status): */
+const JOB_CLIENT_MAX_MS = 2 * 60_000;
+/** - one `daemon wait` client's lifetime; a job still running after it is waited again: */
+const JOB_WAIT_SLICE_MS = 10 * 60_000;
+/** - how long one mine job is waited for in total before the pass moves on (the job is
+ *    left running in the daemon; the fingerprint stays unsaved, so it is retried): */
+const MINE_JOB_MAX_MS = 60 * 60_000;
+/** - the gap between checks when a wait client ends early while the job is alive: */
+const JOB_POLL_MIN_MS = 15_000;
+/** - a one-shot mine (no daemon on this CLI), wall clock: */
+const ONE_SHOT_MAX_MS = 30 * 60_000;
+/** - a palace repair (the live 674 MB palace rebuilt in ~64 s; generous on purpose): */
+const REPAIR_MAX_MS = 30 * 60_000;
+
+/** A job's state in `mempalace daemon jobs` output (`<id>  <state>  <kind>  <iso>`), or
+ *  'missing' when it is not listed. */
+export function parseDaemonJobState(output: string, jobId: string): string {
+  for (const line of output.split(/\r?\n/)) {
+    const cols = line.trim().split(/\s+/);
+    if (cols[0] === jobId && cols[1]) return cols[1].toLowerCase();
+  }
+  return 'missing';
+}
 const MINE_RETRY_MS = 120_000;
 /** Starvation cap: a memory.md that keeps changing (a note every minute) never goes
  *  quiet for the debounce, so it is mined at most this long after its oldest unmined
@@ -475,18 +499,30 @@ export class MemoryManager {
       // Anything mined into the LIVE palace from here on is not in the staged copy.
       const stagingReadAt = Date.now();
       const status = await this.runRaw(bin, ['--palace', palace, 'repair-status']);
+      // Per collection (MemPalace 3.7.1 prints `[drawers] sqlite count: N`, `[closets] ...`).
+      const counts = status.ok ? repairStatusCounts(status.output) : null;
       const count = status.ok ? repairStatusEmbeddingCount(status.output) : null;
-      if (!count || !rebuildNeeded(dataLevel0Bytes(palace), count)) return;
+      if (!counts || !count || !rebuildNeeded(dataLevel0Bytes(palace), count)) return;
       const stamp = String(Date.now());
       const staged = `${palace}.mempalace-rebuild-${stamp}`;
       const backup = `${palace}.mempalace-backup-${stamp}`;
+      const discardStaged = (): void => { try { rmSync(staged, { recursive: true, force: true }); } catch { /* retried by nothing; harmless */ } };
       const built = await this.runRaw(bin, ['--palace', staged, 'repair', '--mode', 'from-sqlite', '--source', palace, '--yes', '--no-backup']);
-      if (!built.ok) { console.error('[memory] palace rebuild staging failed; live palace left untouched'); return; }
+      if (this.mineStopped) { discardStaged(); return; }
+      if (!built.ok) { discardStaged(); console.error('[memory] palace rebuild staging failed; live palace left untouched'); return; }
       const verified = await this.runRaw(bin, ['--palace', staged, 'repair-status']);
-      if (repairStatusEmbeddingCount(verified.output) !== count) {
+      if (!sameCollectionCounts(counts, repairStatusCounts(verified.output))) {
+        discardStaged();
         console.error('[memory] palace rebuild verification failed; live palace left untouched');
         return;
       }
+      // A from-sqlite rebuild does not write mempalace_embedder.json, and without it every
+      // later open warns and assumes the current model. The rebuild embedded with THIS
+      // model, so the old record is carried over only when it names the same model.
+      carryEmbedderRecord(palace, staged, this.model());
+      // Windows cannot rename a directory whose files a process holds open: a resident
+      // daemon (from this or an earlier session) would make the swap fail. Stop it first.
+      await this.stopDaemon();
       if (swapStagedPalace(palace, staged, backup)) {
         console.log(`[memory] rebuilt bloated palace; previous palace retained at ${backup}`);
         this.invalidateMinedSince(stagingReadAt);
@@ -512,14 +548,31 @@ export class MemoryManager {
   }
 
   private runRaw(bin: string, args: string[]): Promise<{ ok: boolean; output: string }> {
+    return this.runCapture(bin, args, REPAIR_MAX_MS).then((r) => ({ ok: r.ok, output: r.output }));
+  }
+
+  /** One mempalace CLI call at below-normal priority, output captured, with a WALL cap
+   *  (never a silence cap: a busy index writes nothing for minutes). At the cap the
+   *  client's whole tree is killed. Killing a client never touches the daemon. */
+  private runCapture(bin: string, args: string[], capMs: number): Promise<{ ok: boolean; code: number | null; output: string; error: string; timedOut: boolean }> {
     return new Promise((resolve) => {
-      let proc: ReturnType<typeof spawn>;
-      try { proc = this.spawnTracked(bin, args, { env: this.childEnv(), stdio: ['ignore', 'pipe', 'ignore'] }); }
-      catch { resolve({ ok: false, output: '' }); return; }
-      let output = '';
+      let proc: ChildProcess;
+      try { proc = this.spawnTracked(bin, args, { env: this.childEnv(), stdio: ['ignore', 'pipe', 'pipe'] }); }
+      catch (e) { resolve({ ok: false, code: null, output: '', error: String(e), timedOut: false }); return; }
+      try { if (proc.pid) setPriority(proc.pid, osConstants.priority.PRIORITY_BELOW_NORMAL); } catch { /* platform policy */ }
+      let output = '', error = '', timedOut = false, settled = false;
+      const finish = (code: number | null): void => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolve({ ok: code === 0 && !timedOut, code, output, error, timedOut });
+      };
       proc.stdout?.on('data', (d) => { output += d.toString(); });
-      proc.once('close', (code) => resolve({ ok: code === 0, output }));
-      proc.once('error', () => resolve({ ok: false, output }));
+      proc.stderr?.on('data', (d) => { error += d.toString(); });
+      const timer = setTimeout(() => { timedOut = true; if (proc.pid) hardKillTree(proc.pid); finish(null); }, capMs);
+      timer.unref?.();
+      proc.once('close', (code) => finish(code));
+      proc.once('error', () => finish(null));
     });
   }
 
@@ -629,52 +682,85 @@ export class MemoryManager {
     return this.submitMine(agentDir, id, false);
   }
 
-  private submitMine(agentDir: string, id: string, daemon: boolean): Promise<boolean> {
-    return new Promise((resolve) => {
-      const bin = this.bin();
-      if (!bin) { resolve(false); return; }
-      ensureMineIgnore(agentDir);
-      let proc: ReturnType<typeof spawn>;
-      try {
-        const args = ['mine', agentDir, '--wing', id, '--agent', id];
-        if (daemon) args.push('--daemon');
-        proc = this.spawnTracked(bin, args, { env: this.childEnv(), stdio: ['ignore', 'pipe', 'pipe'] });
-      } catch { resolve(false); return; }
-      // The short daemon client must not be prioritized above Electron. The
-      // one-shot process needs the same treatment on old MemPalace installs.
-      try { if (proc.pid) setPriority(proc.pid, osConstants.priority.PRIORITY_BELOW_NORMAL); } catch { /* platform policy */ }
-        let err = '';
-        let lastProgress = Date.now();
-        const progress = () => { lastProgress = Date.now(); };
-        proc.stdout?.on('data', progress);
-        proc.stderr?.on('data', (d) => { err += d.toString(); progress(); });
-        let watchedOut = false;
-        const timer = setInterval(() => {
-          if (Date.now() - lastProgress < MINE_WATCHDOG_MS) return;
-          watchedOut = true;
-          clearInterval(timer);
-          if (!this.watchdogLogged.has(id)) {
-            this.watchdogLogged.add(id);
-            console.error(`[memory] mine ${id} made no progress for ${MINE_WATCHDOG_MS / 1000}s; stopping mine and backing off`);
-          }
-          try { proc.kill('SIGTERM'); } catch { /* gone */ }
-          ensureKilled(proc.pid);
-          if (daemon) this.stopDaemon();
-        }, 5_000);
-        timer.unref?.();
-        proc.once('close', (code) => {
-          clearTimeout(timer);
-          if (code !== 0 || watchedOut) {
-            if (!watchedOut) console.error(`[memory] mine ${id} exited ${code}: ${err.slice(-300)}`);
-            // A daemon crash/restart presents to its submit client as a
-            // non-zero exit. Forget the cached successful start so the bounded
-            // retry starts one fresh below-normal daemon.
-            if (!watchedOut && daemon) this.stopDaemon();
-            resolve(false);
-          } else resolve(true);
-        });
-        proc.once('error', () => { clearTimeout(timer); if (daemon) this.stopDaemon(); resolve(false); });
-    });
+  /**
+   * Run one mine job to completion (true) or failure (false).
+   *
+   * MINE-152 X2: a mine on a large palace is SILENT for many minutes while it embeds and
+   * writes; judging it by stdout silence killed every mine and, worse, stopped the daemon
+   * (an ~850 MB model reload) each time: a loop in which nothing was ever mined. Now:
+   *   - daemon: submit with `--background` (returns a job id at once), then `daemon wait`
+   *     on it. Liveness is the daemon's own job state: a job that is still `running` or
+   *     `queued` is alive and is waited for (in slices, up to MINE_JOB_MAX_MS), however
+   *     quiet it is. A client that times out is only a client: the daemon is NEVER
+   *     stopped for it. The daemon start is forgotten only when the daemon is unreachable
+   *     (and `daemon start` is idempotent, so a live daemon is never reloaded).
+   *   - one-shot (no daemon on this CLI): a plain wall cap, ONE_SHOT_MAX_MS.
+   */
+  private async submitMine(agentDir: string, id: string, daemon: boolean): Promise<boolean> {
+    const bin = this.bin();
+    if (!bin || this.mineStopped) return false;
+    ensureMineIgnore(agentDir);
+    const args = ['mine', agentDir, '--wing', id, '--agent', id];
+    if (!daemon) {
+      const r = await this.runCapture(bin, args, ONE_SHOT_MAX_MS);
+      if (!r.ok) this.logMineOnce(id, r.timedOut ? `one-shot mine ${id} still running after ${ONE_SHOT_MAX_MS / 60_000} min; stopped it, will retry` : `mine ${id} exited ${r.code}: ${r.error.slice(-300)}`);
+      return r.ok;
+    }
+    const submitted = await this.runCapture(bin, [...args, '--daemon', '--background'], JOB_CLIENT_MAX_MS);
+    if (this.mineStopped) return false;   // quit killed the client: start nothing more
+    const jobId = /Submitted daemon job ([0-9a-f]{8,})/i.exec(submitted.output)?.[1];
+    if (!submitted.ok || !jobId) {
+      this.logMineOnce(id, `mine ${id}: the daemon did not accept the job (${submitted.timedOut ? 'timed out' : `exit ${submitted.code}`})`);
+      await this.forgetDaemonIfDead(bin);
+      return false;
+    }
+    const startedAt = Date.now();
+    while (!this.mineStopped) {
+      const sliceStart = Date.now();
+      const waited = await this.runCapture(bin, ['daemon', 'wait', jobId], JOB_WAIT_SLICE_MS);
+      if (this.mineStopped) return false;
+      if (waited.ok) { this.watchdogLogged.delete(id); return true; }
+      const state = await this.daemonJobState(bin, jobId);
+      if (state === 'succeeded') { this.watchdogLogged.delete(id); return true; }
+      if (state === 'running' || state === 'queued' || state === 'pending') {
+        if (Date.now() - startedAt >= MINE_JOB_MAX_MS) {
+          this.logMineOnce(id, `mine ${id} is still ${state} in the daemon after ${MINE_JOB_MAX_MS / 60_000} min; leaving it to finish, will check again later`);
+          return false;
+        }
+        // Alive: wait again. A wait client that failed fast must not spin.
+        if (Date.now() - sliceStart < JOB_POLL_MIN_MS) await this.sleep(JOB_POLL_MIN_MS);
+        continue;
+      }
+      if (state === null) await this.forgetDaemonIfDead(bin);
+      this.logMineOnce(id, `mine ${id}: daemon job ${jobId} ended ${state ?? 'with the daemon unreachable'}`);
+      return false;
+    }
+    return false;
+  }
+
+  /** The daemon's recorded state of a job ('running', 'succeeded', ...), 'missing' when
+   *  the daemon does not list it, or null when the daemon cannot be reached. */
+  private async daemonJobState(bin: string, jobId: string): Promise<string | null> {
+    const r = await this.runCapture(bin, ['daemon', 'jobs', '--limit', '100'], JOB_CLIENT_MAX_MS);
+    if (!r.ok) return null;
+    return parseDaemonJobState(r.output, jobId);
+  }
+
+  /** Forget the cached daemon start ONLY when the daemon is actually not running, so the
+   *  next mine starts one. A slow or busy daemon is left alone. */
+  private async forgetDaemonIfDead(bin: string): Promise<void> {
+    const s = await this.runCapture(bin, ['daemon', 'status'], JOB_CLIENT_MAX_MS);
+    if (!/daemon is running/i.test(s.output)) this.daemonStart = null;
+  }
+
+  private logMineOnce(id: string, line: string): void {
+    if (this.watchdogLogged.has(id)) return;
+    this.watchdogLogged.add(id);
+    console.error(`[memory] ${line}`);
+  }
+
+  private sleep(ms: number): Promise<void> {
+    return new Promise((r) => { const t = setTimeout(r, ms); t.unref?.(); });
   }
 
   // — recall (read) —
