@@ -196,6 +196,39 @@ test('CodexRolloutLifecycleSource: reads the newest rollout, a BOUNDED tail only
   assert.deepEqual(later.probe(home), { ok: true, latest: null }, 'beyond the tail = no proof');
 });
 
+test('B8 (Jim\'s pin): the tail bound is 64 KB in ABSOLUTE bytes, and the reader is called with it', (t) => {
+  assert.ok(CODEX_LIFECYCLE_TAIL_BYTES <= 64 * 1024, `the guardrail is a 64 KB tail (is ${CODEX_LIFECYCLE_TAIL_BYTES})`);
+  const src = codeOnly(readSource('src/main/codexRolloutLifecycle.ts'));
+  assert.match(src, /readTail\(file, CODEX_LIFECYCLE_TAIL_BYTES\)/);
+  // Behaviourally, in fixed bytes (not scaled by the constant): a boundary followed by
+  // 256 KB of later lines is out of reach.
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'md-codex-b8-'));
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  const day = path.join(home, 'sessions', '2026', '09', '25');
+  fs.mkdirSync(day, { recursive: true });
+  const filler = tokens('2026-09-25T18:13:00.000Z') + '\n';
+  fs.writeFileSync(path.join(day, 'rollout-2026-09-25T18-00-00-b8.jsonl'),
+    complete(TURN, '2026-09-25T18:12:25.270Z') + '\n' + filler.repeat(Math.ceil((256 * 1024) / filler.length)));
+  assert.deepEqual(new CodexRolloutLifecycleSource().probe(home), { ok: true, latest: null });
+});
+
+test('B9 (Jim\'s pin): the cache re-reads on an mtime change, so a LATER lost Stop is still recoverable', (t) => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'md-codex-b9-'));
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  const day = path.join(home, 'sessions', '2026', '09', '25');
+  fs.mkdirSync(day, { recursive: true });
+  const file = path.join(day, 'rollout-2026-09-25T18-00-00-b9.jsonl');
+  fs.writeFileSync(file, started(TURN, '2026-09-25T18:11:40.000Z') + '\n' + complete(TURN, '2026-09-25T18:12:25.270Z') + '\n');
+  const src = new CodexRolloutLifecycleSource();
+  assert.equal(src.probe(home).latest.turnId, TURN);
+  // The next turn runs and completes, and its Stop is lost too. The file changed, so the
+  // SAME source must see the new boundary.
+  fs.appendFileSync(file, started(NEXT, '2026-09-25T18:20:00.000Z') + '\n' + complete(NEXT, '2026-09-25T18:21:00.000Z') + '\n');
+  const later = new Date(fs.statSync(file).mtimeMs + 5_000);
+  fs.utimesSync(file, later, later);
+  assert.deepEqual(src.probe(home), { ok: true, latest: { kind: 'complete', turnId: NEXT, at: Date.parse('2026-09-25T18:21:00.000Z') } });
+});
+
 test('WIRING: main feeds the bridge a Codex-only probe, from a bounded reader', () => {
   const index = codeOnly(readSource('src/main/index.ts'));
   assert.match(index, /codexTurnProbe: \(agentId\) => \{\s*const home = hive\.codexHomeFor\(agentId\);\s*return home \? codexLifecycle\.probe\(home\) : undefined;\s*\}/);

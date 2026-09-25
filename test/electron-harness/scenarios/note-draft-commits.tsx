@@ -110,7 +110,17 @@ window.__harnessRun = async () => {
     const noteAfterUnload = noteNow();
     const lastFlushNote = rosterWrites.length ? rosterWrites[rosterWrites.length - 1].agents.find((x) => x.id === 'a1')?.note ?? null : null;
 
-    window.harness.report({ ok: true, N, initialValue, a, duringTyping, noteDuringTyping, afterPause, noteAfterPause,
+    // F. C3 (Jim's pin): SLOW typing, a key every 100 ms for over 2 s. The debounce must
+    // restart on EVERY key: nothing is committed while typing, one commit after the pause.
+    c0 = counts();
+    let slow = '';
+    for (let i = 0; i < 22; i++) { slow += 's'; const v = slow; await act(async () => { setValue(area()!, v); }); await sleep(100); }
+    const slowDuring = delta(c0);
+    await sleep(700);
+    const slowAfter = delta(c0);
+    const noteAfterSlow = noteNow();
+
+    window.harness.report({ ok: true, N, slow, slowDuring, slowAfter, noteAfterSlow, initialValue, a, duringTyping, noteDuringTyping, afterPause, noteAfterPause,
       b, afterBlur, noteAfterBlur, afterBlurPause, cText, afterClose, noteAfterClose, reopenedValue,
       d, noteAfterUnload, rosterFlushesOnUnload: rosterWrites.length, lastFlushNote });
   } catch (e) {

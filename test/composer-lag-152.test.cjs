@@ -76,6 +76,14 @@ test('RENDERED F2: the note is never lost: blur, close and quit each commit at o
   assert.equal(r.lastFlushNote, r.d, 'and the LAST roster mirror write on quit carries it');
 });
 
+test('RENDERED F2 (C3, Jim\'s pin): SLOW typing (a key per 100 ms for 2.2 s) commits NOTHING until the pause', async () => {
+  const r = await noteRun();
+  assert.equal(r.ok, true, `scenario failed: ${r.error ?? ''}`);
+  assert.deepEqual(r.slowDuring, { persists: 0, agentsChanges: 0 }, 'the debounce restarts on every key, not only the first');
+  assert.deepEqual(r.slowAfter, { persists: 1, agentsChanges: 1 });
+  assert.equal(r.noteAfterSlow, r.slow);
+});
+
 test('STATIC F2: the roster editor uses the committed draft, not a per-key setAgentNote', () => {
   const ft = codeOnly(readSource('src/renderer/src/components/FullscreenTerminal.tsx'));
   assert.match(ft, /<PrivateNoteTextarea\s+note=\{agent\.note \?\? ''\}\s+onCommit=\{onNoteChange\}/);
