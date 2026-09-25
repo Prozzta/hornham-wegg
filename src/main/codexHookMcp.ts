@@ -48,7 +48,9 @@ function toolInputOf(p: Record<string, unknown>): unknown {
  * Rebuild a Codex tool hook's payload from the rollout tail.
  *  - turn_id: the newest turn_context / task_started turn (never task_complete: at a tool
  *    hook the turn is running, and a completion is the PREVIOUS turn's).
- *  - PreToolUse: the newest tool call that has no output after it (the pending one).
+ *  - PreToolUse: the newest tool call that has no output after it (the pending one), counted
+ *    only within the CURRENT turn: a call an earlier, aborted turn never answered is not pending
+ *    (it would make every later PreToolUse ambiguous until it scrolled out; Jim N-P3a).
  *  - PostToolUse: the newest tool output, joined to its call by call_id.
  */
 export function rebuildToolHook(tail: string, event: McpHookEvent): RebuiltToolHook {
@@ -57,7 +59,8 @@ export function rebuildToolHook(tail: string, event: McpHookEvent): RebuiltToolH
   const outputs = new Map<string, unknown>();
   let pending: Record<string, unknown> | null = null;
   let newestCall: Record<string, unknown> | null = null;
-  const calls = new Map<string, Record<string, unknown>>();
+  /** Calls seen before (newer than) the newest turn marker: this turn's. */
+  const turnCalls = new Set<string>();
   for (let i = lines.length - 1; i >= 0; i--) {
     const line = lines[i];
     if (!line) continue;
@@ -74,9 +77,10 @@ export function rebuildToolHook(tail: string, event: McpHookEvent): RebuiltToolH
     if (OUTPUT_TYPES.has(p.type) && callId) {
       if (!outputs.has(callId)) outputs.set(callId, p.output);
     } else if (CALL_TYPES.has(p.type) && callId) {
-      if (!calls.has(callId)) calls.set(callId, p);
       if (!newestCall) newestCall = p;
-      if (!pending && !outputs.has(callId)) pending = p;
+      const inTurn = turnId === undefined;
+      if (inTurn) turnCalls.add(callId);
+      if (!pending && inTurn && !outputs.has(callId)) pending = p;
     }
   }
   if (event === 'PreToolUse') {
@@ -84,7 +88,7 @@ export function rebuildToolHook(tail: string, event: McpHookEvent): RebuiltToolH
     // Two or more calls still pending (parallel tool calls): which one this hook is for is not
     // knowable from the rollout, so no name is claimed (a gate then fails closed if active).
     let open = 0;
-    for (const id of calls.keys()) if (!outputs.has(id)) open += 1;
+    for (const id of turnCalls) if (!outputs.has(id)) open += 1;
     if (open >= 2) return { turnId, degraded: true };
     return { turnId, toolName: typeof pending.name === 'string' ? pending.name : undefined, toolInput: toolInputOf(pending), callId: pending.call_id as string, degraded: typeof pending.name !== 'string' };
   }

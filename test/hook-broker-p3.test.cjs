@@ -229,6 +229,13 @@ test('STATIC: the MCP-routed events are exactly Pre/PostToolUse, and no hook typ
   }
 });
 
+test('N-P3a: a call an earlier ABORTED turn never answered is not pending; only the current turn\'s calls count', () => {
+  const tail = [L.turnContext(OLD_TURN), L.call('old', 'exec', 'stale'), L.turnContext(TURN), L.call('c1', 'exec', 'now')].join('\n');
+  assert.deepEqual(mcp.rebuildToolHook(tail, 'PreToolUse'), { turnId: TURN, toolName: 'exec', toolInput: { input: 'now' }, callId: 'c1', degraded: false });
+  const none = [L.turnContext(OLD_TURN), L.call('old', 'exec', 'stale'), L.turnContext(TURN)].join('\n');
+  assert.deepEqual(mcp.rebuildToolHook(none, 'PreToolUse'), { turnId: TURN, degraded: true }, 'the stale call is never claimed as this hook\'s');
+});
+
 test('rebuildToolHook: two PENDING parallel calls are ambiguous for PreToolUse -> degraded, no name claimed', () => {
   const tail = [L.turnContext(TURN), L.call('c1', 'exec', 'a'), L.call('c2', 'exec', 'b')].join('\n');
   assert.deepEqual(mcp.rebuildToolHook(tail, 'PreToolUse'), { turnId: TURN, degraded: true });
