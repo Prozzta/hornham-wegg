@@ -165,6 +165,9 @@ interface AgentWake {
   /** Turns whose Stop has been recorded, newest last, bounded (FALSEACTIVE-STALL-2). A
    *  tool event that names one of these arrived after its own turn ended. */
   closedTurns: string[];
+  /** The Codex turn the lifecycle is active FOR, when a hook named it (null otherwise).
+   *  B1 closes a lost Stop only with a completion of exactly this turn. */
+  openTurnId: string | null;
 }
 
 /** How many closed turn ids are remembered per agent. Only a straggler of a RECENT turn
@@ -195,7 +198,7 @@ export class WorkerWakeWatchdog {
   private rec(agentId: string): AgentWake {
     let r = this.agents.get(agentId);
     if (!r) {
-      r = { pending: new Set(), announced: new Set(), inFlight: null, held: null, lifecycle: 'unknown', lastHumanNeedsAt: 0, lastReconcileAttemptAt: 0, providerSession: null, activeSince: 0, closedTurns: [] };
+      r = { pending: new Set(), announced: new Set(), inFlight: null, held: null, lifecycle: 'unknown', lastHumanNeedsAt: 0, lastReconcileAttemptAt: 0, providerSession: null, activeSince: 0, closedTurns: [], openTurnId: null };
       this.agents.set(agentId, r);
     }
     return r;
@@ -249,6 +252,7 @@ export class WorkerWakeWatchdog {
     if (event === 'Stop') {
       if (fullyIdle === false) return false;   // the provider says the turn is not over
       r.lifecycle = 'idle';
+      r.openTurnId = null;
       if (turnId && !r.closedTurns.includes(turnId)) {
         r.closedTurns.push(turnId);
         if (r.closedTurns.length > CLOSED_TURN_MEMORY) r.closedTurns.shift();
@@ -270,7 +274,11 @@ export class WorkerWakeWatchdog {
       r.lifecycle = 'idle';
       return true;
     }
-    if (ACTIVE_EVENTS.has(event)) { r.lifecycle = 'active'; r.activeSince = at; return false; }
+    if (ACTIVE_EVENTS.has(event)) {
+      r.lifecycle = 'active'; r.activeSince = at;
+      r.openTurnId = turnId ?? null;   // no id (Claude, our own submit): the turn is unnamed
+      return false;
+    }
     // A session boundary moots whatever the previous session was doing, in both directions:
     // it never asserts a turn is running (the cold-boot deadlock above), and it must not
     // let a stale `active` from the old session survive into the new one either — a
@@ -355,6 +363,32 @@ export class WorkerWakeWatchdog {
     r.lifecycle = 'active';
     if (status === 'waiting_for_confirmation') r.lastHumanNeedsAt = at;
     return false;
+  }
+
+  /**
+   * FALSEACTIVE-STALL-2 (B1): Codex's own rollout says a turn COMPLETED. Returns true when
+   * that closed the open turn (a retry edge), false when it proves nothing.
+   *
+   * The companion of noteProviderStatus for a provider whose lifecycle is recorded per
+   * turn rather than ticked. It closes ONLY an active lifecycle, and only with proof about
+   * THAT turn: the same turn id when the app knows which turn is open, otherwise a
+   * completion newer than the active epoch (codexTurnEnded). It never opens anything and
+   * never touches an idle or unknown agent. D3 is untouched: this is the provider saying
+   * the turn ended, not silence standing in for it.
+   */
+  noteProviderTurnEnded(agentId: string | undefined, turnId: string, at: number): boolean {
+    if (!agentId || !turnId) return false;
+    const r = this.agents.get(agentId);
+    if (!r || r.lifecycle !== 'active') return false;
+    if (r.openTurnId ? r.openTurnId !== turnId : !(r.activeSince > 0 && at > r.activeSince)) return false;
+    r.lifecycle = 'idle';
+    r.activeSince = 0;
+    r.openTurnId = null;
+    if (!r.closedTurns.includes(turnId)) {
+      r.closedTurns.push(turnId);
+      if (r.closedTurns.length > CLOSED_TURN_MEMORY) r.closedTurns.shift();
+    }
+    return true;
   }
 
   /**
@@ -465,6 +499,12 @@ export class WorkerWakeWatchdog {
       lifecycle: r?.lifecycle ?? 'unknown',
       providerSession: r?.providerSession ?? null
     };
+  }
+
+  /** Read-only: the open turn as the hooks named it, and the active epoch (FALSEACTIVE-STALL-2). */
+  turnFacts(agentId: string): { openTurnId: string | null; activeSince: number } {
+    const r = this.agents.get(agentId);
+    return { openTurnId: r?.openTurnId ?? null, activeSince: r?.activeSince ?? 0 };
   }
 
   /** Forget per-agent state (the agent's PTY was closed). */

@@ -93,6 +93,7 @@ import { RosterStore } from './roster';
 import { buildWorkerLaunch } from './workerLaunch';
 import { ControlRegistry } from './control';
 import { WorkerWakeWatchdog } from './workerWake';
+import { CodexRolloutLifecycleSource } from './codexRolloutLifecycle';
 import { InboxWakeBridge } from './inboxWakeBridge';
 import { WakeStallWatch } from './wakeStall';
 import { newBreadcrumbMemory, shouldLogBreadcrumb } from './wakeBreadcrumb';
@@ -388,6 +389,8 @@ function standingGoalFromRoster(agentId: string): string | null {
 // claims one batch here and submits it through the one owner (CAPACITY_GATED). HookServer
 // feeds it the hook stream, so a permission/HITL prompt blocks wakes.
 const workerWake = new WorkerWakeWatchdog();
+// FALSEACTIVE-STALL-2 (B1): Codex's own turn boundaries, read from a bounded rollout tail.
+const codexLifecycle = new CodexRolloutLifecycleSource();
 // ─── DIAGNOSIS ONLY (branch diag-1.1.46-wake) ───────────────────────────────
 // The 1.1.46 packaged canary produced no wakes and could not say why, because every
 // breadcrumb on the wake path is console.log and a packaged Windows Electron app has
@@ -502,6 +505,11 @@ const capacityStore = new CapacityStore(
 // delivery can land unobserved.
 inboxWake = new InboxWakeBridge({
   coordinator: workerWake,
+  // FALSEACTIVE-STALL-2 (B1): Codex's rollout closes a turn whose Stop was lost.
+  codexTurnProbe: (agentId) => {
+    const home = hive.codexHomeFor(agentId);
+    return home ? codexLifecycle.probe(home) : undefined;
+  },
   inboxIds: (agentId) => hive.inbox(agentId).map((m) => m.id).filter(Boolean),
   facts: (agentId) => {
     const ptyId = ptyForAgent(agentId);
