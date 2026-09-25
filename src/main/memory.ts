@@ -15,9 +15,9 @@
  */
 import { existsSync, readdirSync, readFileSync, writeFileSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
-import { spawn, spawnSync } from 'node:child_process';
+import { spawn, spawnSync, type ChildProcess, type SpawnOptions } from 'node:child_process';
 import { constants as osConstants, setPriority } from 'node:os';
-import { ensureKilled } from './procKill';
+import { ensureKilled, hardKillTree } from './procKill';
 import { quarantineDirsToReap, quarantineStampMs, nextMineDelayMs } from './palaceReap';
 import {
   archivedAgentIds, fingerprintMemory, loadMineState, queueChangedMemory,
@@ -85,9 +85,19 @@ const MINE_PER_AGENT_MIN_MS = 600_000;
 const MINE_BACKOFF_MAX_MS = 1_800_000;
 const MINE_WATCHDOG_MS = 60_000;
 const MINE_RETRY_MS = 120_000;
-/** A daemon that has not become ready in a minute is not allowed to hold a
- * memory change hostage; the compatibility path below takes over. */
-const DAEMON_STARTUP_TIMEOUT_MS = 60_000;
+/** Starvation cap: a memory.md that keeps changing (a note every minute) never goes
+ *  quiet for the debounce, so it is mined at most this long after its oldest unmined
+ *  change anyway. The per-agent 10-minute churn cap still applies on top. */
+const MINE_MAX_WAIT_MS = 600_000;
+/** First-boot grace for `mempalace daemon start`: a SUPPORTED daemon may spend minutes
+ *  loading (or downloading) its embedding model before it reports ready. Slow is not
+ *  unsupported: when this runs out the start is abandoned and retried later, and there
+ *  is NO one-shot mining meanwhile (only a usage error means "no daemon"). */
+const DAEMON_STARTUP_TIMEOUT_MS = 10 * 60_000;
+/** How long quit waits for `mempalace daemon stop`. */
+const QUIT_DAEMON_STOP_MS = 5_000;
+/** How long a fallback waits for a `daemon stop` before it proceeds. */
+const DAEMON_STOP_WAIT_MS = 30_000;
 /** Re-probe a compatibility fallback periodically so an in-session CLI upgrade
  * regains the low-cost daemon without requiring an app restart. */
 const DAEMON_RETRY_MS = 30 * 60_000;
@@ -146,6 +156,15 @@ export class MemoryManager {
   private rebuilding = false;
   /** Log a stalled job once, then retry after backoff without a log storm. */
   private readonly watchdogLogged = new Set<string>();
+  /** Every mempalace child this manager started and that is still running (mines,
+   *  the daemon start/stop clients, repairs, reads), so stop() can kill their trees. */
+  private readonly children = new Set<ChildProcess>();
+  /** A `daemon start` was issued since the last completed `daemon stop`: a resident
+   *  daemon may be running and quit must stop it. */
+  private daemonMayRun = false;
+  private slowDaemonLogged = false;
+  /** Instance copy so a test can shorten the first-boot grace. */
+  private daemonStartupTimeoutMs = DAEMON_STARTUP_TIMEOUT_MS;
 
   constructor(
     private getHome: () => string | null,
@@ -260,9 +279,42 @@ export class MemoryManager {
     this.startMineLoop();
   }
 
-  stop(): void {
+  /**
+   * Stop mining, and leave nothing behind. Every mempalace child still running (a mine,
+   * a repair, the daemon start/stop clients) is killed with its whole process tree:
+   * mempalace is a launcher around python, and killing only the launcher orphans the
+   * python child. A daemon this manager may have started is stopped with
+   * `mempalace daemon stop`: synchronously and bounded when quitting (nothing async
+   * survives quit), fire-and-forget otherwise (home change, reset).
+   */
+  stop(opts: { quitting?: boolean } = {}): void {
     this.mineStopped = true;
     if (this.mineTimer) { clearTimeout(this.mineTimer); this.mineTimer = null; }
+    for (const child of [...this.children]) {
+      if (child.pid) hardKillTree(child.pid);
+    }
+    this.children.clear();
+    if (!this.daemonMayRun) return;
+    this.daemonMayRun = false;
+    this.daemonStart = null;
+    const bin = this.bin();
+    if (!bin) return;
+    if (opts.quitting) {
+      try { spawnSync(bin, ['daemon', 'stop'], { env: this.childEnv(), stdio: 'ignore', timeout: QUIT_DAEMON_STOP_MS, windowsHide: true }); }
+      catch { /* best effort: quit goes ahead */ }
+    } else {
+      void this.stopDaemon();
+    }
+  }
+
+  /** spawn + remember the child until it exits, so stop() can reap it. */
+  private spawnTracked(bin: string, args: string[], opts: SpawnOptions): ChildProcess {
+    const proc = spawn(bin, args, opts);
+    this.children.add(proc);
+    const forget = (): void => { this.children.delete(proc); };
+    proc.once('close', forget);
+    proc.once('error', forget);
+    return proc;
   }
 
   /**
@@ -316,8 +368,13 @@ export class MemoryManager {
   async mineNow(): Promise<void> {
     const home = this.getHome();
     const bin = this.bin();
-    if (!this.active() || !home || !bin) return;
+    if (!this.active() || !home || !bin || this.mineStopped) return;
     if (this.mining) return; // a previous pass is still running — let it finish
+    // Mines and a palace rebuild are mutually exclusive (both flags are set before
+    // their first await, so this is a real exclusion on the one main thread). A mine
+    // that landed in the live palace after the rebuild's staging read would be dropped
+    // by the swap while its fingerprint said "mined". Deferred, not lost: the next tick.
+    if (this.rebuilding) return;
     const agentsDir = join(home, 'hive', 'agents');
     if (!existsSync(agentsDir)) return;
     let ids: string[];
@@ -335,7 +392,7 @@ export class MemoryManager {
           this.pendingMines.delete(id);
           continue; // unchanged across restart too â€” no daemon job
         }
-        queueChangedMemory(this.pendingMines, id, fingerprint, now, MINE_DEBOUNCE_MS);
+        queueChangedMemory(this.pendingMines, id, fingerprint, now, MINE_DEBOUNCE_MS, MINE_MAX_WAIT_MS);
         const pending = this.pendingMines.get(id);
         const last = this.mineState.entries[id]?.minedAt ?? 0;
         if (pending) pending.quietUntil = Math.max(pending.quietUntil, last + MINE_PER_AGENT_MIN_MS);
@@ -412,9 +469,11 @@ export class MemoryManager {
   private async maybeRebuildPalace(): Promise<void> {
     const palace = this.palacePath();
     const bin = this.bin();
-    if (!palace || !bin || this.rebuilding || this.mining || !existsSync(palace)) return;
+    if (!palace || !bin || this.rebuilding || this.mining || this.mineStopped || !existsSync(palace)) return;
     this.rebuilding = true;
     try {
+      // Anything mined into the LIVE palace from here on is not in the staged copy.
+      const stagingReadAt = Date.now();
       const status = await this.runRaw(bin, ['--palace', palace, 'repair-status']);
       const count = status.ok ? repairStatusEmbeddingCount(status.output) : null;
       if (!count || !rebuildNeeded(dataLevel0Bytes(palace), count)) return;
@@ -430,14 +489,32 @@ export class MemoryManager {
       }
       if (swapStagedPalace(palace, staged, backup)) {
         console.log(`[memory] rebuilt bloated palace; previous palace retained at ${backup}`);
+        this.invalidateMinedSince(stagingReadAt);
       } else console.error('[memory] palace rebuild swap failed; live palace restored/untouched');
     } finally { this.rebuilding = false; }
+  }
+
+  /** After a swap, forget every fingerprint recorded since the staging read: that
+   *  content went into the OLD palace, not the staged one now live, so it must be mined
+   *  again. The mine exclusion means there should be none; this is the backstop. */
+  private invalidateMinedSince(stagingReadAt: number): void {
+    const home = this.getHome();
+    if (!home) return;
+    this.mineState ??= loadMineState(home);
+    let dropped = 0;
+    for (const [id, entry] of Object.entries(this.mineState.entries)) {
+      if ((entry.minedAt ?? 0) >= stagingReadAt) { delete this.mineState.entries[id]; dropped += 1; }
+    }
+    if (dropped) {
+      saveMineState(home, this.mineState);
+      console.warn(`[memory] ${dropped} memory file(s) mined during the rebuild will be mined again`);
+    }
   }
 
   private runRaw(bin: string, args: string[]): Promise<{ ok: boolean; output: string }> {
     return new Promise((resolve) => {
       let proc: ReturnType<typeof spawn>;
-      try { proc = spawn(bin, args, { env: this.childEnv(), stdio: ['ignore', 'pipe', 'ignore'] }); }
+      try { proc = this.spawnTracked(bin, args, { env: this.childEnv(), stdio: ['ignore', 'pipe', 'ignore'] }); }
       catch { resolve({ ok: false, output: '' }); return; }
       let output = '';
       proc.stdout?.on('data', (d) => { output += d.toString(); });
@@ -468,29 +545,42 @@ export class MemoryManager {
       const settle = (ready: boolean): void => {
         if (!settled) { settled = true; resolve(ready); }
       };
-      try { proc = spawn(bin, ['daemon', 'start'], { env: this.childEnv(), stdio: ['ignore', 'ignore', 'pipe'] }); }
+      try { proc = this.spawnTracked(bin, ['daemon', 'start'], { env: this.childEnv(), stdio: ['ignore', 'ignore', 'pipe'] }); }
       catch { this.daemonStart = null; settle(false); return; }
+      this.daemonMayRun = true;
       // The daemon's child inherits this on Windows; on POSIX it keeps model
       // maintenance below Electron and active CLI work. Best-effort only.
       try { if (proc.pid) setPriority(proc.pid, osConstants.priority.PRIORITY_BELOW_NORMAL); } catch { /* platform policy */ }
       proc.stderr?.on('data', (d) => { err += d.toString(); });
       const timer = setTimeout(() => {
-        try { proc.kill('SIGTERM'); } catch { /* gone */ }
+        // SLOW, not unsupported: no usage error came back. Never a reason for one-shot
+        // mining. Abandon this start (the client's whole tree, then `daemon stop`, so no
+        // half-started daemon is left running), and let the normal retry try again.
+        if (proc.pid) hardKillTree(proc.pid);
         this.daemonStart = null;
-        this.markDaemonUnavailable(`MemPalace daemon did not become ready in ${DAEMON_STARTUP_TIMEOUT_MS / 1000}s: using one-shot mining; upgrade to 3.7.1 or newer for the low-cost daemon`);
-        settle(false);
-      }, DAEMON_STARTUP_TIMEOUT_MS);
+        if (!this.slowDaemonLogged) {
+          this.slowDaemonLogged = true;
+          console.error(`[memory] MemPalace daemon did not become ready in ${this.daemonStartupTimeoutMs / 1000}s; mining deferred, will retry`);
+        }
+        void this.stopDaemon().then(() => settle(false));
+      }, this.daemonStartupTimeoutMs);
       timer.unref?.();
       proc.once('close', (code) => {
         clearTimeout(timer);
         if (settled) return;
         if (code === 0) { this.daemonUnavailable = null; settle(true); return; }
-        // argparse uses exit 2 for an unknown `daemon` subcommand. Do not retry
-        // that incompatible CLI every two minutes: mining is off, but search
-        // remains active and status tells the user precisely why.
+        // argparse exits 2 for an unknown `daemon` subcommand: THIS CLI has no daemon.
+        // Mining falls back to one-shot runs (search is unaffected), and the daemon is
+        // re-probed after DAEMON_RETRY_MS so an in-session upgrade recovers. Before the
+        // fallback, `daemon stop` makes sure no daemon runs beside the one-shot mines.
         if (code === 2 && /(?:invalid choice|unrecognized arguments|daemon)/i.test(err)) {
-          this.markDaemonUnavailable('MemPalace has no daemon: using one-shot mining; upgrade to 3.7.1 or newer for the low-cost daemon');
-        } else this.daemonStart = null; // transient start failure: bounded retry may recover
+          void this.stopDaemon().then(() => {
+            this.markDaemonUnavailable('MemPalace has no daemon: using one-shot mining; upgrade to 3.7.1 or newer for the low-cost daemon');
+            settle(false);
+          });
+          return;
+        }
+        this.daemonStart = null; // transient start failure: bounded retry may recover
         settle(false);
       });
       proc.once('error', () => { clearTimeout(timer); this.daemonStart = null; settle(false); });
@@ -507,11 +597,20 @@ export class MemoryManager {
     }
   }
 
-  private stopDaemon(): void {
-    const bin = this.bin();
-    if (!bin) return;
-    try { spawn(bin, ['daemon', 'stop'], { env: this.childEnv(), stdio: 'ignore' }); } catch { /* best effort */ }
+  /** `mempalace daemon stop`. Resolves when it exits, or after DAEMON_STOP_WAIT_MS. */
+  private stopDaemon(): Promise<void> {
     this.daemonStart = null;
+    const bin = this.bin();
+    if (!bin) return Promise.resolve();
+    return new Promise((resolve) => {
+      let proc: ChildProcess;
+      try { proc = this.spawnTracked(bin, ['daemon', 'stop'], { env: this.childEnv(), stdio: 'ignore' }); }
+      catch { resolve(); return; }
+      const timer = setTimeout(() => { if (proc.pid) hardKillTree(proc.pid); resolve(); }, DAEMON_STOP_WAIT_MS);
+      timer.unref?.();
+      proc.once('close', () => { clearTimeout(timer); this.daemonMayRun = false; resolve(); });
+      proc.once('error', () => { clearTimeout(timer); resolve(); });
+    });
   }
 
   /** Submit a daemon or compatible one-shot job. Both use the same single
@@ -539,7 +638,7 @@ export class MemoryManager {
       try {
         const args = ['mine', agentDir, '--wing', id, '--agent', id];
         if (daemon) args.push('--daemon');
-        proc = spawn(bin, args, { env: this.childEnv(), stdio: ['ignore', 'pipe', 'pipe'] });
+        proc = this.spawnTracked(bin, args, { env: this.childEnv(), stdio: ['ignore', 'pipe', 'pipe'] });
       } catch { resolve(false); return; }
       // The short daemon client must not be prioritized above Electron. The
       // one-shot process needs the same treatment on old MemPalace installs.
@@ -590,7 +689,7 @@ export class MemoryManager {
       if (!this.active() || !bin) { resolve({ ok: false, output: '', error: 'semantic memory not active' }); return; }
       let proc: ReturnType<typeof spawn>;
       try {
-        proc = spawn(bin, args, { env: this.childEnv(), stdio: ['ignore', 'pipe', 'pipe'] });
+        proc = this.spawnTracked(bin, args, { env: this.childEnv(), stdio: ['ignore', 'pipe', 'pipe'] });
       } catch (e) {
         resolve({ ok: false, output: '', error: e instanceof Error ? e.message : String(e) });
         return;

@@ -25,6 +25,8 @@ export interface MineState {
 export interface PendingMine {
   fingerprint: MemoryFingerprint;
   quietUntil: number;
+  /** When the OLDEST unmined change was first seen: bounds the debounce (max wait). */
+  firstChangedAt: number;
 }
 
 export const emptyMineState = (): MineState => ({ version: 1, entries: {} });
@@ -79,18 +81,22 @@ export function archivedAgentIds(home: string): Set<string> {
 }
 
 /** Coalesce a noisy sequence of writes.  Each new fingerprint pushes the
- * deadline out; a mature entry is removed by the caller only after successful
- * daemon completion. */
+ * deadline out, but never past `maxWaitMs` after the oldest unmined change: a
+ * memory.md appended to every minute would otherwise never go quiet and never be
+ * mined (starvation). A mature entry is removed by the caller only after a
+ * successful mine. */
 export function queueChangedMemory(
   pending: Map<string, PendingMine>,
   id: string,
   fingerprint: MemoryFingerprint,
   now: number,
-  quietMs: number
+  quietMs: number,
+  maxWaitMs = Number.POSITIVE_INFINITY
 ): void {
   const existing = pending.get(id);
   if (!existing || !sameFingerprint(existing.fingerprint, fingerprint)) {
-    pending.set(id, { fingerprint, quietUntil: now + quietMs });
+    const firstChangedAt = existing?.firstChangedAt ?? now;
+    pending.set(id, { fingerprint, firstChangedAt, quietUntil: Math.min(now + quietMs, firstChangedAt + maxWaitMs) });
   }
 }
 
