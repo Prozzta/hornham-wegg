@@ -9,6 +9,7 @@ import { spawnSync } from 'node:child_process';
 import { ensureKilled, hardKillTree } from './procKill';
 import { expandTilde } from './fs';
 import { buildPtyEnv } from './ptyEnv';
+import { createPtyDataBatcher, type PtyDataBatcher } from './ptyDataBatcher';
 import { captureFromLoginShell, isSafeCommandName, userShellPath } from './shellEnv';
 
 /** APPEND the hive's bundled-node dir (`<HIVE_ROOT>/bin/runtime`, which holds a
@@ -43,6 +44,9 @@ interface PtySession {
    *  never leaks into another. Null falls back to the default attached sink
    *  (the primary window), preserving single-window behavior. */
   owner: WebContents | null;
+  /** LAG-150 F3: this session's output on its way to the renderer, coalesced into few
+   *  IPC messages (ptyDataBatcher.ts). Absent only on hand-built test sessions. */
+  out?: PtyDataBatcher;
   /** Epoch ms of the most recent byte this PTY emitted (bumped in onData). The
    *  heartbeat (Lane A #1) reads this for two things: floor-quiet detection (an
    *  agent printing/thinking counts as activity even before it writes a hive
@@ -378,6 +382,17 @@ export class PtyManager {
     this.exitHandler = handler;
   }
 
+  /** One chunk of a live session's output (node-pty onData). */
+  private deliverData(id: string, session: PtySession, data: string): void {
+    // Drop trailing output from a process whose id was already reclaimed by
+    // a respawn (or killed) — it would corrupt the new session's screen.
+    if (this.sessions.get(id) !== session) return;
+    session.hasOutput = true;
+    session.lastOutputAt = Date.now();
+    if (session.out) session.out.push(data);
+    else this.safeSend(`pty:data:${id}`, data, session.owner);
+  }
+
   /** Send to the renderer only if it's still alive. During app quit, killing a
    *  PTY fires onExit asynchronously — by then app.quit() may have destroyed the
    *  window, and `.send()` on a destroyed webContents throws "Object has been
@@ -398,6 +413,8 @@ export class PtyManager {
     if (!s) return false;
     const wc = s.owner ?? this.webContents;
     if (!wc || wc.isDestroyed()) return false;
+    // A screen read must see every byte main has already received: deliver the batch first.
+    s.out?.flush();
     try { wc.send(channel, payload); return true; } catch { return false; }
   }
 
@@ -711,21 +728,17 @@ export class PtyManager {
         humanInputGeneration: 0,
         incarnation: (incarnationSeq += 1)
       };
+      // Route to the session's owner window (multi-window owner routing), read at SEND
+      // time. Batched: one IPC message per burst, not per ~170-byte conpty chunk.
+      session.out = createPtyDataBatcher((data) => this.safeSend(`pty:data:${opts.id}`, data, session.owner));
       this.sessions.set(opts.id, session);
 
-      proc.onData((data) => {
-        // Drop trailing output from a process whose id was already reclaimed by
-        // a respawn (or killed) — it would corrupt the new session's screen.
-        if (this.sessions.get(opts.id) !== session) return;
-        session.hasOutput = true;
-        session.lastOutputAt = Date.now();
-        // Route to the session's owner window (multi-window owner routing).
-        this.safeSend(`pty:data:${opts.id}`, data, session.owner);
-      });
+      proc.onData((data) => this.deliverData(opts.id, session, data));
       proc.onExit(({ exitCode, signal }) => {
         // Stale exit from a process whose id was reclaimed (kill()+respawn) — do
         // NOT touch the live session or tell the renderer the new pty died.
         if (this.sessions.get(opts.id) !== session) return;
+        session.out?.flush(); // every byte before the exit notice, as before batching
         this.safeSend(`pty:exit:${opts.id}`, { exitCode, signal }, session.owner);
         this.sessions.delete(opts.id);
         // Natural exit must run the same lifecycle teardown as an explicit kill.
@@ -834,6 +847,7 @@ export class PtyManager {
     const s = this.sessions.get(id);
     if (!s) return { ok: false, error: `no pty: ${id}` };
     try {
+      s.out?.flush(); // what arrived before the kill still belongs on this pty's screen
       const pid = s.proc.pid;
       s.proc.kill();
       ensureKilled(pid); // verify + sweep the process group so no PID leaks
