@@ -79,3 +79,23 @@ test('STATIC: AgentDetailPanel error banner and the composer chrome are grid-sta
   // The pending list stays the LAG-150 overlay.
   assert.match(comp, /data-queue-overlay[\s\S]{0,80}position: 'absolute'/);
 });
+
+// ─── R-1 (Jim's audit of 6f6aa2e0): the floating error must not trap clicks, and must clear ───
+const errScenario = path.join(__dirname, 'electron-harness', 'scenarios', 'detail-panel-error-overlay.tsx');
+let errRun = null;
+const errResult = () => (errRun ??= runScenario(errScenario, { timeoutMs: 120_000 }));
+
+test('RENDERED R-1: a failed "open terminal" floats its error WITHOUT taking the operator controls\' clicks, and clears', async () => {
+  const r = await errResult();
+  assert.equal(r.ok, true, `scenario failed: ${r.error ?? ''}`);
+  assert.equal(r.foundOpenButton, true);
+  assert.equal(r.alertShown, true, 'the error is shown');
+  assert.equal(r.alertPointerEvents, 'none', 'the floating error never takes the pointer');
+  assert.equal(r.tipCarriesError, true, 'the full error text is readable from the button tip');
+  assert.ok(r.buttonsDuring.length >= 4, `the control buttons were probed (${r.buttonsDuring.length})`);
+  const trapped = r.buttonsDuring.filter((b) => b.hits.some((h) => h !== 'button'));
+  assert.deepEqual(trapped, [], 'top, centre and bottom of every control still hit the control itself');
+  assert.equal(r.tabsDuring, r.tabsBefore, 'the terminal area did not move while the error showed (no grid change)');
+  assert.equal(r.alertShownAfter, false, 'the error clears with the button state, not on the next attempt');
+  assert.equal(r.tabsAfter, r.tabsBefore);
+});
