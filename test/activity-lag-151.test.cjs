@@ -69,11 +69,11 @@ function walk(dir, out = []) {
   return out;
 }
 
-test('CENSUS (6): no feeds / pushFeed anywhere in the renderer (it was write-only)', () => {
+test('CENSUS (6): no feeds / pushFeed / FeedEntry anywhere in the renderer (it was write-only)', () => {
   const hits = [];
   for (const f of walk(path.join(ROOT, 'src/renderer'))) {
     const src = codeOnly(readSource(f));
-    if (/\bpushFeed\b|\bfeeds\b/.test(src)) hits.push(path.relative(ROOT, f));
+    if (/\bpushFeed\b|\bfeeds\b|\bFeedEntry\b/.test(src)) hits.push(path.relative(ROOT, f));
   }
   assert.deepEqual(hits, [], `found: ${hits.join(', ')}`);
 });
