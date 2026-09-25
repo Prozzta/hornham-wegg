@@ -380,7 +380,10 @@ const rosterMirror: {
 
 let rosterFlush: ReturnType<typeof setTimeout> | null = null;
 
-function flushRosterNow(): void {
+/** Write the roster mirror NOW. Exported for an editor that commits on beforeunload
+ *  (useCommittedDraft): its commit lands after this module's own beforeunload flush, so it
+ *  has to flush again or the mirror misses the last edit. */
+export function flushRosterNow(): void {
   if (rosterFlush) { clearTimeout(rosterFlush); rosterFlush = null; }
   try {
     void window.cth?.rosterWrite?.({

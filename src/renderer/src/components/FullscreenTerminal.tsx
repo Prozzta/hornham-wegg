@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
+import { PrivateNoteTextarea } from './PrivateNoteTextarea';
 import { PixelBadge } from './PixelBadge';
 import { PixelButton } from './PixelButton';
 import { PtyTerminalView } from './PtyTerminalView';
@@ -868,22 +869,14 @@ function SidebarRow({
             lineHeight: `${Math.round(noteLabelSize * 1.5)}px`,
             color: 'var(--cth-ink-700)'
           }}>PRIVATE NOTE</div>
-          {/* A textarea, not an input: the note is a bullet list, so Enter has
-              to make a new line rather than doing nothing. autoFocus is safe
-              now that opening is an explicit click, not a pointer fly-by. */}
-          <textarea
-            autoFocus
-            value={agent.note ?? ''}
-            onChange={(e) => onNoteChange(e.target.value)}
-            onKeyDown={(e) => {
-              e.stopPropagation(); // don't let Esc/typing reach the fullscreen handler
-              if (e.key === 'Escape') {
-                setNotePosition(null);
-                buttonRef.current?.focus();
-              }
+          <PrivateNoteTextarea
+            note={agent.note ?? ''}
+            onCommit={onNoteChange}
+            onEscape={() => {
+              setNotePosition(null);
+              buttonRef.current?.focus();
             }}
-            placeholder="one line per bullet…"
-            aria-label={`Note for ${agent.name}`}
+            ariaLabel={`Note for ${agent.name}`}
             style={{
               width: '100%',
               height: noteHeight,
