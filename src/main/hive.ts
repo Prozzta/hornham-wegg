@@ -256,6 +256,17 @@ function shortRand(): string {
  *  scratch state, and it stays on disk (so resume still works) either way. */
 const MINE_IGNORE_LINES = ['settings.json', 'cursor.json', 'inbox/', 'outbox/', '.codex/'];
 
+/** HOOK-BROKER: how long Claude waits for an HTTP hook (seconds). A hung app never holds an
+ *  agent longer than this, and a failed HTTP hook is non-blocking in Claude. */
+export const HOOK_HTTP_TIMEOUT_S = 30;
+
+/** NO_PROXY with loopback added (merged with any existing value, no duplicates). */
+export function mergeNoProxy(existing: string | undefined): string {
+  const parts = (existing ?? '').split(',').map((x) => x.trim()).filter(Boolean);
+  for (const host of ['127.0.0.1', 'localhost']) if (!parts.includes(host)) parts.push(host);
+  return parts.join(',');
+}
+
 /** Idempotently ensure `<agentDir>/.gitignore` excludes the non-memory files.
  *  Append-only: writes only the missing lines, leaving any existing entries. */
 function ensureMineIgnore(agentDir: string): void {
@@ -407,6 +418,13 @@ export class HiveManager {
   private readonly routerRuntime: RouterRuntime;
   /** MESSAGE-LAG-152: every hive commit goes through here: coalesced, async, single-flight,
    *  never on the main thread's critical path (see hiveCommitter.ts). */
+  /** HOOK-BROKER: the in-process HTTP hook endpoint (HookServer), injected by main. Null in
+   *  tests and until wired; every spawn then writes command hooks exactly as before. */
+  private hookBroker: { urlFor(agentId: string): string | null; revoke(agentId: string): void } | null = null;
+  setHookBroker(broker: { urlFor(agentId: string): string | null; revoke(agentId: string): void } | null): void {
+    this.hookBroker = broker;
+  }
+
   private readonly committer = new HiveCommitter({
     root: () => this.root(),
     prepare: (root, git) => this.prepareRepo(root, git),
@@ -850,6 +868,10 @@ export class HiveManager {
     // PowerShell, so every such instruction was dead on a Windows floor. Commands
     // we write for an agent to run bake `nodeCommand()`'s absolute path instead.
     env.HIVE_NODE = this.nodeCommand();
+    // HOOK-BROKER: loopback must never go through a proxy. Claude refuses an HTTP hook when its
+    // proxy settings would route it, and uses the env proxy when one is set.
+    env.NO_PROXY = mergeNoProxy(process.env.NO_PROXY ?? process.env.no_proxy);
+    env.no_proxy = env.NO_PROXY;
     // Generic light/dark hint for TUIs that paint their own background. The app
     // defaults to light but every agent CLI assumed a dark terminal, so Crush and
     // OpenCode looked pasted into a light window. COLORFGBG is the classic
@@ -1033,7 +1055,9 @@ export class HiveManager {
     if (sock && shim) {
       env.HIVE_SOCK = sock;
       const settingsPath = join(dir, 'settings.json');
-      this.writeJson(settingsPath, this.hookSettings(shim, meta.cwd, opts.mcpDefaults, opts.theme));
+      // HOOK-BROKER: this spawn's HTTP hook URL (a fresh token), or null -> command hooks.
+      const hookUrl = this.hookBroker?.urlFor(meta.id) ?? null;
+      this.writeJson(settingsPath, this.hookSettings(shim, meta.cwd, opts.mcpDefaults, opts.theme, hookUrl));
       args.push('--settings', settingsPath);
     }
     return { args, env };
@@ -1075,6 +1099,8 @@ export class HiveManager {
     try {
       const reg = this.registry();
       const agent = reg.agents[id];
+      // An archived agent's hook token is revoked even when the flag is already set.
+      if (archived) this.hookBroker?.revoke(id);
       if (!agent || agent.archived === archived) return;
       agent.archived = archived;
       agent.lastSeen = Date.now();
@@ -1244,7 +1270,7 @@ export class HiveManager {
    *  (W3) the default MCP bundle merged into this PER-SESSION settings file. cwd
    *  scopes the filesystem/git servers; cfg (the consent map) gates which servers
    *  are written. Claude-only — this is invoked solely on the Claude spawn path. */
-  private hookSettings(shim: string, cwd: string, cfg: McpDefaultsMap, theme?: 'light' | 'dark'): unknown {
+  private hookSettings(shim: string, cwd: string, cfg: McpDefaultsMap, theme?: 'light' | 'dark', hookUrl: string | null = null): unknown {
     // Bundled node, NOT bare `node` — see nodeLauncherPath(). Claude runs each of
     // these through `sh -c` with a stripped PATH, where `node` is often absent.
     const cmd = this.nodeRun(shim);
@@ -1252,6 +1278,13 @@ export class HiveManager {
       ...(matcher ? { matcher } : {}),
       hooks: [{ type: 'command', command: cmd }]
     });
+    // HOOK-BROKER: with the broker up, a hook is a POST to the in-process HookServer (0
+    // processes). SessionStart stays a command (Claude does not run HTTP hooks for it), and
+    // so does the status line. An event is EITHER http OR command, never both. With no URL
+    // this function's output is byte-identical to before.
+    const hook = (matcher?: string) => hookUrl
+      ? { ...(matcher ? { matcher } : {}), hooks: [{ type: 'http', url: hookUrl, timeout: HOOK_HTTP_TIMEOUT_S }] }
+      : entry(matcher);
     const mcpServers = this.buildDefaultMcpServers(cwd, cfg);
     return {
       // Match the TUI's truecolor palette to the harness terminal theme —
@@ -1278,17 +1311,17 @@ export class HiveManager {
       // payload to the harness (agent-card context gauge, exact limit).
       statusLine: { type: 'command', command: `${cmd} --status`, padding: 0 },
       hooks: {
-        Stop: [entry()],
-        SubagentStop: [entry()],
-        PreToolUse: [entry('*')],
-        PostToolUse: [entry('*')],
-        UserPromptSubmit: [entry()],
-        Notification: [entry()],
+        Stop: [hook()],
+        SubagentStop: [hook()],
+        PreToolUse: [hook('*')],
+        PostToolUse: [hook('*')],
+        UserPromptSubmit: [hook()],
+        Notification: [hook()],
         SessionStart: [entry()],
         // #5C: surface mid-`/compact` so an agent boxing up its context reads as
         // 'compacting' on the floor instead of looking frozen.
-        PreCompact: [entry()],
-        PostCompact: [entry()]
+        PreCompact: [hook()],
+        PostCompact: [hook()]
       }
     };
   }
@@ -3173,6 +3206,7 @@ process.stdin.on('end', () => {
   // CODEX-HOOK-AGENTID: the hive's own id always wins. A provider may put ITS agent_id in
   // the payload (a Codex or Claude subagent); that value is kept as provider_agent_id.
   const hiveId = process.env.AGENT_ID || null;
+  delete payload.provider_agent_id; // only this shim may set it (N3)
   if (payload.agent_id && payload.agent_id !== hiveId) payload.provider_agent_id = payload.agent_id;
   payload.agent_id = hiveId || payload.agent_id || null;
   const sock = process.env.HIVE_SOCK;

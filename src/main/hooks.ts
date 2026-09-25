@@ -11,6 +11,8 @@
  * Runs in the Electron main process.
  */
 import { createServer, type Server } from 'node:net';
+import { createServer as createHttpServer, type Server as HttpServer, type IncomingMessage, type ServerResponse } from 'node:http';
+import { randomBytes, timingSafeEqual } from 'node:crypto';
 import { existsSync, rmSync } from 'node:fs';
 import { Notification, type WebContents } from 'electron';
 import type { HiveManager } from './hive';
@@ -71,6 +73,31 @@ interface HookPayload {
    *  UserPromptSubmit, PreToolUse, PostToolUse and Stop). Lets the wake coordinator
    *  recognise a tool event that arrives AFTER its own turn's Stop (FALSEACTIVE-STALL-2). */
   turn_id?: string;
+  /** HOOK-BROKER: stamped on ARRIVAL, before handle(): a per-agent monotonic counter and
+   *  the transport it came over. Never trusted from the sender (overwritten). */
+  seq?: number;
+  transport?: HookTransport;
+}
+
+export type HookTransport = 'http' | 'pipe';
+
+/** HOOK-BROKER: the largest HTTP hook body accepted (a PostToolUse tool_response can be big). */
+export const HOOK_HTTP_BODY_MAX = 8 * 1024 * 1024;
+/** HOOK-BROKER: after a listener error, re-listen on the SAME port (live agents' settings name
+ *  it) with these delays; when they are exhausted (~30 s) the broker is down and new spawns get
+ *  the command hooks. */
+export const HOOK_HTTP_RELISTEN_DELAYS_MS = [250, 1_000, 2_000, 5_000, 10_000, 12_000];
+/** The only URL the broker serves: /hook/<agentId>/<32-hex token>. */
+const HOOK_ROUTE = /^\/hook\/([^/?#]+)\/([0-9a-f]{32})$/;
+
+/** Rewrite an HTTP hook body's identity from the AUTHENTICATED URL (9082b05c rules, now
+ *  server-side): an incoming provider_agent_id is never trusted; a differing body agent_id is
+ *  the provider's own (a subagent) and becomes provider_agent_id; agent_id is the URL's. */
+export function applyUrlIdentity(p: Record<string, unknown>, urlAgentId: string): void {
+  delete p.provider_agent_id;
+  const own = typeof p.agent_id === 'string' && p.agent_id !== '' ? p.agent_id : null;
+  if (own && own !== urlAgentId) p.provider_agent_id = own;
+  p.agent_id = urlAgentId;
 }
 
 /** How many distinct {version, driftCode} pairs are counted before they share one bucket. */
@@ -154,13 +181,14 @@ export class HookServer {
         let payload: HookPayload = {};
         try { payload = JSON.parse(buf.slice(0, nl)); } catch { /* ignore */ }
         let res: unknown = {};
-        try { res = this.handle(payload); } catch { res = {}; }
+        try { res = this.handle(this.stampArrival(payload, 'pipe')); } catch { res = {}; }
         conn.end(JSON.stringify(res ?? {}));
       });
       conn.on('error', () => { /* shim hung up — ignore */ });
     });
     this.server.on('error', (e) => console.error('[hive] hook server error:', e));
     this.server.listen(sock);
+    this.startHttp();
   }
 
   stop(): void {
@@ -168,6 +196,180 @@ export class HookServer {
     this.server = null;
     const sock = this.hive.sockPath();
     try { if (sock && existsSync(sock)) rmSync(sock); } catch { /* noop */ }
+    this.stopHttp();
+  }
+
+  // — HOOK-BROKER: Claude's native HTTP hooks, handled in-process (0 processes per hook) —
+  //
+  // Every command hook cost two process creations (cmd.exe + Electron-as-node running the
+  // shim): ~450 ms each, an antivirus scan target, and the jitter that let a hook overtake a
+  // later one. Claude Code can POST a hook to a URL instead. The broker is this server with a
+  // second listener, on loopback, calling the SAME handle(): every gate behaves identically,
+  // and it spawns nothing, so there is nothing to orphan. Providers that can only run a
+  // command keep the pipe and the shim exactly as before.
+
+  private http: HttpServer | null = null;
+  private httpPort: number | null = null;
+  private httpDown = false;
+  private httpStopped = true;
+  private relistenAttempt = 0;
+  private relistenTimer: ReturnType<typeof setTimeout> | null = null;
+  /** agentId -> the token minted for its CURRENT spawn (revoked on archive, replaced on respawn). */
+  private hookTokens = new Map<string, Buffer>();
+  private seqByAgent = new Map<string, number>();
+  /** Hooks per agent per transport in the current minute; flushed to log.jsonl on rollover. */
+  private transportCounts = new Map<string, { http: number; pipe: number }>();
+  private countsMinute = 0;
+  private oversizeLogged = new Set<string>();
+  private brokerDownLogged = false;
+
+  private startHttp(port = 0): void {
+    this.httpStopped = false;
+    const server = createHttpServer((req, res) => this.onHttp(req, res));
+    server.headersTimeout = 5_000;
+    server.requestTimeout = 30_000;
+    server.keepAliveTimeout = 5_000;
+    server.on('error', (e) => this.onHttpError(server, e));
+    server.listen(port, '127.0.0.1', () => {
+      const addr = server.address();
+      if (addr && typeof addr === 'object') {
+        this.httpPort = addr.port;
+        this.httpDown = false;
+        this.relistenAttempt = 0;
+      }
+    });
+    this.http = server;
+  }
+
+  private onHttpError(server: HttpServer, e: unknown): void {
+    if (this.http !== server || this.httpStopped) return;
+    try { server.close(); } catch { /* noop */ }
+    this.http = null;
+    const delay = HOOK_HTTP_RELISTEN_DELAYS_MS[this.relistenAttempt];
+    if (delay === undefined) {
+      // Persistent: new spawns get the command hooks from now on. Live agents' HTTP hooks
+      // fail as non-blocking errors, and the inbox-wake reconcile beat still covers wake.
+      this.httpDown = true;
+      if (!this.brokerDownLogged) {
+        this.brokerDownLogged = true;
+        console.error('[hive] hook broker down; new agents use command hooks:', e);
+        try { this.hive.appendLog({ kind: 'hook-broker-down', error: String(e).slice(0, 200) }); } catch { /* best effort */ }
+      }
+      return;
+    }
+    this.relistenAttempt += 1;
+    // The SAME port: the URLs in running agents' settings name it. With no port yet (the
+    // first bind failed), any port will do, and nobody has a URL to lose.
+    const port = this.httpPort ?? 0;
+    this.relistenTimer = setTimeout(() => { this.relistenTimer = null; if (!this.httpStopped) this.startHttp(port); }, delay);
+    this.relistenTimer.unref?.();
+  }
+
+  private stopHttp(): void {
+    this.httpStopped = true;
+    if (this.relistenTimer) { clearTimeout(this.relistenTimer); this.relistenTimer = null; }
+    try { this.http?.close(); } catch { /* noop */ }
+    this.http = null;
+    this.httpPort = null;
+    this.hookTokens.clear();
+    this.flushTransportCounts();
+  }
+
+  /** The URL this agent's Claude hooks POST to, minting a fresh token (the previous spawn's is
+   *  revoked). Null when the broker is not listening: the caller then writes command hooks. */
+  hookUrl(agentId: string): string | null {
+    if (!this.http || this.httpPort === null || this.httpDown || this.httpStopped || !agentId) return null;
+    const token = randomBytes(16);
+    this.hookTokens.set(agentId, token);
+    return `http://127.0.0.1:${this.httpPort}/hook/${encodeURIComponent(agentId)}/${token.toString('hex')}`;
+  }
+
+  revokeHookToken(agentId: string): void {
+    this.hookTokens.delete(agentId);
+  }
+
+  /** The bound broker port (diagnostics, tests), or null. */
+  hookBrokerPort(): number | null { return this.httpDown ? null : this.httpPort; }
+
+  private onHttp(req: IncomingMessage, res: ServerResponse): void {
+    const reply = (status: number, body: unknown): void => {
+      if (res.headersSent) return;
+      res.writeHead(status, { 'content-type': 'application/json' });
+      res.end(JSON.stringify(body ?? {}));
+    };
+    const m = req.method === 'POST' && req.url ? HOOK_ROUTE.exec(req.url) : null;
+    if (!m) { req.resume(); reply(404, {}); return; }
+    let agentId: string;
+    try { agentId = decodeURIComponent(m[1]); } catch { req.resume(); reply(404, {}); return; }
+    const expected = this.hookTokens.get(agentId);
+    const given = Buffer.from(m[2], 'hex');
+    // Constant-time, and never handled unless it matches: another local process cannot
+    // forge a hook for an agent.
+    if (!expected || expected.length !== given.length || !timingSafeEqual(expected, given)) {
+      req.resume(); reply(403, {}); return;
+    }
+    const chunks: Buffer[] = [];
+    let size = 0;
+    let tooBig = false;
+    req.on('data', (d: Buffer) => {
+      if (tooBig) return;
+      size += d.length;
+      if (size > HOOK_HTTP_BODY_MAX) {
+        tooBig = true;
+        if (!this.oversizeLogged.has(agentId)) {
+          this.oversizeLogged.add(agentId);
+          console.error(`[hive] hook body over ${HOOK_HTTP_BODY_MAX} bytes from ${agentId}; refused`);
+        }
+        reply(413, {});
+        req.resume();
+        return;
+      }
+      chunks.push(d);
+    });
+    req.on('end', () => {
+      if (tooBig) return;
+      let payload: Record<string, unknown> = {};
+      try {
+        const parsed: unknown = JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}');
+        if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) payload = parsed as Record<string, unknown>;
+      } catch { /* an unreadable body is an empty hook */ }
+      applyUrlIdentity(payload, agentId);
+      let out: unknown = {};
+      try { out = this.handle(this.stampArrival(payload as HookPayload, 'http')); } catch { out = {}; }
+      reply(200, out);
+    });
+    req.on('error', () => { /* client went away */ });
+  }
+
+  /** Stamp the arrival order and transport before handle() (never trusted from the body),
+   *  and count it for the per-minute transport log. */
+  private stampArrival(p: HookPayload, transport: HookTransport): HookPayload {
+    p.transport = transport;
+    const agentId = typeof p.agent_id === 'string' && p.agent_id ? p.agent_id : null;
+    if (!agentId) { delete p.seq; return p; }
+    const seq = (this.seqByAgent.get(agentId) ?? 0) + 1;
+    this.seqByAgent.set(agentId, seq);
+    p.seq = seq;
+    const minute = Math.floor(Date.now() / 60_000);
+    if (minute !== this.countsMinute) { this.flushTransportCounts(); this.countsMinute = minute; }
+    const c = this.transportCounts.get(agentId) ?? { http: 0, pipe: 0 };
+    c[transport] += 1;
+    this.transportCounts.set(agentId, c);
+    return p;
+  }
+
+  /** One log row per minute with hooks by transport per agent (http = 0 processes per hook,
+   *  pipe = 2): the measure of what the broker removed. */
+  private flushTransportCounts(): void {
+    if (!this.transportCounts.size) return;
+    const counts = Object.fromEntries(this.transportCounts);
+    this.transportCounts = new Map();
+    try { this.hive.appendLog({ kind: 'hook-transport', minute: this.countsMinute, counts }); } catch { /* best effort */ }
+  }
+
+  /** Hooks by transport per agent in the current minute (diagnostics, tests). */
+  transportCountsNow(): Record<string, { http: number; pipe: number }> {
+    return Object.fromEntries(this.transportCounts);
   }
 
   /** Read this agent's Codex allowance, if it is a Codex worker and anything moved. */
@@ -244,7 +446,7 @@ export class HookServer {
     // session id, transcript and turn are the subagent's. So it never records the session or
     // transcript, never drives the wake lifecycle (a subagent's late tool hook would re-open
     // a finished turn), and a subagent's Stop is not this agent's Stop.
-    const fromSubagent = typeof p.provider_agent_id === 'string' && p.provider_agent_id !== '';
+    const fromSubagent = typeof p.provider_agent_id === 'string' && p.provider_agent_id !== '' && p.provider_agent_id !== agentId;
     if (!fromSubagent) {
       this.onEvent?.(agentId, event, p.message, typeof p.fully_idle === 'boolean' ? p.fully_idle : undefined,
         typeof p.turn_id === 'string' && p.turn_id ? p.turn_id : undefined);
@@ -328,7 +530,9 @@ export class HookServer {
     // drain below): stop the agent CLEANLY at this hook boundary rather than
     // killing the PTY. session_id is in the payload for a later --resume.
     if (agentId && this.control?.shouldHalt(agentId)) {
-      this.emit(agentId, event, p);
+      // A subagent's Stop is not this agent's Stop, halted or not (the renderer reads any
+      // emitted Stop as this agent going idle). The halt still applies to the subagent.
+      if (!(fromSubagent && (event === 'Stop' || event === 'SubagentStop'))) this.emit(agentId, event, p);
       return { continue: false, stopReason: 'Halted by the operator from the floor.' };
     }
 
@@ -426,7 +630,9 @@ export class HookServer {
     // Merged with the roster line below so the two injections never displace each
     // other (only ONE additionalContext can be returned per hook).
     let steer: string | null = null;
-    if ((event === 'UserPromptSubmit' || event === 'PostToolUse') && agentId && this.control) {
+    // Not for a subagent's hook: the one-shot steer is meant for the agent itself, and a
+    // subagent consuming it would lose it (HOOK-BROKER audit N1).
+    if ((event === 'UserPromptSubmit' || event === 'PostToolUse') && agentId && this.control && !fromSubagent) {
       steer = this.control.takeSteer(agentId) ?? null;
     }
 
@@ -437,7 +643,7 @@ export class HookServer {
     // knows the floor all the time instead of only when it remembers to Read.
     // God-only and one line — every other agent is unaffected.
     const wantsRoster = (event === 'SessionStart' || event === 'UserPromptSubmit')
-      && !!agentId && this.hive.isGod(agentId);
+      && !!agentId && !fromSubagent && this.hive.isGod(agentId);
     // Hand the roster the LIVE context-window occupancy (contextById) so each
     // agent line can carry a `ctx NN%` — god then sees whose context is nearly
     // full when it routes work, instead of guessing from cumulative token spend.
@@ -449,7 +655,7 @@ export class HookServer {
     // an Edit Agent save is picked up on the next SessionStart / UserPromptSubmit
     // without restarting the worker. Kept out of --append-system-prompt (volatile-
     // free cache invariant); lives on the live hook channel instead.
-    const wantsGoal = (event === 'SessionStart' || event === 'UserPromptSubmit') && !!agentId;
+    const wantsGoal = (event === 'SessionStart' || event === 'UserPromptSubmit') && !!agentId && !fromSubagent;
     const goalRaw = wantsGoal ? (this.getStandingGoal?.(agentId) ?? null) : null;
     const goal = goalRaw
       ? `<goal>\n${goalRaw}\n</goal>`

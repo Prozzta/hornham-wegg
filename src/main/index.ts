@@ -589,6 +589,10 @@ const hookServer = new HookServer(
     liveWebContents()?.send('hive:providerStatus', { agentId, status: tick.lifecycle });
   }
 );
+// HOOK-BROKER: Claude agents POST their hooks to the HookServer in-process (0 processes per
+// hook). The hive asks for a per-spawn URL; with the broker not listening it gets null and
+// writes the command hooks exactly as before.
+hive.setHookBroker({ urlFor: (id) => hookServer.hookUrl(id), revoke: (id) => hookServer.revokeHookToken(id) });
 const memory = new MemoryManager(
   () => readConfig().harnessHome,
   () => { const c = readConfig(); return { enabled: c.semanticMemory !== false, model: c.embeddingModel ?? 'minilm' }; }
