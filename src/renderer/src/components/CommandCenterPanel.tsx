@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react';
+import { memo, useEffect, useRef, useState } from 'react';
 import { PixelPanel } from './PixelPanel';
 import { AgentImpactBadge } from './AgentImpactBadge';
 import { AgentUsageSelect, AgentUsageWindow } from './AgentUsageLine';
@@ -339,7 +339,7 @@ export function CommandCenterPanel({ agent, fullscreen = false }: { agent: Agent
 
 // ─── Floor tab — roster, model, dispatch, dirs, assistant ────────────────────
 
-function FloorTab({ seed }: { seed: { text: string; seq: number } }) {
+export function FloorTab({ seed }: { seed: { text: string; seq: number } }) {
   const agents = useStore((s) => s.agents);
   const select = useStore((s) => s.select);
   const updateAgent = useStore((s) => s.updateAgent);
@@ -363,9 +363,9 @@ function FloorTab({ seed }: { seed: { text: string; seq: number } }) {
   // new agent spawn on this, so the picker marks it — otherwise the only entry
   // reading "default" was the CLI's, which is a different thing entirely.
   const [defaultModel, setDefaultModel] = useState<string | undefined>(undefined);
-  const [dispatchTo, setDispatchTo] = useState<string>(''); // '' = Michael decides
-  const [dispatchText, setDispatchText] = useState('');
-  const [dispatchMsg, setDispatchMsg] = useState<string | null>(null);
+  // COMPOSER-LAG-152 F1: the dispatch draft lives in DispatchBox, not here, so a keystroke
+  // re-renders the box alone and not this whole dashboard. FloorTab only seeds it.
+  const [issueSeed, setIssueSeed] = useState<{ text: string; seq: number }>({ text: '', seq: 0 });
   // ── ISSUES section state ──
   const [issueRepo, setIssueRepo] = useState<string>('');
   const [issues, setIssues] = useState<GHIssue[]>([]);
@@ -383,12 +383,6 @@ function FloorTab({ seed }: { seed: { text: string; seq: number } }) {
       setDefaultModel(c.defaultModel);
     }).catch(() => { /* noop */ });
   }, []);
-
-  // Seed the dispatch box from a task-card "assign" (keyed on seq so repeat
-  // assigns re-prefill). seq === 0 is the untouched initial state — skip it.
-  useEffect(() => {
-    if (seed.seq > 0) setDispatchText(seed.text);
-  }, [seed.seq, seed.text]);
 
   // Restart an agent's PTY in place. `resume:true` reattaches its prior Claude
   // conversation (`--resume <sessionId>`, resolved in the main process from the
@@ -543,29 +537,6 @@ function FloorTab({ seed }: { seed: { text: string; seq: number } }) {
     }
   };
 
-  // ALL human dispatch flows through the god — never directly into a worker's
-  // inbox. Direct dispatch bypassed the orchestrator's whole job: no 4-part
-  // contract, no card in tasks.json, no board awareness — and the old
-  // 'broadcast' DEFAULT sent the same task to every worker at once. A worker
-  // picked in the dropdown is forwarded as a SUGGESTION the god may follow.
-  const dispatch = async () => {
-    const body = dispatchText.trim();
-    if (!body) return;
-    const suggested = dispatchTo ? agents.find((a) => a.id === dispatchTo) : undefined;
-    const full = suggested
-      ? `${body}\n\n(The human suggests ${suggested.name} (${suggested.id}) for this — your call as orchestrator.)`
-      : body;
-    const res = await window.cth.hiveSend(
-      { to: 'god', act: 'request', subject: 'Task from the human', body: full },
-      'human'
-    );
-    setDispatchText('');
-    setDispatchMsg(res.ok
-      ? `sent to Michael${suggested ? ` (suggesting ${suggested.name})` : ''}`
-      : `failed: ${res.error ?? '?'}`);
-    setTimeout(() => setDispatchMsg(null), 4000);
-  };
-
   const fetchIssues = async () => {
     const repo = issueRepo || repos[0];
     if (!repo) { setIssuesError('No repo selected.'); return; }
@@ -589,8 +560,7 @@ function FloorTab({ seed }: { seed: { text: string; seq: number } }) {
 
   const assignIssue = (issue: GHIssue) => {
     const body = (issue.body ?? '').slice(0, 200);
-    setDispatchText(`GitHub Issue #${issue.number}: ${issue.title}\n\n${body}\n\nURL: ${issue.url}`);
-    setDispatchTo(''); // Michael decomposes and assigns — no more broadcast blasts
+    setIssueSeed((prev) => ({ text: `GitHub Issue #${issue.number}: ${issue.title}\n\n${body}\n\nURL: ${issue.url}`, seq: prev.seq + 1 }));
   };
 
   // Set/clear one agent's token limit atomically in main. Renderer config objects
@@ -652,30 +622,7 @@ function FloorTab({ seed }: { seed: { text: string; seq: number } }) {
   return (
     <Scroll>
       <Section title="DISPATCH — VIA MICHAEL">
-        <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 6 }}>
-          <span style={{ fontFamily: 'var(--cth-font-display)', fontSize: 8, color: 'var(--cth-ink-500)', flexShrink: 0 }}>
-            SUGGESTED OWNER
-          </span>
-          <Select value={dispatchTo} onChange={setDispatchTo}>
-            <option value="">Michael decides</option>
-            {agents.filter((a) => !a.isGod).map((a) => (
-              <option key={a.id} value={a.id}>{a.name}</option>
-            ))}
-          </Select>
-        </div>
-        <textarea
-          value={dispatchText}
-          onChange={(e) => setDispatchText(e.target.value)}
-          rows={2}
-          placeholder="Describe the task… (Michael decomposes, writes the card, and assigns)"
-          style={textareaStyle}
-        />
-        <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginTop: 6 }}>
-          <PixelButton variant="primary" size="sm" onClick={dispatch} disabled={!dispatchText.trim()}>
-            dispatch
-          </PixelButton>
-          {dispatchMsg && <span style={{ fontSize: 12, color: 'var(--cth-ink-500)' }}>{dispatchMsg}</span>}
-        </div>
+        <DispatchBox agents={agents} seed={seed} issueSeed={issueSeed} />
       </Section>
 
       <Section title="AGENTS">
@@ -1300,6 +1247,88 @@ function ActivityTab() {
 
 
 // ─── small shared bits ───────────────────────────────────────────────────────
+
+/**
+ * COMPOSER-LAG-152 F1: the Floor tab's dispatch box owns its own draft. Typing used to set
+ * state in FloorTab, which re-rendered the whole dashboard (every agent's meters, sparkline,
+ * usage and limit editors) per keystroke. Memoised, so FloorTab's own re-renders (tool
+ * counts, telemetry) do not reach it either unless its props change.
+ *
+ * Two seeds, each keyed on seq so a repeat re-fills: `seed` (a task-card "assign") fills the
+ * text only; `issueSeed` (an issue's "assign") also resets the owner to "Michael decides".
+ */
+const DispatchBox = memo(function DispatchBox({ agents, seed, issueSeed }: {
+  agents: Agent[];
+  seed: { text: string; seq: number };
+  issueSeed: { text: string; seq: number };
+}) {
+  const [dispatchTo, setDispatchTo] = useState<string>(''); // '' = Michael decides
+  const [dispatchText, setDispatchText] = useState('');
+  const [dispatchMsg, setDispatchMsg] = useState<string | null>(null);
+
+  // Seed the dispatch box from a task-card "assign" (keyed on seq so repeat
+  // assigns re-prefill). seq === 0 is the untouched initial state — skip it.
+  useEffect(() => {
+    if (seed.seq > 0) setDispatchText(seed.text);
+  }, [seed.seq, seed.text]);
+  useEffect(() => {
+    if (issueSeed.seq === 0) return;
+    setDispatchText(issueSeed.text);
+    setDispatchTo(''); // Michael decomposes and assigns — no more broadcast blasts
+  }, [issueSeed.seq, issueSeed.text]);
+
+  // ALL human dispatch flows through the god — never directly into a worker's
+  // inbox. Direct dispatch bypassed the orchestrator's whole job: no 4-part
+  // contract, no card in tasks.json, no board awareness — and the old
+  // 'broadcast' DEFAULT sent the same task to every worker at once. A worker
+  // picked in the dropdown is forwarded as a SUGGESTION the god may follow.
+  const dispatch = async () => {
+    const body = dispatchText.trim();
+    if (!body) return;
+    const suggested = dispatchTo ? agents.find((a) => a.id === dispatchTo) : undefined;
+    const full = suggested
+      ? `${body}\n\n(The human suggests ${suggested.name} (${suggested.id}) for this — your call as orchestrator.)`
+      : body;
+    const res = await window.cth.hiveSend(
+      { to: 'god', act: 'request', subject: 'Task from the human', body: full },
+      'human'
+    );
+    setDispatchText('');
+    setDispatchMsg(res.ok
+      ? `sent to Michael${suggested ? ` (suggesting ${suggested.name})` : ''}`
+      : `failed: ${res.error ?? '?'}`);
+    setTimeout(() => setDispatchMsg(null), 4000);
+  };
+
+  return (
+    <>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 6 }}>
+            <span style={{ fontFamily: 'var(--cth-font-display)', fontSize: 8, color: 'var(--cth-ink-500)', flexShrink: 0 }}>
+              SUGGESTED OWNER
+            </span>
+            <Select value={dispatchTo} onChange={setDispatchTo}>
+              <option value="">Michael decides</option>
+              {agents.filter((a) => !a.isGod).map((a) => (
+                <option key={a.id} value={a.id}>{a.name}</option>
+              ))}
+            </Select>
+          </div>
+          <textarea
+            value={dispatchText}
+            onChange={(e) => setDispatchText(e.target.value)}
+            rows={2}
+            placeholder="Describe the task… (Michael decomposes, writes the card, and assigns)"
+            style={textareaStyle}
+          />
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginTop: 6 }}>
+            <PixelButton variant="primary" size="sm" onClick={dispatch} disabled={!dispatchText.trim()}>
+              dispatch
+            </PixelButton>
+            {dispatchMsg && <span style={{ fontSize: 12, color: 'var(--cth-ink-500)' }}>{dispatchMsg}</span>}
+          </div>
+    </>
+  );
+});
 
 function Scroll({ children }: { children: React.ReactNode }) {
   // minWidth:0 + overflowX:hidden keep wide children (native selects, long paths,
