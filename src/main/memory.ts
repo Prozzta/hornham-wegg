@@ -66,6 +66,9 @@ export interface MemoryStatus {
   palacePath: string | null;
   model: EmbeddingModel;
   bin: string | null;
+  /** `one-shot` is compatible but costs more than the resident daemon. */
+  miningMode: 'unknown' | 'daemon' | 'one-shot';
+  miningWarning: string | null;
 }
 
 // Scan cheaply every 30s, but give each changed memory.md a full quiet minute
@@ -82,9 +85,12 @@ const MINE_PER_AGENT_MIN_MS = 600_000;
 const MINE_BACKOFF_MAX_MS = 1_800_000;
 const MINE_WATCHDOG_MS = 60_000;
 const MINE_RETRY_MS = 120_000;
-/** First daemon boot may load/download an embedding model before it can emit a
- * job-progress line, so it gets a deliberately separate, generous cap. */
-const DAEMON_STARTUP_TIMEOUT_MS = 10 * 60_000;
+/** A daemon that has not become ready in a minute is not allowed to hold a
+ * memory change hostage; the compatibility path below takes over. */
+const DAEMON_STARTUP_TIMEOUT_MS = 60_000;
+/** Re-probe a compatibility fallback periodically so an in-session CLI upgrade
+ * regains the low-cost daemon without requiring an app restart. */
+const DAEMON_RETRY_MS = 30 * 60_000;
 /** mempalace's device "auto" picks the CoreML execution provider on Apple
  *  Silicon, and CoreML runs the quantized embeddinggemma ONNX graph partially
  *  (330/1647 nodes) with fp16 partitions that overflow → EVERY vector comes
@@ -134,6 +140,9 @@ export class MemoryManager {
   /** Changes awaiting their quiet period. One queue serializes all writes. */
   private readonly pendingMines = new Map<string, PendingMine>();
   private daemonStart: Promise<boolean> | null = null;
+  private daemonUnavailable: string | null = null;
+  private daemonUnavailableLogged = false;
+  private daemonRetryAt = 0;
   private rebuilding = false;
   /** Log a stalled job once, then retry after backoff without a log storm. */
   private readonly watchdogLogged = new Set<string>();
@@ -203,7 +212,9 @@ export class MemoryManager {
       initialized: !!palace && existsSync(palace),
       palacePath: palace,
       model: this.model(),
-      bin: this.bin()
+      bin: this.bin(),
+      miningMode: this.daemonUnavailable ? 'one-shot' : this.daemonStart ? 'daemon' : 'unknown',
+      miningWarning: this.daemonUnavailable
     };
   }
 
@@ -438,22 +449,62 @@ export class MemoryManager {
   /** Start MemPalace's opt-in daemon once. It owns the model and HNSW writer
    * for all later jobs, avoiding a full Python/index load per changed agent. */
   private ensureDaemon(): Promise<boolean> {
+    // An old CLI or a timed-out launch takes the compatible one-shot route for
+    // a while.  Retrying every mine would recreate the very process churn this
+    // daemon was introduced to remove; retrying after an upgrade window is
+    // enough to recover without an app restart.
+    if (this.daemonUnavailable) {
+      if (Date.now() < this.daemonRetryAt) return Promise.resolve(false);
+      this.daemonUnavailable = null;
+      this.daemonStart = null;
+    }
     if (this.daemonStart) return this.daemonStart;
     this.daemonStart = new Promise((resolve) => {
       const bin = this.bin();
       if (!bin) { resolve(false); return; }
       let proc: ReturnType<typeof spawn>;
+      let err = '';
+      let settled = false;
+      const settle = (ready: boolean): void => {
+        if (!settled) { settled = true; resolve(ready); }
+      };
       try { proc = spawn(bin, ['daemon', 'start'], { env: this.childEnv(), stdio: ['ignore', 'ignore', 'pipe'] }); }
-      catch { resolve(false); return; }
+      catch { this.daemonStart = null; settle(false); return; }
       // The daemon's child inherits this on Windows; on POSIX it keeps model
       // maintenance below Electron and active CLI work. Best-effort only.
       try { if (proc.pid) setPriority(proc.pid, osConstants.priority.PRIORITY_BELOW_NORMAL); } catch { /* platform policy */ }
-      const timer = setTimeout(() => { try { proc.kill('SIGTERM'); } catch { /* gone */ } resolve(false); }, DAEMON_STARTUP_TIMEOUT_MS);
+      proc.stderr?.on('data', (d) => { err += d.toString(); });
+      const timer = setTimeout(() => {
+        try { proc.kill('SIGTERM'); } catch { /* gone */ }
+        this.daemonStart = null;
+        this.markDaemonUnavailable(`MemPalace daemon did not become ready in ${DAEMON_STARTUP_TIMEOUT_MS / 1000}s: using one-shot mining; upgrade to 3.7.1 or newer for the low-cost daemon`);
+        settle(false);
+      }, DAEMON_STARTUP_TIMEOUT_MS);
       timer.unref?.();
-      proc.once('close', (code) => { clearTimeout(timer); resolve(code === 0); });
-      proc.once('error', () => { clearTimeout(timer); resolve(false); });
+      proc.once('close', (code) => {
+        clearTimeout(timer);
+        if (settled) return;
+        if (code === 0) { this.daemonUnavailable = null; settle(true); return; }
+        // argparse uses exit 2 for an unknown `daemon` subcommand. Do not retry
+        // that incompatible CLI every two minutes: mining is off, but search
+        // remains active and status tells the user precisely why.
+        if (code === 2 && /(?:invalid choice|unrecognized arguments|daemon)/i.test(err)) {
+          this.markDaemonUnavailable('MemPalace has no daemon: using one-shot mining; upgrade to 3.7.1 or newer for the low-cost daemon');
+        } else this.daemonStart = null; // transient start failure: bounded retry may recover
+        settle(false);
+      });
+      proc.once('error', () => { clearTimeout(timer); this.daemonStart = null; settle(false); });
     });
     return this.daemonStart;
+  }
+
+  private markDaemonUnavailable(message: string): void {
+    this.daemonUnavailable = message;
+    this.daemonRetryAt = Date.now() + DAEMON_RETRY_MS;
+    if (!this.daemonUnavailableLogged) {
+      this.daemonUnavailableLogged = true;
+      console.error(`[memory] ${message}`);
+    }
   }
 
   private stopDaemon(): void {
@@ -463,20 +514,36 @@ export class MemoryManager {
     this.daemonStart = null;
   }
 
-  /** Submit to the resident daemon. The short client does not itself load the
-   * vector index. A 60s watchdog kills the wait and backs off one retry path. */
+  /** Submit a daemon or compatible one-shot job. Both use the same single
+   * queue, debounce, durable fingerprint, priority, and watchdog safeguards. */
   private mineAgent(agentDir: string, id: string): Promise<boolean> {
+    return this.ensureDaemon().then((daemonReady) => {
+      if (daemonReady) return this.submitMine(agentDir, id, true);
+      // A supported daemon can still have a transient launch failure; retain
+      // the regular retry path.  Only the explicitly diagnosed old/hung mode
+      // takes the bounded compatibility route.
+      return this.daemonUnavailable ? this.mineOneShot(agentDir, id) : false;
+    });
+  }
+
+  private mineOneShot(agentDir: string, id: string): Promise<boolean> {
+    return this.submitMine(agentDir, id, false);
+  }
+
+  private submitMine(agentDir: string, id: string, daemon: boolean): Promise<boolean> {
     return new Promise((resolve) => {
-      void this.ensureDaemon().then((daemonReady) => {
-        const bin = this.bin();
-        if (!bin || !daemonReady) { resolve(false); return; }
-        ensureMineIgnore(agentDir);
-        let proc: ReturnType<typeof spawn>;
-        try {
-          proc = spawn(bin, ['mine', agentDir, '--wing', id, '--agent', id, '--daemon'], {
-            env: this.childEnv(), stdio: ['ignore', 'pipe', 'pipe']
-          });
-        } catch { resolve(false); return; }
+      const bin = this.bin();
+      if (!bin) { resolve(false); return; }
+      ensureMineIgnore(agentDir);
+      let proc: ReturnType<typeof spawn>;
+      try {
+        const args = ['mine', agentDir, '--wing', id, '--agent', id];
+        if (daemon) args.push('--daemon');
+        proc = spawn(bin, args, { env: this.childEnv(), stdio: ['ignore', 'pipe', 'pipe'] });
+      } catch { resolve(false); return; }
+      // The short daemon client must not be prioritized above Electron. The
+      // one-shot process needs the same treatment on old MemPalace installs.
+      try { if (proc.pid) setPriority(proc.pid, osConstants.priority.PRIORITY_BELOW_NORMAL); } catch { /* platform policy */ }
         let err = '';
         let lastProgress = Date.now();
         const progress = () => { lastProgress = Date.now(); };
@@ -489,11 +556,11 @@ export class MemoryManager {
           clearInterval(timer);
           if (!this.watchdogLogged.has(id)) {
             this.watchdogLogged.add(id);
-            console.error(`[memory] mine ${id} made no progress for ${MINE_WATCHDOG_MS / 1000}s; stopping daemon and backing off`);
+            console.error(`[memory] mine ${id} made no progress for ${MINE_WATCHDOG_MS / 1000}s; stopping mine and backing off`);
           }
           try { proc.kill('SIGTERM'); } catch { /* gone */ }
           ensureKilled(proc.pid);
-          this.stopDaemon();
+          if (daemon) this.stopDaemon();
         }, 5_000);
         timer.unref?.();
         proc.once('close', (code) => {
@@ -503,12 +570,11 @@ export class MemoryManager {
             // A daemon crash/restart presents to its submit client as a
             // non-zero exit. Forget the cached successful start so the bounded
             // retry starts one fresh below-normal daemon.
-            if (!watchedOut) this.stopDaemon();
+            if (!watchedOut && daemon) this.stopDaemon();
             resolve(false);
           } else resolve(true);
         });
-        proc.once('error', () => { clearTimeout(timer); this.stopDaemon(); resolve(false); });
-      });
+        proc.once('error', () => { clearTimeout(timer); if (daemon) this.stopDaemon(); resolve(false); });
     });
   }
 
