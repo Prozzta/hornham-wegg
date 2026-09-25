@@ -27,6 +27,8 @@ const { HiveManager } = loadTs('src/main/hive.ts');
 const THREAD = '01a0a169-b0e4-71f0-970a-4a8033ccaae4';
 const TURN = '01a0a169-b0e4-71f0-970a-4a8033cc0001';
 const OLD_TURN = '01a0a0f3-6380-7da1-9c69-f9b2a928ed56';
+/** A Codex `exec` program with one nested exec_command, exactly as Codex 0.154 writes it (Jim's A1 capture). */
+const EX = (cmd) => `const r = await tools.exec_command(${JSON.stringify({ cmd, workdir: 'C:\\w', yield_time_ms: 10000 })});\ntext(r.output ?? '');`;
 // Real rollout line shapes (from a live Codex 0.154 rollout).
 const L = {
   taskComplete: (t) => JSON.stringify({ timestamp: 't', type: 'event_msg', payload: { type: 'task_complete', turn_id: t } }),
@@ -38,13 +40,13 @@ const L = {
 };
 
 test('rebuildToolHook: PreToolUse gets the PENDING call; turn_id from turn_context, never an older task_complete', () => {
-  const tail = [L.turnContext(OLD_TURN), L.call('c0', 'exec', 'old'), L.out('c0', 'x'), L.taskComplete(OLD_TURN), L.turnContext(TURN), L.call('c1', 'exec', 'echo p3')].join('\n');
+  const tail = [L.turnContext(OLD_TURN), L.call('c0', 'exec', EX('old')), L.out('c0', 'x'), L.taskComplete(OLD_TURN), L.turnContext(TURN), L.call('c1', 'exec', EX('echo p3'))].join('\n');
   const r = mcp.rebuildToolHook(tail, 'PreToolUse');
-  assert.deepEqual(r, { turnId: TURN, toolName: 'exec', toolInput: { input: 'echo p3' }, callId: 'c1', degraded: false });
+  assert.deepEqual(r, { turnId: TURN, toolName: 'Bash', toolInput: { command: 'echo p3' }, callId: 'c1', degraded: false });
 });
 
 test('rebuildToolHook: a LATE task_complete of an older turn never replaces the running turn\'s id', () => {
-  const tail = [L.turnContext(TURN), L.taskComplete(OLD_TURN), L.call('c1', 'exec', 'echo p3')].join('\n');
+  const tail = [L.turnContext(TURN), L.taskComplete(OLD_TURN), L.call('c1', 'exec', EX('echo p3'))].join('\n');
   assert.equal(mcp.rebuildToolHook(tail, 'PreToolUse').turnId, TURN);
 });
 
@@ -59,14 +61,14 @@ test('rebuildToolHook: PostToolUse joins the newest output to its call; function
 });
 
 test('rebuildToolHook: no pending call yet (every call has its output) or no call at all -> DEGRADED', () => {
-  const done = [L.turnContext(TURN), L.call('c1', 'exec', 'a'), L.out('c1', 'x')].join('\n');
+  const done = [L.turnContext(TURN), L.call('c1', 'exec', EX('a')), L.out('c1', 'x')].join('\n');
   assert.deepEqual(mcp.rebuildToolHook(done, 'PreToolUse'), { turnId: TURN, degraded: true });
   assert.deepEqual(mcp.rebuildToolHook(L.turnContext(TURN), 'PostToolUse'), { turnId: TURN, degraded: true });
 });
 
 test('rebuildToolHook: PostToolUse fires BEFORE Codex writes the output item (measured on the TUI): the newest call, no response yet, NOT degraded', () => {
-  const tail = [L.turnContext(TURN), L.call('c0', 'exec', 'old'), L.out('c0', 'x'), L.call('c1', 'exec', 'echo one')].join('\n');
-  assert.deepEqual(mcp.rebuildToolHook(tail, 'PostToolUse'), { turnId: TURN, toolName: 'exec', toolInput: { input: 'echo one' }, callId: 'c1', degraded: false });
+  const tail = [L.turnContext(TURN), L.call('c0', 'exec', EX('old')), L.out('c0', 'x'), L.call('c1', 'exec', EX('echo one'))].join('\n');
+  assert.deepEqual(mcp.rebuildToolHook(tail, 'PostToolUse'), { turnId: TURN, toolName: 'Bash', toolInput: { command: 'echo one' }, callId: 'c1', degraded: false });
 });
 
 test('the MCP hooks are bounded at 5 s (hook timeout + MCP tool timeout); a healthy one takes ms', () => {
@@ -91,7 +93,7 @@ async function server(t, { gated = [], sessionId } = {}) {
   const home = fs.mkdtempSync(path.join(JAIL, 'cx-'));
   const day = path.join(home, 'sessions', '2026', '09', '25'); fs.mkdirSync(day, { recursive: true });
   const rollout = path.join(day, `rollout-x-${THREAD}.jsonl`);
-  fs.writeFileSync(rollout, [L.turnContext(TURN), L.call('c1', 'exec', 'echo p3')].join('\n') + '\n');
+  fs.writeFileSync(rollout, [L.turnContext(TURN), L.call('c1', 'exec', EX('echo p3'))].join('\n') + '\n');
   const rec = { handled: [], events: [], sessions: [], breaker: [] };
   const hive = { sockPath: () => (process.platform === 'win32' ? `\\\\.\\pipe\\p3-${process.pid}-${Math.random().toString(36).slice(2)}` : path.join(home, 's.sock')), codexHomeFor: () => home, recordSession: (a, s) => rec.sessions.push([a, s]), appendLog: () => {}, registry: () => ({ agents: { cx: { sessionId } } }), isGod: () => false, rosterContext: () => '', recordModel: () => {}, appendCostLedger: () => {} };
   const control = { shouldHalt: () => false, takeSteer: () => null, toolDecision: (id, tool) => (gated.includes(tool) ? { deny: true, reason: `Tool ${tool} is gated by the operator.` } : { deny: false }), snapshot: () => ({ gatedTools: gated }) };
@@ -131,8 +133,8 @@ test('a PreToolUse over MCP is rebuilt from the rollout and handled like the shi
   assert.deepEqual(r.body.result.structuredContent, {});
   const p = rec.handled[0];
   assert.equal(p.agent_id, 'cx');
-  assert.equal(p.tool_name, 'exec');
-  assert.deepEqual(p.tool_input, { input: 'echo p3' });
+  assert.equal(p.tool_name, 'Bash', 'A1: named as Codex command hooks name it');
+  assert.deepEqual(p.tool_input, { command: 'echo p3' });
   assert.equal(p.turn_id, TURN);
   assert.equal(p.session_id, THREAD);
   assert.equal(p.transcript_path, rollout);
@@ -142,7 +144,7 @@ test('a PreToolUse over MCP is rebuilt from the rollout and handled like the shi
 });
 
 test('a gate decision maps back as hookSpecificOutput (deny)', async (t) => {
-  const { s } = await server(t, { gated: ['exec'] });
+  const { s } = await server(t, { gated: ['Bash'] });
   const r = await call(s.mcpEndpoint('cx'), 'PreToolUse');
   assert.equal(r.body.result.structuredContent.hookSpecificOutput.permissionDecision, 'deny');
   assert.match(r.body.result.content[0].text, /deny/);
@@ -170,7 +172,7 @@ test('a subagent thread (not the agent\'s recorded session) becomes provider_age
 
 test('degraded: the item is not in the rollout (after one retry) -> delivered degraded; fails CLOSED only with a gate active; the breaker skips it', async (t) => {
   const open = await server(t);
-  fs.writeFileSync(open.rollout, [L.turnContext(TURN), L.call('c1', 'exec', 'a'), L.out('c1', 'x')].join('\n') + '\n');
+  fs.writeFileSync(open.rollout, [L.turnContext(TURN), L.call('c1', 'exec', EX('a')), L.out('c1', 'x')].join('\n') + '\n');
   const ep = open.s.mcpEndpoint('cx');
   const r1 = await call(ep, 'PreToolUse');
   assert.deepEqual(r1.body.result.structuredContent, {}, 'no gates: nothing to deny');
@@ -188,9 +190,9 @@ test('degraded: the item is not in the rollout (after one retry) -> delivered de
 test('the retry catches an item that lands just after the hook (the spike saw ~25 ms)', async (t) => {
   const { s, rec, rollout } = await server(t);
   fs.writeFileSync(rollout, L.turnContext(TURN) + '\n');
-  setTimeout(() => fs.appendFileSync(rollout, L.call('c9', 'exec', 'late') + '\n'), 5);
+  setTimeout(() => fs.appendFileSync(rollout, L.call('c9', 'exec', EX('late')) + '\n'), 5);
   await call(s.mcpEndpoint('cx'), 'PreToolUse');
-  assert.equal(rec.handled[0].tool_name, 'exec');
+  assert.equal(rec.handled[0].tool_name, 'Bash');
   assert.equal(rec.handled[0].payload_degraded, undefined);
 });
 
@@ -230,15 +232,49 @@ test('STATIC: the MCP-routed events are exactly Pre/PostToolUse, and no hook typ
 });
 
 test('N-P3a: a call an earlier ABORTED turn never answered is not pending; only the current turn\'s calls count', () => {
-  const tail = [L.turnContext(OLD_TURN), L.call('old', 'exec', 'stale'), L.turnContext(TURN), L.call('c1', 'exec', 'now')].join('\n');
-  assert.deepEqual(mcp.rebuildToolHook(tail, 'PreToolUse'), { turnId: TURN, toolName: 'exec', toolInput: { input: 'now' }, callId: 'c1', degraded: false });
-  const none = [L.turnContext(OLD_TURN), L.call('old', 'exec', 'stale'), L.turnContext(TURN)].join('\n');
+  const tail = [L.turnContext(OLD_TURN), L.call('old', 'exec', EX('stale')), L.turnContext(TURN), L.call('c1', 'exec', EX('now'))].join('\n');
+  assert.deepEqual(mcp.rebuildToolHook(tail, 'PreToolUse'), { turnId: TURN, toolName: 'Bash', toolInput: { command: 'now' }, callId: 'c1', degraded: false });
+  const none = [L.turnContext(OLD_TURN), L.call('old', 'exec', EX('stale')), L.turnContext(TURN)].join('\n');
   assert.deepEqual(mcp.rebuildToolHook(none, 'PreToolUse'), { turnId: TURN, degraded: true }, 'the stale call is never claimed as this hook\'s');
 });
 
 test('rebuildToolHook: two PENDING parallel calls are ambiguous for PreToolUse -> degraded, no name claimed', () => {
-  const tail = [L.turnContext(TURN), L.call('c1', 'exec', 'a'), L.call('c2', 'exec', 'b')].join('\n');
+  const tail = [L.turnContext(TURN), L.call('c1', 'exec', EX('a')), L.call('c2', 'exec', EX('b'))].join('\n');
   assert.deepEqual(mcp.rebuildToolHook(tail, 'PreToolUse'), { turnId: TURN, degraded: true });
-  const one = [L.turnContext(TURN), L.call('c1', 'exec', 'a'), L.out('c1', 'x'), L.call('c2', 'exec', 'b')].join('\n');
-  assert.equal(mcp.rebuildToolHook(one, 'PreToolUse').toolName, 'exec', 'one pending is unambiguous');
+  const one = [L.turnContext(TURN), L.call('c1', 'exec', EX('a')), L.out('c1', 'x'), L.call('c2', 'exec', EX('b'))].join('\n');
+  assert.equal(mcp.rebuildToolHook(one, 'PreToolUse').toolName, 'Bash', 'one pending is unambiguous');
+});
+
+test('A1: exec with ONE nested exec_command (JSON arg) is named Bash/{command}, as Codex command hooks name it', () => {
+  const { normaliseCodexExec } = mcp;
+  assert.deepEqual(normaliseCodexExec(EX('echo a && echo b')), { toolName: 'Bash', toolInput: { command: 'echo a && echo b' } });
+  assert.deepEqual(normaliseCodexExec(EX('cmd /c "echo {a} && echo b"')), { toolName: 'Bash', toolInput: { command: 'cmd /c "echo {a} && echo b"' } }, 'braces and quotes inside the command');
+  assert.deepEqual(normaliseCodexExec(EX('echo } done')), { toolName: 'Bash', toolInput: { command: 'echo } done' } }, 'an unbalanced brace inside the command string');
+  assert.deepEqual(normaliseCodexExec(EX('ls tools')), { toolName: 'Bash', toolInput: { command: 'ls tools' } }, 'the word tools inside the command is not a second call');
+});
+
+test('A1: anything not nameable honestly is null (-> DEGRADED, a gate fails closed)', () => {
+  const { normaliseCodexExec } = mcp;
+  const bad = {
+    'no nested call': 'text("hi")',
+    'two nested calls': EX('echo a') + '\n' + EX('rm -rf x'),
+    'another tool too': EX('echo a') + '\nawait tools.apply_patch({"input": "x"});',
+    'only another tool': 'await tools.apply_patch({"input": "x"});',
+    'an alias of tools': 'const t = tools;\n' + EX('echo a'),
+    'a computed command': 'const c = "rm " + "-rf x";\nawait tools.exec_command({ cmd: c });',
+    'a template command': 'await tools.exec_command({"cmd": `rm ${x}`});',
+    'no cmd': 'await tools.exec_command({"workdir": "C:/w"});',
+    'a non-string cmd': 'await tools.exec_command({"cmd": ["rm", "x"]});',
+    'unbalanced': 'await tools.exec_command({"cmd": "x"'
+  };
+  for (const [why, prog] of Object.entries(bad)) assert.equal(normaliseCodexExec(prog), null, why);
+});
+
+test('A1: rebuildToolHook delivers an un-nameable exec as DEGRADED for Pre and Post', () => {
+  const two = EX('echo a') + '\n' + EX('rm -rf x');
+  const tail = [L.turnContext(TURN), L.call('c1', 'exec', two)].join('\n');
+  assert.deepEqual(mcp.rebuildToolHook(tail, 'PreToolUse'), { turnId: TURN, degraded: true });
+  assert.deepEqual(mcp.rebuildToolHook(tail, 'PostToolUse'), { turnId: TURN, degraded: true });
+  const other = [L.turnContext(TURN), L.call('c1', 'apply_patch', '*** Begin Patch')].join('\n');
+  assert.equal(mcp.rebuildToolHook(other, 'PreToolUse').toolName, 'apply_patch', 'a non-exec tool keeps its own name');
 });

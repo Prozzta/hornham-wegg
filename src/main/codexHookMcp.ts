@@ -44,6 +44,63 @@ function toolInputOf(p: Record<string, unknown>): unknown {
   return {};
 }
 
+/** The balanced `{...}` starting at `from` (string-aware), or null. */
+function objectSpan(src: string, from: number): string | null {
+  if (src[from] !== '{') return null;
+  let depth = 0;
+  let quote: string | null = null;
+  for (let i = from; i < src.length; i++) {
+    const ch = src[i];
+    if (quote) {
+      if (ch === '\\') i += 1;
+      else if (ch === quote) quote = null;
+      continue;
+    }
+    if (ch === '"' || ch === "'" || ch === '`') quote = ch;
+    else if (ch === '{') depth += 1;
+    else if (ch === '}' && --depth === 0) return src.slice(from, i + 1);
+  }
+  return null;
+}
+
+const EXEC_COMMAND_CALL = /\btools\s*\.\s*exec_command\s*\(\s*/;
+
+/**
+ * A1 (Jim): Codex's `exec` tool is a JS program that calls nested tools, and Codex's COMMAND
+ * hooks report each nested `tools.exec_command({cmd})` as tool_name "Bash", tool_input
+ * {command: cmd}. Gates and the breaker match on that, so the rebuilt payload must too.
+ * Normalised only when the program makes exactly ONE nested call, it is exec_command, and its
+ * argument is a plain JSON object with a string `cmd` (so the command is exactly what runs).
+ * Anything else (0 or several nested calls, another tool, an alias of `tools`, a computed
+ * command) cannot be named honestly: null, and the caller delivers DEGRADED (a gate fails closed).
+ */
+export function normaliseCodexExec(program: string): { toolName: 'Bash'; toolInput: { command: string } } | null {
+  const m = EXEC_COMMAND_CALL.exec(program);
+  if (!m) return null;
+  const argAt = m.index + m[0].length;
+  const span = objectSpan(program, argAt);
+  if (!span) return null;
+  let arg: unknown;
+  try { arg = JSON.parse(span); } catch { return null; }
+  const cmd = (arg as { cmd?: unknown } | null)?.cmd;
+  if (typeof cmd !== 'string') return null;
+  // With the argument taken out, `tools` must appear exactly once (this call): a second nested
+  // call, another tool, or an alias (`const t = tools`) is not nameable.
+  const rest = program.slice(0, argAt) + program.slice(argAt + span.length);
+  if ((rest.match(/\btools\b/g) ?? []).length !== 1) return null;
+  return { toolName: 'Bash', toolInput: { command: cmd } };
+}
+
+/** The name/input a hook reports for a rollout call, Codex-command-hook compatible. */
+function describeCall(p: Record<string, unknown>): { toolName?: string; toolInput: unknown; degraded: boolean } {
+  if (typeof p.name !== 'string') return { toolInput: toolInputOf(p), degraded: true };
+  if (p.name === 'exec' && typeof p.input === 'string') {
+    const n = normaliseCodexExec(p.input);
+    return n ? { ...n, degraded: false } : { toolInput: toolInputOf(p), degraded: true };
+  }
+  return { toolName: p.name, toolInput: toolInputOf(p), degraded: false };
+}
+
 /**
  * Rebuild a Codex tool hook's payload from the rollout tail.
  *  - turn_id: the newest turn_context / task_started turn (never task_complete: at a tool
@@ -90,7 +147,8 @@ export function rebuildToolHook(tail: string, event: McpHookEvent): RebuiltToolH
     let open = 0;
     for (const id of turnCalls) if (!outputs.has(id)) open += 1;
     if (open >= 2) return { turnId, degraded: true };
-    return { turnId, toolName: typeof pending.name === 'string' ? pending.name : undefined, toolInput: toolInputOf(pending), callId: pending.call_id as string, degraded: typeof pending.name !== 'string' };
+    const d = describeCall(pending);
+    return d.degraded ? { turnId, degraded: true } : { turnId, toolName: d.toolName, toolInput: d.toolInput, callId: pending.call_id as string, degraded: false };
   }
   // PostToolUse runs as soon as the tool returns, and Codex writes the tool's OUTPUT item a
   // moment later (measured on the TUI: absent at the hook). Hooks run in order, so the newest
@@ -99,13 +157,15 @@ export function rebuildToolHook(tail: string, event: McpHookEvent): RebuiltToolH
   if (!newest) return { turnId, degraded: true };
   const newestId = newest.call_id as string;
   const response = outputs.get(newestId);
+  const d = describeCall(newest);
+  if (d.degraded) return { turnId, degraded: true };
   return {
     turnId,
-    toolName: typeof newest.name === 'string' ? newest.name : undefined,
-    toolInput: toolInputOf(newest),
+    toolName: d.toolName,
+    toolInput: d.toolInput,
     ...(response !== undefined ? { toolResponse: response } : {}),
     callId: newestId,
-    degraded: typeof newest.name !== 'string'
+    degraded: false
   };
 }
 
