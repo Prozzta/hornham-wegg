@@ -272,3 +272,25 @@ test('archiving an agent revokes its hook token (a respawn mints a new one)', as
   hive.setArchived('a1', true);
   assert.deepEqual(revoked, ['a1', 'a1'], 'revoked even when the flag was already set');
 });
+
+test('P1 pins (Jim): a GET with a valid token is not a hook (405, never handled); the timeout and re-listen delays are pinned; stop() clears every token', async (t) => {
+  assert.equal(HOOK_HTTP_TIMEOUT_S, 30);
+  assert.deepEqual([...HOOK_HTTP_RELISTEN_DELAYS_MS], [250, 1_000, 2_000, 5_000, 10_000, 12_000]);
+  const { s, rec } = await broker(t);
+  const url = s.hookUrl(A);
+  const got = await new Promise((resolve, reject) => {
+    const u = new URL(url);
+    http.get({ host: u.hostname, port: u.port, path: u.pathname }, (res) => { res.resume(); res.on('end', () => resolve(res.statusCode)); }).on('error', reject);
+  });
+  assert.equal(got, 405);
+  assert.equal(rec.handled.length, 0, 'a GET is never handled as an (empty) hook');
+  s.stop();
+  assert.equal(s.hookTokens.size, 0, 'tokens cleared');
+  assert.equal(s.hookUrl(A), null, 'no URL while stopped');
+  s.start();
+  for (let i = 0; i < 200 && s.hookBrokerPort() === null; i++) await new Promise((r) => setTimeout(r, 5));
+  const oldPath = new URL(url).pathname;
+  const fresh = new URL(s.hookUrl(B));
+  const r = await post(`http://127.0.0.1:${fresh.port}${oldPath}`, { hook_event_name: 'Stop' });
+  assert.equal(r.status, 403, 'a token minted before stop() is dead after it');
+});

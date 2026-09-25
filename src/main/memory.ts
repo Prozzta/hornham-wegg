@@ -14,7 +14,7 @@
  * Runs in the Electron main process.
  */
 import { existsSync, readdirSync, readFileSync, writeFileSync, rmSync } from 'node:fs';
-import { join } from 'node:path';
+import { basename, dirname, join } from 'node:path';
 import { spawn, spawnSync, type ChildProcess, type SpawnOptions } from 'node:child_process';
 import { constants as osConstants, setPriority } from 'node:os';
 import { ensureKilled, hardKillTree } from './procKill';
@@ -94,6 +94,10 @@ const JOB_WAIT_SLICE_MS = 10 * 60_000;
 const MINE_JOB_MAX_MS = 60 * 60_000;
 /** - the gap between checks when a wait client ends early while the job is alive: */
 const JOB_POLL_MIN_MS = 15_000;
+/** X8: a verified rebuild whose swap failed (a reader held the live palace) is retried this
+ *  often on quiet ticks, this many times (~30 min), then discarded (the next launch retries). */
+const SWAP_RETRY_MS = 2 * 60_000;
+const SWAP_RETRY_MAX = 15;
 /** - a one-shot mine (no daemon on this CLI), wall clock: */
 const ONE_SHOT_MAX_MS = 30 * 60_000;
 /** - a palace repair (the live 674 MB palace rebuilt in ~64 s; generous on purpose): */
@@ -189,6 +193,13 @@ export class MemoryManager {
   private slowDaemonLogged = false;
   /** Instance copy so a test can shorten the first-boot grace. */
   private daemonStartupTimeoutMs = DAEMON_STARTUP_TIMEOUT_MS;
+  /** X8: a verified staged palace whose swap failed; retried on quiet ticks (bounded). */
+  private pendingSwap: { staged: string; stagingReadAt: number; attempts: number; nextAt: number } | null = null;
+  /** N3: agent -> a daemon job still running when the pass stopped waiting for it (the 60-min
+   *  cap). The next pass re-waits THAT job instead of submitting a duplicate for the same wing. */
+  private readonly jobsInFlight = new Map<string, string>();
+  /** N1: backups made before this moment belong to an earlier run. */
+  private readonly startedAt = Date.now();
 
   constructor(
     private getHome: () => string | null,
@@ -297,6 +308,8 @@ export class MemoryManager {
     // edit its memory.md would leave all of that on disk for an arbitrary
     // while. This is the pass that makes the existing pile go away by itself.
     this.reapPalace();
+    // N2: a repair killed mid-build (a crash, a kill) leaves its staging dir behind.
+    this.reapRebuildSiblings('rebuild', () => true);
     // Detached external work: a guarded repair must never block Electron's
     // main loop, and it will only swap a fully verified staged palace.
     void this.maybeRebuildPalace();
@@ -313,6 +326,10 @@ export class MemoryManager {
    */
   stop(opts: { quitting?: boolean } = {}): void {
     this.mineStopped = true;
+    if (this.pendingSwap) {
+      try { rmSync(this.pendingSwap.staged, { recursive: true, force: true }); } catch { /* N2 reaps it next start */ }
+      this.pendingSwap = null;
+    }
     if (this.mineTimer) { clearTimeout(this.mineTimer); this.mineTimer = null; }
     for (const child of [...this.children]) {
       if (child.pid) hardKillTree(child.pid);
@@ -399,6 +416,15 @@ export class MemoryManager {
     // that landed in the live palace after the rebuild's staging read would be dropped
     // by the swap while its fingerprint said "mined". Deferred, not lost: the next tick.
     if (this.rebuilding) return;
+    if (this.pendingSwap && Date.now() >= this.pendingSwap.nextAt) {
+      await this.retryPendingSwap();
+      if (this.mineStopped) return;
+    }
+    // While a verified rebuild waits for its swap, mining is deferred. A mine now would run on
+    // the BLOATED palace (measured live: still running after 6 min), keep its files open and
+    // starve the retry, and its result would be mined again after the swap anyway. The wait is
+    // bounded (SWAP_RETRY_MAX), after which the rebuild is dropped and mining resumes.
+    if (this.pendingSwap) return;
     const agentsDir = join(home, 'hive', 'agents');
     if (!existsSync(agentsDir)) return;
     let ids: string[];
@@ -422,6 +448,9 @@ export class MemoryManager {
         if (pending) pending.quietUntil = Math.max(pending.quietUntil, last + MINE_PER_AGENT_MIN_MS);
       }
       for (const id of readyMineIds(this.pendingMines, now)) {
+        // X7: after a stop, the next agent's mine would start a NEW daemon (stop() cleared the
+        // cached start): an orphan the quit can no longer reap.
+        if (this.mineStopped) break;
         if (archived.has(id)) { this.pendingMines.delete(id); continue; }
         const pending = this.pendingMines.get(id);
         if (!pending) continue;
@@ -434,6 +463,7 @@ export class MemoryManager {
         } else {
           pending.quietUntil = Date.now() + MINE_RETRY_MS;
         }
+        if (this.mineStopped) break;
       }
     } finally {
       this.mining = false;
@@ -502,7 +532,13 @@ export class MemoryManager {
       // Per collection (MemPalace 3.7.1 prints `[drawers] sqlite count: N`, `[closets] ...`).
       const counts = status.ok ? repairStatusCounts(status.output) : null;
       const count = status.ok ? repairStatusEmbeddingCount(status.output) : null;
-      if (!counts || !count || !rebuildNeeded(dataLevel0Bytes(palace), count)) return;
+      if (!counts || !count) return;
+      if (!rebuildNeeded(dataLevel0Bytes(palace), count)) {
+        // N1: a healthy palace at a LATER start no longer needs the backup of an earlier
+        // rebuild (673 MB here): reclaim the disk. A backup made in this run is kept.
+        this.reapRebuildSiblings('backup', (stamp) => stamp < this.startedAt);
+        return;
+      }
       const stamp = String(Date.now());
       const staged = `${palace}.mempalace-rebuild-${stamp}`;
       const backup = `${palace}.mempalace-backup-${stamp}`;
@@ -523,11 +559,69 @@ export class MemoryManager {
       // Windows cannot rename a directory whose files a process holds open: a resident
       // daemon (from this or an earlier session) would make the swap fail. Stop it first.
       await this.stopDaemon();
-      if (swapStagedPalace(palace, staged, backup)) {
-        console.log(`[memory] rebuilt bloated palace; previous palace retained at ${backup}`);
-        this.invalidateMinedSince(stagingReadAt);
-      } else console.error('[memory] palace rebuild swap failed; live palace restored/untouched');
+      if (this.mineStopped) { discardStaged(); return; }
+      if (!this.trySwap(palace, staged, stagingReadAt, backup)) {
+        // X8: ANY reader holding the live palace (an agent's search, a wake-up, a mine by
+        // another app) makes the rename fail, and on the live floor that is exactly the boot
+        // window. Keep the VERIFIED rebuild and retry on quiet ticks instead of throwing away
+        // 60-80 s of work and repeating it every launch.
+        this.pendingSwap = { staged, stagingReadAt, attempts: 1, nextAt: Date.now() + SWAP_RETRY_MS };
+        console.error('[memory] palace rebuild swap failed (the live palace is in use); keeping the verified rebuild and retrying');
+      }
     } finally { this.rebuilding = false; }
+  }
+
+  /** Swap a verified staged palace in; on success forget the fingerprints the old palace
+   *  took after the staging read (they are mined again). */
+  private trySwap(palace: string, staged: string, stagingReadAt: number, backup = `${palace}.mempalace-backup-${Date.now()}`): boolean {
+    if (!swapStagedPalace(palace, staged, backup)) return false;
+    console.log(`[memory] rebuilt bloated palace; previous palace retained at ${backup}`);
+    this.invalidateMinedSince(stagingReadAt);
+    return true;
+  }
+
+  /** X8: one more try at swapping the kept rebuild in, with mines excluded and the daemon
+   *  stopped (its open files would block the rename). Bounded; then the rebuild is discarded. */
+  private async retryPendingSwap(): Promise<void> {
+    const ps = this.pendingSwap;
+    const palace = this.palacePath();
+    if (!ps || !palace || this.rebuilding || this.mining || this.mineStopped) return;
+    if (!existsSync(ps.staged)) { this.pendingSwap = null; return; }
+    this.rebuilding = true;
+    try {
+      await this.stopDaemon();
+      if (this.mineStopped) return;
+      if (this.trySwap(palace, ps.staged, ps.stagingReadAt)) { this.pendingSwap = null; return; }
+      ps.attempts += 1;
+      if (ps.attempts >= SWAP_RETRY_MAX) {
+        try { rmSync(ps.staged, { recursive: true, force: true }); } catch { /* N2 reaps it next start */ }
+        this.pendingSwap = null;
+        console.error(`[memory] the live palace stayed in use through ${SWAP_RETRY_MAX} swap attempts; discarded the rebuild (the next launch tries again)`);
+        return;
+      }
+      ps.nextAt = Date.now() + SWAP_RETRY_MS;
+    } finally { this.rebuilding = false; }
+  }
+
+  /** N1/N2: delete this palace's `.mempalace-<kind>-<stamp>` siblings the predicate selects.
+   *  Never the pending staged rebuild. Best-effort. */
+  private reapRebuildSiblings(kind: 'rebuild' | 'backup', select: (stamp: number) => boolean): number {
+    const palace = this.palacePath();
+    if (!palace) return 0;
+    const dir = dirname(palace);
+    const prefix = `${basename(palace)}.mempalace-${kind}-`;
+    let names: string[];
+    try { names = readdirSync(dir); } catch { return 0; }
+    let removed = 0;
+    for (const name of names) {
+      if (!name.startsWith(prefix)) continue;
+      const stamp = Number(name.slice(prefix.length));
+      const full = join(dir, name);
+      if (!Number.isFinite(stamp) || !select(stamp) || full === this.pendingSwap?.staged) continue;
+      try { rmSync(full, { recursive: true, force: true }); removed += 1; } catch { /* in use: next start */ }
+    }
+    if (removed) console.log(`[memory] reclaimed ${removed} old palace ${kind} dir(s)`);
+    return removed;
   }
 
   /** After a swap, forget every fingerprint recorded since the staging read: that
@@ -579,6 +673,8 @@ export class MemoryManager {
   /** Start MemPalace's opt-in daemon once. It owns the model and HNSW writer
    * for all later jobs, avoiding a full Python/index load per changed agent. */
   private ensureDaemon(): Promise<boolean> {
+    // X7: a stopped manager never starts a daemon (quit could no longer reap it).
+    if (this.mineStopped) return Promise.resolve(false);
     // An old CLI or a timed-out launch takes the compatible one-shot route for
     // a while.  Retrying every mine would recreate the very process churn this
     // daemon was introduced to remove; retrying after an upgrade window is
@@ -706,14 +802,19 @@ export class MemoryManager {
       if (!r.ok) this.logMineOnce(id, r.timedOut ? `one-shot mine ${id} still running after ${ONE_SHOT_MAX_MS / 60_000} min; stopped it, will retry` : `mine ${id} exited ${r.code}: ${r.error.slice(-300)}`);
       return r.ok;
     }
-    const submitted = await this.runCapture(bin, [...args, '--daemon', '--background'], JOB_CLIENT_MAX_MS);
-    if (this.mineStopped) return false;   // quit killed the client: start nothing more
-    const jobId = /Submitted daemon job ([0-9a-f]{8,})/i.exec(submitted.output)?.[1];
-    if (!submitted.ok || !jobId) {
-      this.logMineOnce(id, `mine ${id}: the daemon did not accept the job (${submitted.timedOut ? 'timed out' : `exit ${submitted.code}`})`);
-      await this.forgetDaemonIfDead(bin);
-      return false;
+    // N3: a job still running from an earlier pass is waited for again, not resubmitted.
+    let jobId = this.jobsInFlight.get(id);
+    if (!jobId) {
+      const submitted = await this.runCapture(bin, [...args, '--daemon', '--background'], JOB_CLIENT_MAX_MS);
+      if (this.mineStopped) return false;   // quit killed the client: start nothing more
+      jobId = /Submitted daemon job ([0-9a-f]{8,})/i.exec(submitted.output)?.[1];
+      if (!submitted.ok || !jobId) {
+        this.logMineOnce(id, `mine ${id}: the daemon did not accept the job (${submitted.timedOut ? 'timed out' : `exit ${submitted.code}`})`);
+        await this.forgetDaemonIfDead(bin);
+        return false;
+      }
     }
+    this.jobsInFlight.delete(id);
     const startedAt = Date.now();
     while (!this.mineStopped) {
       const sliceStart = Date.now();
@@ -724,6 +825,7 @@ export class MemoryManager {
       if (state === 'succeeded') { this.watchdogLogged.delete(id); return true; }
       if (state === 'running' || state === 'queued' || state === 'pending') {
         if (Date.now() - startedAt >= MINE_JOB_MAX_MS) {
+          this.jobsInFlight.set(id, jobId);
           this.logMineOnce(id, `mine ${id} is still ${state} in the daemon after ${MINE_JOB_MAX_MS / 60_000} min; leaving it to finish, will check again later`);
           return false;
         }
