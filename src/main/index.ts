@@ -557,7 +557,7 @@ const hookServer = new HookServer(
   standingGoalFromRoster,
   // Observed BEFORE the hook response; the bridge defers any retry with setImmediate, so
   // the Stop reply is never blocked and no turn is manufactured inside the hook.
-  (agentId, event, message, fullyIdle) => inboxWake?.onHook(agentId, event, message, fullyIdle),
+  (agentId, event, message, fullyIdle, turnId) => inboxWake?.onHook(agentId, event, message, fullyIdle, turnId),
   (agentId, obs) => { providerCapacity.ingest(agentId, obs); capacityStore.scheduleSave(); },
   // AGY 1.1.48 — ONE validated statusline tick, routed to its two consumers. Capacity
   // first: the allowance pair is a provider fact and is true for the account whether or

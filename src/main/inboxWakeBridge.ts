@@ -129,12 +129,12 @@ export class InboxWakeBridge {
   }
 
   /** HookServer observation (before its response): record lifecycle, retry after the turn. */
-  onHook(agentId: string | undefined, event: string | undefined, message: string | undefined, fullyIdle?: boolean): void {
-    const edge = this.deps.coordinator.noteHook(agentId, event, message, this.deps.now(), fullyIdle);
+  onHook(agentId: string | undefined, event: string | undefined, message: string | undefined, fullyIdle?: boolean, turnId?: string): void {
+    const edge = this.deps.coordinator.noteHook(agentId, event, message, this.deps.now(), fullyIdle, turnId);
     // The lifecycle is sourced ONLY here, from the live hook stream - the one input no
     // in-harness test ever drove. Every hook boundary is recorded so a packaged run shows
     // whether Stop/Notification ever arrive at all, and what the lifecycle became.
-    this.deps.diag?.('hook', { agentId: agentId ?? null, event: event ?? null, edge });
+    this.deps.diag?.('hook', { agentId: agentId ?? null, event: event ?? null, edge, ...(turnId ? { turn: turnId } : {}) });
     if (edge && agentId) {
       this.scheduleWake(agentId, 'hook');
     }

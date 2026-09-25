@@ -64,6 +64,10 @@ interface HookPayload {
    *  agy hook shim. Claude never sends it, so absent must keep meaning "terminal" -
    *  only an explicit `false` refuses the Stop. Never a capacity or account fact. */
   fully_idle?: boolean;
+  /** Codex hook payloads only: the turn this event belongs to (Codex stamps turn_id on
+   *  UserPromptSubmit, PreToolUse, PostToolUse and Stop). Lets the wake coordinator
+   *  recognise a tool event that arrives AFTER its own turn's Stop (FALSEACTIVE-STALL-2). */
+  turn_id?: string;
 }
 
 /** How many distinct {version, driftCode} pairs are counted before they share one bucket. */
@@ -102,7 +106,7 @@ export class HookServer {
      *  synchronously BEFORE this server returns its hook response. It must not submit
      *  or block: the inbox-wake bridge only records lifecycle/HITL state here and defers
      *  any retry with setImmediate, so the response (Stop included) is unchanged. */
-    private onEvent?: (agentId: string | undefined, event: string, message: string | undefined, fullyIdle?: boolean) => void,
+    private onEvent?: (agentId: string | undefined, event: string, message: string | undefined, fullyIdle?: boolean, turnId?: string) => void,
     /** L0 — provider allowance observed on the status line. Optional so the server
      *  runs unchanged where no tracker is wired (tests, and any build without L0).
      *  HookServer deliberately does not hold the tracker: it hands over a
@@ -232,7 +236,8 @@ export class HookServer {
     // halt gate, the breaker and session recording. It can arrive with agent_id null
     // from a session nobody spawned, and none of that machinery is for it.
     if (event === 'AgyStatusLine') return this.handleAgyStatus(p);
-    this.onEvent?.(agentId, event, p.message, typeof p.fully_idle === 'boolean' ? p.fully_idle : undefined);
+    this.onEvent?.(agentId, event, p.message, typeof p.fully_idle === 'boolean' ? p.fully_idle : undefined,
+      typeof p.turn_id === 'string' && p.turn_id ? p.turn_id : undefined);
     if (agentId && typeof p.transcript_path === 'string' && p.transcript_path) {
       this.transcriptPaths.set(agentId, p.transcript_path);
     }

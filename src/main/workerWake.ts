@@ -162,7 +162,17 @@ interface AgentWake {
    *  ever read while the lifecycle IS active, so the hook path deliberately leaves a
    *  spent value in place rather than spending a write clearing it. */
   activeSince: number;
+  /** Turns whose Stop has been recorded, newest last, bounded (FALSEACTIVE-STALL-2). A
+   *  tool event that names one of these arrived after its own turn ended. */
+  closedTurns: string[];
 }
+
+/** How many closed turn ids are remembered per agent. Only a straggler of a RECENT turn
+ *  can still be in flight, so a short window is enough. */
+const CLOSED_TURN_MEMORY = 16;
+/** Events that can only happen INSIDE a turn. A late one from a closed turn is stale. A
+ *  UserPromptSubmit is not in here: a new prompt is never a straggler of an old turn. */
+const IN_TURN_EVENTS = new Set(['PreToolUse', 'PostToolUse']);
 
 /** `inbox-wake:<agent>:<sha256 of the sorted ids>` - the same batch always has the same id. */
 export function inboxWakeRequestId(agentId: string, ids: readonly string[]): string {
@@ -185,7 +195,7 @@ export class WorkerWakeWatchdog {
   private rec(agentId: string): AgentWake {
     let r = this.agents.get(agentId);
     if (!r) {
-      r = { pending: new Set(), announced: new Set(), inFlight: null, held: null, lifecycle: 'unknown', lastHumanNeedsAt: 0, lastReconcileAttemptAt: 0, providerSession: null, activeSince: 0 };
+      r = { pending: new Set(), announced: new Set(), inFlight: null, held: null, lifecycle: 'unknown', lastHumanNeedsAt: 0, lastReconcileAttemptAt: 0, providerSession: null, activeSince: 0, closedTurns: [] };
       this.agents.set(agentId, r);
     }
     return r;
@@ -233,14 +243,27 @@ export class WorkerWakeWatchdog {
    * still running, and believing it over the event name is what stops a mid-chain Stop
    * from opening a window for a second prompt.
    */
-  noteHook(agentId: string | undefined, event: string | undefined, message: string | undefined, at = Date.now(), fullyIdle?: boolean): boolean {
+  noteHook(agentId: string | undefined, event: string | undefined, message: string | undefined, at = Date.now(), fullyIdle?: boolean, turnId?: string): boolean {
     if (!agentId || !event) return false;
     const r = this.rec(agentId);
     if (event === 'Stop') {
       if (fullyIdle === false) return false;   // the provider says the turn is not over
       r.lifecycle = 'idle';
+      if (turnId && !r.closedTurns.includes(turnId)) {
+        r.closedTurns.push(turnId);
+        if (r.closedTurns.length > CLOSED_TURN_MEMORY) r.closedTurns.shift();
+      }
       return true;
     }
+    // FALSEACTIVE-STALL-2. Each hook is its own short-lived shim process on the pipe, so
+    // arrival order is not event order: on the live floor a Codex PostToolUse arrived 5 s
+    // AFTER its turn's end (and a PreToolUse 8 s after its tool finished). Read as a fresh
+    // edge, that straggler re-opened a turn that was already over, and nothing would ever
+    // close it again, because the turn's Stop had already come and gone: every wake was
+    // then refused as lifecycle-active, for good. Codex stamps turn_id on its hooks, so a
+    // tool event naming a turn we have already seen END is recognised for what it is and
+    // ignored. Scoped to in-turn events on purpose: a UserPromptSubmit always opens.
+    if (turnId && IN_TURN_EVENTS.has(event) && r.closedTurns.includes(turnId)) return false;
     if (event === 'SubagentStop') return r.lifecycle === 'idle';   // never turns active into idle
     if (event === 'Notification') {
       if (classifyHook(event, message) === 'needsHuman') { r.lastHumanNeedsAt = at; return false; }
