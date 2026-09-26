@@ -87,7 +87,8 @@ export async function runWorker(cfg: WorkerConfig, port: Port, deps: { Database:
   const embedder = new OnnxEmbedder(modelPath, tokenizer, verifiedOrt, { intraOpNumThreads: 2 });
   const engine = new MemoryEngine({
     hiveRoot: cfg.hiveRoot, store, embedder, countTokens: (t) => tokenizer.count(t), mode: () => readMode(cfg.modeFile),
-    log: (row) => port.postMessage({ event: 'log', ...row })
+    log: (row) => port.postMessage({ event: 'log', ...row }),
+    onModelUnload: () => port.postMessage({ event: 'model-unloaded' })
   });
   engine.storeOpenOptions = openOpts;
   if (quarantined) port.postMessage({ event: 'log', kind: 'native-memory-quarantined', file: quarantined });

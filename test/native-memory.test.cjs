@@ -231,6 +231,21 @@ test('CLIENT (section 3): no fork until the first request; one init; replies by 
   assert.equal(workers.length, 4);
 });
 
+test('CLIENT (Jim N2): after the worker reports an idle model unload, the next request gets the COLD deadline again', async () => {
+  const workers = [];
+  let now = 0;
+  const c = new NativeMemoryClient({ fork: () => { const w = fakeWorker(); workers.push(w); return w; }, config: () => ({ hiveRoot: 'h' }), now: () => now, setTimer: () => ({}), clearTimer: () => {} });
+  const p = c.request('search', { query: 'x' });
+  const req = workers[0].posted[1];
+  workers[0].reply({ id: req.id, ok: true, exit: 0 });
+  await p;
+  void c.request('search', { query: 'y' });
+  assert.equal(workers[0].posted[2].deadline, 250, 'warm');
+  workers[0].reply({ event: 'model-unloaded' });
+  void c.request('search', { query: 'z' });
+  assert.equal(workers[0].posted[3].deadline, 2000, 'cold again after the unload');
+});
+
 test('CLIENT: no runtime pieces (no config) = exit 3 and nothing forked', async () => {
   let forks = 0;
   const c = new NativeMemoryClient({ fork: () => { forks++; return fakeWorker(); }, config: () => null });
@@ -499,7 +514,8 @@ test('IDLE UNLOAD (Jim R2): every embed re-arms ONE unload timer of MODEL_IDLE_U
   let unloaded = 0;
   const emb = { loaded: true, embed: async (t) => t.map(() => new Float32Array(384)), unload: async () => { unloaded++; } };
   const store = { search: () => [] };
-  const e = new MemoryEngine({ hiveRoot: dir(), store, embedder: emb, countTokens: words, mode: () => 'native', watch: null,
+  let told = 0;
+  const e = new MemoryEngine({ hiveRoot: dir(), store, embedder: emb, countTokens: words, mode: () => 'native', watch: null, onModelUnload: () => { told++; },
     setTimer: (fn, ms) => { const t = { fn, ms, cleared: false }; timers.push(t); if (ms === 0) setImmediate(fn); return t; }, clearTimer: (t) => { t.cleared = true; } });
   await e.search({ query: 'a' });
   await e.search({ query: 'b' });
@@ -509,6 +525,7 @@ test('IDLE UNLOAD (Jim R2): every embed re-arms ONE unload timer of MODEL_IDLE_U
   unloadTimers[1].fn();
   await new Promise((r) => setImmediate(r));
   assert.equal(unloaded, 1);
+  assert.equal(told, 1, 'main is told (N2)');
 });
 
 test('ALLOW-LIST: a DIRECTORY named like a Markdown file is not a source', () => {

@@ -138,6 +138,9 @@ export class NativeMemoryClient {
     const m = msg as { id?: number; event?: string } & Reply;
     if (m && m.event) {
       if (m.event === 'ready') this.ready = true;
+      // Jim N2: the model was dropped after idle, so the next search pays a model load again:
+      // it gets the COLD budget, not the warm one.
+      else if (m.event === 'model-unloaded') this.warm = false;
       else this.d.log?.({ ...(m as unknown as Record<string, unknown>) });
       return;
     }

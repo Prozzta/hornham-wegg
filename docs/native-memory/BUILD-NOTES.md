@@ -2,7 +2,7 @@
 
 **Status:** built and tested on branch `memory-154`, off `origin/release-1.1.53` (`79ee6b91`, with `76c8d3ce` carried).
 - Nothing is pushed, released or cut.
-- The default mode is `legacy`, which changes **nothing**: no worker, no token, no PATH change, and the `/memory` route answers 404.
+- The default mode is `legacy`, which changes **nothing**: no worker, no token, no PATH change, and the `/memory` route answers 403 (no `MEMORY_TOKEN` is ever minted in `legacy`, so no caller can authenticate).
 
 **Scope lock** (the Human, via god): 1.1.54 is PURELY the MemPalace replacement.
 - No other fixes, cards, refactors or doc sweeps.
@@ -225,6 +225,17 @@ All measurements were taken on **copies**. The live palace, the installed app an
 4. Optional cleanup, which 1.1.53 does not need: delete `<userData>/memory/`, `<hive>/memory-engine.json` and `<hive>/bin/memory/`.
 
 **Rolling back within 1.1.54:** set `<hive>/memory-engine.json` to `{"mode":"fallback-legacy"}`. The very next `mempalace` call runs the legacy CLI, with no data migration.
+
+## Operator runbook notes (Jim's audit, MEMORY-154-AUDIT.md)
+
+- **Delete the gate-6 review file after labelling.** `<userData>/memory/<key>.shadow-review.jsonl` (and its rotated `*.shadow-review.<stamp>.jsonl`) holds query **and chunk text**. It is kept whole while the review window is open (`keep: Infinity`). When the gate-6 labels are done, delete it with the app closed.
+- **N3, worker down:** after 3 crashes within 10 minutes the worker stays down until the app restarts, and memory requests answer exit 3. Set `<hive>/memory-engine.json` to `{"mode":"fallback-legacy"}`: the next `mempalace` call runs the legacy CLI. Restart the app to retry native.
+- **N4, a mode change takes effect for NEW agent spawns.** `MEMORY_TOKEN`, the endpoint and the PATH with the shim are injected at spawn. After moving from `legacy` to `shadow`/`native`, respawn the agents. The shim reads the mode on every call, so moving back to `fallback-legacy`/`legacy` takes effect at once for agents that already have the shim.
+- **N2 (fixed here):** when the idle timer unloads the model, the worker tells main, and the next search gets the cold budget (2 s), not the warm one (250 ms). A test pins it.
+- **For 1.1.55** (non-blocking):
+  - **N5:** the model digest is checked once per worker life, at the first load; re-check on reload.
+  - **N7:** the gate-2 smoke flag ships in the production binary (harmless: it only ever uses temp paths).
+  - Keep the tokenizer parity (0 mismatches over 1,148 texts) as a regression check for any model bump.
 
 ## Open
 
