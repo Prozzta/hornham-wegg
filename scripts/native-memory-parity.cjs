@@ -86,7 +86,7 @@ function parseLegacy(text) {
     const nativeMs = Date.now() - t1;
     const nativeCold = first; first = false;
     // CONTAMINATION GUARD: a query file that was mined (or indexed) would find itself. Refuse.
-    const deny = /PARITY-INTENTS|parity-queries|queries(-private)?\.json/i;
+    const deny = /PARITY-INTENTS|parity-queries|parity2|(phyllis|dwight|oscar)-queries|queries(-all|-merged|-private)*\.json/i;
     const tainted = [...legacy.map((x) => x.source), ...nat.map((x) => x.source)].filter((s) => deny.test(s));
     if (tainted.length) throw new Error(`contaminated: a hit came from the query set itself (${tainted.join(', ')})`);
     const L = legacy.map((x) => ({ source: x.source, wing: x.wing, chunk: h(x.text) }));

@@ -11,6 +11,7 @@ import { randomBytes, createHash, timingSafeEqual } from 'node:crypto';
 import { join, resolve, sep, basename, dirname, isAbsolute } from 'node:path';
 import { homedir, tmpdir } from 'node:os';
 import { runMemorySmoke, smokeTarget } from './nativeMemory/smoke';
+import { benchTarget, runMemoryBenchHost } from './nativeMemory/bench';
 import { request as httpsRequest } from 'node:https';
 import { PtyManager, type SpawnOptions } from './pty';
 import {
@@ -186,7 +187,9 @@ if (DEV_ISOLATION) {
 // folder HERE, before anything reads it, so no config, hive or palace of the user's is opened;
 // the ready handler then runs only the smoke and exits.
 const memorySmokeOut = smokeTarget(process.argv);
-if (memorySmokeOut) {
+// The speed-gate bench host (bench.ts): the same isolation as the smoke.
+const memoryBenchDir = benchTarget(process.argv);
+if (memorySmokeOut || memoryBenchDir) {
   const smokeUserData = mkdtempSync(join(tmpdir(), 'munder-smoke-userdata-'));
   app.setPath('userData', smokeUserData);
   app.setPath('sessionData', smokeUserData);
@@ -6033,6 +6036,35 @@ function onSystemResume(reason: string): void {
 }
 
 app.whenReady().then(() => {
+  if (memoryBenchDir) {
+    void runMemoryBenchHost(memoryBenchDir, (hiveRoot, baseUrl, idleUnloadMs, dbFile) => {
+      const w = new NativeMemoryWiring({
+        hiveRoot: () => hiveRoot,
+        palacePath: () => null,
+        userData: app.getPath('userData'),
+        resourcesDir: app.isPackaged ? process.resourcesPath : join(app.getAppPath(), 'resources'),
+        workerEntry: join(__dirname, 'memoryWorker.js'),
+        fork: (entry) => utilityProcess.fork(entry, [], { serviceName: 'munder-memory-bench', stdio: 'ignore' }) as unknown as WorkerHandle,
+        memoryBaseUrl: baseUrl,
+        legacyBin: () => null,
+        writeShim: () => null,
+        log: () => undefined,
+        vecLoadablePath: () => {
+          // eslint-disable-next-line @typescript-eslint/no-require-imports
+          try { return toUnpacked((require('sqlite-vec') as { getLoadablePath(): string }).getLoadablePath()); } catch { return null; }
+        }
+      });
+      if (idleUnloadMs || dbFile) {
+        const orig = w.workerConfig.bind(w);
+        w.workerConfig = () => {
+          const c = dbFile ? w.workerConfigFor(hiveRoot, dbFile) : orig();
+          return c ? { ...c, ...(idleUnloadMs ? { idleUnloadMs } : {}) } : c;
+        };
+      }
+      return w;
+    }).then(() => app.exit(0), () => app.exit(1));
+    return;
+  }
   if (memorySmokeOut) {
     void runMemorySmoke(memorySmokeOut, {
       fork: () => utilityProcess.fork(join(__dirname, 'memoryWorker.js'), [], { serviceName: 'munder-memory-smoke', stdio: 'ignore' }) as unknown as WorkerHandle,

@@ -114,7 +114,9 @@ module.exports = { dcg, ndcgAt, recallAt, perQuery, pairedBootstrap, kappa, eval
 if (require.main === module) {
   const arg = (k) => { const i = process.argv.indexOf(k); return i > 0 ? process.argv[i + 1] : null; };
   const read = (f) => JSON.parse(fs.readFileSync(f, 'utf8'));
-  const res = evaluate({ sheet: read(arg('--labels')), key: read(arg('--key')), pub: read(arg('--public')), second: arg('--second') ? read(arg('--second')) : null, seed: Number(arg('--seed') || 1), exclude: (arg('--exclude') || '').split(',').filter(Boolean) });
+  const res = evaluate({ sheet: read(arg('--labels')), key: read(arg('--key')), pub: read(arg('--public')), // --second accepts several sheets, comma-separated (e.g. round 2's cross-assigned labellers);
+  // they cover different queries, so their items are merged for one kappa.
+  second: arg('--second') ? { queries: arg('--second').split(',').flatMap((f) => read(f).queries) } : null, seed: Number(arg('--seed') || 1), exclude: (arg('--exclude') || '').split(',').filter(Boolean) });
   console.log(JSON.stringify(res, null, 1));
   process.exitCode = res.pass ? 0 : 1;
 }

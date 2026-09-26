@@ -30,6 +30,8 @@ export interface WorkerConfig {
   vecPath: string;
   vecSha256: string | null;
   modeFile: string;
+  /** Optional idle-unload override (the speed bench only); absent = MODEL_IDLE_UNLOAD_MS. */
+  idleUnloadMs?: number;
 }
 
 export interface Port {
@@ -88,7 +90,8 @@ export async function runWorker(cfg: WorkerConfig, port: Port, deps: { Database:
   const engine = new MemoryEngine({
     hiveRoot: cfg.hiveRoot, store, embedder, countTokens: (t) => tokenizer.count(t), mode: () => readMode(cfg.modeFile),
     log: (row) => port.postMessage({ event: 'log', ...row }),
-    onModelUnload: () => port.postMessage({ event: 'model-unloaded' })
+    onModelUnload: () => port.postMessage({ event: 'model-unloaded' }),
+    ...(typeof cfg.idleUnloadMs === 'number' && cfg.idleUnloadMs > 0 ? { idleUnloadMs: cfg.idleUnloadMs } : {})
   });
   engine.storeOpenOptions = openOpts;
   if (quarantined) port.postMessage({ event: 'log', kind: 'native-memory-quarantined', file: quarantined });

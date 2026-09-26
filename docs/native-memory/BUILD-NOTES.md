@@ -173,7 +173,33 @@ All measurements were taken on **copies**. The live palace, the installed app an
     - (b) accept on the overall result plus no cohort regression, with gate 6's shadow re-run on real queries as the confirmation;
     - (c) another rule.
 
-**God's decision on gate 4: option (b), CONDITIONAL. It is a gate-rule DEFERRAL, not a waiver.**
+**SUPERSEDED. God first chose option (b), a deferral to gate 6; the Human then REVERSED it.**
+- The Human asked why we don't simply test more, and approved it: **the per-cohort ≥ −5 lower-bound rule applies NOW, at gate 4, on an expanded set.**
+- The gate-6 shadow diagnostics below stay, as the real-query **confirmation** step before any cutover.
+- The history of the deferral is kept below for the record.
+
+**Expanded gate 4, round 2** (god andyparity2/2b):
+- **Queries:** 373 in all.
+  - Round 1: 53 (r01 excluded as an extraction artifact).
+  - PHYLLIS 160 and DWIGHT 160, authored as 20 per scorable cohort plus 5 no-match per 105-query file, and 10 plus 5 per 55-query file. Oscar could not be woken.
+  - That gives **68–72 per scorable cohort**, inside Jim's 40–80 target for a CI half-width of about 10 pts. There are 28 no-match queries.
+- **Replay:** on the SAME frozen pre-10:54Z copies. The contamination guard also covers the round-2 file names; none tripped.
+- **Labels:**
+  - JIM, primary, all 373: 1,027 round-1 labels reused where the item is identical (the same query, source and text), and 6,325 new.
+  - DWIGHT, second labeller: a random 20% of Phyllis's queries (32).
+  - PHYLLIS, second labeller: a random 20% of Dwight's (32), plus her round-1 20%.
+  - Kappa is computed over all the second labels (≥ 0.4 required). The Human spot-checks 10.
+- **The gate is QUALITY AND SPEED together** (the Human; Jim's method, MEMORY-154-AUDIT Addendum 2):
+  - quality: the per-cohort ≥ −5 lower bound on NDCG@5 and recall@10 (semantic NDCG@5 reported first, the watch item);
+  - speed, **end-to-end** through the wrapper an agent runs:
+    - native warm p95 ≤ 250 ms;
+    - worker-cold and model-cold p95 ≤ 2 s;
+    - p95 ≤ 250 ms during a backfill;
+    - native faster than legacy on p50 AND p95 in every cohort;
+    - ≤ 1 Electron-as-Node process per call.
+  - The results table is below, once the labels are in.
+
+**History: god's first decision on gate 4, option (b) conditional (a gate-rule DEFERRAL, now superseded).**
 - **1.1.54 may ship memory-154 ONLY legacy-default** (zero behaviour change), with `shadow` available.
 - **Basis:**
   - overall native is significantly better on both metrics (both lower bounds > 0);
@@ -239,6 +265,6 @@ All measurements were taken on **copies**. The live palace, the installed app an
 
 ## Open
 
-1. **Gate 4:** decided, option (b) conditional: ship legacy-default only; the per-cohort rule moves to gate 6 on shadow real queries. **The Human spot-check (10 queries) is still required before the cut.**
+1. **Gate 4 (expanded, quality + speed):** the replay and the speed bench have run. **The labels are pending** (Jim, all queries; Dwight and Phyllis, 20% cross). **The Human spot-check (10 queries) is required before the cut.**
 2. **Opt-ins:** whether the 2 nested deliverables and any top-level notes join the allow-list (god and the owners).
 3. **Not covered on this host:** the mac and Linux artifact smokes; the Defender/BitDefender install-time scan observation.

@@ -48,6 +48,9 @@ export interface EngineDeps {
   log?: (row: Record<string, unknown>) => void;
   /** Told when the idle timer drops the model (Jim N2: main then treats the next search as cold). */
   onModelUnload?: () => void;
+  /** Idle time before the model is dropped (default MODEL_IDLE_UNLOAD_MS; the speed bench
+   *  shortens it to measure model-cold). */
+  idleUnloadMs?: number;
 }
 
 interface Task { priority: number; seq: number; run: () => Promise<void> }
@@ -113,7 +116,7 @@ export class MemoryEngine {
     this.stats.embedded += texts.length;
     this.stats.embedMs += this.now() - t0;
     if (this.unloadTimer) this.clearTimer(this.unloadTimer);
-    this.unloadTimer = this.setTimer(() => { this.unloadTimer = null; void this.d.embedder.unload(); this.d.onModelUnload?.(); }, MODEL_IDLE_UNLOAD_MS);
+    this.unloadTimer = this.setTimer(() => { this.unloadTimer = null; void this.d.embedder.unload(); this.d.onModelUnload?.(); }, this.d.idleUnloadMs ?? MODEL_IDLE_UNLOAD_MS);
     return v;
   }
 

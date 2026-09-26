@@ -591,3 +591,18 @@ test('GATE-6 DIAGNOSTICS: the redacted shadow row carries the cohort and ranked 
   assert.equal(logs[2].reviewCaptured, true);
   assert.ok(!JSON.stringify(logs).includes('"q"'), 'the hive log still has no text');
 });
+
+test('SMOKE / BENCH FLAGS are inert unless passed: no flag -> null; index.ts redirects userData and branches ONLY when one is present', () => {
+  const { smokeTarget } = loadTs('src/main/nativeMemory/smoke.ts');
+  const { benchTarget } = loadTs('src/main/nativeMemory/bench.ts');
+  for (const argv of [[], ['app.exe'], ['app.exe', '--native-memory-smoke'], ['app.exe', '--native-memory-bench'], ['app.exe', '--other=1']]) {
+    assert.equal(smokeTarget(argv), null, JSON.stringify(argv));
+    assert.equal(benchTarget(argv), null, JSON.stringify(argv));
+  }
+  assert.equal(smokeTarget(['x', '--native-memory-smoke=C:/t/r.json']), 'C:/t/r.json');
+  assert.equal(benchTarget(['x', '--native-memory-bench=C:/t/b']), 'C:/t/b');
+  const idx = fs.readFileSync(path.join(REPO, 'src', 'main', 'index.ts'), 'utf8');
+  assert.match(idx, /const memorySmokeOut = smokeTarget\(process\.argv\);/);
+  assert.match(idx, /const memoryBenchDir = benchTarget\(process\.argv\);\r?\nif \(memorySmokeOut \|\| memoryBenchDir\) \{/, 'userData is redirected only when a flag is present');
+  assert.match(idx, /app\.whenReady\(\)\.then\(\(\) => \{\r?\n  if \(memoryBenchDir\) \{/, 'the bench branch runs only with the flag');
+});
