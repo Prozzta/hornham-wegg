@@ -13,7 +13,7 @@
 import { createHash } from 'node:crypto';
 import { existsSync, readFileSync } from 'node:fs';
 import { delimiter, join } from 'node:path';
-import { classifyQuery, EXIT, MemoryTokens, MODE_FILE, NativeMemoryClient, parseMode, reviewCaptureActive, validateRequest, type MemoryMode, type WorkerHandle } from './service';
+import { classifyQuery, EXIT, MemoryTokens, MODE_FILE, NativeMemoryClient, parseMode, reviewCaptureActive, validateRequest, WAKE_UP_DEADLINE_MS, type MemoryMode, type WorkerHandle } from './service';
 import type { WorkerConfig } from './worker';
 
 export interface RuntimeManifest {
@@ -121,6 +121,18 @@ export class NativeMemoryWiring {
     return env;
   }
 
+  /** NATIVE-WAKEUP-EMPTY-INDEX (a), god: when the mode is NATIVE, fork the worker (its below-normal
+   *  startup backfill runs; the model loads at the first embed) instead of waiting for the first
+   *  request, so the first task-start wake-up does not meet an empty index. main calls it no
+   *  earlier than 30 s after the first window finished loading (the spec's lazy rule). Legacy,
+   *  shadow and fallback-legacy: nothing (legacy keeps its zero-startup-work contract). */
+  prewarm(): boolean {
+    if (this.mode() !== 'native') return false;
+    const ok = this.client.prewarm();
+    this.d.log({ kind: 'native-memory-prewarm', forked: ok });
+    return ok;
+  }
+
   agentExited(agentId: string): void {
     this.tokens.revoke(agentId);
   }
@@ -158,7 +170,9 @@ export class NativeMemoryWiring {
       });
       return { status: 200, body: { exit: EXIT.ok } };
     }
-    const r = await this.client.request(v.op, v.args, v.op === 'search' ? undefined : 2_000);
+    // NATIVE-WAKEUP N1: a wake-up may wait up to WAKE_WAIT_MS for its wing on a filling index,
+    // so its deadline covers that wait plus the cold budget. status keeps 2 s; search its own.
+    const r = await this.client.request(v.op, v.args, v.op === 'search' ? undefined : v.op === 'wake-up' ? WAKE_UP_DEADLINE_MS : 2_000);
     return { status: 200, body: { exit: r.exit, text: r.text, json: r.json, error: r.error } };
   }
 
