@@ -37,6 +37,8 @@ import { basename, dirname, join } from 'node:path';
 
 /** Rotate a live append file at this size. */
 export const APPEND_ROTATE_BYTES = 8 * 1024 * 1024;
+/** How often a kept-open file is checked for having been deleted underneath it. */
+export const APPEND_LINK_CHECK_MS = 1_000;
 /** Rotated log files kept (the legacy file is extra and never deleted). */
 export const LOG_KEEP_ROTATED = 8;
 
@@ -77,6 +79,8 @@ export class AppendFile {
   private fd: number | null = null;
   private size = 0;
   private firstOpen = true;
+  /** When the kept-open file was last checked for having been deleted underneath us. */
+  private linkCheckedAt = 0;
   /** After a rotation that could not rename (the file is busy), wait this far before retrying. */
   private nextRotateAt = 0;
   private readonly cap: number;
@@ -92,6 +96,17 @@ export class AppendFile {
   /** Append one already-serialised line (must end in \n). Best-effort: never throws. */
   append(line: string): void {
     try {
+      // DELETED UNDER US (Jim, PERF-153-FINAL residual): a kept-open file that someone unlinked
+      // takes writes into a ghost (nlink 0) that nobody can read, and the path cannot be
+      // reopened while we hold it. Checked at most once a second: an fstat on the open fd,
+      // which no antivirus scans. Then close the ghost and reopen by path.
+      if (this.fd !== null) {
+        const t = this.now();
+        if (t - this.linkCheckedAt >= APPEND_LINK_CHECK_MS) {
+          this.linkCheckedAt = t;
+          if (fstatSync(this.fd).nlink === 0) this.closeFd();
+        }
+      }
       if (this.fd === null) this.open();
       if (this.fd === null) return;
       const n = writeSync(this.fd, line, null, 'utf8');

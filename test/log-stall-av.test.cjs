@@ -336,3 +336,23 @@ test('F3 wiring: wakeDiag counts EVERY row in telemetry first, then the breadcru
   assert.match(stall, /wakeDiag\(stage, fields\);[\s\S]*noteWakeRefusal/, 'the stall watchdog still sees every refusal');
   assert.match(idx, /try \{ workerWake\.forget\(agentId, id\); \} catch \{[^}]*\}\s*try \{ forgetWakeRows\(wakeRows, agentId\); \}/, 'N4: an agent that leaves the floor is forgotten by the row policy too');
 });
+
+test('RESIDUAL (Jim PERF-153-FINAL): a live log DELETED under a kept-open file is noticed within a second and recreated; no rows go to the ghost after that', () => {
+  const { APPEND_LINK_CHECK_MS } = loadTs('src/main/appendLog.ts');
+  const d = dir(); const p = path.join(d, 'log.jsonl');
+  let t = 1_000_000;
+  const f = new AppendFile(p, { now: () => t });
+  f.append('{"a":1}\n');
+  fs.rmSync(p);                                   // someone deletes the live log
+  t += APPEND_LINK_CHECK_MS;
+  f.append('{"a":2}\n');
+  assert.ok(fs.existsSync(p), 'recreated by path');
+  assert.deepEqual(rows(p).map((l) => JSON.parse(l).a), [2], 'the row landed in the new file, not the ghost');
+  // Throttled: within the interval no fstat is made (and nothing is lost when nothing was deleted).
+  const real = fs.fstatSync; let fstats = 0;
+  fs.fstatSync = (...a) => { fstats += 1; return real(...a); };
+  try { for (let i = 0; i < 20; i++) f.append('{"a":3}\n'); } finally { fs.fstatSync = real; }
+  assert.equal(fstats, 0, 'at most one check a second');
+  f.close();
+  assert.equal(rows(p).length, 21);
+});
