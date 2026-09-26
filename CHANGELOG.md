@@ -15,8 +15,8 @@ All notable changes to this project are documented here. The format is based on
 
 **Agents hear about new mail mid-turn, take turns with the machine's heavy jobs, and the Human
 gets a Talk view of the conversation with Michael.** Wakes are more reliable, Antigravity
-agents start idle with their instructions, and the native memory engine (still shipped off)
-can answer `mempalace wake-up` too. Rollback: 1.1.54.
+and Codex agents start without a turn of their own, and an early `mempalace wake-up` on the
+native memory engine (still shipped off) no longer meets an empty index. Rollback: 1.1.54.
 
 ### Added
 
@@ -33,15 +33,15 @@ can answer `mempalace wake-up` too. Rollback: 1.1.54.
 - **One heavy job at a time, enforced by the app.** An install, a build, a packaging run, a full
   test suite or a benchmark now takes a slot before it starts. When the slots are taken, the
   agent is told who holds them and to carry on with light work. Settings → Autonomy & Budgets →
-  **Heavy jobs at once** (Off, or 1 to 8; default 1). A slot is freed when the job ends: the
+  **Heavy jobs at once** (Off, 1, 2, 3, 4, 6 or 8; default 1). A slot is freed when the job ends: the
   tool's own end, a watcher that checks every 20 s for the job's processes, the agent's terminal
   closing, or after 60 minutes at most. The holders are shown in `fleet.json`.
-- **Antigravity agents start idle, with their instructions.** Each AGY agent is launched as its
-  own custom agent carrying its hive instructions, and waits for work instead of starting a turn
-  on its own. Codex agents receive the same instructions as developer instructions.
-- **The native memory engine answers `mempalace wake-up`** (when it is on): the app warms the
-  engine shortly after start and waits a few seconds at most for the agent's own notes to be
-  indexed, rather than answering with nothing.
+- **Antigravity and Codex agents start idle, with their instructions.** Each AGY agent is
+  launched as its own custom agent carrying its hive instructions, and Codex agents receive
+  them as developer instructions. Both wait for work instead of starting a turn on their own.
+- **An early `mempalace wake-up` no longer meets an empty index** (native memory engine,
+  when it is on): the app starts the engine about 30 s after launch, indexes each agent's own
+  notes first, and a wake-up waits up to 5 s for them.
 
 ### Fixed
 

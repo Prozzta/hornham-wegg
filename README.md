@@ -181,8 +181,8 @@ wholesale merges. The shape of the line, as evidence for the three ideas above:
   agent is told about mail that arrives while it works, at its next tool call; installs,
   builds, full suites and benches take a slot (default one at a time, set in Settings), so
   agents stop loading the machine all at once; the Human reads the conversation with
-  Michael in a Talk view beside the terminal; AGY agents start idle with their
-  instructions; and wakes left unsent in a provider's input box are recovered.
+  Michael in a Talk view beside the terminal; AGY and Codex agents start idle with
+  their instructions; and wakes left unsent in a provider's input box are recovered.
 
 Every milestone carries a dated human acceptance and evidence tag in the fork's
 internal mission ledger; this README keeps only the shape.
@@ -354,9 +354,9 @@ Two data planes feed one renderer:
     - **Storage:** an index of 10.6 MB against an 80 MB palace.
   - **Until the cutover, MemPalace and its Python CLI are still required.** Legacy is the
     default and legacy mining is unchanged, so the palace stays current for a rollback.
-  - **`wake-up`** (since 1.1.55) is answered natively too. The worker is warmed 30 s after
-    the first window loads (native mode only), and a wake-up waits at most a few seconds for
-    the agent's own notes to be indexed.
+  - **An early `wake-up`** (since 1.1.55) no longer meets an empty index: in native mode
+    the worker is started 30 s after the first window loads, each agent's own notes are
+    indexed first, and a wake-up waits up to 5 s for them.
 - **Mid-turn mail** (since 1.1.55). The hook server tracks each agent's turn and, at its next
   tool call, adds an `<inbox-update>` notice for inbox files that arrived since the turn
   began (each announced once, at most five listed, sender text escaped). A message may carry
