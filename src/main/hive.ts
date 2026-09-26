@@ -578,6 +578,21 @@ export class HiveManager {
     return existsSync(home) ? home : null;
   }
 
+  /** MIDTURN-MAIL-BLIND L1: the message file names in an agent's inbox (not inbox/.done), with
+   *  no parsing: a directory listing is all a per-hook check may cost. [] when there is none. */
+  inboxFileNames(id: string): string[] {
+    try { return readdirSync(join(this.agentDir(id), 'inbox')).filter((f) => f.endsWith('.json')); } catch { return []; }
+  }
+
+  /** MIDTURN-MAIL-BLIND L1: one inbox message's header (read once per new file), or null. */
+  inboxHeader(id: string, file: string): { id: string; from: string; subject: string; supersedes?: string[] } | null {
+    if (!/^[^\\/]+\.json$/.test(file)) return null;
+    try {
+      const m = JSON.parse(readFileSync(join(this.agentDir(id), 'inbox', file), 'utf8')) as Partial<HiveMessage>;
+      return { id: String(m.id ?? file.replace(/\.json$/, '')), from: String(m.from ?? '?'), subject: String(m.subject ?? ''), ...normalizeSupersedes(m.supersedes) };
+    } catch { return null; }
+  }
+
   private agentDir(id: string): string {
     return join(this.root()!, 'agents', id);
   }
