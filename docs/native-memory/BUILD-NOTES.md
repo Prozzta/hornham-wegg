@@ -197,7 +197,60 @@ All measurements were taken on **copies**. The live palace, the installed app an
     - p95 ≤ 250 ms during a backfill;
     - native faster than legacy on p50 AND p95 in every cohort;
     - ≤ 1 Electron-as-Node process per call.
-  - The results table is below, once the labels are in.
+
+**RESULT: expanded gate 4 PASSES on quality AND speed.**
+- Every scorable cohort passes the quality rule.
+- **Every lower bound is above ZERO, not just above −5**: native is significantly better than legacy in every cohort, and the watch item (semantic NDCG@5) is now +6.9 [+0.2, +13.7].
+- No cohort is within 2 pts of −5, so god's near-line re-review rule does not trigger.
+- **Kappa:** all second labels 0.490; Jim vs Dwight 0.437; Jim vs Phyllis (rounds 1 and 2) 0.530. All are above the 0.4 floor.
+- **Jim's labelling method** (disclosed to god, who accepted it): 8 subagents under his rubric, plus his blind self-check on 48 items (kappa 0.596, no 0-vs-2 flips).
+
+| Cohort | n (scored) | NDCG@5 Δ | recall@10 Δ | Quality gate | native e2e warm p50 / p95 (cmd · bash) | legacy e2e p50 / p95 (cmd · bash) | faster p50+p95 |
+|---|---|---|---|---|---|---|---|
+| overall | 373 (333) | +20.7 [17.1, 24.3] | +32.5 [27.8, 37.1] | PASS | 121 / 126.5 · 158.8 / 165.5 | 1471.9 / 1744.3 · 1492.6 / 1818.3 | yes |
+| semantic | 72 (71) | +6.9 [0.2, 13.7] | +10.8 [3.1, 18.7] | PASS | 122.5 / 127.8 · 160 / 167.2 | 1468.9 / 1752.4 · 1489.9 / 1816.4 | yes |
+| exact-identifier | 69 (65) | +43.2 [34.6, 51.8] | +65.9 [56.3, 75.2] | PASS | 119.3 / 124 · 157.2 / 162.5 | 1472.6 / 1780.3 · 1490.6 / 1808.8 | yes |
+| wing-scoped | 68 (65) | +14.9 [8.3, 21.5] | +17.0 [7.7, 26.4] | PASS | 120.5 / 127.8 · 158.8 / 165.7 | 1480 / 1696.7 · 1495.8 / 1802.3 | yes |
+| punctuation | 67 (63) | +23.9 [15.3, 32.5] | +45.1 [32.0, 57.0] | PASS | 120.7 / 124.7 · 158.3 / 163.1 | 1467.1 / 1727.1 · 1492.6 / 1848 | yes |
+| stale | 68 (67) | +15.5 [9.1, 22.4] | +24.1 [16.7, 31.8] | PASS | 122.2 / 128.1 · 159.6 / 168.3 | 1469 / 1738.3 · 1490.4 / 1833.2 | yes |
+| no-match | 29 (2) | +38.8 [30.7, 47.0] | +100.0 [100.0, 100.0] | not gated | 120.6 / 123.8 · 158 / 162.5 | 1467.8 / 1726 · 1489.6 / 1823.9 | yes |
+
+| Speed criterion | Measured | Pass |
+|---|---|---|
+| native warm p95 <= 250 ms (e2e, worst wrapper) | 165.5 | PASS |
+| worker-cold <= 2 s (x3) | 634.8, 638.2, 629 | PASS |
+| model-cold <= 2 s (x3) | 208.1, 207.6, 215.3 | PASS |
+| during backfill p95 <= 250 ms | 161.5 (p50 143.7, n 372) | PASS |
+| native faster than legacy, every cohort, p50 AND p95 | yes | PASS |
+| <= 1 Electron-as-Node per call | 1 | PASS |
+
+Runtime-cold (first shim run of the session; reported, not gated): 639.2 ms. Main event-loop delay during the backfill (monitorEventLoopDelay, 10 ms resolution): p50 15.58 / p95 18.1 ms. Failed calls: 12. Machine at start: CPU 12%, heavy jobs: 0.
+Kappa (all second labels): 0.490. Labelled queries: 373; excluded: r01.
+
+**How the speed numbers were measured** (Jim's method, Addendum 2; god's conditions)
+- **End-to-end** means the wrapper an agent runs on PATH (`mempalace.cmd` through cmd, and the POSIX `mempalace` through Git bash) → the shim on Electron-as-Node → the built app's windowless bench host (`--native-memory-bench`: the same main-side memory code, the real `utilityProcess` worker) → the answer.
+- **Legacy** is the uv `mempalace.exe` through the same wrappers (Python start included), always `--palace` on the **frozen copy**, asserted before every call.
+- **Repetitions:** 3 per query per engine per wrapper; one warm-up discarded per engine per host start.
+- **Native** comes from run 2, on the fixed build: the host restarted every 100 queries (it self-stops at god's 20-min cap), 1,116 successful calls per wrapper.
+- **Legacy warm** comes from run 1. Those calls never touch the bench host, so they stand (god, andynativeonly). Percentiles count **successful calls only**.
+- **Failed calls: 12.** All 12 are ONE query, `dw065` (the text `--native-memory-smoke=`), which **both** engines reject as an unrecognised option (exit 2, argparse and the shim alike): 3 reps × 2 wrappers × 2 engines. It is parity, not a regression. No other call failed.
+- **The run-1 native warm numbers were INVALID and are discarded.** The host's 20-minute cap stopped it about a third of the way through the hour-long phase. The resulting fast exit-3 failures were inside run 1's percentiles, and the driver now counts successful calls only.
+- **Cold**, 3 each:
+  - worker-cold: a fresh host over the built index, first request;
+  - model-cold: after the idle unload, using a bench-only 8 s idle setting;
+  - runtime-cold (the first shim run of a session) is reported, not gated.
+- **During a backfill:** an empty index; the whole query set end-to-end while it builds.
+- **Main event-loop delay:** `monitorEventLoopDelay` at a 10 ms timer resolution; p95 18.1 ms, i.e. about 8 ms of lag.
+- **Machine:** CPU 12% at the start, no heavy jobs, the floor rule enforced throughout. The live app's routine legacy mining is counted as ambient load (0 at start and end).
+- **The backfill fix:** 4-chunk steps gave an end-to-end p95 of 304 ms during a backfill (a search waits for one step, ~100 ms, on top of the shim's ~110–150 ms start). **One chunk per step:** p95 **161.5 ms**. **Cost: none measurable.** A full backfill of the copy took about 77 s against about 81–87 s before, because a smaller batch pads less.
+- **Process count, deterministic:** `NODE_OPTIONS=--require <tracer>` logs every Electron-as-Node start. Over 20 calls (10 cmd, 10 bash), **exactly one** start per call.
+  - The WMI samples that showed 0 were a sampling race (`WITHIN 0.1` polling misses a ~100 ms process).
+  - **The bash `sh` hop is OURS:** our POSIX wrapper is a `#!/bin/sh` script, and MSYS cannot `exec` a native Win32 program in place, so `sh.exe` stays as its waiting parent. The two `bash.exe` processes are the agent's own Git-bash shell and its launcher.
+  - It fits "1 wrapper + 1 Electron-as-Node", with sh as the wrapper. Removing it would need a native launcher exe. It costs about 38 ms (bash p95 165.5 against cmd 126.5), well inside the gate.
+- **Shim fix found by the round-2 queries (for Jim):**
+  - the shim now parses argv as argparse does, so a dash-led token that contains whitespace is query text and `--` ends the options;
+  - before this, an agent's quoted `"--format json ..."` query was rejected by the shim though legacy accepted it;
+  - a test pins it.
 
 **History: god's first decision on gate 4, option (b) conditional (a gate-rule DEFERRAL, now superseded).**
 - **1.1.54 may ship memory-154 ONLY legacy-default** (zero behaviour change), with `shadow` available.
@@ -265,6 +318,6 @@ All measurements were taken on **copies**. The live palace, the installed app an
 
 ## Open
 
-1. **Gate 4 (expanded, quality + speed):** the replay and the speed bench have run. **The labels are pending** (Jim, all queries; Dwight and Phyllis, 20% cross). **The Human spot-check (10 queries) is required before the cut.**
+1. **Gate 4 (expanded, quality + speed): PASS** (above). **The Human spot-check (10 queries) is still required before the cut.**
 2. **Opt-ins:** whether the 2 nested deliverables and any top-level notes join the allow-list (god and the owners).
 3. **Not covered on this host:** the mac and Linux artifact smokes; the Defender/BitDefender install-time scan observation.
