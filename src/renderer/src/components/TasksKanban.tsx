@@ -4,7 +4,7 @@ import { PixelButton } from './PixelButton';
 import { PixelBadge } from './PixelBadge';
 import { Icon } from './Icon';
 import { useStore } from '@/store/store';
-import { normalizeHumanQA, type HumanQAFields } from './humanQuestion';
+import { storedHumanQA, type HumanQAFields } from './humanQuestion';
 import { SafeMarkdown } from './HumanQuestionCard';
 
 /** A card on the task kanban. Mirrors HiveTask in the main/preload process —
@@ -91,12 +91,14 @@ export function parseTasks(raw: unknown): HiveTask[] {
       priority: typeof t.priority === 'number' ? t.priority : 3,
       createdAt: typeof t.createdAt === 'string' ? t.createdAt : new Date().toISOString(),
       humanQA: Array.isArray(t.humanQA)
-        // normalizeHumanQA keeps every known field, dismissedAt included (else a dismissed
-        // card would resurface on the next poll) and the ASKME options/recommended/multi/
-        // chosen, so a re-parse never strips them.
+        // F3 (Jim): the entry is kept AS STORED (options, recommended, multi, chosen and any
+        // other field, uncapped), so writing a card back never rewrites its questions; only
+        // the fields this view reads are typed from the validated form, and dismissedAt is
+        // kept (else a dismissed card would resurface on the next poll). The caps and
+        // validation of options apply where a card is rendered (normalizeHumanQA there).
         ? (t.humanQA as unknown[])
-          .map(normalizeHumanQA)
-          .filter((e): e is HumanQA => e !== null)
+          .map(storedHumanQA)
+          .filter((e): e is NonNullable<typeof e> => e !== null)
         : undefined
     }));
 }

@@ -44,11 +44,20 @@ test('XSS: raw HTML is shown as text, never markup; unsafe or non-https links ar
   assert.equal((html.match(/<a /g) || []).length, 1, 'exactly one live link');
 });
 
-test('markdown: images and headings are unwrapped to text; the allow-list is exactly the subset', () => {
-  assert.deepEqual([...ALLOWED_ELEMENTS].sort(), ['a', 'br', 'code', 'del', 'em', 'li', 'ol', 'p', 'strong', 'ul']);
-  const html = md('## Heading text\n\n![alt text](https://x/y.png)\n\n| a | b |\n|---|---|\n| 1 | 2 |');
-  assert.doesNotMatch(html, /<h\d|<img|<table/);
+test('markdown: headings unwrap to text, an image becomes its alt text (F2), never an <img>; the allow-list is exactly the subset', () => {
+  assert.deepEqual([...ALLOWED_ELEMENTS].sort(), ['a', 'br', 'code', 'del', 'em', 'img', 'li', 'ol', 'p', 'pre', 'strong', 'ul']);
+  const html = md('## Heading text\n\n![alt text](https://x/y.png) and ![](https://x/z.png)\n\n| a | b |\n|---|---|\n| 1 | 2 |');
+  assert.doesNotMatch(html, /<h\d|<img|<table|y\.png|z\.png/);
   assert.match(html, /Heading text/);
+  assert.match(html, /\[image: alt text\]/);
+});
+
+test('F1: a fenced or indented code block keeps its lines (pre-wrap mono block); inline code stays a chip', () => {
+  const html = md('Run these:\n\n```powershell\nStop-Process -Name foo\nRemove-Item C:\\x -Recurse\n```\n\nor indented:\n\n    first line\n    second line\n\nand `inline` code.');
+  assert.match(html, /<pre class="cth-hq-pre" style="[^"]*white-space:pre-wrap[^"]*"><code[^>]*>Stop-Process -Name foo\nRemove-Item C:\\x -Recurse\n<\/code><\/pre>/);
+  assert.match(html, /<pre class="cth-hq-pre"[^>]*><code[^>]*>first line\nsecond line\n<\/code><\/pre>/);
+  assert.match(html, /<code style="[^"]*padding:0 3px[^"]*">inline<\/code>/, 'inline code keeps the chip');
+  assert.doesNotMatch(html, /<code style="[^"]*padding:0 3px[^"]*">Stop-Process/, 'a block is not a chip');
 });
 
 test('safeHref: https only (the same rule as main app:openExternal)', () => {
@@ -90,21 +99,29 @@ test('normalizeHumanQA: legacy entries unchanged; options validated and capped; 
   assert.equal(hq.normalizeHumanQA({ q: 'x', options: Array.from({ length: 20 }, (_, i) => `o${i}`) }).options.length, hq.MAX_OPTIONS);
 });
 
-test('the kanban re-parse keeps options/recommended/multi/chosen and dismissedAt (a re-parse never strips them)', () => {
-  // parseTasks (TasksKanban) maps every humanQA entry through normalizeHumanQA; the component
-  // module imports the store via the @ alias, so the mapping is pinned statically here and the
-  // normalizer is exercised on the same shapes.
+test('F3: the kanban re-parse keeps each STORED entry as written (uncapped options, invalid recommended, unknown fields), typing only what views read', () => {
+  // parseTasks (TasksKanban) maps every humanQA entry through storedHumanQA; the component
+  // imports the store via the @ alias, so the mapping is pinned statically and the helper is
+  // exercised directly.
   const kanban = codeOnly(readSource('src/renderer/src/components/TasksKanban.tsx'));
-  assert.match(kanban, /\.map\(normalizeHumanQA\)\s*\.filter\(\(e\): e is HumanQA => e !== null\)/);
-  const raw = [
-    { q: 'old', a: 'yes', chosen: [0], options: [{ label: 'Yes' }] },
-    { q: 'gone', dismissedAt: 'd' },
-    { q: 'now?', options: [{ label: 'A', detail: 'd' }, { label: 'B' }], recommended: 0, multi: true }
-  ];
-  const qa = raw.map(hq.normalizeHumanQA);
-  assert.deepEqual(qa[0], { q: 'old', a: 'yes', chosen: [0], options: [{ label: 'Yes' }] });
-  assert.deepEqual(qa[1], { q: 'gone', dismissedAt: 'd' });
-  assert.deepEqual(qa[2], raw[2]);
+  assert.match(kanban, /\.map\(storedHumanQA\)\s*\.filter\(/);
+  const many = Array.from({ length: 12 }, (_, i) => ({ label: 'L'.repeat(i === 0 ? 300 : 3) + i, detail: 'd' }));
+  const raw = { q: 'pick?', options: many, recommended: 40, multi: 'yes', chosen: [11], extra: { keep: 1 }, a: 7, askedAt: 't' };
+  const stored = hq.storedHumanQA(raw);
+  assert.equal(stored.options, many, 'the options array is the stored one: 12 entries, a 300-char label, nothing capped');
+  assert.equal(stored.recommended, 40); assert.equal(stored.multi, 'yes'); assert.deepEqual(stored.chosen, [11]);
+  assert.deepEqual(stored.extra, { keep: 1 }, 'an unknown field survives');
+  assert.equal(stored.a, undefined, 'a non-string answer is not handed to the views');
+  assert.equal(stored.askedAt, 't');
+  assert.equal(hq.storedHumanQA({ nope: 1 }), null);
+  assert.deepEqual(hq.storedHumanQA({ q: 'gone', dismissedAt: 'd' }), { q: 'gone', a: undefined, askedAt: undefined, answeredAt: undefined, dismissedAt: 'd' });
+  // Answering such an entry writes it back with only a/answeredAt/chosen added.
+  const [answered] = hq.recordAnswer([stored], stored, { text: 'L1', chosen: [1] }, 'now');
+  assert.equal(answered.options, many); assert.equal(answered.recommended, 40); assert.deepEqual(answered.extra, { keep: 1 });
+  assert.equal(answered.a, 'L1'); assert.deepEqual(answered.chosen, [1]);
+  // What a card RENDERS is still validated and capped.
+  const shown = hq.normalizeHumanQA(stored);
+  assert.equal(shown.options.length, hq.MAX_OPTIONS); assert.equal(shown.recommended, undefined); assert.equal(shown.multi, undefined);
 });
 
 // ── the card ───────────────────────────────────────────────────────────────
@@ -205,4 +222,67 @@ test('no HTML sink anywhere in the card code', () => {
     const src = codeOnly(readSource(f));
     assert.doesNotMatch(src, /dangerouslySetInnerHTML|innerHTML|rehype-raw|rehypeRaw/, f);
   }
+});
+
+// ── T1: select-then-send, driven through the component's own handlers ─────
+
+/** Render the card as a plain function with a minimal useState shim, so its real onClick /
+ *  onKeyDown handlers can be invoked without a DOM (the repo has no DOM library). */
+function drive(props) {
+  const real = React.useState;
+  const states = []; let n = 0;
+  React.useState = (init) => { const i = n++; if (!(i in states)) states[i] = typeof init === 'function' ? init() : init;
+    return [states[i], (v) => { states[i] = typeof v === 'function' ? v(states[i]) : v; }]; };
+  const render = () => { n = 0; try { return HumanQuestionCard(props); } finally { /* keep shim for re-renders */ } };
+  const find = (el, pred, out = []) => {
+    if (!el || typeof el !== 'object') return out;
+    if (Array.isArray(el)) { for (const c of el) find(c, pred, out); return out; }
+    if (el.props) { if (pred(el)) out.push(el); find(el.props.children, pred, out); }
+    return out;
+  };
+  return { render, find, restore: () => { React.useState = real; } };
+}
+
+test('T1: clicking an option only selects it (never answers); the send button or Ctrl+Enter answers, once', () => {
+  const calls = [];
+  const d = drive({ entry: { q: 'Which?', options: [{ label: 'A' }, { label: 'B' }] }, onAnswer: (a) => { calls.push(a); } });
+  try {
+    let tree = d.render();
+    const opt = (t, i) => d.find(t, (e) => e.props['data-option'] === i)[0];
+    opt(tree, 1).props.onClick();
+    tree = d.render();
+    assert.deepEqual(calls, [], 'an option click never calls onAnswer');
+    assert.equal(opt(tree, 1).props['aria-checked'], true, 'it is selected');
+    opt(tree, 0).props.onClick(); tree = d.render();
+    assert.deepEqual(calls, [], 'switching the selection does not answer either');
+    const send = d.find(tree, (e) => typeof e.props.onClick === 'function' && e.props.variant === 'primary')[0];
+    assert.ok(send, 'the send button');
+    send.props.onClick();
+    assert.deepEqual(calls, [{ text: 'A', chosen: [0] }], 'the button answers with the selection');
+    const ta = d.find(tree, (e) => e.type === 'textarea')[0];
+    ta.props.onKeyDown({ key: 'Enter', ctrlKey: true, metaKey: false });
+    assert.equal(calls.length, 2, 'Ctrl+Enter answers too');
+    ta.props.onKeyDown({ key: 'Enter', ctrlKey: false, metaKey: false });
+    assert.equal(calls.length, 2, 'a plain Enter does not');
+  } finally { d.restore(); }
+});
+
+test('T1: with nothing chosen and no note there is nothing to send', () => {
+  const calls = [];
+  const d = drive({ entry: { q: 'Which?', options: [{ label: 'A' }] }, onAnswer: (a) => { calls.push(a); } });
+  try {
+    const tree = d.render();
+    const send = d.find(tree, (e) => typeof e.props.onClick === 'function' && e.props.variant === 'primary')[0];
+    assert.equal(send.props.disabled, true);
+    send.props.onClick();
+    assert.deepEqual(calls, []);
+  } finally { d.restore(); }
+});
+
+test('T2: an answer lands on the OPEN entry only, never on an earlier answered entry with the same q', () => {
+  const earlier = { q: 'Same?', a: 'old answer', answeredAt: 'then' };
+  const open = { q: 'Same?', askedAt: 'now' };
+  const next = hq.recordAnswer([earlier, { ...open }], open, { text: 'new' }, 't');
+  assert.deepEqual(next[0], earlier, 'the earlier answer is untouched');
+  assert.equal(next[1].a, 'new', 'the re-parsed open copy (same q, unanswered) is answered');
 });

@@ -179,3 +179,13 @@ export function answerMail(task: { id: string; title: string }, open: HumanQAFie
     ].join('\n')
   };
 }
+
+/** F3: a STORED humanQA entry kept as written (options, recommended, multi, chosen and any other
+ *  field, uncapped), or null without a string q. Only the typed fields a view reads (q, a and the
+ *  stamps) come from the validated form; an invalid one is unset. Writing the card back therefore
+ *  never rewrites its questions; the caps apply where an entry is rendered (normalizeHumanQA). */
+export function storedHumanQA(raw: unknown): (HumanQAFields & Record<string, unknown>) | null {
+  const n = normalizeHumanQA(raw);
+  if (!n) return null;
+  return { ...(raw as Record<string, unknown>), q: n.q, a: n.a, askedAt: n.askedAt, answeredAt: n.answeredAt, dismissedAt: n.dismissedAt };
+}

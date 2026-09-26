@@ -7,8 +7,9 @@
  * Readability: the first line (or sentence) is a bold headline, the rest a body rendered
  * as a SAFE markdown subset: paragraphs and line breaks, bullet and numbered lists, bold,
  * italic, inline code and https links. Nothing else becomes markup: raw HTML is shown as
- * text (react-markdown without rehype-raw has no HTML sink), images and headings are
- * unwrapped to their text, and links open only through the main-process opener.
+ * text (react-markdown without rehype-raw has no HTML sink), headings are unwrapped to
+ * their text, an image becomes its alt text, a code block keeps its lines (commands for
+ * the human must not merge), and links open only through the main-process opener.
  *
  * Options ({label, detail}) render as choice buttons: pick one (or several when `multi`),
  * optionally add a note, then answer. The free-text note is always available, so the human
@@ -46,7 +47,9 @@ export interface HumanQuestionCardProps {
 }
 
 /** The markdown subset a question may use; everything else is unwrapped to its text. */
-export const ALLOWED_ELEMENTS = ['p', 'br', 'ul', 'ol', 'li', 'strong', 'em', 'code', 'a', 'del'];
+export const ALLOWED_ELEMENTS = ['p', 'br', 'ul', 'ol', 'li', 'strong', 'em', 'code', 'pre', 'a', 'del', 'img'];
+
+const mono: CSSProperties = { fontFamily: 'var(--cth-font-mono)', fontSize: 12 };
 
 const KIND_LABEL: Record<QuestionKind, string> = { choice: 'CHOOSE', question: 'QUESTION', todo: 'TO-DO' };
 const KIND_COLOR: Record<QuestionKind, string> = {
@@ -73,12 +76,25 @@ export function SafeMarkdown({ source, onOpenLink }: { source: string; onOpenLin
           ul: ({ children }) => <ul style={{ margin: '0 0 8px', paddingLeft: 20 }}>{children}</ul>,
           ol: ({ children }) => <ol style={{ margin: '0 0 8px', paddingLeft: 22 }}>{children}</ol>,
           li: ({ children }) => <li style={{ margin: '2px 0', whiteSpace: 'pre-line' }}>{children}</li>,
-          code: ({ children }) => (
-            <code style={{
-              fontFamily: 'var(--cth-font-mono)', fontSize: 12, padding: '0 3px',
-              background: 'var(--cth-paper-200)', boxShadow: 'inset 0 0 0 1px var(--cth-ink-100)'
-            }}>{children}</code>
+          // F1 (Jim): a fenced or indented block keeps its line breaks, so a multi-line command
+          // for the human never collapses onto one line. Block code text always carries a
+          // newline (inline code cannot), which tells the two apart.
+          pre: ({ children }) => (
+            <pre className="cth-hq-pre" style={{
+              ...mono, lineHeight: '17px', margin: '0 0 8px', padding: '6px 8px', whiteSpace: 'pre-wrap',
+              overflowWrap: 'anywhere', background: 'var(--cth-paper-200)', boxShadow: 'inset 0 0 0 1px var(--cth-ink-100)'
+            }}>{children}</pre>
           ),
+          code: ({ children }) => (String(children ?? '').includes('\n')
+            ? <code style={mono}>{children}</code>
+            : (
+              <code style={{
+                ...mono, padding: '0 3px',
+                background: 'var(--cth-paper-200)', boxShadow: 'inset 0 0 0 1px var(--cth-ink-100)'
+              }}>{children}</code>
+            )),
+          // F2 (Jim): an image is never fetched or shown; its alt text stays readable.
+          img: ({ alt }) => (alt ? <span className="cth-hq-img">[image: {alt}]</span> : null),
           a: ({ href, children }) => {
             const h = safeHref(href);
             if (!h) return <span>{children}</span>;
@@ -127,7 +143,7 @@ export function HumanQuestionCard({
 
   const toggle = (i: number) => {
     if (!interactive || sending) return;
-    setPicked((cur) => togglePick(entry.multi, cur, i));
+    setPicked((cur) => togglePick(entry.multi, cur, i));  // selecting never answers (T1)
   };
   const submit = () => {
     if (!interactive || sending || !answer) return;
