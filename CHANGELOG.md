@@ -11,6 +11,18 @@ All notable changes to this project are documented here. The format is based on
 > v0.4.5 (below). Earlier 1.1.x releases are described on the
 > [releases page](https://github.com/Prozzta/hornham-wegg/releases).
 
+## [1.1.57] — 2026-09-26
+
+**Two Settings fixes.** Rollback: 1.1.56.
+
+### Fixed
+
+- **Settings shows what you saved when you reopen it.** Every control read the value it had when
+  the app started, so a change (for example "Heavy jobs at once") looked lost on reopen, although
+  it was saved and already in effect. Settings now reads the current settings each time it opens.
+- **Dropdowns are readable in the dark theme.** They showed white text on a white list. In both
+  themes they now match the other inputs, so in the light theme they are cream instead of white.
+
 ## [1.1.56] — 2026-09-26
 
 **Talk is removed from the main app while it is rebuilt as a separate build.** In 1.1.55 it slowed

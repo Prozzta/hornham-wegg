@@ -23,7 +23,7 @@ and unattended.
 
 <p>
   <a href="./LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-F4D35E.svg?style=flat-square&labelColor=6E1423"></a>
-  <img alt="Version: 1.1.56" src="https://img.shields.io/badge/version-1.1.56-F4D35E.svg?style=flat-square&labelColor=6E1423">
+  <img alt="Version: 1.1.57" src="https://img.shields.io/badge/version-1.1.57-F4D35E.svg?style=flat-square&labelColor=6E1423">
   <img alt="Fork of chaitanyagiri/munder-difflin" src="https://img.shields.io/badge/fork%20of-chaitanyagiri%2Fmunder--difflin-F4F1EA.svg?style=flat-square&labelColor=6E1423">
 </p>
 
@@ -183,9 +183,12 @@ wholesale merges. The shape of the line, as evidence for the three ideas above:
   agents stop loading the machine all at once; the Human reads the conversation with
   Michael in a Talk view beside the terminal; AGY and Codex agents start idle with
   their instructions; and wakes left unsent in a provider's input box are recovered.
-- **Talk taken out of the main app** (1.1.56, the current release) — it slowed the whole
+- **Talk taken out of the main app** (1.1.56) — it slowed the whole
   app, most of all in the split view, so it is being rebuilt as a separate build. Everything
   else in 1.1.55 stays, and Talk's history files on disk are left untouched.
+- **Settings fixes** (1.1.57, the current release) — Settings shows what you saved when
+  you reopen it (every control read its value from app start), and dropdowns are readable
+  in the dark theme and match the other inputs in both themes.
 
 Every milestone carries a dated human acceptance and evidence tag in the fork's
 internal mission ledger; this README keeps only the shape.

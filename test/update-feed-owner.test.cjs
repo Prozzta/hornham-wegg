@@ -97,7 +97,7 @@ test('package.json repository and version, and the lockfile agrees on the versio
   const pkg = JSON.parse(read('package.json'));
   assert.equal(pkg.repository.url, `https://github.com/${OWN}.git`,
     'electron-builder falls back to `repository` for a github publish, so it must not point upstream');
-  assert.equal(pkg.version, '1.1.56');
+  assert.equal(pkg.version, '1.1.57');
   const lock = JSON.parse(read('package-lock.json'));
   assert.equal(lock.version, pkg.version, 'package-lock root version agrees');
   assert.equal(lock.packages[''].version, pkg.version, 'package-lock packages[""] version agrees');
