@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { PixelButton } from './PixelButton';
 import { PixelBadge } from './PixelBadge';
+import { HumanQuestionCard, type HumanAnswer } from './HumanQuestionCard';
+import { answerMail, normalizeHumanQA, recordAnswer } from './humanQuestion';
 import { useStore } from '@/store/store';
 import { type HiveTask, type HumanQA, openQuestion, waitsOnHuman } from './TasksKanban';
 
@@ -78,22 +79,16 @@ export function AskMeTab() {
    * that case nothing is written and the draft is kept.
    */
 
-  const sendAnswer = async (task: HiveTask) => {
-    const text = (drafts[task.id] ?? '').trim();
+  const sendAnswer = async (task: HiveTask, answer: HumanAnswer) => {
+    const text = answer.text.trim();
     const open = openQuestion(task);
     if (!text || !open || sending) return;
+    const ans = { text, chosen: answer.chosen };
     setSending(task.id);
     try {
-      // 1) Document the answer ON the card.
-      const next = tasks.map((t) => {
-        if (t.id !== task.id) return t;
-        const qa = (t.humanQA ?? []).map((e) =>
-          e === open || (e.q === open.q && !e.a)
-            ? { ...e, a: text, answeredAt: new Date().toISOString() }
-            : e
-        );
-        return { ...t, humanQA: qa };
-      });
+      // 1) Document the answer ON the card (the chosen options too, when there were any).
+      const nowIso = new Date().toISOString();
+      const next = tasks.map((t) => (t.id !== task.id ? t : { ...t, humanQA: recordAnswer(t.humanQA ?? [], open, ans, nowIso) }));
       const updated = next.find((candidate) => candidate.id === task.id);
       const result = updated
         ? await window.cth.hivePatchTask(task.id, { humanQA: updated.humanQA })
@@ -101,17 +96,7 @@ export function AskMeTab() {
       if (!result.ok) throw new Error('task changed before answer could be saved');
       setTasks(next);
       // 2) Tell the god, so the card gets unblocked and work continues.
-      await window.cth.hiveSend({
-        to: 'god',
-        act: 'inform',
-        subject: `HUMAN ANSWER on task "${task.title}"`,
-        body: [
-          `The human answered the open question on task ${task.id} ("${task.title}"):`,
-          `Q: ${open.q}`,
-          `A: ${text}`,
-          'The answer is also recorded in the card\'s humanQA. Act on it, unblock the card, and continue the work.'
-        ].join('\n')
-      }, 'human');
+      await window.cth.hiveSend({ to: 'god', act: 'inform', ...answerMail(task, open, ans) }, 'human');
       setAnswerDraft(task.id, '');
     } catch { /* leave the draft so the user can retry */ }
     setSending(null);
@@ -206,34 +191,16 @@ export function AskMeTab() {
             </div>
 
             <div style={{ padding: 9, display: 'flex', flexDirection: 'column', gap: 8 }}>
-              {/* the question */}
-              <div style={{ fontSize: 15, lineHeight: '19px', color: 'var(--cth-ink-900)', whiteSpace: 'pre-wrap' }}>
-                {open.q}
-              </div>
-
-              {/* answer box */}
-              <textarea
-                value={drafts[t.id] ?? ''}
-                onChange={(e) => setAnswerDraft(t.id, e.target.value)}
-                onKeyDown={(e) => { if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) void sendAnswer(t); }}
-                rows={3}
-                placeholder="Your answer — or 'done', with the result… (Ctrl+Enter to send)"
-                style={{
-                  width: '100%', boxSizing: 'border-box', padding: '6px 8px', resize: 'vertical',
-                  background: 'var(--cth-paper-100)', border: 'none',
-                  boxShadow: 'inset 0 0 0 1px var(--cth-ink-100)',
-                  fontFamily: 'var(--cth-font-mono)', fontSize: 15, lineHeight: '18px',
-                  color: 'var(--cth-ink-900)', outline: 'none'
-                }}
+              {/* the ask: headline, readable body, options, note + answer (shared card) */}
+              <HumanQuestionCard
+                key={open.askedAt ?? open.q}
+                entry={normalizeHumanQA(open) ?? { q: open.q }}
+                draft={drafts[t.id] ?? ''}
+                onDraftChange={(v) => setAnswerDraft(t.id, v)}
+                onAnswer={(ans) => sendAnswer(t, ans)}
+                sending={sending === t.id}
               />
               <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-                <PixelButton
-                  variant="primary" size="sm"
-                  disabled={!(drafts[t.id] ?? '').trim() || sending === t.id}
-                  onClick={() => void sendAnswer(t)}
-                >
-                  {sending === t.id ? 'sending…' : 'respond & unblock'}
-                </PixelButton>
                 {(t.humanQA?.filter((e) => e.a).length ?? 0) > 0 && (
                   <button
                     onClick={() => openTaskDetail(t.id)}
