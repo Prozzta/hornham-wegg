@@ -34,9 +34,21 @@ const MAX_DETAIL = 2000;
 
 /** Valid options only (non-empty string labels, optional string detail), capped. */
 export function normalizeOptions(raw: unknown): HumanQAOption[] | undefined {
+  return normalizeOptionsIndexed(raw)?.options;
+}
+
+/**
+ * The valid options plus, for each, its position in the RAW stored list. The stored
+ * `recommended` and `chosen` are RAW positions (what the god wrote, and what stays in
+ * tasks.json); the card works on the valid list. Without this map, an invalid option (an
+ * empty label, say) ahead of a valid one would shift every index after it.
+ */
+export function normalizeOptionsIndexed(raw: unknown): { options: HumanQAOption[]; rawIndex: number[] } | undefined {
   if (!Array.isArray(raw)) return undefined;
   const out: HumanQAOption[] = [];
-  for (const o of raw) {
+  const rawIndex: number[] = [];
+  for (let r = 0; r < raw.length; r++) {
+    const o: unknown = raw[r];
     if (out.length >= MAX_OPTIONS) break;
     // A bare string is accepted as a label (the god may write ["A", "B"]).
     const label = typeof o === 'string' ? o : (o && typeof o === 'object' ? (o as { label?: unknown }).label : undefined);
@@ -46,8 +58,9 @@ export function normalizeOptions(raw: unknown): HumanQAOption[] | undefined {
       label: label.trim().slice(0, MAX_LABEL),
       ...(typeof detail === 'string' && detail.trim() ? { detail: detail.trim().slice(0, MAX_DETAIL) } : {})
     });
+    rawIndex.push(r);
   }
-  return out.length ? out : undefined;
+  return out.length ? { options: out, rawIndex } : undefined;
 }
 
 /** Normalize one raw humanQA entry, or null when it has no string q. Unknown fields are
@@ -56,9 +69,12 @@ export function normalizeHumanQA(raw: unknown): HumanQAFields | null {
   if (!raw || typeof raw !== 'object') return null;
   const e = raw as Record<string, unknown>;
   if (typeof e.q !== 'string') return null;
-  const options = normalizeOptions(e.options);
-  const idx = (v: unknown): v is number => typeof v === 'number' && Number.isInteger(v) && !!options && v >= 0 && v < options.length;
-  const chosen = Array.isArray(e.chosen) ? [...new Set(e.chosen.filter(idx))] : [];
+  const indexed = normalizeOptionsIndexed(e.options);
+  const options = indexed?.options;
+  // Stored recommended/chosen are RAW positions: map each to its place in the valid list.
+  const toShown = (v: unknown): number => (typeof v === 'number' && Number.isInteger(v) && indexed ? indexed.rawIndex.indexOf(v) : -1);
+  const rec = toShown(e.recommended);
+  const chosen = Array.isArray(e.chosen) ? [...new Set(e.chosen.map(toShown).filter((i) => i >= 0))].sort((a, b) => a - b) : [];
   return {
     q: e.q,
     ...(typeof e.a === 'string' ? { a: e.a } : {}),
@@ -66,7 +82,7 @@ export function normalizeHumanQA(raw: unknown): HumanQAFields | null {
     ...(typeof e.answeredAt === 'string' ? { answeredAt: e.answeredAt } : {}),
     ...(typeof e.dismissedAt === 'string' ? { dismissedAt: e.dismissedAt } : {}),
     ...(options ? { options } : {}),
-    ...(idx(e.recommended) ? { recommended: e.recommended } : {}),
+    ...(rec >= 0 ? { recommended: rec } : {}),
     ...(options && e.multi === true ? { multi: true } : {}),
     ...(chosen.length ? { chosen } : {})
   };
@@ -156,8 +172,9 @@ export interface ComposedAnswer {
  * outside the entry's options are dropped.
  */
 export function recordAnswer<T extends HumanQAFields>(qa: T[], open: T, answer: ComposedAnswer, nowIso: string): T[] {
-  const opts = normalizeOptions(open.options) ?? [];
-  const chosen = [...new Set((answer.chosen ?? []).filter((i) => Number.isInteger(i) && i >= 0 && i < opts.length))];
+  // answer.chosen indexes the VALID list the card showed; the store keeps RAW positions.
+  const rawIndex = normalizeOptionsIndexed(open.options)?.rawIndex ?? [];
+  const chosen = [...new Set((answer.chosen ?? []).filter((i) => Number.isInteger(i) && i >= 0 && i < rawIndex.length).map((i) => rawIndex[i]))].sort((a, b) => a - b);
   return qa.map((e) =>
     e === open || (e.q === open.q && !e.a)
       ? { ...e, a: answer.text, answeredAt: nowIso, ...(chosen.length ? { chosen } : {}) }
@@ -166,14 +183,16 @@ export function recordAnswer<T extends HumanQAFields>(qa: T[], open: T, answer: 
 
 /** The ASK ME answer path, mail side: the inbox message the god gets. */
 export function answerMail(task: { id: string; title: string }, open: HumanQAFields, answer: ComposedAnswer): { subject: string; body: string } {
-  const opts = normalizeOptions(open.options) ?? [];
+  const indexed = normalizeOptionsIndexed(open.options);
+  const opts = indexed?.options ?? [];
   const chosen = (answer.chosen ?? []).filter((i) => Number.isInteger(i) && i >= 0 && i < opts.length);
   return {
     subject: `HUMAN ANSWER on task "${task.title}"`,
     body: [
       `The human answered the open question on task ${task.id} ("${task.title}"):`,
       `Q: ${open.q}`,
-      ...(chosen.length ? [`CHOSE: ${chosen.map((i) => `#${i} "${opts[i].label}"`).join(', ')}`] : []),
+      // #n is the option's position in the list as the god wrote it (the stored raw index).
+      ...(chosen.length ? [`CHOSE: ${chosen.map((i) => `#${indexed!.rawIndex[i]} "${opts[i].label}"`).join(', ')}`] : []),
       `A: ${answer.text}`,
       'The answer is also recorded in the card\'s humanQA. Act on it, unblock the card, and continue the work.'
     ].join('\n')

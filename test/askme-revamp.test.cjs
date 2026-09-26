@@ -93,7 +93,7 @@ test('normalizeHumanQA: legacy entries unchanged; options validated and capped; 
     q: 'pick', options: ['Plain', { label: '  Detailed ', detail: ' why ' }, { label: '' }, { nope: 1 }, 7, null],
     recommended: 1, multi: true, chosen: [1, 1, 5, -1, 'x', 0], junk: 'dropped'
   });
-  assert.deepEqual(e, { q: 'pick', options: [{ label: 'Plain' }, { label: 'Detailed', detail: 'why' }], recommended: 1, multi: true, chosen: [1, 0] });
+  assert.deepEqual(e, { q: 'pick', options: [{ label: 'Plain' }, { label: 'Detailed', detail: 'why' }], recommended: 1, multi: true, chosen: [0, 1] });
   assert.equal(hq.normalizeHumanQA({ q: 'x', options: [{ label: 'A' }], recommended: 3 }).recommended, undefined, 'out of range');
   assert.equal(hq.normalizeHumanQA({ q: 'x', multi: true }).multi, undefined, 'multi without options');
   assert.equal(hq.normalizeHumanQA({ q: 'x', options: Array.from({ length: 20 }, (_, i) => `o${i}`) }).options.length, hq.MAX_OPTIONS);
@@ -285,4 +285,25 @@ test('T2: an answer lands on the OPEN entry only, never on an earlier answered e
   const next = hq.recordAnswer([earlier, { ...open }], open, { text: 'new' }, 't');
   assert.deepEqual(next[0], earlier, 'the earlier answer is untouched');
   assert.equal(next[1].a, 'new', 'the re-parsed open copy (same q, unanswered) is answered');
+});
+
+test('chosen/recommended are RAW stored positions: an invalid option in the middle never shifts them (Jim edge, god follow-up)', () => {
+  // The god wrote four options; the second has an empty label, so the card shows three.
+  const raw = { q: 'Which?', options: [{ label: 'A' }, { label: '' }, { label: 'C' }, { label: 'D' }], recommended: 2 };
+  const shown = hq.normalizeHumanQA(raw);
+  assert.deepEqual(shown.options.map((o) => o.label), ['A', 'C', 'D']);
+  assert.equal(shown.recommended, 1, 'raw 2 (C) is shown at 1');
+  // The human picks C and D on the card (shown indexes 1 and 2).
+  const [stored] = hq.recordAnswer([raw], raw, { text: 'C; D', chosen: [2, 1] }, 'now');
+  assert.deepEqual(stored.chosen, [2, 3], 'stored as the RAW positions of C and D');
+  assert.deepEqual(stored.options, raw.options, 'the stored options are untouched');
+  assert.equal(stored.options[stored.chosen[0]].label, 'C');
+  assert.equal(stored.options[stored.chosen[1]].label, 'D');
+  // Read back, the card marks C and D again.
+  assert.deepEqual(hq.normalizeHumanQA(stored).chosen, [1, 2]);
+  // The mail names the raw positions with the right labels.
+  assert.match(hq.answerMail({ id: 't', title: 'x' }, raw, { text: 'C; D', chosen: [1, 2] }).body, /CHOSE: #2 "C", #3 "D"/);
+  // A stored index that points at the invalid option, or out of range, is dropped on read.
+  assert.equal(hq.normalizeHumanQA({ ...raw, chosen: [1, 9], recommended: 1 }).chosen, undefined);
+  assert.equal(hq.normalizeHumanQA({ ...raw, recommended: 1 }).recommended, undefined);
 });
