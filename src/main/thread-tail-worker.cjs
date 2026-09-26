@@ -6,10 +6,14 @@ const { existsSync, openSync, closeSync, readSync, readdirSync, statSync } = req
 const { join } = require('node:path');
 
 const CHUNK_BYTES = 64 * 1024;
+const ROLLOUT_RESCAN_MS = 5_000;
 let source = null;
 const cursors = new Map();
+let rolloutCache = { home: '', file: null, scannedAt: 0 };
 
 function newestRollout(codexHome) {
+  const now = Date.now();
+  if (rolloutCache.home === codexHome && rolloutCache.file && existsSync(rolloutCache.file) && now - rolloutCache.scannedAt < ROLLOUT_RESCAN_MS) return rolloutCache.file;
   const root = join(codexHome, 'sessions');
   if (!existsSync(root)) return null;
   const dirs = (dir) => { try { return readdirSync(dir, { withFileTypes: true }).filter((e) => e.isDirectory()).map((e) => e.name); } catch { return []; } };
@@ -23,7 +27,8 @@ function newestRollout(codexHome) {
       try { const info = statSync(file); if (!newest || info.mtimeMs > newest.mtimeMs) newest = { file, mtimeMs: info.mtimeMs }; } catch { /* writer rotated */ }
     }
   }
-  return newest && newest.file;
+  rolloutCache = { home: codexHome, file: newest && newest.file, scannedAt: now };
+  return rolloutCache.file;
 }
 
 function tailOnce() {
@@ -33,11 +38,11 @@ function tailOnce() {
   if (!file) return;
   let info; try { info = statSync(file); } catch { return; }
   const prior = cursors.get(file);
-  // A newly selected file begins at EOF: persisted Talk is the historical view;
-  // replaying an entire provider transcript after reader restart could re-admit
-  // an unrelated, matching Human line.
-  if (!prior) { cursors.clear(); cursors.set(file, { offset: info.size, remainder: '' }); return; }
-  const offset = info.size < prior.offset ? 0 : prior.offset;
+  // Start a newly selected rollout at its beginning. Receipt admission still
+  // filters history, while EOF would lose the first Human turn after respawn.
+  if (!prior) { cursors.clear(); cursors.set(file, { offset: 0, remainder: '' }); }
+  const current = cursors.get(file);
+  const offset = info.size < current.offset ? 0 : current.offset;
   const length = Math.min(CHUNK_BYTES, Math.max(0, info.size - offset));
   if (!length) return;
   const buffer = Buffer.allocUnsafe(length);

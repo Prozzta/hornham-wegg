@@ -108,6 +108,32 @@ test('THREAD-VIEW receipt admission is one-time and machine beats Human in its n
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
 
+test('THREAD-VIEW closes each provider admission latch on a non-Human turn', async () => {
+  const { store: module, dir } = loadThreadStore();
+  const store = new module.ThreadViewStore(path.join(dir, 'userData', 'threads'));
+  const rows = async () => (await store.list('michael')).map((row) => row.text);
+  const claude = (type, text) => JSON.stringify({ type, timestamp: Date.now(), message: { content: text } });
+  const codex = (type, text) => JSON.stringify({ type: 'event_msg', timestamp: new Date().toISOString(), payload: { type, message: text } });
+  try {
+    for (const [ingest, user, agent] of [
+      [(line) => store.ingestClaudeLine('michael', line), (text) => claude('user', text), (text) => claude('assistant', text)],
+      [(line) => store.ingestCodexLine('michael', line), (text) => codex('user_message', text), (text) => codex('agent_message', text)]
+    ]) {
+      const human = `Human-${Math.random()}`;
+      store.recordReceipt('michael', human, 'human-terminal');
+      await ingest(user(human)); await ingest(agent('REPLY-TO-HUMAN'));
+      await ingest(user('machine hive nudge')); await ingest(agent('REPLY-TO-HIVE-NUDGE'));
+      const humanAgain = `${human}-again`;
+      store.recordReceipt('michael', humanAgain, 'human-terminal');
+      await ingest(user(humanAgain)); await ingest(agent('REPLY-TO-HUMAN-AGAIN'));
+    }
+    const result = await rows();
+    assert.ok(result.includes('REPLY-TO-HUMAN'));
+    assert.ok(result.includes('REPLY-TO-HUMAN-AGAIN'));
+    assert.equal(result.includes('REPLY-TO-HIVE-NUDGE'), false, 'a nudge clears the previous Human admission for both providers');
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
 test('THREAD-VIEW starts queued Human UI TTL at COMMIT, not enqueue', () => {
   const { store, dir } = loadThreadStore();
   const originalNow = Date.now;

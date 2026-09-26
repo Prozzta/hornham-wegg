@@ -185,6 +185,7 @@ export class ThreadViewStore {
     if (!text) return;
     if (row?.type === 'user') {
       if (this.consumeHumanReceipt(agentId, text, Number(row?.timestamp) || Date.now())) this.admitted.add(agentId);
+      else this.admitted.delete(agentId); // machine/Hive turn ends the prior Human exchange
       return;
     }
     if (row?.type === 'assistant' && this.admitted.has(agentId)) await this.append(agentId, { speaker: 'agent', text, source: 'claude' });
@@ -198,6 +199,7 @@ export class ThreadViewStore {
     if (!text) return;
     if (kind === 'user_message') {
       if (this.consumeHumanReceipt(agentId, text, Date.parse(row?.timestamp) || Date.now())) this.admitted.add(agentId);
+      else this.admitted.delete(agentId); // machine/Hive turn ends the prior Human exchange
     } else if (kind === 'agent_message' && this.admitted.has(agentId)) {
       await this.append(agentId, { speaker: 'agent', text, source: 'codex' });
     }
@@ -234,6 +236,7 @@ export class ThreadViewStore {
     const dir = this.agentDir(agentId);
     await rm(dir, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });
     this.receipts.delete(agentId); this.terminalReceiptWindows.delete(agentId);
+    this.admitted.delete(agentId);
     await this.loadLayouts();
     if (this.layouts.delete(agentId)) await this.writeLayouts();
     await this.init();
@@ -260,6 +263,7 @@ export class ThreadViewStore {
       if (isRegistered(agentId)) continue;
       await rm(dir, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });
       this.receipts.delete(agentId); this.terminalReceiptWindows.delete(agentId);
+      this.admitted.delete(agentId);
       if (this.layouts.delete(agentId)) await this.writeLayouts();
       removed.push(agentId);
     }
