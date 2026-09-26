@@ -46,6 +46,7 @@ import {
   type TerminalAutomationBlock
 } from './terminalAutomation';
 import { sanitizeTerminalSelection } from './terminalSelection';
+import { composerRegionEndsWith } from './composerAttestation';
 import '@xterm/xterm/css/xterm.css';
 
 export interface TerminalEntry {
@@ -673,23 +674,11 @@ export function readScreenForNeedle(ptyId: string, needle: string, expectedTail?
       const line = buf.getLine(buf.baseY + y);
       if (line && line.translateToString(true).includes(needle)) screenCount += 1;
     }
-    // A wrapped prompt is several xterm rows. Rejoin only the current logical line,
-    // walking back while THIS row is a continuation; its suffix lets main distinguish
-    // its own unsent nudge from text a person placed on the composer.
-    const tailRows: string[] = [promptLine.translateToString(false)];
-    let y = buf.baseY + buf.cursorY;
-    while (y > buf.baseY && buf.getLine(y)?.isWrapped) {
-      y -= 1;
-      const previous = buf.getLine(y);
-      if (!previous) break;
-      tailRows.unshift(previous.translateToString(false));
-    }
-    const promptTail = tailRows.join('').trimEnd();
     return {
       onPromptRow: promptLine.translateToString(true).includes(needle),
       screenCount,
       ...(typeof expectedTail === 'string' && expectedTail.length > 0 && expectedTail.length <= 8192
-        ? { promptTailMatches: promptTail.endsWith(expectedTail.trimEnd()) }
+        ? { promptTailMatches: composerRegionEndsWith(buf, buf.baseY + buf.cursorY, expectedTail) }
         : {})
     };
   } catch {

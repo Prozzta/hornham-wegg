@@ -226,6 +226,19 @@ test('CODEX (2) a confirmed turn stays active until its Stop: UserPromptSubmit h
   assert.equal(roll.reqs.length, 1);
 });
 
+test('WAKE-155 C2: a genuine task_started between claim and async settle confirms the committed wake', async () => {
+  const probe = { current: { ok: true, latest: { kind: 'complete', turnId: '01a0dc65', at: T('06:27:56.300') } } };
+  const f = floor({ probe });
+  await dwightCommitted(f);
+  // claim is 06:28:19.902 and the owner settles at 06:28:20.594. Codex can start
+  // in that window; rollout may not observe it until the next reconcile.
+  probe.current = { ok: true, latest: { kind: 'started', turnId: 'n-between', at: T('06:28:20.100') } };
+  f.now = T('06:28:30.000');
+  f.bridge.reconcileAll(['dwight']);
+  assert.equal(f.coordinator.state('dwight').provisional, false);
+  assert.ok(f.diags.some((d) => d.stage === 'codex-rollout' && d.confirmed === true));
+});
+
 test('WAKE-155 CODEX: a previous task_complete that arrives after the claim is NOT a new turn start or a confirmation', async () => {
   const probe = { current: { ok: true, latest: { kind: 'complete', turnId: 'old-turn', at: T('06:27:56.300') } } };
   const f = floor({ probe });

@@ -522,11 +522,10 @@ export class WorkerWakeWatchdog {
   noteProviderTurnStarted(agentId: string | undefined, turnId: string, at: number): boolean {
     if (!agentId || !turnId || !Number.isFinite(at)) return false;
     const r = this.agents.get(agentId);
-    // The boundary must follow the COMMITTED epoch itself. A delayed row from before
-    // settle belongs to the task that caused the wake, even when it is timestamped after
-    // claim(). Failing closed costs one retry; accepting it loses the inbox indefinitely.
+    // claim() is the handoff boundary: a real task_started after it belongs to this
+    // wake even when rollout observes it before the async owner settle completes.
     if (!r || r.lifecycle !== 'active' || !r.provisional
-      || !(r.claimedAt > 0 && r.activeSince > 0 && at > r.activeSince)
+      || !(r.claimedAt > 0 && at >= r.claimedAt)
       || r.closedTurns.includes(turnId)) return false;
     r.openTurnId = turnId;
     this.turnStarted(r, at);
