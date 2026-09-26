@@ -170,6 +170,11 @@ export interface ComposedAnswer {
  * (`a`, `answeredAt`, and `chosen` when options were picked). The open entry is matched
  * by identity or, after a re-parse, by its text while still unanswered. Chosen indexes
  * outside the entry's options are dropped.
+ *
+ * CONTRACT (every host, ASK ME and Talk alike): pass the STORED entry (as parsed, e.g. via
+ * storedHumanQA) as \`open\` here and to answerMail; give ONLY the card the normalized entry
+ * (normalizeHumanQA). A normalized \`open\` makes the raw-position map the identity, so the
+ * card's shown indexes would be stored instead of the raw positions.
  */
 export function recordAnswer<T extends HumanQAFields>(qa: T[], open: T, answer: ComposedAnswer, nowIso: string): T[] {
   // answer.chosen indexes the VALID list the card showed; the store keeps RAW positions.
