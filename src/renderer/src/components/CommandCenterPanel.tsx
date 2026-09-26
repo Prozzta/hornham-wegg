@@ -13,6 +13,7 @@ import { TriggersTab } from './triggers/TriggersTab';
 import { TriggerHistoryTab } from './triggers/TriggerHistoryTab';
 import { WorkersTab } from './WorkersTab';
 import { ThreadTalkPanel } from './ThreadTalkPanel';
+import type { ThreadLayoutV1 } from '../../../preload';
 import { SkillsTab } from './SkillsTab';
 import { acquireTerminal, disposeTerminal, resetTerminal } from './terminalPool';
 import { terminalInstanceKey } from './terminalRecovery';
@@ -88,20 +89,32 @@ export function CommandCenterPanel({ agent, fullscreen = false }: { agent: Agent
   // Phase 1 decision: Michael opens on the readable Human conversation; other
   // agents keep their existing Terminal default in AgentDetailPanel.
   const [tab, setTab] = useState<CCTab>('talk');
+  const [threadLayout, setThreadLayout] = useState<ThreadLayoutV1 | null>(null);
   // The per-agent layout is private userData state, separate from Talk JSONL and
   // validated by main. It survives restart without joining roster/hive storage.
   useEffect(() => {
     let live = true;
     void window.cth.threadLayoutGet(agent.id, 'talk').then((layout) => {
-      if (live && layout) setTab(layout.preferredView);
+      if (live && layout) { setThreadLayout(layout); setTab(layout.preferredView); }
     }).catch(() => { /* default Talk remains safe */ });
     return () => { live = false; };
   }, [agent.id]);
   const selectTab = (next: CCTab) => {
     setTab(next);
     if (next === 'talk' || next === 'terminal') {
-      void window.cth.threadLayoutSet(agent.id, { preferredView: next, split: null, lastSelectedAt: Date.now() }, 'talk');
+      const candidate = { preferredView: next, split: threadLayout?.split ?? null, lastSelectedAt: Date.now() };
+      setThreadLayout((previous) => previous ? { ...previous, ...candidate } : null);
+      void window.cth.threadLayoutSet(agent.id, candidate, 'talk').then((saved) => { if (saved) setThreadLayout(saved); });
     }
+  };
+  const toggleThreadSplit = () => {
+    const split = threadLayout?.split
+      ? null
+      : { orientation: 'vertical' as const, talkDock: 'right' as const, ratio: 0.5 };
+    const preferredView: 'talk' | 'terminal' = tab === 'terminal' ? 'terminal' : 'talk';
+    const candidate = { preferredView, split, lastSelectedAt: Date.now() };
+    setThreadLayout((previous) => previous ? { ...previous, ...candidate } : null);
+    void window.cth.threadLayoutSet(agent.id, candidate, 'talk').then((saved) => { if (saved) setThreadLayout(saved); });
   };
   // The trigger-history ledger has nothing to say until an outside party can
   // reach us, so its tab appears only once an org key or a webhook exists. This
@@ -302,15 +315,22 @@ export function CommandCenterPanel({ agent, fullscreen = false }: { agent: Agent
             <Icon name={t.icon} /> {t.label}
           </button>
         ))}
+        {(tab === 'talk' || tab === 'terminal') && agent.ptyId && (
+          <button
+            onClick={toggleThreadSplit}
+            title={threadLayout?.split ? 'Return to a single Talk or Terminal pane' : 'Show Talk and Terminal side by side'}
+            style={{ padding: '4px 8px 3px', border: '1px solid var(--cth-ink-300)', cursor: 'pointer', background: 'var(--cth-cream-200)', color: 'var(--cth-ink-900)', fontFamily: 'var(--cth-font-ui)', fontSize: 13 }}
+          >{threadLayout?.split ? 'single pane' : 'split pane'}</button>
+        )}
       </div>
 
       {/* Body */}
-      <div style={{ flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column' }}>
-        {tab === 'terminal' && (
+      <div style={{ flex: 1, minHeight: 0, display: 'flex', flexDirection: threadLayout?.split && (tab === 'talk' || tab === 'terminal') ? threadLayout.split.orientation === 'vertical' ? 'row' : 'column' : 'column' }}>
+        {(tab === 'terminal' || (threadLayout?.split && tab === 'talk')) && (
           isFullscreenedHere ? (
             <Centered>Terminal is open in fullscreen. Press Esc to bring it back.</Centered>
           ) : agent.ptyId ? (
-            <>
+            <div style={{ flex: threadLayout?.split ? threadLayout.split.ratio : 1, minWidth: 0, minHeight: 0, display: 'flex', flexDirection: 'column' }}>
               <div style={{ flex: 1, minHeight: 0, display: 'flex' }}>
                 <PtyTerminalView
                   key={terminalInstanceKey(agent.ptyId, agent.terminalGeneration)}
@@ -330,12 +350,12 @@ export function CommandCenterPanel({ agent, fullscreen = false }: { agent: Agent
                 />
               </div>
               <MessageQueueComposer agent={agent} />
-            </>
+            </div>
           ) : (
             <Centered>Michael has no live terminal.</Centered>
           )
         )}
-        {tab === 'talk' && <ThreadTalkPanel agentId={agent.id} agentName={agent.name} />}
+        {(tab === 'talk' || (threadLayout?.split && tab === 'terminal')) && <div style={{ flex: threadLayout?.split ? 1 - threadLayout.split.ratio : 1, minWidth: 0, minHeight: 0, display: 'flex' }}><ThreadTalkPanel agentId={agent.id} agentName={agent.name} /></div>}
         {tab === 'floor' && <FloorTab seed={dispatchSeed} />}
         {tab === 'tasks' && <TasksKanban />}
         {tab === 'human' && <AskMeTab />}

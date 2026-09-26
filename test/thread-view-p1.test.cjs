@@ -40,6 +40,8 @@ test('Michael starts on Talk without terminal resize churn', () => {
   const talk = read('src/renderer/src/components/ThreadTalkPanel.tsx');
   assert.match(commandCenter, /useState<CCTab>\('talk'\)/);
   assert.match(commandCenter, /ThreadTalkPanel/);
+  assert.match(commandCenter, /toggleThreadSplit/);
+  assert.match(commandCenter, /threadLayout\?\.split/);
   assert.match(talk, /does not mount or[\s\S]*resize an xterm/);
   assert.match(talk, /onThreadEvent/);
   assert.doesNotMatch(talk, /setInterval\(load, 2000\)/, 'Talk must use normalized delta delivery, not history polling');
