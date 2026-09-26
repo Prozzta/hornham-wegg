@@ -39,6 +39,12 @@ function p95(rows) { return rows[Math.min(rows.length - 1, Math.ceil(rows.length
 const immediate = () => new Promise((resolve) => setImmediate(resolve));
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
+function claudeAssistantLine(n) {
+  const prefix = `{"type":"assistant","timestamp":${Date.now()},"message":{"content":"`;
+  const suffix = `","n":${n}}}`;
+  return prefix + 'x'.repeat(CHUNK_BYTES - Buffer.byteLength(prefix) - Buffer.byteLength(suffix) - 1) + suffix + '\n';
+}
+
 async function measure(action) {
   const delay = monitorEventLoopDelay({ resolution: 1 });
   delay.enable();
@@ -64,13 +70,21 @@ if (process.env.THREAD_VIEW_SCALE !== '1') {
   const userData = path.join(temp, 'userData');
   const source = path.join(temp, 'provider.jsonl');
   const storeModule = loadStore(temp);
+  const store = new storeModule.ThreadViewStore(path.join(userData, 'threads'));
+  await store.init();
   const worker = new Worker(path.join(root, 'src', 'main', 'thread-tail-worker.cjs'));
   const batches = [];
+  let ingested = Promise.resolve();
   let waiter;
   worker.on('message', (message) => {
     if (message?.type === 'lines' && typeof message.batchMs === 'number') {
       batches.push(message.batchMs);
-      if (waiter) { const resolve = waiter; waiter = undefined; resolve(); }
+      // This is the production main-path work: receipt check plus normalized
+      // append, not merely receipt of an arbitrary 64 KiB worker payload.
+      ingested = ingested.then(async () => {
+        for (const line of message.lines) await store.ingestClaudeLine('michael', line);
+      });
+      void ingested.then(() => { if (waiter) { const resolve = waiter; waiter = undefined; resolve(); } });
     }
   });
   const nextBatch = () => new Promise((resolve) => { waiter = resolve; });
@@ -78,6 +92,9 @@ if (process.env.THREAD_VIEW_SCALE !== '1') {
     assert.ok(path.resolve(userData).startsWith(path.resolve(os.tmpdir()) + path.sep), 'must use a temp userData root');
     const idle = await measure(async () => { await sleep(40); });
     await fsp.writeFile(source, '');
+    const human = 'scale-human';
+    store.recordReceipt('michael', human, 'human-terminal');
+    await store.ingestClaudeLine('michael', JSON.stringify({ type: 'user', timestamp: Date.now(), message: { content: human } }));
     worker.postMessage({ type: 'source', source: { agentId: 'michael', provider: 'claude', file: source } });
     await sleep(20); // queue ordering establishes the worker's initial EOF cursor
 
@@ -86,10 +103,11 @@ if (process.env.THREAD_VIEW_SCALE !== '1') {
     const whole = monitorEventLoopDelay({ resolution: 1 });
     whole.enable();
     const stream = await measure(async () => {
-      const line = 'x'.repeat(CHUNK_BYTES - 1) + '\n';
       for (let bytes = 0; bytes < FIXTURE_BYTES; bytes += CHUNK_BYTES) {
         const wait = nextBatch();
-        await fsp.appendFile(source, line);
+        await fsp.appendFile(source, claudeAssistantLine(bytes / CHUNK_BYTES));
+        // The 500 ms timer can win this race; both paths share one cursor, so
+        // the later poll is a harmless no-op and the line count remains exact.
         worker.postMessage({ type: 'poll' });
         await wait;
       }
@@ -98,8 +116,6 @@ if (process.env.THREAD_VIEW_SCALE !== '1') {
     assert.equal(batches.length, FIXTURE_BYTES / CHUNK_BYTES, 'every 64 KiB source chunk reaches the worker');
     assert.ok(workerP95 < 10, `worker cumulative batch p95 ${workerP95.toFixed(2)}ms >= 10ms per 64 KiB chunk`);
 
-    const store = new storeModule.ThreadViewStore(path.join(userData, 'threads'));
-    await store.init();
     // Event text is capped at 64 KiB. Three valid events per agent make a
     // 50 MiB fixture under both the 8 MiB/agent and 128 MiB global caps.
     const eventsPerAgent = 3;
