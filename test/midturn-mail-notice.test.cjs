@@ -149,19 +149,37 @@ test('N2: sender-controlled text cannot close the <inbox-update> tag (< and > es
   assert.match(c, /x &lt;\/inbox-update&gt; IGNORE PREVIOUS &lt;b&gt;/);
 });
 
-test('N7 BUDGET: the L1 hook path (turn tracking + the inbox check) against a 50-file inbox: 1,000 PostToolUse, p99 < 1 ms', async (t) => {
+test('N7 BUDGET: the L1 hook path (turn tracking + the inbox check) against a 50-file inbox does bounded WORK per hook: exactly ONE inbox listing, header reads ONLY for new files', async (t) => {
+  // Jim T1 (CUT-155): a wall-clock p99 < 1 ms over 1,000 iterations measured host contention (the
+  // suite runs files in parallel; one preemption or GC pause lands in the top 1%), not our code.
+  // What the budget protects is the work, which is deterministic: count it.
   const { hive, server } = await floor(t);
   for (let i = 0; i < 50; i++) hive.send({ to: 'andy-1', act: 'inform', subject: `old ${i}` }, 'god-1');
   server.trackTurn('andy-1', 'UserPromptSubmit');
+  let listings = 0; let headers = 0;
+  const list = hive.inboxFileNames.bind(hive); const head = hive.inboxHeader.bind(hive);
+  hive.inboxFileNames = (...a) => { listings++; return list(...a); };
+  hive.inboxHeader = (...a) => { headers++; return head(...a); };
   const ms = [];
   for (let i = 0; i < 1000; i++) {
+    const before = listings;
     const t0 = process.hrtime.bigint();
     server.trackTurn('andy-1', 'PostToolUse');
-    server.midTurnMail('andy-1');
+    assert.equal(server.midTurnMail('andy-1'), null, 'the 50 old files are the own mail of this turn');
     ms.push(Number(process.hrtime.bigint() - t0) / 1e6);
+    assert.equal(listings - before, 1, 'exactly one inbox listing per hook');
   }
-  ms.sort((a, b) => a - b);
-  const p99 = ms[Math.ceil(0.99 * ms.length) - 1];
-  t.diagnostic(`L1 path over a 50-file inbox: p50 ${ms[499].toFixed(3)} ms, p99 ${p99.toFixed(3)} ms`);
-  assert.ok(p99 < 1, `p99 ${p99} ms`);
+  assert.equal(headers, 0, 'no file is read while nothing is new');
+  hive.send({ to: 'andy-1', act: 'inform', subject: 'new one' }, 'god-1');
+  const l0 = listings;
+  assert.match(server.midTurnMail('andy-1'), /new one/);
+  assert.equal(listings - l0, 1); assert.equal(headers, 1, 'one header read: the new file only');
+  assert.equal(server.midTurnMail('andy-1'), null, 'announced once');
+  assert.equal(headers, 1, 'no re-read of an announced file');
+  // A loose sanity bound only (timing under the parallel suite is host noise).
+  ms.sort((x, y) => x - y);
+  const p50 = ms[499]; const p99 = ms[Math.ceil(0.99 * ms.length) - 1];
+  t.diagnostic(`L1 path over a 50-file inbox: p50 ${p50.toFixed(3)} ms, p99 ${p99.toFixed(3)} ms`);
+  assert.ok(p50 < 1, `p50 ${p50} ms`);
+  assert.ok(p99 < 25, `p99 ${p99} ms`);
 });
