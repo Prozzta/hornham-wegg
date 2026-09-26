@@ -199,6 +199,19 @@ test('config: AGY PostToolUse/PostInvocation are the one-way command; PreToolUse
       assert.equal(hooks[ev][0].matcher, undefined, ev);
       assert.equal(typeof hooks[ev][0].command, 'string', ev);
     }
+    // AGY's schema, over EVERY entry of EVERY event (one bad handler rejects the whole group):
+    // a tool event entry is {matcher, hooks:[handler...]}; a flat event entry IS a handler; every
+    // handler has type command and a non-empty string command.
+    const TOOL_EVENTS = new Set(['PreToolUse', 'PostToolUse']);
+    const isHandler = (h) => h && h.type === 'command' && typeof h.command === 'string' && h.command.length > 0 && h.hooks === undefined;
+    assert.deepEqual(Object.keys(hooks).sort(), ['PostInvocation', 'PostToolUse', 'PreInvocation', 'PreToolUse', 'Stop']);
+    for (const [ev, entries] of Object.entries(hooks)) {
+      assert.ok(Array.isArray(entries) && entries.length > 0, ev);
+      for (const e of entries) {
+        if (TOOL_EVENTS.has(ev)) { assert.equal(typeof e.matcher, 'string', ev); assert.ok(Array.isArray(e.hooks) && e.hooks.length > 0 && e.hooks.every(isHandler), ev); }
+        else assert.ok(isHandler(e), `${ev}: a flat handler with a command`);
+      }
+    }
     const handlerOf = (ev) => (hooks[ev][0].hooks ? hooks[ev][0].hooks[0] : hooks[ev][0]);
     const cmdOf = (ev) => handlerOf(ev).command;
     assert.match(cmdOf('PostToolUse'), /agy-oneway\.cmd agy PostToolUse$/);
