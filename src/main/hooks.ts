@@ -16,6 +16,7 @@ import { randomBytes, timingSafeEqual } from 'node:crypto';
 import { existsSync, rmSync } from 'node:fs';
 import { Notification, type WebContents } from 'electron';
 import type { HiveManager } from './hive';
+import { classifyHeavy, commandFromToolInput, isBackground, type HeavyJobLock } from './heavyJob';
 import { modelForHiveSpawn, type HarnessConfig } from './config';
 import type { ControlRegistry } from './control';
 import type { CircuitBreaker } from './breaker';
@@ -747,6 +748,18 @@ export class HookServer {
     return `<inbox-update>\n${fresh.length} new message(s) arrived in your inbox during this turn:\n${lines.join('\n')}\nRead them before you send or finish: one may change or cancel what you are doing.\n</inbox-update>`;
   }
 
+  /** HEAVY-JOB-SERIALIZE: the app-held heavy-job lock (main wires it; null in tests = no lock). */
+  private heavyLock: HeavyJobLock | null = null;
+  setHeavyLock(lock: HeavyJobLock | null): void { this.heavyLock = lock; }
+
+  /** The id that pairs a heavy call's PreToolUse with its PostToolUse: the provider's tool-use
+   *  id when it sends one, else the command itself (identical in both hooks). */
+  private static heavyCallId(p: HookPayload): string {
+    const id = (p as { tool_use_id?: unknown }).tool_use_id;
+    if (typeof id === 'string' && id) return `id:${id}`;
+    return `cmd:${(commandFromToolInput(p.tool_input) ?? '').slice(0, 500)}`;
+  }
+
   private handle(p: HookPayload): unknown {
     const agentId = p.agent_id ?? undefined;
     const event = p.hook_event_name ?? 'Unknown';
@@ -946,6 +959,37 @@ export class HookServer {
           }
         };
       }
+    }
+
+    // HEAVY-JOB-SERIALIZE (AFTER every other PreToolUse deny above: a call the HITL gate refuses
+    // never runs, so it must never take a slot; Jim MF1a): a heavy command (install / build / full
+    // suite / bench) takes one of the
+    // machine's heavy-job slots, or is DENIED naming the holders. Every provider reaches this deny
+    // (Claude http, Codex mcp, the AGY shim's deny translation). A subagent's call counts as its
+    // agent's. Settings "Heavy jobs at once" = Off makes this do nothing.
+    if (event === 'PreToolUse' && agentId && this.heavyLock) {
+      // Jim N1: a DEGRADED Codex hook (rebuilt from the rollout tail) may carry no tool input:
+      // it cannot be classified, so it is allowed and logged.
+      if (p.payload_degraded === true && commandFromToolInput(p.tool_input) === null) {
+        try { this.hive.appendLog({ kind: 'heavy-lock', action: 'degraded', agentId, tool: p.tool_name ?? null }); } catch { /* best effort */ }
+      }
+      const cls = classifyHeavy(p.tool_name, p.tool_input);
+      if (cls.heavy) {
+        // A call whose PostToolUse may not pair back (Codex's mcp hooks can arrive degraded) is
+        // freed like a background one: by the process check, PTY exit or the TTL (Jim N1).
+        const unpaired = p.transport === 'mcp' || p.payload_degraded === true;
+        const d = this.heavyLock.acquire(agentId, cls, commandFromToolInput(p.tool_input) ?? '', HookServer.heavyCallId(p), isBackground(p.tool_input) || unpaired);
+        if (!d.allow) {
+          this.emitControl(agentId, p.tool_name, d.reason);
+          this.emit(agentId, event, p);
+          return { hookSpecificOutput: { hookEventName: 'PreToolUse', permissionDecision: 'deny', permissionDecisionReason: d.reason } };
+        }
+      }
+    }
+    // A heavy FOREGROUND call returned, succeeded or FAILED (a suite exiting 1 fires PostToolUseFailure):
+    // its job is done (a backgrounded one, or a missed Post, is left to the watcher).
+    if ((event === 'PostToolUse' || event === 'PostToolUseFailure') && agentId && this.heavyLock && classifyHeavy(p.tool_name, p.tool_input).heavy) {
+      this.heavyLock.callDone(agentId, HookServer.heavyCallId(p));
     }
 
     // 7C.2 — mid-run steering: inject queued operator guidance as context on the

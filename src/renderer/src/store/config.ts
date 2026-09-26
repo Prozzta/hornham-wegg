@@ -65,6 +65,8 @@ export interface HarnessConfig {
   /** May the orchestrator ("Michael") spin up agents on its own? Default FALSE,
    *  so an absent value reads as off. Mirrors src/main/config.ts. */
   orchestratorMaySpawn?: boolean;
+  /** HEAVY-JOB-SERIALIZE: heavy jobs (installs, builds, full suites, benches) at once; 'off' = no limit. Default 1. */
+  heavyJobsAtOnce?: number | 'off';
   defaultCommand: string;
   /** Default model for newly spawned agents (e.g. 'claude-sonnet-4-6[1m]'); unset = CLI default. */
   defaultModel?: string;

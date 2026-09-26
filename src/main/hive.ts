@@ -1466,6 +1466,10 @@ export class HiveManager {
         SubagentStop: [hook()],
         PreToolUse: [hook('*')],
         PostToolUse: [hook('*')],
+        // HEAVY-JOB-SERIALIZE (Jim MF1): a FAILED tool call (e.g. a test suite exiting 1) fires
+        // PostToolUseFailure, not PostToolUse; without it a heavy job's slot would never be freed
+        // by its own call. (Claude Code 2.1.283 has this event.)
+        PostToolUseFailure: [hook('*')],
         UserPromptSubmit: [hook()],
         Notification: [hook()],
         SessionStart: [entry()],

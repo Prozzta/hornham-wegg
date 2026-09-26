@@ -45,6 +45,7 @@ import {
 import { HiveManager, type AgentMeta, type HiveMessage, type HiveTask } from './hive';
 import { ThreadViewStore, threadRoot } from './threadView';
 import { HookServer } from './hooks';
+import { HeavyJobLock, heavyLimit, probeProcesses } from './heavyJob';
 import { CapacityRuntime } from './capacityRuntime';
 import { CapacityStore, capacityStorePath } from './capacityPersistence';
 import type { CapacityNotifyIntent } from './capacityNotify';
@@ -711,6 +712,16 @@ const hookServer = new HookServer(
     liveWebContents()?.send('hive:providerStatus', { agentId, status: tick.lifecycle });
   }
 );
+// HEAVY-JOB-SERIALIZE: the machine's heavy-job slots (Settings "Heavy jobs at once", read live).
+// PreToolUse takes or denies a slot; a background job's slot is freed by a hidden process check
+// that runs ONLY while a slot is held; PTY exit and a TTL free the rest. Holders go to fleet.json.
+const heavyLock = new HeavyJobLock({
+  limit: () => heavyLimit(readConfig().heavyJobsAtOnce),
+  roots: () => ptyManager.list().flatMap((s) => { const a = ptyToAgent.get(s.id); return a && s.pid > 0 ? [{ agentId: a, pid: s.pid }] : []; }),
+  probe: probeProcesses,
+  log: (row) => { try { hive.appendLog(row); } catch { /* best effort */ } }
+});
+hookServer.setHeavyLock(heavyLock);
 // HOOK-BROKER: Claude agents POST their hooks to the HookServer in-process (0 processes per
 // hook). The hive asks for a per-spawn URL; with the broker not listening it gets null and
 // writes the command hooks exactly as before.
@@ -904,6 +915,8 @@ function teardownPty(id: string): void {
     try { workerWake.forget(agentId, id); } catch { /* best-effort */ }
     try { forgetWakeRows(wakeRows, agentId); } catch { /* best-effort */ }
     try { nativeMemory.agentExited(agentId); } catch { /* best-effort */ }
+    // HEAVY-JOB-SERIALIZE: its jobs went with the PTY (unless another PTY of it is still alive).
+    if (![...ptyToAgent.values()].includes(agentId)) { try { heavyLock.agentGone(agentId); } catch { /* best-effort */ } }
     // Drop breaker state so a dead agent can't leak/zombie a tripped level.
     try { breaker.forget(agentId); } catch { /* best-effort */ }
     // W1 — kill this agent's proxy-bridge sidecar (qwen), if any, so a dead
@@ -1941,7 +1954,8 @@ function writeFleetSnapshot(): void {
           wake: wakeTelemetry.forAgent(id)
         };
       });
-    hive.writeFleetSnapshot({ ts: now, agents, wake: wakeTelemetry.snapshot(now) });
+    // HEAVY-JOB-SERIALIZE: who holds the heavy-job slots (god reads fleet.json every standup).
+    hive.writeFleetSnapshot({ ts: now, agents, wake: wakeTelemetry.snapshot(now), heavyLock: { limit: heavyLimit(readConfig().heavyJobsAtOnce), holders: heavyLock.snapshot() } });
   } catch (e) {
     console.error('[fleet] snapshot failed:', e);
   }
