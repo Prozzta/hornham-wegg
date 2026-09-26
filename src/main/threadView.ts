@@ -49,6 +49,7 @@ const SEGMENT_BYTES = 1 * 1024 * 1024;
 export const PER_AGENT_CAP = 8 * 1024 * 1024;
 export const GLOBAL_CAP = 128 * 1024 * 1024;
 const MAX_EVENT_TEXT_BYTES = 64 * 1024;
+const LIST_PAGE_BYTES = 128 * 1024;
 export const RECEIPT_TTL_MS = 2 * 60_000;
 export const TERMINAL_RECEIPT_WINDOW_MS = 10_000;
 export const RECEIPT_LIMIT = 200;
@@ -223,11 +224,26 @@ export class ThreadViewStore {
 
   async list(agentId: string, limit = 500): Promise<ThreadEvent[]> {
     const dir = this.agentDir(agentId);
-    const names = (await readdir(dir).catch(() => [] as string[])).filter((n) => n.endsWith('.jsonl')).sort();
+    const names = (await readdir(dir).catch(() => [] as string[])).filter((n) => n.endsWith('.jsonl')).sort().reverse();
     const rows: ThreadEvent[] = [];
     for (const name of names) {
-      const raw = await readFile(join(dir, name), 'utf8').catch(() => '');
-      for (const line of raw.split('\n')) { if (!line) continue; try { rows.push(JSON.parse(line) as ThreadEvent); } catch { /* torn line: retry on next read */ } }
+      if (rows.length >= limit) break;
+      const file = join(dir, name);
+      const info = await stat(file).catch(() => undefined);
+      if (!info) continue;
+      // Main never parses an agent's whole 8 MiB projection. A page exceeds
+      // the 64 KiB event payload cap, so the final complete line is intact.
+      const start = Math.max(0, info.size - LIST_PAGE_BYTES);
+      const bytes = Buffer.alloc(info.size - start);
+      const handle = await open(file, 'r').catch(() => undefined);
+      if (!handle) continue;
+      try { await handle.read(bytes, 0, bytes.length, start); } finally { await handle.close(); }
+      const lines = bytes.toString('utf8').split('\n');
+      if (start) lines.shift(); // page begins partway through an older line
+      for (let i = lines.length - 1; i >= 0 && rows.length < limit; i -= 1) {
+        if (!lines[i]) continue;
+        try { rows.push(JSON.parse(lines[i]) as ThreadEvent); } catch { /* torn line: retry on next read */ }
+      }
     }
     return rows.sort((a, b) => a.at - b.at).slice(-Math.max(1, Math.min(limit, 1000)));
   }

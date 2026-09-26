@@ -24,6 +24,10 @@ test('THREAD-VIEW keeps private history outside hive and bounds it', () => {
   assert.match(source, /GLOBAL_CAP = 128 \* 1024 \* 1024/);
   assert.match(source, /resolve\(userData, 'threads'\)/);
   assert.doesNotMatch(source, /harnessHome|agents\/.*thread/);
+  const list = source.slice(source.indexOf('async list('), source.indexOf('async archive('));
+  assert.match(list, /LIST_PAGE_BYTES/);
+  assert.match(list, /await handle\.read\(/);
+  assert.doesNotMatch(list, /readFile\(/, 'initial Talk history must not parse the whole projection on main');
 });
 
 test('THREAD-VIEW admits a one-time Human receipt and blocks machine interference', () => {
