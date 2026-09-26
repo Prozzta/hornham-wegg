@@ -2273,23 +2273,23 @@ export class HiveManager {
       matcher: '*',
       hooks: [{ type: 'command', command: this.nodeRunUnquoted(shim, event), timeout: 0 }]
     });
-    const plain = (event: string) => ({
-      hooks: [{ type: 'command', command: this.nodeRunUnquoted(shim, event), timeout: 0 }]
-    });
+    // Y2 (Jim, live): AGY's hooks.md defines PreInvocation/PostInvocation/Stop as FLAT lists of
+    // handler objects; only the tool events are grouped (`matcher` + `hooks`). A wrapped entry on
+    // a flat event fails the parse ("command hook must specify 'command'") and AGY drops the WHOLE
+    // group, tool events included: no hive hook ever fired for AGY agents before this.
+    const plain = (event: string) => ({ type: 'command', command: this.nodeRunUnquoted(shim, event), timeout: 0 });
     // HOOK-BROKER P4: the observational events go one-way (cheap); the ones that must be able to
     // answer (a PreToolUse deny, a PreInvocation steer, a Stop block) keep the shim. A steer is
     // never taken by a one-way hook (P4 audit Y1); AGY's documented injection point is
     // PreInvocation (`injectSteps`), which fires before every model call.
     const oneway = this.writeAgyOneway();
-    const cheap = (event: string, matcher?: string) => ({
-      ...(matcher ? { matcher } : {}),
-      hooks: [{ type: 'command', command: `${oneway} agy ${event}`, timeout: 0 }]
-    });
+    const cheapHandler = (event: string) => ({ type: 'command', command: `${oneway} agy ${event}`, timeout: 0 });
+    const cheapTool = (event: string) => ({ matcher: '*', hooks: [cheapHandler(event)] });
     const group = {
       PreToolUse: [tool('PreToolUse')],
-      PostToolUse: [oneway ? cheap('PostToolUse', '*') : tool('PostToolUse')],
+      PostToolUse: [oneway ? cheapTool('PostToolUse') : tool('PostToolUse')],
       PreInvocation: [plain('PreInvocation')],
-      PostInvocation: [oneway ? cheap('PostInvocation') : plain('PostInvocation')],
+      PostInvocation: [oneway ? cheapHandler('PostInvocation') : plain('PostInvocation')],
       Stop: [plain('Stop')]
     };
     const gem = join(homedir(), '.gemini');

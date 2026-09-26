@@ -191,12 +191,21 @@ test('config: AGY PostToolUse/PostInvocation are the one-way command; PreToolUse
     await hive.ensureAgent({ id: 'a1', name: 'A', provider: 'claude', cwd: home });
     hive.installAgyHooks();
     const hooks = JSON.parse(fs.readFileSync(path.join(home, '.gemini', 'config', 'hooks.json'), 'utf8'))['munder-hive'];
-    const cmdOf = (ev) => hooks[ev][0].hooks[0].command;
+    // Y2: AGY's hooks.md shapes. Tool events are grouped (matcher + hooks); the rest are FLAT
+    // handler objects. A wrapped flat event makes AGY reject the WHOLE group (proven live, 1.2.11).
+    for (const ev of ['PreToolUse', 'PostToolUse']) { assert.equal(hooks[ev][0].matcher, '*', ev); assert.equal(hooks[ev][0].hooks.length, 1, ev); }
+    for (const ev of ['PreInvocation', 'PostInvocation', 'Stop']) {
+      assert.equal(hooks[ev][0].hooks, undefined, `${ev} must be FLAT, not wrapped`);
+      assert.equal(hooks[ev][0].matcher, undefined, ev);
+      assert.equal(typeof hooks[ev][0].command, 'string', ev);
+    }
+    const handlerOf = (ev) => (hooks[ev][0].hooks ? hooks[ev][0].hooks[0] : hooks[ev][0]);
+    const cmdOf = (ev) => handlerOf(ev).command;
     assert.match(cmdOf('PostToolUse'), /agy-oneway\.cmd agy PostToolUse$/);
     assert.match(cmdOf('PostInvocation'), /agy-oneway\.cmd agy PostInvocation$/);
     // Y1: PreInvocation carries AGY's steer, so it must be able to answer.
     for (const ev of ['PreToolUse', 'PreInvocation', 'Stop']) assert.match(cmdOf(ev), /agy-hook\.cjs/, ev);
-    for (const ev of Object.keys(hooks)) { assert.equal(hooks[ev][0].hooks[0].type, 'command'); assert.doesNotMatch(cmdOf(ev), /["']/, 'AGY passes quotes literally'); }
+    for (const ev of Object.keys(hooks)) { assert.equal(handlerOf(ev).type, 'command'); assert.doesNotMatch(cmdOf(ev), /["']/, 'AGY passes quotes literally'); }
     const bat = fs.readFileSync(path.join(home, 'hive', 'bin', 'agy-oneway.cmd'), 'utf8');
     assert.match(bat, /\(\(echo %1 %2 %AGENT_ID%& findstr \/v \/c:@@m@@\) > \\\\\.\\pipe\\munder-difflin-[0-9a-f]+\) 2>nul/);
   } finally { process.env.HOME = JAIL; process.env.USERPROFILE = JAIL; }
