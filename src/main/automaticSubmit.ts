@@ -382,7 +382,13 @@ export type ProvenanceEligibility = { eligible: true } | { eligible: false; reas
 
 /** What the rendered screen says about our staged text. The ONLY erase oracle
  *  (section 5.1): the prompt row at `baseY + cursorY`, and the whole screen. */
-export interface ScreenReading { onPromptRow: boolean; screenCount: number }
+export interface ScreenReading {
+  onPromptRow: boolean;
+  screenCount: number;
+  /** When requested, the renderer proved that the current logical composer ends in the
+   * exact automatic text. It is not a generic "needle seen" answer. */
+  promptTailMatches?: boolean;
+}
 
 /** The claim capacity is re-asked under. Mirrors `capacityRuntime.DeliveryClaim`. */
 export interface OwnerClaim {
@@ -417,7 +423,7 @@ export interface OwnerDeps {
   lastHumanInputAt: (ptyId: string) => number | undefined;
   abortCapability: (agentId: string) => AbortCapability;
   /** Read the rendered screen for `needle`. Resolves null when nothing can answer. */
-  readScreen: (ptyId: string, needle: string) => Promise<ScreenReading | null>;
+  readScreen: (ptyId: string, needle: string, expectedTail?: string) => Promise<ScreenReading | null>;
   capacity: {
     admit: (agentId: string, workClass: WorkClass) => AdmissionDecision;
     /** Admission's own question re-asked NOW for this claim, tri-state intact. A
@@ -704,6 +710,10 @@ export class AutomaticSubmitOwner {
   private readonly inhibited = new Map<string, HeldInterference>();
   /** PRIOR TEXT: consecutive unreadable checks per PTY (see PRIOR_TEXT_UNREADABLE_MAX). */
   private readonly priorUnreadable = new Map<string, { count: number; since: number }>();
+  /** The last text this owner staged and Entered on each live PTY. A later retry may press
+   * Enter again only when the renderer proves that exact text still occupies the composer
+   * AND no human generation advanced since we staged it. */
+  private readonly ownDrafts = new Map<string, { text: string; humanStage: number; incarnation: unknown }>();
 
   constructor(private readonly deps: OwnerDeps) {}
 
@@ -888,7 +898,7 @@ export class AutomaticSubmitOwner {
       const needles = priorTextNeedles(req.priorText);
       if (needles.length === 0) return this.refuse(decision, 'PRIOR_TEXT_UNVERIFIED', 'no usable needle');
       for (const needle of needles) {
-        const seen = await this.readScreen(ptyId, needle);
+        const seen = await this.readScreen(ptyId, needle, req.priorText);
         if (!seen) {
           const now = deps.now();
           const u = this.priorUnreadable.get(ptyId) ?? { count: 0, since: now };
@@ -902,6 +912,17 @@ export class AutomaticSubmitOwner {
         }
         this.priorUnreadable.delete(ptyId);
         if (seen.onPromptRow) {
+          const own = this.ownDrafts.get(ptyId);
+          // WAKE-SELF-TEXT-HOLD: our previous Enter may have reached the PTY while the
+          // provider left the line unsent. This is safe to re-enter only with all three
+          // proofs: the renderer's whole composer tail matches our exact text, the owner
+          // remembers staging that text in this incarnation, and no human key arrived.
+          if (seen.promptTailMatches === true && own?.text === req.priorText
+            && own.incarnation === incarnation && own.humanStage === deps.humanGeneration(ptyId)) {
+            const retried = this.reenterOwnDraft(req, ptyId, incarnation, decision, own.humanStage);
+            if (retried.kind === 'COMMITTED') this.ownDrafts.delete(ptyId);
+            return retried;
+          }
           return this.interfere({ req, ptyId, incarnation, decision, humanStage: deps.humanGeneration(ptyId) ?? 0 }, 'PRIOR_TEXT_ON_PROMPT', undefined);
         }
       }
@@ -948,7 +969,10 @@ export class AutomaticSubmitOwner {
     const verdict = await Promise.resolve(commitSection(staged, deps));
     switch (verdict.kind) {
       case 'ENTERED':
-        if (verdict.ok) return { kind: 'COMMITTED' };
+        if (verdict.ok) {
+          this.ownDrafts.set(ptyId, { text: req.text, humanStage: staged.humanStage, incarnation: staged.incarnation });
+          return { kind: 'COMMITTED' };
+        }
         // The Enter did not go out and our text is still on a live prompt: residue we
         // cannot account for. Held, not retried (the grant was HELD in-section).
         return this.interfere(staged, 'ENTER_WRITE_FAILED', verdict.error);
@@ -978,13 +1002,38 @@ export class AutomaticSubmitOwner {
     return detail === undefined ? { kind: 'INTERFERED', reason } : { kind: 'INTERFERED', reason, detail };
   }
 
-  private readScreen(ptyId: string, needle: string): Promise<ScreenReading | null> {
+  /** Re-press Enter on a composer that is positively our untouched prior write. This is
+   * deliberately not STAGE: typing a second nudge would fuse it with the first. */
+  private reenterOwnDraft(req: SubmitRequest, ptyId: string, incarnation: unknown, decision: AdmissionDecision | null, humanStage: number): SubmitOutcome {
+    const deps = this.deps;
+    // The original COMMITTED already owns this message's capacity grant. The retry has
+    // no new work to admit; release its speculative grant before handing the one extra
+    // Enter to the SAME non-yielding critical section as every other automatic Enter.
+    if (decision) deps.capacity.cancelGrant(decision);
+    const staged: Staged = { req, ptyId, incarnation, decision: null, humanStage };
+    const verdict = commitSection(staged, deps);
+    switch (verdict.kind) {
+      case 'ENTERED':
+        return verdict.ok ? { kind: 'COMMITTED' }
+          : this.interfere(staged, 'ENTER_WRITE_FAILED', verdict.error);
+      case 'FAILED':
+        return { kind: 'FAILED', reason: verdict.reason };
+      case 'INTERFERED':
+        return this.interfere(staged, verdict.reason, verdict.detail);
+      case 'LATE_REFUSAL':
+        // No decision reaches this path, so a late admission result is impossible.
+        return this.interfere(staged, 'PROVENANCE_LOST_AFTER_STAGE', verdict.basis);
+    }
+  }
+
+  private readScreen(ptyId: string, needle: string, expectedTail?: string): Promise<ScreenReading | null> {
     return new Promise((resolve) => {
       let done = false;
       const finish = (v: ScreenReading | null) => { if (!done) { done = true; resolve(v); } };
       this.deps.setTimer(() => finish(null), SCREEN_ORACLE_TIMEOUT_MS);
-      this.deps.readScreen(ptyId, needle).then(
-        (v) => finish(v && typeof v.onPromptRow === 'boolean' && typeof v.screenCount === 'number' ? v : null),
+      this.deps.readScreen(ptyId, needle, expectedTail).then(
+        (v) => finish(v && typeof v.onPromptRow === 'boolean' && typeof v.screenCount === 'number'
+          && (v.promptTailMatches === undefined || typeof v.promptTailMatches === 'boolean') ? v : null),
         () => finish(null)
       );
     });

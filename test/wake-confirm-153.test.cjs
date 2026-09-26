@@ -226,6 +226,39 @@ test('CODEX (2) a confirmed turn stays active until its Stop: UserPromptSubmit h
   assert.equal(roll.reqs.length, 1);
 });
 
+test('WAKE-155 CODEX: a previous task_complete that arrives after the claim is NOT a new turn start or a confirmation', async () => {
+  const probe = { current: { ok: true, latest: { kind: 'complete', turnId: 'old-turn', at: T('06:27:56.300') } } };
+  const f = floor({ probe });
+  await dwightCommitted(f);
+  // This is the field failure: a late read of the PREVIOUS turn's task_complete has a
+  // timestamp after claim(), but it is still a completion, not evidence that our Enter
+  // opened a turn. 1.1.53 treated any boundary as task_started and stranded the agent.
+  probe.current = { ok: true, latest: { kind: 'complete', turnId: 'old-turn', at: T('06:28:20.100') } };
+  f.now = T('06:28:30');
+  f.bridge.reconcileAll(['dwight']);
+  assert.equal(f.coordinator.state('dwight').provisional, true, 'only a NEW task_started after the submit can confirm');
+  assert.ok(!f.diags.some((d) => d.stage === 'codex-rollout' && d.confirmed === true), 'the old completion is never logged as a confirmation');
+});
+
+test('WAKE-155 CODEX: a legacy false-confirmed active epoch is made provisional and re-pended once', async () => {
+  const probe = { current: { ok: true, latest: { kind: 'complete', turnId: 'old-turn', at: T('06:28:20.100') } } };
+  const f = floor({ probe });
+  await dwightCommitted(f);
+  // Model the persisted in-memory state made by the 1.1.53 bug: task_complete was treated
+  // as a start, so the epoch became active/non-provisional even though the completion is
+  // older than the submit epoch. The detector must make the existing bounded retry path run.
+  const legacy = f.coordinator.agents.get('dwight');
+  legacy.provisional = false;
+  legacy.turnStartAt = probe.current.latest.at;
+  legacy.openTurnId = null;
+  f.now = T('06:28:20.594') + SUBMIT_CONFIRM_MS;
+  f.bridge.reconcileAll(['dwight']);
+  assert.equal(f.coordinator.state('dwight').lifecycle, 'unknown');
+  assert.ok(f.diags.some((d) => d.stage === 'submit-unconfirmed' && d.ids === 1), 'the old claim is re-pended once');
+  assert.equal(f.reqs.length, 2, 'the bridge immediately makes the one permitted :again claim');
+  assert.ok(f.diags.some((d) => d.stage === 'codex-stuck-active' && d.recovered === true));
+});
+
 test('CODEX (2) a provider with no turn-start signal keeps "COMMITTED is active until Stop" (never provisional)', async () => {
   const f = floor({ confirms: false });
   await dwightCommitted(f);
@@ -268,11 +301,12 @@ function world(over = {}) {
     promptBlock: () => null,
     lastHumanInputAt: () => undefined,
     abortCapability: () => ({ kind: 'VERIFIED', clearControl: '\x15', settleMs: 300 }),
-    readScreen: (ptyId, needle) => {
+    readScreen: over.readScreen ?? ((ptyId, needle, expectedTail) => {
       if (w.screen === 'silent') return new Promise(() => {});
       const row = w.promptRow ? w.promptRow(w.prompt) : w.prompt;
-      return Promise.resolve({ onPromptRow: row.includes(needle), screenCount: [...w.scrollback, w.prompt].filter((r) => r.includes(needle)).length });
-    },
+      return Promise.resolve({ onPromptRow: row.includes(needle), screenCount: [...w.scrollback, w.prompt].filter((r) => r.includes(needle)).length,
+        ...(expectedTail ? { promptTailMatches: w.prompt.endsWith(expectedTail) } : {}) });
+    }),
     capacity: {
       admit: (agentId, workClass) => ({ verdict: 'ALLOW', reason: ADMISSION_REASON.AVAILABLE, poolKey: 'pool', state: null, workClass, limitEpochAt: null, grantId: null }),
       revalidate: () => ({ verdict: 'ALLOW', reason: ADMISSION_REASON.AVAILABLE }),
@@ -307,6 +341,23 @@ test('OWNER (2) the unsent nudge still on the prompt: INTERFERED PRIOR_TEXT_ON_P
   assert.deepEqual(await run(w, o.submit(sub())), { kind: 'INTERFERED', reason: 'PRIOR_TEXT_ON_PROMPT' });
   assert.deepEqual(w.writes, [], 'not a byte');
   assert.ok(o.inhibition('pty-dwight'), 'held for a person');
+});
+
+test('WAKE-155 OWNER: a matching, untouched automatic draft is our own unsent prompt, so retry presses Enter once instead of holding it', async () => {
+  const w = world({
+    prompt: '',
+    readScreen: () => Promise.resolve({ onPromptRow: true, screenCount: 1, promptTailMatches: true })
+  });
+  const o = new OWN.AutomaticSubmitOwner(w.deps);
+  // Record that this exact automatic text was staged by this owner. The first Enter was
+  // accepted by the PTY but the TUI left the text in its composer (the observed Claude case).
+  assert.deepEqual(await run(w, o.submit(sub({ requestId: 'first', text: PRIOR, priorText: undefined }))), { kind: 'COMMITTED' });
+  w.prompt = PRIOR;
+  w.scrollback.length = 0;
+  w.writes.length = 0;
+  assert.deepEqual(await run(w, o.submit(sub({ requestId: 'retry' }))), { kind: 'COMMITTED' });
+  assert.deepEqual(w.writes, ['\r'], 'no duplicate prompt: re-press only Enter on the proven self draft');
+  assert.equal(o.inhibition('pty-dwight'), null, 'self recovery never creates a human-interference hold');
 });
 
 test('OWNER (2) WRAPPED: a long unsent nudge whose cursor row holds only its tail is still seen', async () => {

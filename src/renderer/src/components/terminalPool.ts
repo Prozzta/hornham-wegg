@@ -661,7 +661,7 @@ function reportPromptState(entry: TerminalEntry): void {
  * Null = the screen is not evidence: no such terminal, it has exited, or the buffer could
  * not be read. Main treats null as "no reading" and holds the item.
  */
-export function readScreenForNeedle(ptyId: string, needle: string): { onPromptRow: boolean; screenCount: number } | null {
+export function readScreenForNeedle(ptyId: string, needle: string, expectedTail?: string): { onPromptRow: boolean; screenCount: number; promptTailMatches?: boolean } | null {
   const entry = pool.get(ptyId);
   if (!entry || entry.exited || !entry.opened || !needle) return null;
   try {
@@ -673,7 +673,25 @@ export function readScreenForNeedle(ptyId: string, needle: string): { onPromptRo
       const line = buf.getLine(buf.baseY + y);
       if (line && line.translateToString(true).includes(needle)) screenCount += 1;
     }
-    return { onPromptRow: promptLine.translateToString(true).includes(needle), screenCount };
+    // A wrapped prompt is several xterm rows. Rejoin only the current logical line,
+    // walking back while THIS row is a continuation; its suffix lets main distinguish
+    // its own unsent nudge from text a person placed on the composer.
+    const tailRows: string[] = [promptLine.translateToString(false)];
+    let y = buf.baseY + buf.cursorY;
+    while (y > buf.baseY && buf.getLine(y)?.isWrapped) {
+      y -= 1;
+      const previous = buf.getLine(y);
+      if (!previous) break;
+      tailRows.unshift(previous.translateToString(false));
+    }
+    const promptTail = tailRows.join('').trimEnd();
+    return {
+      onPromptRow: promptLine.translateToString(true).includes(needle),
+      screenCount,
+      ...(typeof expectedTail === 'string' && expectedTail.length > 0 && expectedTail.length <= 8192
+        ? { promptTailMatches: promptTail.endsWith(expectedTail.trimEnd()) }
+        : {})
+    };
   } catch {
     return null;
   }
@@ -695,7 +713,8 @@ function ensureScreenReadResponder(): void {
     // provenance self-test uses), so the reading reflects the repaint a clear provoked
     // rather than the frame before it.
     entry.term.write('', () => {
-      window.cth.answerScreenReading(req.requestId, readScreenForNeedle(req.ptyId, String(req.needle ?? '')));
+      window.cth.answerScreenReading(req.requestId, readScreenForNeedle(req.ptyId, String(req.needle ?? ''),
+        typeof req.expectedTail === 'string' ? req.expectedTail : undefined));
     });
   });
 }

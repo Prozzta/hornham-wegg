@@ -135,7 +135,7 @@ const MUTANTS = [
   ['w the stall watchdog shouts on every beat once stalled', STALL,
     '    if (cur.announced) return null;\n', ''],
   ['w a deliberate human-set state is announced as a stall', STALL,
-    "  'no-pending-ids', 'paused', 'halted', 'auto-delivery-paused', 'held-interfered', 'hitl-hold'",
+    "  'no-pending-ids', 'paused', 'halted', 'auto-delivery-paused', 'hitl-hold'",
     "  'no-pending-ids'"],
   ['w a session boundary no longer clears a stale active label', WAKE,
     "    if (event === 'SessionStart' || event === 'SessionEnd') { r.lifecycle = 'unknown'; return false; }",

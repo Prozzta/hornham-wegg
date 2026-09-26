@@ -1147,13 +1147,14 @@ test('ScreenReadingBroker: nobody to ask, a malformed answer and a stranger’s 
 
   const sent = [];
   const timers = [];
-  const b = new ScreenReadingBroker((ptyId, requestId, needle) => { sent.push({ ptyId, requestId, needle }); return true; },
+  const b = new ScreenReadingBroker((ptyId, requestId, needle, expectedTail) => { sent.push({ ptyId, requestId, needle, expectedTail }); return true; },
     10_000, (fn) => { timers.push(fn); });
-  const good = b.request('p', 'needle');
+  const good = b.request('p', 'needle', 'our exact draft');
+  assert.equal(sent[0].expectedTail, 'our exact draft', 'the renderer gets the exact self-draft tail to attest');
   b.answer('not-a-pending-id', { onPromptRow: false, screenCount: 0 });
   assert.equal(b.outstanding, 1, 'an id that is not pending settles nothing');
-  b.answer(sent[0].requestId, { onPromptRow: true, screenCount: 2, extra: 'ignored' });
-  assert.deepEqual(await good, { onPromptRow: true, screenCount: 2 });
+  b.answer(sent[0].requestId, { onPromptRow: true, screenCount: 2, promptTailMatches: true, extra: 'ignored' });
+  assert.deepEqual(await good, { onPromptRow: true, screenCount: 2, promptTailMatches: true });
 
   const bad = b.request('p', 'needle');
   b.answer(sent[1].requestId, { onPromptRow: 'no', screenCount: 0 });
@@ -1164,7 +1165,7 @@ test('ScreenReadingBroker: nobody to ask, a malformed answer and a stranger’s 
   assert.equal(await forgotten, null);
   assert.equal(b.outstanding, 0, 'an unanswered request does not grow the map');
 
-  for (const v of [null, {}, { onPromptRow: true }, { onPromptRow: true, screenCount: -1 }, { onPromptRow: true, screenCount: 1.5 }]) {
+  for (const v of [null, {}, { onPromptRow: true }, { onPromptRow: true, screenCount: -1 }, { onPromptRow: true, screenCount: 1.5 }, { onPromptRow: true, screenCount: 1, promptTailMatches: 'yes' }]) {
     assert.equal(isScreenReading(v), false, JSON.stringify(v));
   }
 });
