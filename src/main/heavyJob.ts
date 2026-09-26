@@ -201,7 +201,10 @@ export interface HeavyHolder {
   seenRunning: boolean;
 }
 
-export interface ProcRow { pid: number; parentPid: number; commandLine: string }
+/** One process of the listing. `createdMs` (epoch ms) is what the watcher judges by (Jim MF3). */
+export interface ProcRow { pid: number; parentPid: number; commandLine: string; createdMs?: number }
+/** Clock skew allowed between the app's clock and a process CreationDate. */
+export const HEAVY_CREATED_SKEW_MS = 2_000;
 export interface HeavyLockDeps {
   limit: () => HeavyLimit;
   now?: () => number;
@@ -289,7 +292,13 @@ export class HeavyJobLock {
     this.release(agentId, 'posttool');
   }
 
-  /** The agents that have a heavy-classified process under their PTY now (one probe), or null. */
+  /** The holders that are still BUSY now (one probe), or null.
+   *  Jim MF3: NOT by classifying command lines. Real heavy jobs hide behind wrappers (Claude's
+   *  `bash -c "... eval '...'"`, `node ...npm-cli.js ci`, `cmd /s /c ""npm.cmd" ci"`, electron-builder's
+   *  cli.js, Claude's PowerShell launcher that never shows the command at all). A holder is busy
+   *  while its agent's PTY tree has ANY descendant CREATED at or after its acquire: exact for every
+   *  wrapper, shim and tool, and conservative (the agent's other calls only extend the hold). The
+   *  PTY root itself and its long-lived children (created earlier) never count. */
   private async heavyAgents(): Promise<Set<string> | null> {
     if (!this.d.probe || !this.d.roots) return null;
     let procs: ProcRow[];
@@ -297,12 +306,18 @@ export class HeavyJobLock {
     const parent = new Map(procs.map((p) => [p.pid, p.parentPid]));
     const rootOf = new Map(this.d.roots().map((r) => [r.pid, r.agentId]));
     const ownerOf = (pid: number): string | null => {
-      const seen = new Set<number>(); let cur: number | undefined = pid;
+      const seen = new Set<number>(); let cur: number | undefined = parent.get(pid); // start ABOVE the process: a root is not its own descendant
+      seen.add(pid);
       while (cur !== undefined && !seen.has(cur)) { seen.add(cur); const a = rootOf.get(cur); if (a) return a; cur = parent.get(cur); }
       return null;
     };
     const busy = new Set<string>();
-    for (const p of procs) if (classifyCommand(p.commandLine).heavy) { const a = ownerOf(p.pid); if (a) busy.add(a); }
+    for (const p of procs) {
+      if (typeof p.createdMs !== 'number') continue;
+      const a = ownerOf(p.pid);
+      const h = a ? this.holders.get(a) : undefined;
+      if (h && p.createdMs >= h.since - HEAVY_CREATED_SKEW_MS) busy.add(h.agentId);
+    }
     return busy;
   }
 
@@ -362,12 +377,13 @@ export class HeavyJobLock {
 /** The default process listing: one hidden, non-interactive PowerShell CIM query (Windows only). */
 export function probeProcesses(): Promise<ProcRow[]> {
   if (process.platform !== 'win32') return Promise.resolve([]);
-  const script = 'Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId,CommandLine | ConvertTo-Json -Compress';
+  // CreationDate as epoch ms (PowerShell 5.1 serialises a DateTime as /Date(...)/, so convert here).
+  const script = "Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId,CommandLine,@{n='CreatedMs';e={ if ($_.CreationDate) { [int64](($_.CreationDate.ToUniversalTime() - [datetime]'1970-01-01').TotalMilliseconds) } else { $null } }} | ConvertTo-Json -Compress";
   return new Promise((resolve) => execFile('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', script], { windowsHide: true, timeout: 10_000, maxBuffer: 16 * 1024 * 1024 }, (err, stdout) => {
     if (err || !stdout.trim()) return resolve([]);
     try {
-      const rows = JSON.parse(stdout) as Array<{ ProcessId: number; ParentProcessId: number; CommandLine: string | null }>;
-      resolve((Array.isArray(rows) ? rows : [rows]).filter((r) => r && Number.isInteger(r.ProcessId)).map((r) => ({ pid: r.ProcessId, parentPid: r.ParentProcessId, commandLine: r.CommandLine ?? '' })));
+      const rows = JSON.parse(stdout) as Array<{ ProcessId: number; ParentProcessId: number; CommandLine: string | null; CreatedMs: number | null }>;
+      resolve((Array.isArray(rows) ? rows : [rows]).filter((r) => r && Number.isInteger(r.ProcessId)).map((r) => ({ pid: r.ProcessId, parentPid: r.ParentProcessId, commandLine: r.CommandLine ?? '', ...(typeof r.CreatedMs === 'number' ? { createdMs: r.CreatedMs } : {}) })));
     } catch { resolve([]); }
   }));
 }

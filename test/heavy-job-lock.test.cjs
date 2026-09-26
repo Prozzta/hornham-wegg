@@ -136,7 +136,7 @@ test('OFF: never denies and holds nothing; a LIVE change applies at the next acq
 });
 
 test('BACKGROUND: its PostToolUse does NOT free the slot; the process check does, after 2 scans with no heavy process under the holder\'s PTY', async () => {
-  let procs = [{ pid: 10, parentPid: 1, commandLine: 'bash' }, { pid: 11, parentPid: 10, commandLine: 'node --test test/*.test.cjs' }, { pid: 20, parentPid: 2, commandLine: 'npm ci' }];
+  let procs = [{ pid: 10, parentPid: 1, commandLine: 'bash', createdMs: 1 }, { pid: 11, parentPid: 10, commandLine: 'node --test test/*.test.cjs', createdMs: 1_000_100 }, { pid: 20, parentPid: 2, commandLine: 'npm ci', createdMs: 1_000_100 }];
   let probes = 0;
   const x = lock(1, { roots: () => [{ agentId: 'andy', pid: 10 }, { agentId: 'jim', pid: 2 }], probe: async () => { probes++; return procs; } });
   x.l.acquire('andy', H, 'node --test test/*.test.cjs', 'bg', true);
@@ -170,7 +170,7 @@ test('the process check runs ONLY while a slot is held (never when nothing is he
 });
 
 test('Jim MF1: a FOREGROUND call whose PostToolUse never comes (Esc, a timeout, a degraded Codex hook) is freed by the watcher, not pinned for the TTL', async () => {
-  let procs = [{ pid: 10, parentPid: 1, commandLine: 'bash' }, { pid: 11, parentPid: 10, commandLine: 'npm ci' }];
+  let procs = [{ pid: 10, parentPid: 1, commandLine: 'bash', createdMs: 1 }, { pid: 11, parentPid: 10, commandLine: 'npm ci', createdMs: 1_000_100 }];
   const x = lock(1, { roots: () => [{ agentId: 'a', pid: 10 }], probe: async () => procs });
   x.l.acquire('a', H, 'npm ci', 'call-1', false);   // no callDone will ever arrive
   x.tick(HEAVY_SCAN_MS);
@@ -267,7 +267,7 @@ test('OFF (god): never denies, but a heavy call is still LOGGED as unlimited', (
 });
 
 test('Jim N2: a foreground call whose heavy job outlives it (a detached child) KEEPS the slot after one descendant check; freed later by the watcher', async () => {
-  let procs = [{ pid: 10, parentPid: 1, commandLine: 'bash' }, { pid: 11, parentPid: 10, commandLine: 'npm run build' }];
+  let procs = [{ pid: 10, parentPid: 1, commandLine: 'bash', createdMs: 1 }, { pid: 11, parentPid: 10, commandLine: 'npm run build', createdMs: 1_000_100 }];
   const x = lock(1, { roots: () => [{ agentId: 'a', pid: 10 }], probe: async () => procs });
   x.l.acquire('a', H, 'npm run build', '1', false);
   x.l.callDone('a', '1');
@@ -280,7 +280,7 @@ test('Jim N2: a foreground call whose heavy job outlives it (a detached child) K
   for (let i = 0; i < HEAVY_SCAN_MISSES; i++) await x.l.scan();
   assert.equal(x.l.snapshot().length, 0);
   // and with no heavy child the foreground call frees it after the one check
-  const y = lock(1, { roots: () => [{ agentId: 'b', pid: 20 }], probe: async () => [{ pid: 20, parentPid: 1, commandLine: 'bash' }] });
+  const y = lock(1, { roots: () => [{ agentId: 'b', pid: 20 }], probe: async () => [{ pid: 20, parentPid: 1, commandLine: 'bash', createdMs: 1 }] });
   y.l.acquire('b', H, 'npm ci', '1', false);
   y.l.callDone('b', '1');
   await new Promise((r) => setImmediate(r));
@@ -289,7 +289,7 @@ test('Jim N2: a foreground call whose heavy job outlives it (a detached child) K
 });
 
 test('Jim N5: a TTL expiry while the watcher last SAW the job running logs expired-still-running (not a silent ttl)', async () => {
-  const x = lock(1, { roots: () => [{ agentId: 'a', pid: 10 }], probe: async () => [{ pid: 11, parentPid: 10, commandLine: 'node --test test/*.test.cjs' }] });
+  const x = lock(1, { roots: () => [{ agentId: 'a', pid: 10 }], probe: async () => [{ pid: 11, parentPid: 10, commandLine: 'node --test test/*.test.cjs', createdMs: 1_000_100 }] });
   x.l.acquire('a', H, 'node --test test/*.test.cjs', '1', true);
   await x.l.scan();
   x.tick(HEAVY_TTL_MS);
@@ -328,4 +328,50 @@ test('Jim MF1b: a FAILED heavy call (PostToolUseFailure, e.g. a suite exiting 1)
   assert.equal(l.snapshot().length, 0);
   const hiveSrc = fs.readFileSync(path.join(REPO, 'src', 'main', 'hive.ts'), 'utf8');
   assert.match(hiveSrc, /PostToolUse: \[hook\('\*'\)\],[\s\S]{0,400}PostToolUseFailure: \[hook\('\*'\)\],/);
+});
+
+// ── Jim re-check MF3: the watcher judges by process CREATION, not by command lines ─────────
+
+// The real command-line shapes Jim captured on this machine (HEAVY-LOCK-155-AUDIT.md re-check):
+// none of them classifies as heavy, yet each IS the running heavy job.
+// String.raw: the Windows paths are kept byte for byte (no escape processing).
+const REAL_SHAPES = [
+  String.raw`C:\Program Files\Git\bin\..\usr\bin\bash.exe -c "source /c/Users/x/.claude/shell-snapshots/snapshot-bash-1.sh 2>/dev/null || true && eval 'npm ci > log 2>&1' < /dev/null && pwd -P >| /tmp/cwd"`,
+  String.raw`C:\Program Files\Git\bin\..\usr\bin\bash.exe -c "source /c/Users/x/.claude/shell-snapshots/snapshot-bash-1.sh && eval 'node --test test/*.test.cjs' < /dev/null"`,
+  String.raw`"C:\nvm\v20\node.exe" "C:\nvm\v20\node_modules\npm\bin\npm-cli.js" ci`,
+  String.raw`C:\WINDOWS\system32\cmd.exe /d /s /c ""C:\nvm\v20\npm.cmd" ci"`,
+  String.raw`"C:\nvm\v20\node.exe" "C:\wt\node_modules\electron-builder\cli.js" --win`,
+  String.raw`"C:\nvm\v20\node.exe" "C:\wt\node_modules\electron-vite\bin\electron-vite.js" build`,
+  String.raw`powershell.exe -NoProfile -NonInteractive -Command "$__claudeCodeScript = $env:CLAUDE_CODE_SHELL_LAUNCHER_SCRIPT; & ([scriptblock]::Create($__claudeCodeScript))"`
+];
+
+test('MF3: a job visible only through the REAL wrapper shapes keeps the slot (a descendant created after the acquire), whatever its command line says', async () => {
+  for (const shape of REAL_SHAPES) assert.equal(classifyCommand(shape).heavy, false, `the shape itself is unclassifiable: ${shape.slice(0, 60)}`);
+  for (const shape of REAL_SHAPES) {
+    let procs = [{ pid: 10, parentPid: 1, commandLine: 'claude.exe', createdMs: 1 }, { pid: 12, parentPid: 10, commandLine: shape, createdMs: 1_000_050 }];
+    const x = lock(1, { roots: () => [{ agentId: 'a', pid: 10 }], probe: async () => procs });
+    x.l.acquire('a', H, 'npm ci', 'c', false);
+    x.tick(HEAVY_SCAN_MS);
+    await x.l.scan(); await x.l.scan(); await x.l.scan();
+    assert.equal(x.l.snapshot().length, 1, `still running under: ${shape.slice(0, 60)}`);
+    procs = [procs[0]];
+    await x.l.scan(); await x.l.scan();
+    assert.equal(x.l.snapshot().length, 0, 'gone: freed');
+  }
+});
+
+test('MF3: the PTY root and its LONG-LIVED children (created before the acquire, e.g. an MCP server) never keep a slot', async () => {
+  const procs = [{ pid: 10, parentPid: 1, commandLine: 'claude.exe', createdMs: 1_000_000 + 1 }, { pid: 13, parentPid: 10, commandLine: 'node mcp-server.js', createdMs: 900_000 }];
+  const x = lock(1, { roots: () => [{ agentId: 'a', pid: 10 }], probe: async () => procs });
+  x.l.acquire('a', H, 'npm ci', 'c', false);
+  x.tick(HEAVY_SCAN_MS);
+  await x.l.scan(); await x.l.scan();
+  assert.equal(x.l.snapshot().length, 0, 'the root (even if restarted) is not its own descendant; the old child predates the acquire');
+});
+
+test('MF3: the real listing carries CreationDate as epoch ms (hidden PowerShell, no window)', () => {
+  const src = fs.readFileSync(path.join(REPO, 'src', 'main', 'heavyJob.ts'), 'utf8');
+  assert.match(src, /CreationDate\.ToUniversalTime\(\) - \[datetime\]'1970-01-01'\)\.TotalMilliseconds/);
+  assert.match(src, /windowsHide: true/);
+  assert.ok(!/classifyCommand\(p\.commandLine\)/.test(src), 'the watcher no longer classifies command lines');
 });
