@@ -41,8 +41,14 @@ export const HIVE_GIT_IDENTITY = ['-c', 'commit.gpgsign=false', '-c', 'user.name
 /** Switches off the maintenance git would otherwise run inside a commit (see the header). */
 export const NO_AUTO_MAINTENANCE = ['-c', 'gc.auto=0', '-c', 'maintenance.auto=false'];
 
-export const COMMIT_IDLE_MS = 5_000;
-export const COMMIT_MAX_WAIT_MS = 30_000;
+/** 1.1.53 AV R2 (Jim, AV-152): each commit costs ~59 process starts (git plus the Human's
+ *  identity-guard hooks, which fork a shell per substitution and must keep running on every
+ *  commit), each one an antivirus scan. Commits are the hive's audit trail, not its delivery
+ *  path (a message is on disk and delivered before any commit), so they are batched harder:
+ *  a quiet 30 s, and at most every 2 min under a steady stream. Flush on quit is unchanged,
+ *  and a crash loses no file, only the grouping of the history. */
+export const COMMIT_IDLE_MS = 30_000;
+export const COMMIT_MAX_WAIT_MS = 120_000;
 export const COMMIT_TIMEOUT_MS = 60_000;
 export const LOCK_RETRIES = 5;
 export const STALE_LOCK_MS = 10_000;

@@ -1312,6 +1312,13 @@ export class HiveManager {
     const hook = (matcher?: string) => hookUrl
       ? { ...(matcher ? { matcher } : {}), hooks: [{ type: 'http', url: hookUrl, timeout: HOOK_HTTP_TIMEOUT_S }] }
       : entry(matcher);
+    // 1.1.53 AV R1: with the broker up (on Windows), the status line is a sourced builtins-only
+    // script that POSTs to the broker: 0 processes per refresh instead of ~5 (incl. Electron as
+    // Node). The status line cannot simply go: it is the only source of the subscription's
+    // rate_limits (the capacity seam), the model and the exact context window.
+    const statusParts = brokerUrlParts(hookUrl);
+    const statusScript = statusParts ? this.writeClaudeStatusScript() : null;
+    const statusCommand = statusParts && statusScript ? claudeStatusCommand(statusScript, statusParts) : `${cmd} --status`;
     const mcpServers = this.buildDefaultMcpServers(cwd, cfg);
     return {
       // Match the TUI's truecolor palette to the harness terminal theme —
@@ -1336,7 +1343,7 @@ export class HiveManager {
       // the only clean programmatic source for the session's REAL context
       // window. The shim prints a compact in-terminal gauge and forwards the
       // payload to the harness (agent-card context gauge, exact limit).
-      statusLine: { type: 'command', command: `${cmd} --status`, padding: 0 },
+      statusLine: { type: 'command', command: statusCommand, padding: 0 },
       hooks: {
         Stop: [hook()],
         SubagentStop: [hook()],
@@ -2313,6 +2320,20 @@ export class HiveManager {
 
   /** P4: write `agy-oneway.cmd` for this hive's pipe and return its path, or null (not Windows,
    *  no hive, or a path AGY could not run unquoted: then the shim is used, as before). */
+/** AV R1: write `<hive>/bin/claude-status.sh` and return its path with forward slashes (what the
+   *  status-line shell reads), or null (not Windows, no hive, or a path needing quoting). */
+  private writeClaudeStatusScript(): string | null {
+    const root = this.root();
+    if (process.platform !== 'win32' || !root) return null;
+    const path = join(root, 'bin', 'claude-status.sh').replace(/\\/g, '/');
+    if (/[\s"'`$\\]/.test(path)) return null;
+    try {
+      mkdirSync(join(root, 'bin'), { recursive: true });
+      writeFileSync(path, CLAUDE_STATUS_SH, 'utf8');
+      return path;
+    } catch { return null; }
+  }
+
   private writeAgyOneway(): string | null {
     const root = this.root();
     const sock = this.sockPath();
@@ -3262,6 +3283,22 @@ write there become searchable by every agent. You don't run \`mine\` yourself.
 // A minimal pipe: read the hook payload on stdin, tag it with this agent's id,
 // forward it to the hive's UDS, and relay the response back to `claude`. All the
 // real logic lives in the main process (HookServer). Never blocks a stop on error.
+/** 1.1.53 AV R1: the Claude status line as a SOURCED shell script (builtins only, no process).
+ *  LF line endings are load-bearing (bash reads a CR as part of the command). */
+export const CLAUDE_STATUS_SH = "# Munder Difflin: the Claude status line (1.1.53 AV R1). Generated; do not edit.\n# SOURCED by the shell Claude runs the statusLine command in (\". <this> port id token\"),\n# and it uses shell BUILTINS only, so a refresh starts no process: before, each one\n# started hive-node.cmd and the ~180 MB Electron binary as Node (~5 processes, ~630 ms).\n# It reads the status JSON from stdin, POSTs it to the app's loopback hook broker over\n# bash's /dev/tcp, and prints the reply (the context gauge). Any failure prints nothing.\n__munder_status() {\n  local LC_ALL=C body='' line\n  while IFS= read -r line || [ -n \"$line\" ]; do body+=\"$line\"$'\\n'; done\n  { exec 3<>\"/dev/tcp/127.0.0.1/$1\"; } 2>/dev/null || return 0\n  printf 'POST /status/%s/%s HTTP/1.0\\r\\nHost: 127.0.0.1\\r\\nContent-Type: application/json\\r\\nContent-Length: %d\\r\\n\\r\\n%s' \"$2\" \"$3\" \"${#body}\" \"$body\" >&3\n  while IFS= read -r -t 2 line <&3; do line=${line%$'\\r'}; [ -z \"$line\" ] && break; done\n  while IFS= read -r -t 2 line <&3 || [ -n \"$line\" ]; do printf '%s' \"$line\"; done\n  exec 3<&- 3>&-\n  return 0\n}\n__munder_status \"$@\"\nunset -f __munder_status\n";
+
+/** The broker URL's parts, for the status-line command; null when the URL is not ours or an
+ *  id could need shell quoting (the caller then keeps the command shim). */
+export function brokerUrlParts(url: string | null): { port: number; agentId: string; token: string } | null {
+  const m = url ? /^http:\/\/127\.0\.0\.1:(\d{1,5})\/hook\/([A-Za-z0-9._-]+)\/([0-9a-f]{32})$/.exec(url) : null;
+  return m ? { port: Number(m[1]), agentId: m[2], token: m[3] } : null;
+}
+
+/** The statusLine command that sources the script: every part is quote-free by construction. */
+export function claudeStatusCommand(scriptPath: string, parts: { port: number; agentId: string; token: string }): string {
+  return `. '${scriptPath}' ${parts.port} ${parts.agentId} ${parts.token}`;
+}
+
 export const HOOK_SHIM = `#!/usr/bin/env node
 'use strict';
 const net = require('net');
