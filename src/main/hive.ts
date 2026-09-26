@@ -80,6 +80,23 @@ export interface HiveMessage {
   requires_reply: boolean;
   needs_human: boolean;
   created_at: string;
+  /** MIDTURN-MAIL-BLIND (1.1.55): the ids of earlier messages this one cancels or corrects
+   *  (a retraction, a changed decision). Optional; the router uses it to flag a reply that was
+   *  written before its sender read this. */
+  supersedes?: string[];
+  /** Set by the ROUTER, never trusted from a sender: this message answers one that the sender's
+   *  own unread inbox had already superseded when it was sent (see routeMessage). */
+  superseded_by?: string;
+}
+
+/** A sender's `supersedes` (a string or an array), bounded: up to 10 non-empty ids of at most
+ *  200 characters. Anything else is dropped rather than failing the whole message. */
+export function normalizeSupersedes(v: unknown): { supersedes?: string[] } {
+  const list = (Array.isArray(v) ? v : typeof v === 'string' ? [v] : [])
+    .filter((x): x is string => typeof x === 'string' && x.trim().length > 0 && x.length <= 200)
+    .map((x) => x.trim())
+    .slice(0, 10);
+  return list.length ? { supersedes: list } : {};
 }
 
 /** One hive message reshaped for the voice read-layer (`hive:messages`): the
@@ -561,6 +578,21 @@ export class HiveManager {
     return existsSync(home) ? home : null;
   }
 
+  /** MIDTURN-MAIL-BLIND L1: the message file names in an agent's inbox (not inbox/.done), with
+   *  no parsing: a directory listing is all a per-hook check may cost. [] when there is none. */
+  inboxFileNames(id: string): string[] {
+    try { return readdirSync(join(this.agentDir(id), 'inbox')).filter((f) => f.endsWith('.json')); } catch { return []; }
+  }
+
+  /** MIDTURN-MAIL-BLIND L1: one inbox message's header (read once per new file), or null. */
+  inboxHeader(id: string, file: string): { id: string; from: string; subject: string; supersedes?: string[] } | null {
+    if (!/^[^\\/]+\.json$/.test(file)) return null;
+    try {
+      const m = JSON.parse(readFileSync(join(this.agentDir(id), 'inbox', file), 'utf8')) as Partial<HiveMessage>;
+      return { id: String(m.id ?? file.replace(/\.json$/, '')), from: String(m.from ?? '?'), subject: String(m.subject ?? ''), ...normalizeSupersedes(m.supersedes) };
+    } catch { return null; }
+  }
+
   private agentDir(id: string): string {
     return join(this.root()!, 'agents', id);
   }
@@ -1017,6 +1049,8 @@ export class HiveManager {
       // the global auth.json is still linked into that home — see installCodexHooks
       // and F1. Under MUNDER_DEV=1 it is not.) Both share the HIVE_SOCK wiring below.
       const preArgs: string[] = [];
+      // Codex: set when the protocol went into its developer_instructions (no positional prompt).
+      let developerInstructionsSet = false;
       // Dispatch on the structured bridge descriptor (the foundation's `bridgeOf`
       // derives {kind:'hooks'} from the legacy `hookBridge` for agy/codex, and
       // returns the explicit {kind:'proxy'} for qwen). Two ways a hookless CLI
@@ -1043,10 +1077,11 @@ export class HiveManager {
               this.reconcileAgyStatusline();
             }
             else if (desc.shim === 'codex') {
-              const codex = this.installCodexHooks(dir, meta.id);
+              const codex = this.installCodexHooks(dir, meta.id, preset.systemPromptChannel === 'codex-developer-instructions' ? prompt : null);
               // F1 fail-closed: provisioning refused, so this agent must not start.
               if (codex.refusal) return { args: [], env: {}, refusal: codex.refusal };
               env.CODEX_HOME = codex.home;
+              if (codex.developerInstructions) developerInstructionsSet = true;
               // Codex refuses to run hooks from a config dir without persisted
               // "hook trust" (normally an interactive gate). Our hooks.json is
               // hive-authored inside an isolated CODEX_HOME, so we bypass that gate
@@ -1126,6 +1161,17 @@ export class HiveManager {
       // type-into-tui (Crush): the bare TUI reads a positional as a Cobra subcommand
       // → `Unknown command`. So DROP the positional and hand the protocol back as
       // seedPrompt; the renderer types it into the TUI after boot (ondev-b).
+      // AGY-STARTUP-TURN: agy's real system channel. The protocol becomes the SYSTEM prompt of
+      // a per-agent custom agent, and agy starts with NO initial prompt, so it comes up idle
+      // (an `-i` prompt is a first USER turn, which AGY runs as a task). Refused (dev build,
+      // not the live hive) or failed: the initial-prompt path below, as before.
+      if (preset.systemPromptChannel === 'agy-custom-agent') {
+        const agent = this.installAgyAgent(meta, prompt);
+        if (agent) return { args: [...preArgs, '--agent', agent], env };
+      }
+      // Codex: the protocol is already its developer_instructions (installCodexHooks), so NO
+      // positional prompt: `codex` (and `codex resume <sid>`) start without a user turn.
+      if (developerInstructionsSet) return { args: [...preArgs], env };
       if (preset.seedDelivery === 'type-into-tui') return { args: [...preArgs], env, seedPrompt: prompt };
       // If a provider somehow exposes neither a flag nor a positional prompt, spawn bare.
       if (flag) return { args: [...preArgs, flag, prompt], env };
@@ -1420,6 +1466,10 @@ export class HiveManager {
         SubagentStop: [hook()],
         PreToolUse: [hook('*')],
         PostToolUse: [hook('*')],
+        // HEAVY-JOB-SERIALIZE (Jim MF1): a FAILED tool call (e.g. a test suite exiting 1) fires
+        // PostToolUseFailure, not PostToolUse; without it a heavy job's slot would never be freed
+        // by its own call. (Claude Code 2.1.283 has this event.)
+        PostToolUseFailure: [hook('*')],
         UserPromptSubmit: [hook()],
         Notification: [hook()],
         SessionStart: [entry()],
@@ -1728,8 +1778,70 @@ export class HiveManager {
       hops: typeof partial.hops === 'number' ? partial.hops : 0,
       requires_reply: partial.requires_reply ?? ['request', 'query', 'propose'].includes(act),
       needs_human: partial.needs_human ?? false,
-      created_at: partial.created_at ?? new Date().toISOString()
+      created_at: partial.created_at ?? new Date().toISOString(),
+      ...normalizeSupersedes(partial.supersedes)
     };
+  }
+
+  /**
+   * MIDTURN-MAIL-BLIND L2: the message in the SENDER's still-unread inbox that supersedes the
+   * one `msg` answers, if any. The case it catches: A asks B for X; B starts working; A sends
+   * "cancel X" (supersedes: [X]); B, mid-turn, never sees it and sends its result for X. The
+   * cancel is then sitting unread in B's inbox (not in inbox/.done) at the moment B's reply is
+   * routed. A superseding message that B has already READ (moved to .done) is not a match: then
+   * the reply was sent knowingly. Reads only B's inbox directory (a handful of files).
+   */
+  private unreadSupersederFor(msg: HiveMessage): HiveMessage | null {
+    if (!msg.in_reply_to) return null;
+    // N3 (Jim): the reply's in_reply_to AND up to 3 of its ancestors, so a cancel of the ORIGINAL
+    // dispatch also flags a reply to a request derived from it. An ancestor is found hive-wide by
+    // its file name (<id>.json in some agent's inbox or inbox/.done): stats only, no parsing.
+    const targets = new Set<string>([msg.in_reply_to]);
+    let cur: string | null = msg.in_reply_to;
+    for (let hop = 0; hop < HiveManager.SUPERSEDE_ANCESTOR_HOPS && cur; hop++) {
+      const parent: string | null = this.findDeliveredMessage(cur)?.in_reply_to ?? null;
+      if (!parent || targets.has(parent)) break;
+      targets.add(parent);
+      cur = parent;
+    }
+    const inbox = join(this.agentDir(msg.from), 'inbox');
+    let files: string[];
+    try { files = readdirSync(inbox).filter((f) => f.endsWith('.json')); } catch { return null; }
+    // N4 (Jim): a bounded synchronous parse, on the routing path: the newest 50 files (ids are
+    // time-stamped, so the name order is the arrival order), none over 64 KB.
+    files.sort();
+    for (const f of files.slice(-HiveManager.SUPERSEDE_SCAN_MAX_FILES).reverse()) {
+      try {
+        const full = join(inbox, f);
+        if (statSync(full).size > HiveManager.SUPERSEDE_SCAN_MAX_BYTES) continue;
+        const m = JSON.parse(readFileSync(full, 'utf8')) as Partial<HiveMessage>;
+        const sup = normalizeSupersedes(m.supersedes).supersedes;
+        if (sup && sup.some((s) => targets.has(s)) && typeof m.id === 'string') return m as HiveMessage;
+      } catch { /* a file being written: not a match this time */ }
+    }
+    return null;
+  }
+
+  static readonly SUPERSEDE_ANCESTOR_HOPS = 3;
+  static readonly SUPERSEDE_SCAN_MAX_FILES = 50;
+  static readonly SUPERSEDE_SCAN_MAX_BYTES = 64 * 1024;
+
+  /** A delivered message by id: <id>.json in any agent's inbox or inbox/.done, or null. */
+  private findDeliveredMessage(id: string): Partial<HiveMessage> | null {
+    if (!/^[A-Za-z0-9._-]{1,200}$/.test(id)) return null;
+    const root = this.root();
+    if (!root) return null;
+    let agents: string[] = [];
+    try { agents = readdirSync(join(root, 'agents')); } catch { return null; }
+    for (const a of agents) {
+      for (const p of [join(root, 'agents', a, 'inbox', `${id}.json`), join(root, 'agents', a, 'inbox', '.done', `${id}.json`)]) {
+        try {
+          if (!existsSync(p) || statSync(p).size > HiveManager.SUPERSEDE_SCAN_MAX_BYTES) continue;
+          return JSON.parse(readFileSync(p, 'utf8')) as Partial<HiveMessage>;
+        } catch { /* unreadable: keep looking */ }
+      }
+    }
+    return null;
   }
 
   /** Atomically deliver a message into a recipient agent's inbox.
@@ -1768,6 +1880,21 @@ export class HiveManager {
   }
 
   private routeMessage(msg: HiveMessage): void {
+    // The router alone sets superseded_by: a sender cannot pre-mark its own mail.
+    delete msg.superseded_by;
+    // MIDTURN-MAIL-BLIND L2: a reply to a request that was cancelled or corrected while its
+    // sender was mid-turn is still DELIVERED (its content may still matter), but flagged in the
+    // subject and the superseded_by field, so the requester sees at once it answers a superseded
+    // ask. The sender is told by the superseding message itself, already unread in its inbox.
+    const sup = this.unreadSupersederFor(msg);
+    if (sup) {
+      msg.superseded_by = sup.id;
+      // N2 (Jim): the quoted parts are sender-controlled: escape < and > (agents may read the
+      // subject inside tagged context).
+      const esc = (s: string): string => s.replace(/</g, '&lt;').replace(/>/g, '&gt;');
+      msg.subject = `[superseded by ${esc(sup.id)} (${esc(String(sup.from))}: ${esc(String(sup.subject ?? '').slice(0, 80))}): sent before ${msg.from} read it] ${msg.subject}`;
+      try { this.appendLog({ kind: 'superseded-delivery', id: msg.id, from: msg.from, to: msg.to, inReplyTo: msg.in_reply_to, supersededBy: sup.id }); } catch { /* noop */ }
+    }
     if (msg.hops > HOP_CAP) {
       // loop guard — drop a runaway message rather than let agents ping-pong.
       // There's no human queue to fall back on; the god agent owns conflicts.
@@ -2336,6 +2463,117 @@ export class HiveManager {
    *  Runtime-scoped by AGENT_ID (the shim no-ops for non-hive agy sessions), so
    *  this global config never disturbs the user's own `agy` usage. Best-effort,
    *  idempotent (only our own group is overwritten). */
+  /** AGY-STARTUP-TURN: the per-agent agy custom agent's name (agy selects it by NAME). */
+  static agyAgentName(agentId: string): string {
+    // N6 (Jim): the name must identify ONE agent. A hive id is normally already [a-z0-9-]
+    // (identity); any other id gets a short hash suffix, so two ids that sanitise alike
+    // ("A_b", "a-b") never share one agent.md.
+    const base = agentId.toLowerCase().replace(/[^a-z0-9-]/g, '-');
+    if (base === agentId && base.length <= 56) return `munder-${base}`;
+    return `munder-${base.slice(0, 48)}-${createHash('sha256').update(agentId).digest('hex').slice(0, 8)}`;
+  }
+
+  /** N5 (Jim): at startup, remove OUR agy agents (marked) whose hive agent is not on the floor
+   *  any more (not registered, or archived): leftovers of a crash, where no PTY teardown ran.
+   *  Someone else's agent under a munder- name is never touched. Gated like every global write. */
+  sweepAgyAgents(): number {
+    if (!this.mayWriteGlobalConfig('Antigravity agent sweep')) return 0;
+    const dir = join(homedir(), '.gemini', 'config', 'agents');
+    const live = new Set(Object.entries(this.registry().agents).filter(([, a]) => !a.archived).map(([id]) => HiveManager.agyAgentName(id)));
+    let removed = 0;
+    let names: string[] = [];
+    try { names = readdirSync(dir).filter((n) => n.startsWith('munder-')); } catch { return 0; }
+    for (const n of names) {
+      if (live.has(n)) continue;
+      try {
+        const f = join(dir, n, 'agent.md');
+        if (!readFileSync(f, 'utf8').includes(HiveManager.AGY_AGENT_MARK)) continue;
+        rmSync(join(dir, n), { recursive: true, force: true });
+        removed++;
+      } catch { /* not ours / unreadable: leave it */ }
+    }
+    return removed;
+  }
+
+  /** The line that marks an agent.md as ours: only such a file is ever rewritten or removed. */
+  static readonly AGY_AGENT_MARK = 'Written by the Munder Difflin app';
+
+  private agyAgentDir(agentId: string): string {
+    return join(homedir(), '.gemini', 'config', 'agents', HiveManager.agyAgentName(agentId));
+  }
+
+  /** The agent.md for one hive agent: YAML frontmatter + ONE H1 whose body is the hive protocol
+   *  (agy's system prompt for this agent). Shape confirmed on the live CLI (AGY probe,
+   *  2026-09-26): discovered at ~/.gemini/config/agents/<name>/agent.md, selected with
+   *  `--agent <name>`, the body applied as instructions, no turn at start, the global hooks still
+   *  fire, and `--conversation` resume keeps it. Strings are JSON-quoted (valid YAML), and a
+   *  prompt line that starts with `#` is escaped so it cannot open a second section. */
+  static agyAgentMarkdown(meta: { id: string; name: string }, prompt: string): string {
+    const name = HiveManager.agyAgentName(meta.id);
+    return [
+      '---',
+      `name: ${name}`, // [a-z0-9-] only: plain YAML, exactly the probe-verified form
+      `description: ${JSON.stringify(`Munder Difflin hive agent ${meta.name} (${meta.id}): its standing hive instructions. ${HiveManager.AGY_AGENT_MARK}; removed when the agent leaves the floor.`)}`,
+      'mainAgent: true',
+      'inheritCustomizations: true',
+      // V1 (Jim; verified in a jailed agy HOME): without this, the agent is offered as a
+      // SUBAGENT in the user's own plain `agy` sessions. With it, only `--agent` selects it.
+      'subagent: false',
+      // Kept out of the user's /agents panel (harmless to --agent selection, verified).
+      'hidden: true',
+      '---',
+      '',
+      `# ${meta.name} (${meta.id}), a Munder Difflin hive agent`,
+      '',
+      prompt.replace(/^#/gm, '\\#'),
+      ''
+    ].join('\n');
+  }
+
+  /** Write (or refresh) this agent's agy custom agent and return its name, or null when the
+   *  global write is refused or fails (the caller then falls back to `-i`). Global config, so
+   *  it goes through `mayWriteGlobalConfig`. Rewritten only when the content changed (a new
+   *  prompt: another version, a renamed agent), via a temp file + rename. */
+  private installAgyAgent(meta: { id: string; name: string }, prompt: string): string | null {
+    if (!this.mayWriteGlobalConfig('Antigravity agent')) return null;
+    const dir = this.agyAgentDir(meta.id);
+    const file = join(dir, 'agent.md');
+    const body = HiveManager.agyAgentMarkdown(meta, prompt);
+    try {
+      if (existsSync(file)) {
+        const cur = readFileSync(file, 'utf8');
+        if (cur === body) return HiveManager.agyAgentName(meta.id);
+        // Someone else's agent under our name: never overwrite it.
+        if (!cur.includes(HiveManager.AGY_AGENT_MARK)) {
+          console.warn(`[hive] ${file} exists and is not ours: agy falls back to an initial prompt`);
+          return null;
+        }
+      }
+      mkdirSync(dir, { recursive: true });
+      writeFileSync(`${file}.tmp`, body, 'utf8');
+      renameSync(`${file}.tmp`, file);
+      return HiveManager.agyAgentName(meta.id);
+    } catch (e) {
+      console.error('[hive] installAgyAgent failed:', e);
+      return null;
+    }
+  }
+
+  /** Remove this agent's agy custom agent when it leaves the floor (killed or archived), so
+   *  they do not pile up in the user's `agy agents`. Only a file we wrote is removed. */
+  removeAgyAgent(agentId: string): void {
+    if (!this.mayWriteGlobalConfig('Antigravity agent removal')) return;
+    const dir = this.agyAgentDir(agentId);
+    const file = join(dir, 'agent.md');
+    try {
+      if (!existsSync(file)) return;
+      if (!readFileSync(file, 'utf8').includes(HiveManager.AGY_AGENT_MARK)) return;
+      rmSync(dir, { recursive: true, force: true });
+    } catch (e) {
+      console.error('[hive] removeAgyAgent failed:', e);
+    }
+  }
+
   private installAgyHooks(): void {
     const root = this.root();
     if (!root) return;
@@ -2618,7 +2856,65 @@ export class HiveManager {
    *
    *  Returns the CODEX_HOME path for the caller to put in the worker's env, or a
    *  refusal the caller must honour. */
-  private installCodexHooks(dir: string, agentId?: string): { home: string; refusal?: string } {
+  /** AGY-STARTUP-TURN (Codex): put `developer_instructions` at the TOP of a Codex config (a
+   *  top-level TOML key must precede the first [table]). A single-line top-level
+   *  `developer_instructions` already in the user's seed is replaced (a second one would be a
+   *  duplicate key, and Codex would refuse to start); a multi-line one cannot be replaced
+   *  safely, so null (the caller keeps the positional prompt). The value is a TOML basic string
+   *  (JSON's escapes are valid TOML). */
+  static withCodexDeveloperInstructions(config: string, text: string): string | null {
+    // N3 (Jim): the key may be written bare or quoted ("developer_instructions" / '...').
+    const KEY = /^\s*(["']?)developer_instructions\1\s*=\s*/;
+    const lines = config.split(/\r?\n/);
+    // N2 (Jim): anything that can REPLACE or OVERRIDE our instructions makes the top-level key
+    // unreliable, so keep the positional prompt: a model_instructions_file (or its old name),
+    // or developer_instructions inside any table (a profile, possibly the default one).
+    if (lines.some((l) => /^\s*(["']?)(model_instructions_file|experimental_instructions_file)\1\s*=/.test(l))) return null;
+    const firstTable = lines.findIndex((l) => /^\s*\[/.test(l));
+    const topEnd = firstTable < 0 ? lines.length : firstTable;
+    if (lines.some((l, i) => i >= topEnd && KEY.test(l))) return null;
+    const kept: string[] = [];
+    for (let i = 0; i < lines.length; i++) {
+      if (i < topEnd && KEY.test(lines[i])) {
+        const v = lines[i].replace(KEY, '');
+        // Multi-line strings (''' or """) cannot be removed line-wise with certainty.
+        if (/^('''|""")/.test(v)) return null;
+        continue;
+      }
+      kept.push(lines[i]);
+    }
+    return `# --- munder-hive: this agent's standing hive instructions (auto-generated; do not edit) ---\ndeveloper_instructions = ${HiveManager.tomlString(text)}\n\n${kept.join('\n')}`;
+  }
+
+  /** A TOML basic string. JSON's escapes are valid TOML, but JSON leaves U+007F (DEL) raw, and
+   *  TOML forbids it unescaped (N4, Jim). */
+  static tomlString(text: string): string {
+    return JSON.stringify(text).replace(/\u007f/g, '\\u007F');
+  }
+
+  /** N1 (Jim): the args of a `codex resume` whose session lives in `ownerHome`. When that is
+   *  ANOTHER agent's CODEX_HOME, its config.toml carries the OWNER's developer_instructions, so
+   *  THIS agent's own are appended with `-c` (a -c override beats config.toml), and a cross-agent
+   *  resume never silently runs under another agent's identity. Unchanged otherwise, or when this
+   *  agent has none of ours (then its positional prompt still carries its identity). */
+  static codexResumeArgs(args: string[], myHome: string | undefined, ownerHome: string): string[] {
+    if (!myHome || ownerHome === myHome) return args;
+    let own: string | null = null;
+    try { own = HiveManager.ownCodexDeveloperInstructions(readFileSync(join(myHome, 'config.toml'), 'utf8')); } catch { own = null; }
+    return own ? [...args, '-c', `developer_instructions=${HiveManager.tomlString(own)}`] : args;
+  }
+
+  /** N1 (Jim): this agent's OWN developer instructions, read back from the line we write at the
+   *  top of its config.toml, or null. A resume that runs under ANOTHER agent's CODEX_HOME passes
+   *  them with `-c`, so it never silently takes that agent's identity. */
+  static ownCodexDeveloperInstructions(configText: string): string | null {
+    const m = /^# --- munder-hive: this agent's standing hive instructions[^\n]*\r?\ndeveloper_instructions = ("(?:[^"\\\r\n]|\\.)*")\s*$/m.exec(configText);
+    if (!m) return null;
+    try { return JSON.parse(m[1].replace(/\\u007F/g, '\\u007f')) as string; } catch { return null; }
+  }
+
+  private installCodexHooks(dir: string, agentId?: string, developerInstructions: string | null = null): { home: string; refusal?: string; developerInstructions?: boolean } {
+    let devSet = false;
     const home = join(dir, '.codex');
     try {
       mkdirSync(home, { recursive: true });
@@ -2713,9 +3009,14 @@ export class HiveManager {
           config += `\n[[hooks.${ev}]]\n[[hooks.${ev}.hooks]]\ntype = "command"\ncommand = '${this.nodeRunUnquoted(shim)}'\ntimeout = 30\n`;
         }
       }
+      if (developerInstructions) {
+        const withDev = HiveManager.withCodexDeveloperInstructions(config, developerInstructions);
+        if (withDev !== null) { config = withDev; devSet = true; }
+        else console.warn(`[hive] ${join(home, 'config.toml')}: the seed defines developer_instructions on several lines; Codex keeps the positional prompt`);
+      }
       writeFileSync(join(home, 'config.toml'), config, 'utf8');
-    } catch (e) { console.error('[hive] installCodexHooks failed:', e); }
-    return { home };
+    } catch (e) { console.error('[hive] installCodexHooks failed:', e); devSet = false; }
+    return { home, ...(devSet ? { developerInstructions: true } : {}) };
   }
 
   /** Pi (earendil-works) bridge. Pi has a rich `pi.on(event, …)` lifecycle but no
@@ -3187,11 +3488,15 @@ Write one JSON file into \`outbox/\` (any filename ending in \`.json\`):
   "subject": "one-line summary",
   "body": "the details",
   "conversation": "carry this across a thread (optional)",
-  "in_reply_to": "<message id you're replying to> (optional)"
+  "in_reply_to": "<message id you're replying to> (optional)",
+  "supersedes": ["<id of an earlier message this one cancels or corrects>"] (optional)
 }
 \`\`\`
 
 The harness fills in \`id\`, \`from\`, \`hops\`, and timestamps.
+
+A message that answers a request its sender had already been sent a \`supersedes\` for, still
+unread, is delivered flagged: the harness sets \`superseded_by\` and prefixes the subject.
 
 ## Rules of the road
 - Only \`request\`, \`query\`, and \`propose\` expect a reply. \`inform\` and \`done\` are terminal —

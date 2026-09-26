@@ -16,6 +16,7 @@ import { randomBytes, timingSafeEqual } from 'node:crypto';
 import { existsSync, rmSync } from 'node:fs';
 import { Notification, type WebContents } from 'electron';
 import type { HiveManager } from './hive';
+import { classifyHeavy, commandFromToolInput, isBackground, type HeavyJobLock } from './heavyJob';
 import { modelForHiveSpawn, type HarnessConfig } from './config';
 import type { ControlRegistry } from './control';
 import type { CircuitBreaker } from './breaker';
@@ -704,6 +705,61 @@ export class HookServer {
     return this.contextById.get(agentId);
   }
 
+  /** MIDTURN-MAIL-BLIND L1: per agent, whether a turn is open, the inbox files present when it
+   *  began (the turn's own mail, never announced), and the ones already announced. */
+  private readonly turns = new Map<string, { open: boolean; known: Set<string>; noticed: Set<string> }>();
+  static readonly MIDTURN_MAIL_MAX_LISTED = 5;
+
+  /** Turn boundaries, for every provider:
+   *  - a turn BEGINS at UserPromptSubmit / SessionStart (Claude, Codex), or at the first
+   *    PreInvocation / PostToolUse while no turn is open (AGY has no UserPromptSubmit; and a
+   *    state lost across an app restart re-opens quietly). The inbox is snapshotted then.
+   *  - a turn ENDS at Stop. */
+  private trackTurn(agentId: string, event: string): void {
+    const t = this.turns.get(agentId);
+    const snapshot = (): void => {
+      this.turns.set(agentId, { open: true, known: new Set(this.hive.inboxFileNames?.(agentId) ?? []), noticed: new Set() });
+    };
+    if (event === 'UserPromptSubmit' || event === 'SessionStart') { snapshot(); return; }
+    if (event === 'Stop') { if (t) t.open = false; return; }
+    if ((event === 'PreInvocation' || event === 'PostToolUse') && !t?.open) snapshot();
+  }
+
+  /** The notice for inbox files that appeared since this turn began and were not announced yet,
+   *  or null. Each file is announced ONCE (a `peek` shows it without consuming it: the
+   *  PreToolUse notice, so the PostToolUse after it still delivers it if a CLI ignores
+   *  PreToolUse context). A superseding message says what it supersedes. Sender-controlled
+   *  text is escaped so it cannot close the <inbox-update> tag (N2). */
+  private midTurnMail(agentId: string, peek = false): string | null {
+    const t = this.turns.get(agentId);
+    if (!t?.open) return null;
+    const fresh = (this.hive.inboxFileNames?.(agentId) ?? []).filter((f) => !t.known.has(f) && !t.noticed.has(f)).sort();
+    if (!fresh.length) return null;
+    if (!peek) for (const f of fresh) t.noticed.add(f);
+    const esc = (s: string): string => s.replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    const lines = fresh.slice(0, HookServer.MIDTURN_MAIL_MAX_LISTED).map((f) => {
+      const h = this.hive.inboxHeader?.(agentId, f) ?? null;
+      if (!h) return `- ${esc(f)}`;
+      const sup = h.supersedes?.length ? ` (SUPERSEDES ${esc(h.supersedes.join(', '))})` : '';
+      return `- from ${esc(h.from)}: "${esc(h.subject.slice(0, 160))}" [${esc(h.id)}]${sup}`;
+    });
+    if (fresh.length > lines.length) lines.push(`- and ${fresh.length - lines.length} more`);
+    if (!peek) { try { this.hive.appendLog({ kind: 'midturn-mail-notice', agentId, count: fresh.length }); } catch { /* noop */ } }
+    return `<inbox-update>\n${fresh.length} new message(s) arrived in your inbox during this turn:\n${lines.join('\n')}\nRead them before you send or finish: one may change or cancel what you are doing.\n</inbox-update>`;
+  }
+
+  /** HEAVY-JOB-SERIALIZE: the app-held heavy-job lock (main wires it; null in tests = no lock). */
+  private heavyLock: HeavyJobLock | null = null;
+  setHeavyLock(lock: HeavyJobLock | null): void { this.heavyLock = lock; }
+
+  /** The id that pairs a heavy call's PreToolUse with its PostToolUse: the provider's tool-use
+   *  id when it sends one, else the command itself (identical in both hooks). */
+  private static heavyCallId(p: HookPayload): string {
+    const id = (p as { tool_use_id?: unknown }).tool_use_id;
+    if (typeof id === 'string' && id) return `id:${id}`;
+    return `cmd:${(commandFromToolInput(p.tool_input) ?? '').slice(0, 500)}`;
+  }
+
   private handle(p: HookPayload): unknown {
     const agentId = p.agent_id ?? undefined;
     const event = p.hook_event_name ?? 'Unknown';
@@ -719,6 +775,8 @@ export class HookServer {
     // transcript, never drives the wake lifecycle (a subagent's late tool hook would re-open
     // a finished turn), and a subagent's Stop is not this agent's Stop.
     const fromSubagent = typeof p.provider_agent_id === 'string' && p.provider_agent_id !== '' && p.provider_agent_id !== agentId;
+    // MIDTURN-MAIL-BLIND L1: turn boundaries, before any early return below.
+    if (agentId && !fromSubagent) this.trackTurn(agentId, event);
     if (!fromSubagent) {
       this.onEvent?.(agentId, event, p.message, typeof p.fully_idle === 'boolean' ? p.fully_idle : undefined,
         typeof p.turn_id === 'string' && p.turn_id ? p.turn_id : undefined);
@@ -903,6 +961,37 @@ export class HookServer {
       }
     }
 
+    // HEAVY-JOB-SERIALIZE (AFTER every other PreToolUse deny above: a call the HITL gate refuses
+    // never runs, so it must never take a slot; Jim MF1a): a heavy command (install / build / full
+    // suite / bench) takes one of the
+    // machine's heavy-job slots, or is DENIED naming the holders. Every provider reaches this deny
+    // (Claude http, Codex mcp, the AGY shim's deny translation). A subagent's call counts as its
+    // agent's. Settings "Heavy jobs at once" = Off makes this do nothing.
+    if (event === 'PreToolUse' && agentId && this.heavyLock) {
+      // Jim N1: a DEGRADED Codex hook (rebuilt from the rollout tail) may carry no tool input:
+      // it cannot be classified, so it is allowed and logged.
+      if (p.payload_degraded === true && commandFromToolInput(p.tool_input) === null) {
+        try { this.hive.appendLog({ kind: 'heavy-lock', action: 'degraded', agentId, tool: p.tool_name ?? null }); } catch { /* best effort */ }
+      }
+      const cls = classifyHeavy(p.tool_name, p.tool_input);
+      if (cls.heavy) {
+        // A call whose PostToolUse may not pair back (Codex's mcp hooks can arrive degraded) is
+        // freed like a background one: by the process check, PTY exit or the TTL (Jim N1).
+        const unpaired = p.transport === 'mcp' || p.payload_degraded === true;
+        const d = this.heavyLock.acquire(agentId, cls, commandFromToolInput(p.tool_input) ?? '', HookServer.heavyCallId(p), isBackground(p.tool_input) || unpaired);
+        if (!d.allow) {
+          this.emitControl(agentId, p.tool_name, d.reason);
+          this.emit(agentId, event, p);
+          return { hookSpecificOutput: { hookEventName: 'PreToolUse', permissionDecision: 'deny', permissionDecisionReason: d.reason } };
+        }
+      }
+    }
+    // A heavy FOREGROUND call returned, succeeded or FAILED (a suite exiting 1 fires PostToolUseFailure):
+    // its job is done (a backgrounded one, or a missed Post, is left to the watcher).
+    if ((event === 'PostToolUse' || event === 'PostToolUseFailure') && agentId && this.heavyLock && classifyHeavy(p.tool_name, p.tool_input).heavy) {
+      this.heavyLock.callDone(agentId, HookServer.heavyCallId(p));
+    }
+
     // 7C.2 — mid-run steering: inject queued operator guidance as context on the
     // next eligible hook (no fragile typing into the TUI). Delivered once.
     // Merged with the roster line below so the two injections never displace each
@@ -916,6 +1005,18 @@ export class HookServer {
     if ((event === 'UserPromptSubmit' || event === 'PostToolUse' || event === 'PreInvocation') && agentId && this.control && !fromSubagent && p.transport !== 'pipe-oneway') {
       steer = this.control.takeSteer(agentId) ?? null;
     }
+    // MIDTURN-MAIL-BLIND L1: mail that arrived DURING this turn, named once, on the same
+    // answering hooks the steer uses (Claude/Codex PostToolUse, AGY PreInvocation). Never on a
+    // one-way hook (its reply is not read) or a subagent's.
+    const mail = (event === 'PostToolUse' || event === 'PreInvocation') && agentId && !fromSubagent && p.transport !== 'pipe-oneway'
+      ? this.midTurnMail(agentId)
+      // N1 (Jim): the SEND moment is a tool call, so PreToolUse carries it too, as a PEEK (not
+      // consumed: the PostToolUse after it still delivers it). CLAUDE ONLY (the http transport):
+      // AGY's shim turns any PreToolUse reply object into a decision and fails CLOSED (a notice
+      // would DENY the tool), and Codex's PreToolUse context handling is unverified.
+      : event === 'PreToolUse' && agentId && !fromSubagent && p.transport === 'http'
+        ? this.midTurnMail(agentId, true)
+        : null;
 
     // Keep god's roster CURRENT. fleet.json is always fresh on disk, but god's
     // context is not: after a restart it resumes a transcript describing the old
@@ -942,12 +1043,12 @@ export class HookServer {
       ? `<goal>\n${goalRaw}\n</goal>`
       : null;
 
-    if (steer || roster || goal) {
+    if (steer || roster || goal || mail) {
       this.emit(agentId, event, p);
       return {
         hookSpecificOutput: {
           hookEventName: event,
-          additionalContext: [roster, goal, steer].filter(Boolean).join('\n\n')
+          additionalContext: [roster, goal, steer, mail].filter(Boolean).join('\n\n')
         }
       };
     }

@@ -52,11 +52,18 @@ export interface EngineDeps {
   /** Idle time before the model is dropped (default MODEL_IDLE_UNLOAD_MS; the speed bench
    *  shortens it to measure model-cold). */
   idleUnloadMs?: number;
+  /** NATIVE-WAKEUP N1: how long a wake-up waits for its caller's own wing to be indexed (tests). */
+  wakeWaitMs?: number;
 }
+
+/** NATIVE-WAKEUP N1 (Jim, god andyn1wait): the bound on a wake-up's wait for its own wing. */
+export const WAKE_WAIT_MS = 5_000;
 
 interface Task { priority: number; seq: number; run: () => Promise<void> }
 
-export interface SearchArgs { query: string; wing?: string | null; room?: string | null; results?: number; since?: string | null; before?: string | null }
+export interface SearchArgs { query: string; wing?: string | null; room?: string | null; results?: number; since?: string | null; before?: string | null;
+  /** The asking agent's own wing (from its MEMORY_TOKEN): never a filter, only a backfill hint. */
+  caller?: string | null }
 export interface EngineReply { exit: number; text: string; json?: unknown }
 
 export class MemoryEngine {
@@ -74,6 +81,46 @@ export class MemoryEngine {
   private backfilling: Promise<{ discovery: Discovery; embedded: number; removed: number }> | null = null;
   /** Paths whose ingest failed, with the error (the migration report's "failed"). */
   readonly failed = new Map<string, string>();
+  /** NATIVE-WAKEUP-EMPTY-INDEX (b): wings a caller asked about. A backfill in progress takes their
+   *  sources NEXT (checked before every source), so an agent's own memory is indexed first even
+   *  when the backfill had already started without it (e.g. at app start). */
+  private readonly preferredWings = new Set<string>();
+  /** The sources the running backfill has not taken yet (N1: is a wing still waiting?). */
+  private backfillRemaining: SourceEntry[] = [];
+  /** Wake-ups waiting for a wing's last source to be committed. */
+  private readonly wingWaiters = new Map<string, Array<() => void>>();
+
+  /** Does the running backfill still have sources of this wing to take (or one in flight)? */
+  private wingPending(wing: string): boolean {
+    return !!this.backfilling && (this.backfillRemaining.some((e) => e.wing === wing) || this.inFlightWing === wing);
+  }
+  private inFlightWing: string | null = null;
+
+  /** Resolve when the backfill has committed the wing's last source, or after `ms`. */
+  private waitForWing(wing: string, ms: number): Promise<void> {
+    if (!this.wingPending(wing)) return Promise.resolve();
+    return new Promise<void>((resolve) => {
+      let done = false;
+      const finish = (): void => { if (!done) { done = true; resolve(); } };
+      const list = this.wingWaiters.get(wing) ?? [];
+      list.push(finish);
+      this.wingWaiters.set(wing, list);
+      this.setTimer(finish, ms);
+      // The whole backfill ending also releases the wait.
+      void this.backfilling?.then(finish, finish);
+    });
+  }
+
+  private wingDone(wing: string): void {
+    if (this.backfillRemaining.some((e) => e.wing === wing)) return;
+    for (const f of this.wingWaiters.get(wing) ?? []) f();
+    this.wingWaiters.delete(wing);
+  }
+
+  /** Mark a caller's wing as wanted: the running (or next) backfill indexes it first. */
+  preferWing(wing: string | null | undefined): void {
+    if (typeof wing === 'string' && /^[A-Za-z0-9._-]{1,120}$/.test(wing)) this.preferredWings.add(wing);
+  }
   stats = { embedded: 0, embedMs: 0, searches: 0 };
 
   constructor(private readonly d: EngineDeps) {
@@ -124,6 +171,8 @@ export class MemoryEngine {
   // — requests —
 
   search(a: SearchArgs): Promise<EngineReply> {
+    // (b) The wing searched, else the caller's own, is wanted: index it first.
+    this.preferWing(a.wing ?? a.caller ?? null);
     return this.enqueue(PRIORITY.search, async () => {
       this.stats.searches++;
       const sinceMs = a.since ? Date.parse(a.since) : null;
@@ -142,7 +191,12 @@ export class MemoryEngine {
     });
   }
 
-  wakeUp(wing: string | null): Promise<EngineReply> {
+  async wakeUp(wing: string | null): Promise<EngineReply> {
+    // (b) A wake-up is the caller's (or an explicit) wing: index it first.
+    this.preferWing(wing);
+    // N1: a task-start wake-up on a still-filling index waits (bounded) for ITS wing's sources,
+    // then answers with whatever is indexed. A search never waits.
+    if (wing) await this.waitForWing(wing, this.d.wakeWaitMs ?? WAKE_WAIT_MS);
     return this.enqueue(PRIORITY.wake, async () => {
       let identity: string | null = null;
       if (wing && /^[A-Za-z0-9._-]+$/.test(wing)) {
@@ -213,7 +267,15 @@ export class MemoryEngine {
       for (const path of this.d.store.sourceShas().keys()) {
         if (!wanted.has(path)) { await this.enqueue(PRIORITY.backfill, async () => this.d.store.removeSource(path)); removed++; }
       }
-      for (const e of discovery.eligible) embedded += await this.ingestEntry(e, PRIORITY.backfill);
+      // (b) Before EACH source, a preferred wing (a caller that asked meanwhile) goes first.
+      const remaining = this.backfillRemaining = [...discovery.eligible];
+      while (remaining.length) {
+        const i = Math.max(0, remaining.findIndex((x) => this.preferredWings.has(x.wing)));
+        const [e] = remaining.splice(i, 1);
+        this.inFlightWing = e.wing;
+        try { embedded += await this.ingestEntry(e, PRIORITY.backfill); }
+        finally { this.inFlightWing = null; this.wingDone(e.wing); }
+      }
       this.d.log?.({ kind: 'native-memory-backfill', eligible: discovery.eligible.length, embedded, removed, failed: this.failed.size });
       return { discovery, embedded, removed };
     })().finally(() => { this.backfilling = null; });

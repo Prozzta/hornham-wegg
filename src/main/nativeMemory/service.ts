@@ -76,6 +76,10 @@ export const EXIT = { ok: 0, usage: 2, unavailable: 3, degraded: 4, unauthorized
 
 export const SEARCH_DEADLINE_WARM_MS = 250;
 export const SEARCH_DEADLINE_COLD_MS = 2_000;
+/** NATIVE-WAKEUP N1: a wake-up may first wait (engine WAKE_WAIT_MS = 5 s) for its caller's wing on
+ *  a filling index; its deadline covers that wait + the cold budget + a margin. (Main must not
+ *  import the engine, so the pairing is pinned by a test.) */
+export const WAKE_UP_DEADLINE_MS = 8_000;
 /** Crash restarts allowed in RESTART_WINDOW_MS before the worker is left down (answers exit 3). */
 export const MAX_RESTARTS = 3;
 export const RESTART_WINDOW_MS = 10 * 60_000;
@@ -118,6 +122,13 @@ export class NativeMemoryClient {
 
   /** Forked yet? (tests, status) */
   get forked(): boolean { return this.worker !== null; }
+
+  /** NATIVE-WAKEUP-EMPTY-INDEX (a): fork the worker now instead of at the first request (its
+   *  startup backfill then fills an empty index before an agent's first wake-up). Idempotent;
+   *  false when the worker cannot be forked (no config, or left down). */
+  prewarm(): boolean {
+    return this.ensureWorker() !== null;
+  }
 
   private ensureWorker(): WorkerHandle | null {
     if (this.worker) return this.worker;
@@ -255,7 +266,8 @@ export function validateRequest(body: MemoryRequest, callerWing: string, servedP
       const v = a[k];
       if (v !== undefined && v !== null && (typeof v !== 'string' || !ISO.test(v) || Number.isNaN(Date.parse(v)))) return { exit: EXIT.usage, error: `--${k} must be an ISO date` };
     }
-    return { op: 'search', args: { query: q, wing, room, results: n, since: a.since ?? null, before: a.before ?? null } };
+    // `caller` (the token's wing) is never a filter: only NATIVE-WAKEUP (b)'s backfill hint.
+    return { op: 'search', args: { query: q, wing, room, results: n, since: a.since ?? null, before: a.before ?? null, caller: callerWing } };
   }
   if (cmd === 'wake-up') {
     const wing = optWing(a.wing);

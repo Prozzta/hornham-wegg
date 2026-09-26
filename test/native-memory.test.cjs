@@ -160,7 +160,8 @@ test('FTS query + RRF + compaction policy (pure)', () => {
 
 test('VALIDATION (section 6): ranges, ISO dates, wing names, --palace must be a served path; wake-up without --wing is the CALLER\'s', () => {
   const served = ['C:\\Dunder\\hive', 'C:/Dunder/palace'];
-  assert.deepEqual(validateRequest({ cmd: 'search', args: { query: 'x', results: 3 } }, 'a1', served), { op: 'search', args: { query: 'x', wing: null, room: null, results: 3, since: null, before: null } });
+  // NATIVE-WAKEUP (b): `caller` is the token's wing as a backfill hint; `wing` (the filter) stays null.
+  assert.deepEqual(validateRequest({ cmd: 'search', args: { query: 'x', results: 3 } }, 'a1', served), { op: 'search', args: { query: 'x', wing: null, room: null, results: 3, since: null, before: null, caller: 'a1' } });
   for (const bad of [{ query: '' }, { query: 'x', results: 0 }, { query: 'x', results: 101 }, { query: 'x', results: 2.5 }, { query: 'x', wing: 'a b' }, { query: 'x', since: 'yesterday' }, { query: 'x'.repeat(2001) }]) {
     assert.equal(validateRequest({ cmd: 'search', args: bad }, 'a1', served).exit, EXIT.usage, JSON.stringify(bad));
   }

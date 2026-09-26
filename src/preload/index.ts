@@ -79,6 +79,43 @@ export interface HiveMessage {
   created_at: string;
 }
 
+/** Private THREAD-VIEW projection; raw provider files never cross this bridge. */
+export interface ThreadViewEvent {
+  id: string;
+  at: number;
+  speaker: 'human' | 'agent';
+  text: string;
+  source: 'human-ui' | 'human-terminal' | 'claude' | 'codex' | 'humanQA';
+  truncated?: boolean;
+}
+export interface ThreadLayoutV1 {
+  version: 1;
+  preferredView: 'talk' | 'terminal';
+  split: null | { orientation: 'horizontal' | 'vertical'; talkDock: 'left' | 'right' | 'top' | 'bottom'; ratio: number };
+  lastSelectedAt: number;
+}
+
+type ThreadEventPayload = { agentId: string; event: ThreadViewEvent };
+const threadEventListeners = new Set<(payload: ThreadEventPayload) => void>();
+let threadEventPort: MessagePort | undefined;
+
+// The main process transfers a fresh port after every renderer load. Keep this
+// subscription entirely local to preload: normalized events never use an IPC
+// broadcast and raw provider rows never cross the bridge.
+ipcRenderer.on('thread:port', (event) => {
+  const port = event.ports[0] as MessagePort | undefined;
+  if (!port) return;
+  try { threadEventPort?.close(); } catch { /* replaced port */ }
+  threadEventPort = port;
+  port.onmessage = (message) => {
+    const payload = message.data as ThreadEventPayload;
+    if (!payload || typeof payload.agentId !== 'string' || !payload.event || typeof payload.event.id !== 'string') return;
+    for (const listener of threadEventListeners) listener(payload);
+  };
+  port.start();
+});
+ipcRenderer.send('thread:portReady');
+
 /** A hive message reshaped for the voice read-layer (`hive:messages`). `subject`
  *  and `body` are REDACTED in the main process before crossing this boundary —
  *  the renderer never receives a raw body or a secret. Mirror of `VoiceMessage`
@@ -659,12 +696,12 @@ const api = {
   /** L0-FUSION stage 5: main asks this renderer to READ A RENDERED SCREEN for the submit
    *  owner's erase verification. The renderer answers with `answerScreenReading`; it
    *  decides nothing, and silence is read by main as "no reading", never as "erased". */
-  onScreenReadRequest: (cb: (req: { requestId: string; ptyId: string; needle: string }) => void): (() => void) => {
-    const listener = (_e: IpcRendererEvent, req: { requestId: string; ptyId: string; needle: string }) => cb(req);
+  onScreenReadRequest: (cb: (req: { requestId: string; ptyId: string; needle: string; expectedTail?: string }) => void): (() => void) => {
+    const listener = (_e: IpcRendererEvent, req: { requestId: string; ptyId: string; needle: string; expectedTail?: string }) => cb(req);
     ipcRenderer.on('autoSubmit:readScreen', listener);
     return () => ipcRenderer.removeListener('autoSubmit:readScreen', listener);
   },
-  answerScreenReading: (requestId: string, reading: { onPromptRow: boolean; screenCount: number } | null): void => {
+  answerScreenReading: (requestId: string, reading: { onPromptRow: boolean; screenCount: number; promptTailMatches?: boolean } | null): void => {
     ipcRenderer.send('autoSubmit:screenReading', requestId, reading);
   },
   /** May automatic delivery arm on this terminal RIGHT NOW? Evaluated fresh in main on
@@ -864,6 +901,19 @@ const api = {
     ipcRenderer.invoke('hive:setAgentHold', id, hold),
   hiveBoard: (): Promise<string> => ipcRenderer.invoke('hive:board'),
   hiveTasks: (): Promise<unknown> => ipcRenderer.invoke('hive:tasks'),
+  threadList: (agentId: string): Promise<ThreadViewEvent[]> => ipcRenderer.invoke('thread:list', agentId),
+  onThreadEvent: (cb: (payload: ThreadEventPayload) => void): (() => void) => {
+    threadEventListeners.add(cb);
+    return () => threadEventListeners.delete(cb);
+  },
+  threadLayoutGet: (agentId: string, fallback: 'talk' | 'terminal'): Promise<ThreadLayoutV1 | null> =>
+    ipcRenderer.invoke('thread:layoutGet', agentId, fallback),
+  threadLayoutSet: (agentId: string, layout: Partial<ThreadLayoutV1>, fallback: 'talk' | 'terminal'): Promise<ThreadLayoutV1 | null> =>
+    ipcRenderer.invoke('thread:layoutSet', agentId, layout, fallback),
+  threadSweepOrphans: (): Promise<{ ok: boolean; removed?: string[]; error?: string }> =>
+    ipcRenderer.invoke('thread:sweepOrphans'),
+  threadRecordHuman: (agentId: string, text: string, source: 'human-ui' | 'human-terminal'):
+    Promise<{ ok: boolean; error?: string; event?: ThreadViewEvent }> => ipcRenderer.invoke('thread:recordHuman', agentId, text, source),
   hiveLog: (n?: number): Promise<unknown[]> => ipcRenderer.invoke('hive:log', n ?? 200),
   hiveMemory: (id: string): Promise<string> => ipcRenderer.invoke('hive:memory', id),
   hiveInbox: (id: string): Promise<HiveMessage[]> => ipcRenderer.invoke('hive:inbox', id),
@@ -1301,6 +1351,10 @@ const api = {
    *  archives it automatically via pty:kill; this is the explicit primitive. */
   hiveSetArchived: (id: string, archived: boolean): Promise<{ ok: boolean; error?: string }> =>
     ipcRenderer.invoke('hive:setArchived', id, archived),
+  /** Explicit Human retire: removes the private Talk projection.  Routine PTY
+   * lifecycle archiving never calls this. */
+  threadRetire: (id: string): Promise<{ ok: boolean; error?: string }> =>
+    ipcRenderer.invoke('thread:retire', id),
 
   // ─── Slack integration (Slack message → Michael's queue) ─────────────────────
   /** Register a listener for inbound Slack messages; returns an unsubscribe fn.

@@ -515,15 +515,38 @@ export class WorkerWakeWatchdog {
   }
 
   /**
-   * CODEX-FALSEACTIVE-153: Codex's rollout says a turn STARTED at `at` (task_started). A start
-   * after the claim confirms the provisional epoch our submit opened. Returns true when it
-   * confirmed one. Never opens, closes or re-pends anything.
+   * CODEX-FALSECONFIRM-155: only a NEW Codex `task_started` can confirm the provisional
+   * epoch. A task_complete is proof about the old turn, even if its delayed rollout read
+   * arrives after claim(); accepting it was how a lost Enter became permanently active.
    */
-  noteProviderTurnStarted(agentId: string | undefined, at: number): boolean {
-    if (!agentId || !Number.isFinite(at)) return false;
+  noteProviderTurnStarted(agentId: string | undefined, turnId: string, at: number): boolean {
+    if (!agentId || !turnId || !Number.isFinite(at)) return false;
     const r = this.agents.get(agentId);
-    if (!r || r.lifecycle !== 'active' || !r.provisional || !(r.claimedAt > 0 && at >= r.claimedAt)) return false;
+    // claim() is the handoff boundary: a real task_started after it belongs to this
+    // wake even when rollout observes it before the async owner settle completes.
+    if (!r || r.lifecycle !== 'active' || !r.provisional
+      || !(r.claimedAt > 0 && at >= r.claimedAt)
+      || r.closedTurns.includes(turnId)) return false;
+    r.openTurnId = turnId;
     this.turnStarted(r, at);
+    return true;
+  }
+
+  /**
+   * CODEX-FALSECONFIRM-155 recovery for the legacy false-confirm state. Versions before
+   * this guard could make an active epoch non-provisional from a delayed task_complete;
+   * it then blocked every later inbox delivery forever. A completion older than the epoch
+   * cannot close it, so turn it back into the bounded provisional path and let beat()
+   * re-pend the ids once. This is intentionally Codex-specific at the bridge call site.
+   */
+  recoverStuckCodexActive(agentId: string | undefined, completedAt: number, now = Date.now()): boolean {
+    if (!agentId || !Number.isFinite(completedAt) || !Number.isFinite(now)) return false;
+    const r = this.agents.get(agentId);
+    if (!r || r.lifecycle !== 'active' || r.provisional || !(r.activeSince > 0) || r.commitIds.length === 0
+      || !(completedAt < r.activeSince && r.turnStartAt <= completedAt)
+      || now - r.activeSince < SUBMIT_CONFIRM_MS) return false;
+    r.provisional = true;
+    r.openTurnId = null;
     return true;
   }
 

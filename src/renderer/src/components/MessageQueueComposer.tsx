@@ -139,6 +139,9 @@ export function MessageQueueComposer({ agent }: MessageQueueComposerProps) {
           : 'Attached files:\n') + attachments.map((a) => `- ${a.path} (${a.name})`).join('\n')
       : text;
     enqueueMessage(agent.id, body);
+    // THREAD-VIEW: only the human-visible Michael composer gets a Human receipt.
+    // This is a side record, never a second send route; queue/automaticSubmit own delivery.
+    if (agent.isGod) void window.cth.threadRecordHuman(agent.id, body, 'human-ui');
     setText('');
     setAttachments([]);
   };

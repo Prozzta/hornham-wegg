@@ -23,7 +23,7 @@ and unattended.
 
 <p>
   <a href="./LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-F4D35E.svg?style=flat-square&labelColor=6E1423"></a>
-  <img alt="Version: 1.1.54" src="https://img.shields.io/badge/version-1.1.54-F4D35E.svg?style=flat-square&labelColor=6E1423">
+  <img alt="Version: 1.1.55" src="https://img.shields.io/badge/version-1.1.55-F4D35E.svg?style=flat-square&labelColor=6E1423">
   <img alt="Fork of chaitanyagiri/munder-difflin" src="https://img.shields.io/badge/fork%20of-chaitanyagiri%2Fmunder--difflin-F4F1EA.svg?style=flat-square&labelColor=6E1423">
 </p>
 
@@ -171,12 +171,18 @@ wholesale merges. The shape of the line, as evidence for the three ideas above:
   ~0.01 ms), with wake logging cut to the rows that record a change (27 → 4.5 per
   message); an active turn that needs the provider's confirmation, so an agent can no
   longer be stuck "active" by a stale status or a swallowed Enter; and the Ask Me cards.
-- **Memory search without Python** (1.1.54, the current release) — a native engine in the
+- **Memory search without Python** (1.1.54) — a native engine in the
   app replaces the MemPalace search agents run (warm end to end ~127 ms against ~1,750 ms
   for the Python CLI; better ranking on every cohort of 373 real, labelled queries, NDCG@5
   +20.7 points). It ships off: legacy by default (MemPalace and Python are still required
   until the cutover), then a staged rollout with an immediate `fallback-legacy` brake. The
   palace is never touched.
+- **Mail mid-turn, one heavy job at a time, and Talk** (1.1.55, the current release) — an
+  agent is told about mail that arrives while it works, at its next tool call; installs,
+  builds, full suites and benches take a slot (default one at a time, set in Settings), so
+  agents stop loading the machine all at once; the Human reads the conversation with
+  Michael in a Talk view beside the terminal; AGY and Codex agents start idle with
+  their instructions; and wakes left unsent in a provider's input box are recovered.
 
 Every milestone carries a dated human acceptance and evidence tag in the fork's
 internal mission ledger; this README keeps only the shape.
@@ -348,6 +354,25 @@ Two data planes feed one renderer:
     - **Storage:** an index of 10.6 MB against an 80 MB palace.
   - **Until the cutover, MemPalace and its Python CLI are still required.** Legacy is the
     default and legacy mining is unchanged, so the palace stays current for a rollback.
+  - **An early `wake-up`** (since 1.1.55) no longer meets an empty index: in native mode
+    the worker is started 30 s after the first window loads, each agent's own notes are
+    indexed first, and a wake-up waits up to 5 s for them.
+- **Mid-turn mail** (since 1.1.55). The hook server tracks each agent's turn and, at its next
+  tool call, adds an `<inbox-update>` notice for inbox files that arrived since the turn
+  began (each announced once, at most five listed, sender text escaped). A message may carry
+  `supersedes`, and the router marks the older one `superseded_by`.
+- **The heavy-job lock** (since 1.1.55). A `PreToolUse` classifier recognises installs,
+  builds, packaging, full suites and benches (through `bash -c`, `cmd /c` and PowerShell
+  wrappers) and takes one of N slots (Settings → **Heavy jobs at once**, read live). Over the
+  limit, the call is denied with the holder's name. A slot is freed by the call's
+  `PostToolUse` / `PostToolUseFailure`, by a watcher that runs only while a slot is held
+  (one hidden process listing every 20 s: the job counts as running while the agent's
+  terminal has a process started after the slot was taken; a failed listing never frees a
+  slot), by the terminal's exit, or after 60 minutes.
+- **Talk** (since 1.1.55). Main tails Michael's Claude or Codex transcript off the main
+  thread, normalises the messages and pushes them to the renderer. The history lives in the
+  app's data folder (never the hive), capped at 8 MB per agent; it is kept when an agent is
+  archived and deleted only when the Human retires it.
 
 The renderer is presentation: main remains the sole submission authority, and nothing
 the UI displays can cause or prevent a wake.

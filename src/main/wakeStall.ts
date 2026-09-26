@@ -21,12 +21,13 @@ export const WAKE_STALL_AFTER_MS = 5 * 60_000;
 
 /**
  * Refusal reasons that are a DELIBERATE state rather than a stall. A paused, halted or
- * auto-delivery-paused agent is refusing because a human said so; an INTERFERED hold and a
- * HITL prompt are both waiting on a human answer. Announcing those would train everyone to
- * ignore the watchdog, which is the only failure mode that would make it worse than nothing.
+ * auto-delivery-paused agent is refusing because a human said so; a HITL prompt is likewise
+ * explicitly waiting on a human answer. An INTERFERED hold is different: it may be a stale
+ * automatic draft (as in WAKE-SELF-TEXT-HOLD), so pending mail must become an audible stall
+ * rather than disappearing behind a silent hold.
  */
 const DELIBERATE = new Set([
-  'no-pending-ids', 'paused', 'halted', 'auto-delivery-paused', 'held-interfered', 'hitl-hold'
+  'no-pending-ids', 'paused', 'halted', 'auto-delivery-paused', 'hitl-hold'
 ]);
 
 /** What the caller should do about this refusal. */

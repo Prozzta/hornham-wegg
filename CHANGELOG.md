@@ -11,6 +11,51 @@ All notable changes to this project are documented here. The format is based on
 > v0.4.5 (below). Earlier 1.1.x releases are described on the
 > [releases page](https://github.com/Prozzta/hornham-wegg/releases).
 
+## [1.1.55] — 2026-09-26
+
+**Agents hear about new mail mid-turn, take turns with the machine's heavy jobs, and the Human
+gets a Talk view of the conversation with Michael.** Wakes are more reliable, Antigravity
+and Codex agents start without a turn of their own, and an early `mempalace wake-up` on the
+native memory engine (still shipped off) no longer meets an empty index. Rollback: 1.1.54.
+
+### Added
+
+- **Talk: the Human's conversation with Michael as a conversation.** A view beside the terminal
+  that shows the Human's turns and Michael's replies (Claude and Codex), including the questions
+  Michael asks, with the terminal still one click away. Its history is private to the app (never
+  in the hive), capped at 8 MB per agent, restored newest first and read a page at a time; it
+  survives archiving an agent and is deleted only when the Human retires that agent, which the
+  close dialog says.
+- **Mail that arrives during a turn is announced during that turn.** When a message lands in an
+  agent's inbox while it is working, the agent is told at its next tool call (the sender, the
+  subject and the id, a handful at most), so it reads it before it sends or finishes rather than
+  after. A message can say which earlier message it **supersedes**, and the notice says so.
+- **One heavy job at a time, enforced by the app.** An install, a build, a packaging run, a full
+  test suite or a benchmark now takes a slot before it starts. When the slots are taken, the
+  agent is told who holds them and to carry on with light work. Settings → Autonomy & Budgets →
+  **Heavy jobs at once** (Off, 1, 2, 3, 4, 6 or 8; default 1). A slot is freed when the job ends: the
+  tool's own end, a watcher that checks every 20 s for the job's processes, the agent's terminal
+  closing, or after 60 minutes at most. The holders are shown in `fleet.json`.
+- **Antigravity and Codex agents start idle, with their instructions.** Each AGY agent is
+  launched as its own custom agent carrying its hive instructions, and Codex agents receive
+  them as developer instructions. Both wait for work instead of starting a turn on their own.
+- **An early `mempalace wake-up` no longer meets an empty index** (native memory engine,
+  when it is on): the app starts the engine about 30 s after launch, indexes each agent's own
+  notes first, and a wake-up waits up to 5 s for them.
+
+### Fixed
+
+- **Wakes that stuck on a line that was never sent.** When a provider left our wake text sitting
+  unsent in its input box, the app now sends it, but only when it can prove the text is its own
+  and no one has typed since. A stale Codex "task complete" is no longer taken as proof that a
+  wake started.
+- **Wake text in a narrow terminal** that wraps over several lines is read correctly.
+
+### Unchanged
+
+- **The native memory engine still ships off** (legacy by default), and the palace is never
+  touched.
+
 ## [1.1.54] — 2026-09-26
 
 **A built-in replacement for the MemPalace search that agents run. It ships off: after the

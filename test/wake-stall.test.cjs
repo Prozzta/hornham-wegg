@@ -69,12 +69,20 @@ test('an empty inbox is never a stall even when the REASON is not the empty-inbo
 });
 
 test('states a human asked for stay quiet however long they last', () => {
-  for (const why of ['paused', 'halted', 'auto-delivery-paused', 'held-interfered', 'hitl-hold']) {
+  for (const why of ['paused', 'halted', 'auto-delivery-paused', 'hitl-hold']) {
     const w = new WakeStallWatch();
     for (let t = 0; t <= 30 * 60_000; t += 15_000) {
       assert.equal(w.note('a', why, 3, T + t), null, `${why} is deliberate, not stuck`);
     }
   }
+});
+
+test('WAKE-155: an interfered hold with pending mail is surfaced as a stall, not silently exempted', () => {
+  const w = new WakeStallWatch();
+  assert.equal(w.note('andy', 'held-interfered', 1, T), null);
+  const stall = w.note('andy', 'held-interfered', 1, T + WAKE_STALL_AFTER_MS);
+  assert.ok(stall, 'the owner hold is visible to the floor after the bounded watchdog interval');
+  assert.equal(stall.why, 'held-interfered');
 });
 
 test('a changing reason restarts the clock — the state machine is moving', () => {

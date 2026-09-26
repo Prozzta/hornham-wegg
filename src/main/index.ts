@@ -1,7 +1,8 @@
-import { app, BrowserWindow, clipboard, dialog, ipcMain, Menu, powerMonitor, powerSaveBlocker, screen, shell, Notification, utilityProcess } from 'electron';
+import { app, BrowserWindow, clipboard, dialog, ipcMain, Menu, MessageChannelMain, powerMonitor, powerSaveBlocker, screen, shell, Notification, utilityProcess, type MessagePortMain, type WebContents } from 'electron';
 import { NativeMemoryWiring, toUnpacked } from './nativeMemory/mainWiring';
 import type { WorkerHandle } from './nativeMemory/service';
 import { spawn } from 'node:child_process';
+import { Worker } from 'node:worker_threads';
 import {
   rmSync, existsSync, readFileSync, readdirSync, statSync, cpSync, writeFileSync,
   unlinkSync, mkdirSync, renameSync, createWriteStream, copyFileSync, lstatSync,
@@ -42,7 +43,9 @@ import {
   getLogGraph, getCommitFiles, getFileAtRev, compareRefs, listWorktrees, checkoutRef
 } from './git';
 import { HiveManager, type AgentMeta, type HiveMessage, type HiveTask } from './hive';
+import { ThreadViewStore, threadRoot } from './threadView';
 import { HookServer } from './hooks';
+import { HeavyJobLock, heavyLimit, probeProcesses } from './heavyJob';
 import { CapacityRuntime } from './capacityRuntime';
 import { CapacityStore, capacityStorePath } from './capacityPersistence';
 import type { CapacityNotifyIntent } from './capacityNotify';
@@ -352,6 +355,88 @@ const hive = new HiveManager(
 );
 // #7C — operator control state (pause/gate/steer/halt), read by the HookServer
 // when deciding hook returns.
+// Private Human↔agent conversation projection. userData is selected before this
+// module reaches HiveManager, so this can never point at the git-backed hive.
+class ThreadEventChannel {
+  private port: MessagePortMain | undefined;
+  private ownerId: number | undefined;
+  attach(contents: WebContents, replace = false): void {
+    if (contents.isDestroyed() || (!replace && this.ownerId === contents.id && this.port)) return;
+    try { this.port?.close(); } catch { /* previous renderer closed */ }
+    const { port1, port2 } = new MessageChannelMain();
+    this.port = port1; this.ownerId = contents.id;
+    contents.once('destroyed', () => {
+      if (this.ownerId !== contents.id) return;
+      try { this.port?.close(); } catch { /* already closed */ }
+      this.port = undefined; this.ownerId = undefined;
+    });
+    try { contents.postMessage('thread:port', null, [port2]); }
+    catch { try { port1.close(); } catch { /* no receiver */ } this.port = undefined; this.ownerId = undefined; }
+  }
+  publish(agentId: string, event: import('./threadView').ThreadEvent): void {
+    const contents = liveWebContents();
+    if (!contents) return;
+    this.attach(contents);
+    try { this.port?.postMessage({ agentId, event }); }
+    catch { this.port = undefined; this.ownerId = undefined; }
+  }
+}
+
+type ThreadTailSource =
+  | { agentId: string; provider: 'claude'; file: string }
+  | { agentId: string; provider: 'codex'; codexHome: string };
+
+/** The sidecar owns transcript/rollout filesystem reads. Main receives a bounded
+ * line batch and remains the sole receipt-admission/private-storage owner. */
+class ThreadTailWorker {
+  private readonly worker = new Worker(join(__dirname, 'thread-tail-worker.cjs'));
+  private sourceKey = '';
+  private processing = Promise.resolve();
+  constructor(private readonly consume: (source: ThreadTailSource, lines: string[]) => Promise<void>) {
+    this.worker.unref();
+    this.worker.on('message', (message: unknown) => {
+      const row = message as { type?: unknown; agentId?: unknown; provider?: unknown; lines?: unknown };
+      if (row?.type !== 'lines' || typeof row.agentId !== 'string' || (row.provider !== 'claude' && row.provider !== 'codex') || !Array.isArray(row.lines)) return;
+      const lines = row.lines.filter((line): line is string => typeof line === 'string').slice(0, 256);
+      const source = row.provider === 'codex'
+        ? { agentId: row.agentId, provider: 'codex', codexHome: '' } as ThreadTailSource
+        : { agentId: row.agentId, provider: 'claude', file: '' } as ThreadTailSource;
+      this.processing = this.processing.then(() => this.consume(source, lines)).catch((e) => console.error('[thread-view] ingest failed:', e));
+    });
+    this.worker.on('error', (e) => console.error('[thread-view] tail worker failed:', e));
+  }
+  setSource(source: ThreadTailSource | null): void {
+    const key = source ? JSON.stringify(source) : '';
+    if (key === this.sourceKey) return;
+    this.sourceKey = key;
+    this.worker.postMessage({ type: 'source', source });
+  }
+}
+
+const threadEvents = new ThreadEventChannel();
+const threadView = new ThreadViewStore(threadRoot(app.getPath('userData')), (agentId, event) => threadEvents.publish(agentId, event));
+void threadView.init().catch((e) => console.error('[thread-view] init failed:', e));
+const threadTailer = new ThreadTailWorker(async (source, lines) => {
+  for (const line of lines) {
+    if (source.provider === 'codex') await threadView.ingestCodexLine(source.agentId, line);
+    else await threadView.ingestClaudeLine(source.agentId, line);
+  }
+});
+// Registry selection is cheap main-owned state. The worker does every directory
+// walk/stat/open/read and emits bounded complete-line batches from each 64 KiB tick.
+function refreshMichaelThreadSource(): void {
+  const registry = hive.registry();
+  const id = registry.godId;
+  if (!id) return threadTailer.setSource(null);
+  const provider = String(registry.agents[id]?.provider ?? 'claude').toLowerCase();
+  if (provider === 'codex') {
+    const home = readConfig().harnessHome;
+    return threadTailer.setSource(home ? { agentId: id, provider: 'codex', codexHome: join(home, 'agents', id, '.codex') } : null);
+  }
+  const file = hookServer.transcriptPath(id);
+  threadTailer.setSource(file ? { agentId: id, provider: 'claude', file } : null);
+}
+setInterval(() => { try { refreshMichaelThreadSource(); } catch (e) { console.error('[thread-view] source refresh failed:', e); } }, 500).unref();
 const control = new ControlRegistry();
 // Stage 7A — the live observability tap. Receives Claude Code's first-party OTel
 // over loopback OTLP/JSON and exposes the locked usage-provider seam. resolveCwd
@@ -501,14 +586,15 @@ const providerCapacity = new CapacityRuntime({
 // final check sits next to main's Enter with nothing that can yield between them. See
 // automaticSubmit.ts for the transaction and automaticSubmitWiring.ts for what each of
 // its effects means here.
-const screenReadings = new ScreenReadingBroker((ptyId, requestId, needle) =>
-  ptyManager.sendToOwner(ptyId, 'autoSubmit:readScreen', { requestId, ptyId, needle }));
+const screenReadings = new ScreenReadingBroker((ptyId, requestId, needle, expectedTail) =>
+  ptyManager.sendToOwner(ptyId, 'autoSubmit:readScreen', { requestId, ptyId, needle, expectedTail }));
 const automaticSubmit = new AutomaticSubmitOwner(buildOwnerDeps({
   pty: ptyManager,
   capacity: providerCapacity,
   ptyForAgent: (agentId) => ptyForAgent(agentId),
   providerForPty: (ptyId) => ptyProvider.get(ptyId),
-  requestScreenReading: (ptyId, needle) => screenReadings.request(ptyId, needle),
+  requestScreenReading: (ptyId, needle, expectedTail) => screenReadings.request(ptyId, needle, expectedTail),
+  onCommitted: (agentId, text) => threadView.commitSubmission(agentId, text),
   onOutcome: (r) => {
     // An outcome can raise an INTERFERED hold or settle one: the impact string moves.
     pushAgentImpact();
@@ -626,6 +712,16 @@ const hookServer = new HookServer(
     liveWebContents()?.send('hive:providerStatus', { agentId, status: tick.lifecycle });
   }
 );
+// HEAVY-JOB-SERIALIZE: the machine's heavy-job slots (Settings "Heavy jobs at once", read live).
+// PreToolUse takes or denies a slot; a background job's slot is freed by a hidden process check
+// that runs ONLY while a slot is held; PTY exit and a TTL free the rest. Holders go to fleet.json.
+const heavyLock = new HeavyJobLock({
+  limit: () => heavyLimit(readConfig().heavyJobsAtOnce),
+  roots: () => ptyManager.list().flatMap((s) => { const a = ptyToAgent.get(s.id); return a && s.pid > 0 ? [{ agentId: a, pid: s.pid }] : []; }),
+  probe: probeProcesses,
+  log: (row) => { try { hive.appendLog(row); } catch { /* best effort */ } }
+});
+hookServer.setHeavyLock(heavyLock);
 // HOOK-BROKER: Claude agents POST their hooks to the HookServer in-process (0 processes per
 // hook). The hive asks for a per-spawn URL; with the broker not listening it gets null and
 // writes the command hooks exactly as before.
@@ -639,6 +735,8 @@ const memory = new MemoryManager(
 // NATIVE-MEMORY (1.1.54): the MemPalace replacement. Default mode `legacy` makes this inert:
 // no worker, no token, no PATH change, the /memory route answers 404. Past legacy, the engine
 // runs in a utility process forked on the first memory request (never at start-up).
+/** NATIVE-WAKEUP-EMPTY-INDEX (a): the spec's lazy-fork floor after the first window is idle. */
+const NATIVE_MEMORY_PREWARM_DELAY_MS = 30_000;
 const nativeMemory = new NativeMemoryWiring({
   hiveRoot: () => hive.root(),
   palacePath: () => memory.palacePath(),
@@ -807,10 +905,18 @@ function teardownPty(id: string): void {
     if (leftProvider === 'antigravity' && ![...ptyProvider.values()].includes('antigravity')) {
       try { hive.agyAgentsGone(); } catch (e) { console.error('[hive] agyAgentsGone failed:', e); }
     }
+    // AGY-STARTUP-TURN: the agent left the floor (killed or archived): remove its agy custom
+    // agent, unless another PTY of the same agent is still alive (a restart in place spawns
+    // the new one first, and agy may re-read its customizations mid-session).
+    if (leftProvider === 'antigravity' && ![...ptyToAgent.values()].includes(agentId)) {
+      try { hive.removeAgyAgent(agentId); } catch (e) { console.error('[hive] removeAgyAgent failed:', e); }
+    }
     // Drop watchdog state so a dead agent can't get nudged or leak its grace.
     try { workerWake.forget(agentId, id); } catch { /* best-effort */ }
     try { forgetWakeRows(wakeRows, agentId); } catch { /* best-effort */ }
     try { nativeMemory.agentExited(agentId); } catch { /* best-effort */ }
+    // HEAVY-JOB-SERIALIZE: its jobs went with the PTY (unless another PTY of it is still alive).
+    if (![...ptyToAgent.values()].includes(agentId)) { try { heavyLock.agentGone(agentId); } catch { /* best-effort */ } }
     // Drop breaker state so a dead agent can't leak/zombie a tripped level.
     try { breaker.forget(agentId); } catch { /* best-effort */ }
     // W1 — kill this agent's proxy-bridge sidecar (qwen), if any, so a dead
@@ -1848,7 +1954,8 @@ function writeFleetSnapshot(): void {
           wake: wakeTelemetry.forAgent(id)
         };
       });
-    hive.writeFleetSnapshot({ ts: now, agents, wake: wakeTelemetry.snapshot(now) });
+    // HEAVY-JOB-SERIALIZE: who holds the heavy-job slots (god reads fleet.json every standup).
+    hive.writeFleetSnapshot({ ts: now, agents, wake: wakeTelemetry.snapshot(now), heavyLock: { limit: heavyLimit(readConfig().heavyJobsAtOnce), holders: heavyLock.snapshot() } });
   } catch (e) {
     console.error('[fleet] snapshot failed:', e);
   }
@@ -3453,6 +3560,9 @@ async function spawnAgentCore(opts: AgentSpawnOptions, owner: Electron.WebConten
         if (typedSid) resumeNotFound = true;
       } else {
         if (ownerHome !== myHome) opts.env = { ...(opts.env ?? {}), CODEX_HOME: ownerHome };
+        // N1 (AGY-STARTUP-TURN, Codex): a resume under ANOTHER agent's CODEX_HOME carries THIS
+        // agent's own developer_instructions with -c (the owner's config.toml holds the owner's).
+        opts.args = HiveManager.codexResumeArgs(opts.args ?? [], myHome, ownerHome);
         const args = opts.args ?? [];
         // Positional order matters: `codex resume [OPTIONS] [SESSION_ID] [PROMPT]`.
         // The hive identity prompt rides in `args` as a POSITIONAL (codex has no
@@ -4082,6 +4192,33 @@ ipcMain.handle('hive:requestInboxWake', (_evt, id: unknown) => {
 ipcMain.handle('hive:messages', (_evt, opts: unknown) =>
   hive.voiceMessages(opts && typeof opts === 'object' ? (opts as Parameters<typeof hive.voiceMessages>[0]) : {})
 );
+// THREAD-VIEW P1: renderer sees only the normalized private projection. It never
+// receives raw provider rollout/transcript files or tool/system records.
+ipcMain.handle('thread:list', async (_evt, id: unknown) =>
+  typeof id === 'string' ? threadView.list(id) : []
+);
+ipcMain.on('thread:portReady', (event) => threadEvents.attach(event.sender, true));
+ipcMain.handle('thread:layoutGet', async (_evt, id: unknown, fallback: unknown) =>
+  typeof id === 'string' ? threadView.layout(id, fallback === 'terminal' ? 'terminal' : 'talk') : null
+);
+ipcMain.handle('thread:layoutSet', async (_evt, id: unknown, layout: unknown, fallback: unknown) =>
+  typeof id === 'string' ? threadView.setLayout(id, layout, fallback === 'terminal' ? 'terminal' : 'talk') : null
+);
+ipcMain.handle('thread:sweepOrphans', async () => {
+  if (!hive.enabled()) return { ok: false, error: 'hive disabled (no registry)' };
+  try {
+    const sweepStartedAt = Date.now();
+    const removed = await threadView.sweepOrphans((id) => Boolean(hive.registry().agents[id]), sweepStartedAt);
+    return { ok: true, removed };
+  } catch (e) { return { ok: false, error: String(e) }; }
+});
+ipcMain.handle('thread:recordHuman', async (_evt, id: unknown, text: unknown, source: unknown) => {
+  if (typeof id !== 'string' || typeof text !== 'string' || !text.trim()) return { ok: false, error: 'invalid thread message' };
+  const kind = source === 'human-terminal' ? 'human-terminal' : 'human-ui';
+  threadView.recordReceipt(id, text, kind);
+  const event = await threadView.append(id, { speaker: 'human', text, source: kind });
+  return { ok: true, event };
+});
 ipcMain.handle('hive:send', (_evt, partial: Partial<HiveMessage>, from: unknown) => {
   if (!hive.enabled()) return { ok: false, error: 'hive disabled (no harnessHome)' };
   const msg = hive.send(partial ?? {}, typeof from === 'string' ? from : 'system');
@@ -4111,7 +4248,15 @@ ipcMain.handle('hive:setArchived', (_evt, id: unknown, archived: unknown) => {
   if (typeof id !== 'string') return { ok: false, error: 'invalid id' };
   if (!hive.enabled()) return { ok: false, error: 'hive disabled (no harnessHome)' };
   hive.setArchived(id, archived === true);
+  // Lifecycle archival happens on ordinary PTY exit and startup reconciliation.
+  // It MUST retain private Talk history; only `thread:retire` is a human request
+  // to remove it.
   return { ok: true };
+});
+ipcMain.handle('thread:retire', async (_evt, id: unknown) => {
+  if (typeof id !== 'string' || !id) return { ok: false, error: 'invalid id' };
+  try { await threadView.archive(id); return { ok: true }; }
+  catch (e) { return { ok: false, error: String(e) }; }
 });
 ipcMain.handle('hive:patchAgentRole', (_evt, id: unknown, role: unknown) => {
   if (typeof id !== 'string') return { ok: false, error: 'invalid id' };
@@ -5312,6 +5457,10 @@ registerRealtimeActionIpc({
     try { liveWebContents()?.send(archived ? 'hive:agentArchived' : 'hive:agentSpawned', { id }); } catch { /* window gone */ }
     return { ok: true };
   },
+  retireThread: async (id) => {
+    try { await threadView.archive(id); return { ok: true }; }
+    catch (e) { return { ok: false, error: String(e) }; }
+  },
   // clear_context: hand the text to the renderer's queue so delivery rides every
   // existing gate (idle-only, boot grace, draft/picker safety).
   enqueueToAgent: (id, text) => {
@@ -5901,6 +6050,9 @@ function bootstrapHiveServices(): void {
   // the last AGY agent leaves. Startup only gives back a lease a dead run left behind.
   // After hookServer.start(), so a locator always names a listening pipe. Stable only.
   hive.startAgyStatusline();
+  // AGY-STARTUP-TURN N5: remove our agy custom agents a crashed run left behind (agents no longer
+  // on the floor). Before any spawn; gated like every global write; only our marked files.
+  try { hive.sweepAgyAgents(); } catch (e) { console.error('[hive] sweepAgyAgents failed:', e); }
   // Bind the telemetry collector BEFORE the renderer spawns any agent, then point
   // the hive at it so every subsequent spawn is instrumented. Best-effort — a bind
   // failure just leaves telemetry off (transcript reconciler stays). No breaker.start():
@@ -6153,6 +6305,15 @@ app.whenReady().then(() => {
   // off, the app keeps Electron's default menu — zero behavior change.
   if (readConfig().multiWindow) installAppMenu();
   createWindow();
+  // NATIVE-WAKEUP-EMPTY-INDEX (a): in NATIVE mode, fork the memory worker (its below-normal
+  // startup backfill fills the index) 30 s after the first window finished loading, the spec's
+  // lazy rule ("no earlier than 30 seconds after the first window becomes idle"), so an agent's
+  // first task-start wake-up does not meet an empty index. The mode is read at fire time; any
+  // other mode does nothing. A first memory request before then forks it as always.
+  mainWindow?.webContents.once('did-finish-load', () => {
+    const t = setTimeout(() => { try { nativeMemory.prewarm(); } catch (e) { console.error('[native-memory] prewarm failed:', e); } }, NATIVE_MEMORY_PREWARM_DELAY_MS);
+    t.unref?.();
+  });
   // Auto-start the Slack webhook server when configured. Best-effort: a tunnel
   // failure (offline) is logged, not fatal. The tunnel URL is ephemeral and
   // changes per restart, so the user re-pastes it via Settings → Start.

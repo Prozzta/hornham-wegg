@@ -219,12 +219,16 @@ export class InboxWakeBridge {
     }
     this.rolloutReported.delete(agentId);
     const latest = probe.latest;
-    // CODEX-FALSEACTIVE-153: any boundary after our claim is Codex confirming the turn our
-    // submit asked for (a completion too: that turn ran). Recorded before the close below.
-    if (latest && st.provisional && this.deps.coordinator.noteProviderTurnStarted(agentId, latest.at)) {
+    // WAKE-CODEX-FALSECONFIRM: a completion is NEVER a start. The rollout may replay the
+    // previous task_complete after our claim; only a new task_started can prove this Enter.
+    if (latest?.kind === 'started' && st.provisional
+      && this.deps.coordinator.noteProviderTurnStarted(agentId, latest.turnId, latest.at)) {
       this.deps.diag?.('codex-rollout', { agentId, confirmed: true, turn: latest.turnId, at: latest.at });
     }
     if (!latest || latest.kind !== 'complete') return;       // no boundary, or a turn is running
+    if (this.deps.coordinator.recoverStuckCodexActive(agentId, latest.at, this.deps.now())) {
+      this.deps.diag?.('codex-stuck-active', { agentId, recovered: true, turn: latest.turnId, at: latest.at });
+    }
     const closed = this.deps.coordinator.noteProviderTurnEnded(agentId, latest.turnId, latest.at);
     if (closed) this.deps.diag?.('codex-rollout', { agentId, closed: true, turn: latest.turnId, at: latest.at });
   }
