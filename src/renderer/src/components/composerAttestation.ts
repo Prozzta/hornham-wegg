@@ -21,6 +21,10 @@ export function normalizeComposerText(text: string): string {
   return text.replace(/\s+/g, ' ').trim();
 }
 
+function compactComposerText(text: string): string {
+  return text.replace(/\s+/g, '');
+}
+
 /**
  * Attest the visible composer region, from its prompt marker through the
  * cursor row. This deliberately does not depend on IBufferLine.isWrapped:
@@ -29,6 +33,7 @@ export function normalizeComposerText(text: string): string {
 export function composerRegionEndsWith(buffer: IBuffer, cursorAbsoluteY: number, expectedTail: string): boolean {
   const expected = normalizeComposerText(expectedTail);
   if (!expected) return false;
+  const compactExpected = compactComposerText(expectedTail);
   const first = Math.max(0, cursorAbsoluteY - COMPOSER_LOOKBACK_ROWS);
   for (let start = cursorAbsoluteY; start >= first; start -= 1) {
     const prompt = buffer.getLine(start);
@@ -41,7 +46,11 @@ export function composerRegionEndsWith(buffer: IBuffer, cursorAbsoluteY: number,
       if (!row) break;
       rows.push(unframeComposerRow(row.translateToString(false)));
     }
-    return normalizeComposerText(rows.join('\n')).endsWith(expected);
+    const observed = rows.join('\n');
+    // TUIs can hard-wrap an opaque inbox id in the middle of the token. Its inserted
+    // newline is layout whitespace, not an edit; compare the compact form as well.
+    return normalizeComposerText(observed).endsWith(expected)
+      || compactComposerText(observed).endsWith(compactExpected);
   }
   return false;
 }

@@ -16,8 +16,10 @@ epoch, restores the bounded provisional path, and re-pends the committed ids onc
 The submit owner remembers only its own last committed text, incarnation, and human
 generation. On a retry, it re-presses Enter only when the rendered composer region from
 its prompt marker through the cursor exactly matches that text after TUI border and
-whitespace normalization, and the generation is unchanged. This covers explicit Ink and
-ratatui row breaks as well as xterm soft wraps. It uses the
+whitespace normalization (including a hard wrap inside an opaque id), and the generation
+is unchanged. This covers explicit Ink and ratatui row breaks as well as xterm soft wraps.
+The real Codex v0.154.0 PTY capture identifies `›` (U+203A) as its composer marker; it is
+accepted alongside `>` and `❯`. It uses the
 existing non-yielding commit section; anything else remains an interference hold.
 Screen-reading IPC now carries that optional attestation. A pending `held-interfered`
 state is no longer excluded from the five-minute wake-stall diagnostic.
@@ -34,7 +36,9 @@ human-interference fail-closed path.
 
 - New regressions fail before C1/C2 for explicit TUI composer rows and a genuine Codex
   `task_started` between claim and settle, respectively.
-- Passed: `node --test test/composer-attestation.test.cjs test/automatic-submit-wiring.test.cjs test/wake-confirm-153.test.cjs test/wake-stall.test.cjs` (124 tests).
+- Mutant proof: the `at > activeSince` C2 revert and removal of the `closedTurns` replay
+  guard each fail their named regression; the restored implementation passes.
+- Passed: `node --test test/composer-attestation.test.cjs test/automatic-submit-wiring.test.cjs test/wake-confirm-153.test.cjs test/wake-stall.test.cjs` (125 tests).
 - Passed: `npm run typecheck`.
 - Required `npm ci` installed dependencies but its concurrent native rebuild saw an
   `node-pty\\build` lock; no process was killed. The normal postinstall patch was then

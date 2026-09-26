@@ -10,7 +10,7 @@ function write(term, text) {
   return new Promise((resolve) => term.write(text, resolve));
 }
 
-const NUDGE = 'You have new hive inbox message(s) at least: 2026-09-27T01-40-00-000Z-god-oscarwakec, 2026-09-27T01-41-00-000Z-jim-wake155r-oscar. Read your inbox, act on everything pending, and move handled messages to inbox/.done/.';
+const NUDGE = 'You have new hive inbox message(s) at least: 2026-09-27T01-40-00-000Z-god-oscarwakec, 2026-09-27T01-41-00-000Z-jim-wake155r-oscar. Read your inbox, act on everything pending, and move handled messages to inbox/.done/. Your inbox directory is authoritative: work every still-pending item and do not reprocess archived messages.';
 
 function boxedComposerRows(text, cols, marker = '>') {
   const usable = cols - 6; // "│ > " / "│   " plus " │"
@@ -26,6 +26,13 @@ function boxedComposerRows(text, cols, marker = '>') {
     }
   }
   if (row) rows.push(row);
+  return rows.map((value, index) => `\u2502 ${index ? '  ' : `${marker} `}${value} \u2502`);
+}
+
+function hardBoxedComposerRows(text, cols, marker = '>') {
+  const usable = cols - 6;
+  const rows = [];
+  for (let offset = 0; offset < text.length; offset += usable) rows.push(text.slice(offset, offset + usable));
   return rows.map((value, index) => `\u2502 ${index ? '  ' : `${marker} `}${value} \u2502`);
 }
 
@@ -52,4 +59,11 @@ test('WAKE-155 C1: one human character inserted into an explicit composer makes 
   await write(term, boxedComposerRows(NUDGE.replace('inbox message', 'inboxX message'), 60).join('\r\n'));
   const buffer = term.buffer.active;
   assert.equal(composerRegionEndsWith(buffer, buffer.baseY + buffer.cursorY, NUDGE), false);
+});
+
+test('WAKE-155 C1: a 40-column TUI hard break inside an opaque message id is layout whitespace', async () => {
+  const term = new Terminal({ cols: 40, rows: 20, scrollback: 20 });
+  await write(term, hardBoxedComposerRows(NUDGE, 40).join('\r\n'));
+  const buffer = term.buffer.active;
+  assert.equal(composerRegionEndsWith(buffer, buffer.baseY + buffer.cursorY, NUDGE), true);
 });
