@@ -2779,6 +2779,18 @@ export class HiveManager {
     return JSON.stringify(text).replace(/\u007f/g, '\\u007F');
   }
 
+  /** N1 (Jim): the args of a `codex resume` whose session lives in `ownerHome`. When that is
+   *  ANOTHER agent's CODEX_HOME, its config.toml carries the OWNER's developer_instructions, so
+   *  THIS agent's own are appended with `-c` (a -c override beats config.toml), and a cross-agent
+   *  resume never silently runs under another agent's identity. Unchanged otherwise, or when this
+   *  agent has none of ours (then its positional prompt still carries its identity). */
+  static codexResumeArgs(args: string[], myHome: string | undefined, ownerHome: string): string[] {
+    if (!myHome || ownerHome === myHome) return args;
+    let own: string | null = null;
+    try { own = HiveManager.ownCodexDeveloperInstructions(readFileSync(join(myHome, 'config.toml'), 'utf8')); } catch { own = null; }
+    return own ? [...args, '-c', `developer_instructions=${HiveManager.tomlString(own)}`] : args;
+  }
+
   /** N1 (Jim): this agent's OWN developer instructions, read back from the line we write at the
    *  top of its config.toml, or null. A resume that runs under ANOTHER agent's CODEX_HOME passes
    *  them with `-c`, so it never silently takes that agent's identity. */

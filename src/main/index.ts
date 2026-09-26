@@ -3458,15 +3458,10 @@ async function spawnAgentCore(opts: AgentSpawnOptions, owner: Electron.WebConten
         console.warn(`[resume] codex session "${sid}" not found in any agent CODEX_HOME - starting fresh`);
         if (typedSid) resumeNotFound = true;
       } else {
-        if (ownerHome !== myHome) {
-          opts.env = { ...(opts.env ?? {}), CODEX_HOME: ownerHome };
-          // N1 (AGY-STARTUP-TURN, Codex): the owner home's config.toml carries the OWNER's
-          // developer_instructions. Pass THIS agent's own with -c (it overrides config.toml), so
-          // a cross-agent resume never silently runs under another agent's identity.
-          let own: string | null = null;
-          try { own = myHome ? HiveManager.ownCodexDeveloperInstructions(readFileSync(join(myHome, 'config.toml'), 'utf8')) : null; } catch { own = null; }
-          if (own) opts.args = [...(opts.args ?? []), '-c', `developer_instructions=${HiveManager.tomlString(own)}`];
-        }
+        if (ownerHome !== myHome) opts.env = { ...(opts.env ?? {}), CODEX_HOME: ownerHome };
+        // N1 (AGY-STARTUP-TURN, Codex): a resume under ANOTHER agent's CODEX_HOME carries THIS
+        // agent's own developer_instructions with -c (the owner's config.toml holds the owner's).
+        opts.args = HiveManager.codexResumeArgs(opts.args ?? [], myHome, ownerHome);
         const args = opts.args ?? [];
         // Positional order matters: `codex resume [OPTIONS] [SESSION_ID] [PROMPT]`.
         // The hive identity prompt rides in `args` as a POSITIONAL (codex has no

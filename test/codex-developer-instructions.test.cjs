@@ -93,12 +93,28 @@ test('N1: ownCodexDeveloperInstructions reads back exactly what we wrote (for a 
   assert.equal(toml.parse(`developer_instructions = ${HiveManager.tomlString(text)}`).developer_instructions, text);
 });
 
-test('N1 WIRING: a codex resume under ANOTHER agent\'s CODEX_HOME passes THIS agent\'s own developer_instructions with -c', () => {
+test('N1 BEHAVIOUR (Jim re-check gap): a resume of a session owned by ANOTHER agent\'s CODEX_HOME carries `-c developer_instructions=<THIS agent\'s own>`; its own home or no ours = args unchanged', async (t) => {
+  const s = sandbox(t, SEED);
+  const a = await s.hive.ensureAgent({ id: 'agent-a', name: 'Aye', provider: 'codex', cwd: s.home });
+  const b = await s.hive.ensureAgent({ id: 'agent-b', name: 'Bee', provider: 'codex', cwd: s.home });
+  const myHome = a.env.CODEX_HOME; const ownerHome = b.env.CODEX_HOME;
+  const base = ['--dangerously-bypass-hook-trust'];
+  const out = HiveManager.codexResumeArgs(base, myHome, ownerHome);
+  const i = out.indexOf('-c');
+  assert.ok(i >= 0, `-c appended: ${JSON.stringify(out.map((x) => x.slice(0, 40)))}`);
+  assert.match(out[i + 1], /^developer_instructions="/);
+  const passed = toml.parse(out[i + 1]).developer_instructions;
+  assert.match(passed, /^You are "Aye" \(agent-a\)/, 'THIS agent\'s identity, not the owner\'s');
+  assert.ok(!passed.includes('"Bee"'));
+  assert.deepEqual(HiveManager.codexResumeArgs(base, myHome, myHome), base, 'its own home: unchanged');
+  assert.deepEqual(HiveManager.codexResumeArgs(base, undefined, ownerHome), base, 'no home of its own: unchanged');
+  fs.writeFileSync(path.join(myHome, 'config.toml'), 'model = "m"\n');
+  assert.deepEqual(HiveManager.codexResumeArgs(base, myHome, ownerHome), base, 'none of ours (the positional fallback carries identity): unchanged');
+});
+
+test('N1 WIRING: index.ts routes the codex resume args through HiveManager.codexResumeArgs, after pointing CODEX_HOME at the owner', () => {
   const src = fs.readFileSync(path.join(__dirname, '..', 'src', 'main', 'index.ts'), 'utf8');
-  const block = src.slice(src.indexOf('if (ownerHome !== myHome) {'), src.indexOf("console.log('[resume] codex resume'"));
-  assert.match(block, /CODEX_HOME: ownerHome/);
-  assert.match(block, /HiveManager\.ownCodexDeveloperInstructions\(readFileSync\(join\(myHome, 'config\.toml'\), 'utf8'\)\)/);
-  assert.match(block, /'-c', `developer_instructions=\$\{HiveManager\.tomlString\(own\)\}`/);
+  assert.match(src, /if \(ownerHome !== myHome\) opts\.env = \{ \.\.\.\(opts\.env \?\? \{\}\), CODEX_HOME: ownerHome \};\s*(\/\/[^\n]*\n\s*)*opts\.args = HiveManager\.codexResumeArgs\(opts\.args \?\? \[\], myHome, ownerHome\);/);
 });
 
 test('CODEX: a MULTI-LINE developer_instructions in the seed cannot be replaced safely -> the positional prompt stays (the old path), the seed untouched', async (t) => {
