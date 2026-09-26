@@ -25,6 +25,9 @@ export interface InboxWakeSubmit {
   agentId: string;
   admissionClass: 'CAPACITY_GATED';
   text: string;
+  /** The text of an earlier nudge that was never confirmed as a turn (WakeClaim.recheck):
+   *  the owner must see it absent from the prompt before typing this one. */
+  priorText?: string;
 }
 
 export interface InboxWakeBridgeDeps {
@@ -49,6 +52,9 @@ export interface InboxWakeBridgeDeps {
    *  read from a bounded rollout tail. Undefined = not a Codex agent (no probe). Optional so
    *  every existing deployment and test runs unchanged. */
   codexTurnProbe?: (agentId: string) => import('./codexRolloutLifecycle').CodexLifecycleProbe | undefined;
+  /** CODEX-FALSEACTIVE-153: does this agent's provider report its own turn starts? Then
+   *  our COMMITTED epoch is provisional until it does. Absent = no (the plain reading). */
+  confirmsTurnStart?: (agentId: string) => boolean;
 }
 
 export class InboxWakeBridge {
@@ -78,11 +84,12 @@ export class InboxWakeBridge {
   }
 
   /** THE one wake path, for events and reconciliation alike. Returns the claim it submitted. */
-  requestInboxWake(agentId: string, cause: WakeCause, mode: WakeMode): WakeClaim | null {
+  requestInboxWake(agentId: string, cause: WakeCause, mode: WakeMode, readIds?: string[]): WakeClaim | null {
     const { coordinator } = this.deps;
     this.deps.diag?.('enter', { agentId, cause, mode });
-    const ids = this.deps.inboxIds(agentId);
-    coordinator.reconcile(agentId, ids);
+    // The beat passes the ids it has just read and reconciled: one inbox read per beat.
+    const ids = readIds ?? this.deps.inboxIds(agentId);
+    if (!readIds) coordinator.reconcile(agentId, ids);
     const f = this.deps.facts(agentId);
     const now = this.deps.now();
     this.deps.diag?.('facts', {
@@ -108,7 +115,8 @@ export class InboxWakeBridge {
         requestId: claim.requestId,
         agentId,
         admissionClass: 'CAPACITY_GATED',
-        text: this.deps.text(claim.ids)
+        text: this.deps.text(claim.ids),
+        ...(claim.recheck ? { priorText: this.deps.text(claim.recheck) } : {})
       });
       this.deps.diag?.('submit', { agentId, cause, mode, requestId: claim.requestId });
     } catch (e) {
@@ -119,7 +127,7 @@ export class InboxWakeBridge {
       .then((outcome) => outcome?.kind ?? 'FAILED', () => 'FAILED')
       .then((kind) => {
         this.deps.diag?.('settle', { agentId, cause, mode, outcome: kind, requestId: claim.requestId });
-        coordinator.settle(claim, kind, this.deps.now());
+        coordinator.settle(claim, kind, this.deps.now(), kind === 'COMMITTED' && (this.deps.confirmsTurnStart?.(agentId) ?? false));
         this.deps.log?.(`[inbox-wake] ${kind === 'COMMITTED' ? 'commit' : 'release'} ${agentId} cause=${cause} outcome=${kind}`);
       });
     return claim;
@@ -192,12 +200,13 @@ export class InboxWakeBridge {
    * waiting may have lost its Stop. Ask Codex's rollout (bounded tail) whether the open turn
    * completed, and close it only with that proof. Everything else fails closed.
    */
-  private closeLostCodexTurn(agentId: string): void {
+  private closeLostCodexTurn(agentId: string, inboxIds: readonly string[]): void {
     const probeFn = this.deps.codexTurnProbe;
     if (!probeFn) return;
     const st = this.deps.coordinator.state(agentId);
     if (st.lifecycle !== 'active') return;
-    if (this.deps.inboxIds(agentId).length === 0) return;   // nothing waiting: nothing is stuck
+    // A provisional epoch is probed with or without mail: its confirmation is a turn START.
+    if (inboxIds.length === 0 && !st.provisional) return;   // nothing waiting: nothing is stuck
     const probe = probeFn(agentId);
     if (!probe) return;                                      // not a Codex agent
     if (!probe.ok) {
@@ -209,6 +218,11 @@ export class InboxWakeBridge {
     }
     this.rolloutReported.delete(agentId);
     const latest = probe.latest;
+    // CODEX-FALSEACTIVE-153: any boundary after our claim is Codex confirming the turn our
+    // submit asked for (a completion too: that turn ran). Recorded before the close below.
+    if (latest && st.provisional && this.deps.coordinator.noteProviderTurnStarted(agentId, latest.at)) {
+      this.deps.diag?.('codex-rollout', { agentId, confirmed: true, turn: latest.turnId, at: latest.at });
+    }
     if (!latest || latest.kind !== 'complete') return;       // no boundary, or a turn is running
     const closed = this.deps.coordinator.noteProviderTurnEnded(agentId, latest.turnId, latest.at);
     if (closed) this.deps.diag?.('codex-rollout', { agentId, closed: true, turn: latest.turnId, at: latest.at });
@@ -217,13 +231,19 @@ export class InboxWakeBridge {
   /** The reconciliation beat: the same path, in reconcile mode, over every live agent. */
   reconcileAll(agentIds: readonly string[]): void {
     for (const agentId of agentIds) {
-      try { this.closeLostCodexTurn(agentId); }
-      catch (e) { this.deps.diag?.('codex-rollout', { agentId, closed: false, why: 'probe-threw', error: String(e) }); }
       // Per agent, so one throwing agent cannot silently take the whole beat down with it
       // (today it does: runWorkerWakeBeat catches at the top and the rest of the fleet is
       // skipped every tick, forever). Reported, then rethrown - unchanged behaviour.
       try {
-        this.requestInboxWake(agentId, 'reconcile', 'reconcile');
+        const ids = this.deps.inboxIds(agentId);
+        this.deps.coordinator.reconcile(agentId, ids);
+        try { this.closeLostCodexTurn(agentId, ids); }
+        catch (e) { this.deps.diag?.('codex-rollout', { agentId, closed: false, why: 'probe-threw', error: String(e) }); }
+        // The beat's own lifecycle edges (deferred idle, unconfirmed submit, re-announce),
+        // after the reconcile so ids that left the disk are not re-pended.
+        const edge = this.deps.coordinator.beat(agentId, this.deps.now());
+        if (edge) this.deps.diag?.(edge.kind, { agentId, ...('ids' in edge ? { ids: edge.ids.length } : {}) });
+        this.requestInboxWake(agentId, 'reconcile', 'reconcile', ids);
       } catch (e) {
         this.deps.diag?.('throw', { agentId, cause: 'reconcile', mode: 'reconcile', error: String(e) });
         throw e;

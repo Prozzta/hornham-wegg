@@ -522,6 +522,14 @@ inboxWake = new InboxWakeBridge({
     const home = hive.codexHomeFor(agentId);
     return home ? codexLifecycle.probe(home) : undefined;
   },
+  // CODEX-FALSEACTIVE-153: the providers whose own turn start reaches main (Claude and Codex
+  // UserPromptSubmit, Codex task_started, AGY PreInvocation). Only for these is a COMMITTED
+  // wake provisional until confirmed; any other provider keeps "active until Stop".
+  confirmsTurnStart: (agentId) => {
+    const ptyId = ptyForAgent(agentId);
+    const provider = ptyId ? ptyProvider.get(ptyId) : undefined;
+    return provider === 'claude' || provider === 'codex' || provider === 'antigravity';
+  },
   inboxIds: (agentId) => hive.inbox(agentId).map((m) => m.id).filter(Boolean),
   facts: (agentId) => {
     const ptyId = ptyForAgent(agentId);

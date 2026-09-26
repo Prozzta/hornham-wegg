@@ -134,6 +134,32 @@ test('R1 settings: with the broker up (Windows) the statusLine SOURCES claude-st
   assert.doesNotMatch(written, /\r/, 'no CR: bash would read it as part of a command');
 });
 
+test('R1 N1: claude-status.sh is never rewritten in place (other shells source it): unchanged = untouched, changed = temp + rename', { skip: !WIN }, async () => {
+  const URL_ = 'http://127.0.0.1:5555/hook/a1/' + TOK;
+  const { home } = await settingsFor({ urlFor: () => URL_, revoke: () => {} });
+  const script = path.join(home, 'hive', 'bin', 'claude-status.sh');
+  const writes = [], renames = [];
+  const w0 = fs.writeFileSync, r0 = fs.renameSync;
+  fs.writeFileSync = function (p, ...a) { writes.push(String(p)); return w0.call(this, p, ...a); };
+  fs.renameSync = function (a, b) { renames.push([String(a), String(b)]); return r0.call(this, a, b); };
+  const isScript = (p) => path.resolve(p) === path.resolve(script);
+  try {
+    const hive = new HiveManager(() => home);
+    hive.setHookBroker({ urlFor: () => URL_, revoke: () => {} });
+    await hive.ensureAgent({ id: 'b2', name: 'B', provider: 'claude', cwd: home });
+    assert.equal(writes.filter(isScript).length, 0, 'unchanged content: the script is not written');
+    assert.equal(renames.filter(([, b]) => isScript(b)).length, 0, 'unchanged content: nothing is renamed over it');
+    w0(script, 'stale', 'utf8');
+    await hive.ensureAgent({ id: 'c3', name: 'C', provider: 'claude', cwd: home });
+    assert.equal(writes.filter(isScript).length, 0, 'a change never writes the sourced file in place');
+    const ren = renames.filter(([, b]) => isScript(b));
+    assert.equal(ren.length, 1, 'a change lands via ONE rename');
+    assert.ok(writes.some((p) => path.resolve(p) === path.resolve(ren[0][0])), 'the renamed file is the temp just written');
+    assert.equal(fs.readFileSync(script, 'utf8'), CLAUDE_STATUS_SH);
+    assert.deepEqual(fs.readdirSync(path.dirname(script)).filter((f) => f.endsWith('.tmp')), [], 'no temp left behind');
+  } finally { fs.writeFileSync = w0; fs.renameSync = r0; }
+});
+
 test('R1 settings: with the broker down, or a URL that is not ours, the status line stays the command shim', async () => {
   const down = await settingsFor({ urlFor: () => null, revoke: () => {} });
   assert.match(down.settings.statusLine.command, / --status$/);

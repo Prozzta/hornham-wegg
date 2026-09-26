@@ -448,6 +448,12 @@ export interface SubmitRequest {
   text: string;
   /** How long the owner keeps holding the PTY after a COMMIT. Default SETTLE_MS. */
   settleMs?: number;
+  /** CODEX-FALSEACTIVE-153: the text of an EARLIER automatic submit that was entered but
+   *  never became a provider turn, so it may still sit unsent in the composer. Before
+   *  anything is staged the screen must show it is NOT there: still
+   *  there is INTERFERED (held for a person, never typed after it); no reading is REFUSED
+   *  (nothing typed, asked again later). Absent = no such check. */
+  priorText?: string;
 }
 
 export type RefusalReason =
@@ -465,7 +471,8 @@ export type RefusalReason =
   | 'PROMPT_SETTLING'
   | 'HUMAN_INPUT_RECENT'
   | 'HUMAN_INPUT_BEFORE_STAGE'
-  | 'STAGE_WRITE_FAILED';
+  | 'STAGE_WRITE_FAILED'
+  | 'PRIOR_TEXT_UNVERIFIED';
 
 export type InterferenceReason =
   | 'HUMAN_INPUT_AFTER_STAGE'
@@ -476,7 +483,8 @@ export type InterferenceReason =
   | 'STAGED_TEXT_NOT_POSITIVELY_VISIBLE'
   | 'CLEAR_WRITE_FAILED'
   | 'ERASE_NOT_VERIFIED'
-  | 'ENTER_WRITE_FAILED';
+  | 'ENTER_WRITE_FAILED'
+  | 'PRIOR_TEXT_ON_PROMPT';
 
 export type SubmitOutcome =
   /** The Enter went out. The one outcome a caller may acknowledge a queue item on. */
@@ -563,6 +571,20 @@ export function needleFor(text: string): string | null {
   const first = text.split('\n').map((l) => l.trim()).find((l) => l.length > 0) ?? '';
   const needle = first.slice(0, MAX_NEEDLE).trimEnd();
   return needle.length >= MIN_NEEDLE ? needle : null;
+}
+
+/**
+ * The needles that find an UNSENT earlier text on the prompt row: its TAIL, not its head.
+ * The cursor sits right after text typed into a composer, and a long nudge wraps, so only
+ * its end is on the cursor's row; once submitted, the transcript echoes the whole text
+ * ABOVE an empty composer and the cursor's row holds none of it. Two lengths, so a row
+ * boundary inside the longer tail still leaves the short one whole on the cursor's row.
+ * (Residual: a boundary inside the last few characters is not seen.)
+ */
+export function priorTextNeedles(text: string): string[] {
+  const t = text.trimEnd();
+  if (t.length < MIN_NEEDLE) return [];
+  return [...new Set([t.slice(-MAX_NEEDLE).trimStart(), t.slice(-MIN_NEEDLE)])].filter((n) => n.length >= MIN_NEEDLE);
 }
 
 function payloadIdentity(text: string): string {
@@ -847,6 +869,21 @@ export class AutomaticSubmitOwner {
       if (ready === 'GONE') return this.refuse(decision, 'PTY_GONE');
       if (waited >= READY_TIMEOUT_MS) return this.refuse(decision, 'TERMINAL_NOT_READY');
       await this.sleep(READY_POLL_MS);
+    }
+
+    // ── PRIOR TEXT (CODEX-FALSEACTIVE-153): an earlier nudge that never became a turn may
+    // still be on the prompt. Typed after it, both would go out as one prompt. Read before
+    // the STAGE guards below, which must not be separated from the write by this yield.
+    if (req.priorText !== undefined) {
+      const needles = priorTextNeedles(req.priorText);
+      if (needles.length === 0) return this.refuse(decision, 'PRIOR_TEXT_UNVERIFIED', 'no usable needle');
+      for (const needle of needles) {
+        const seen = await this.readScreen(ptyId, needle);
+        if (!seen) return this.refuse(decision, 'PRIOR_TEXT_UNVERIFIED', 'no screen reading');
+        if (seen.onPromptRow) {
+          return this.interfere({ req, ptyId, incarnation, decision, humanStage: deps.humanGeneration(ptyId) ?? 0 }, 'PRIOR_TEXT_ON_PROMPT', undefined);
+        }
+      }
     }
 
     // ── STAGE: every guard re-read IMMEDIATELY before the write, no yield between ────

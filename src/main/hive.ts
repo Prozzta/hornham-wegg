@@ -2349,7 +2349,16 @@ export class HiveManager {
     if (/[\s"'`$\\]/.test(path)) return null;
     try {
       mkdirSync(join(root, 'bin'), { recursive: true });
-      writeFileSync(path, CLAUDE_STATUS_SH, 'utf8');
+      // Other agents' status shells SOURCE this file on every refresh, so it is never
+      // rewritten in place (a torn read): unchanged content is left alone, and a change
+      // lands whole via a temp file + rename.
+      let current: string | null = null;
+      try { current = readFileSync(path, 'utf8'); } catch { /* not yet written */ }
+      if (current !== CLAUDE_STATUS_SH) {
+        const tmp = `${path}.${process.pid}.tmp`;
+        writeFileSync(tmp, CLAUDE_STATUS_SH, 'utf8');
+        renameSync(tmp, path);
+      }
       return path;
     } catch { return null; }
   }
