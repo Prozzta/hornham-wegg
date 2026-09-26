@@ -636,6 +636,44 @@ export class HiveManager {
     }
   }
 
+  /**
+   * NATIVE-MEMORY section 6: `<root>/bin/memory/`, the directory the app PREPENDS to an agent's
+   * PATH once the native engine is past `legacy`, so `mempalace` resolves to the shim before a
+   * uv-installed mempalace.exe. Two wrappers, both running the shim on Electron-as-Node:
+   * `mempalace.cmd` (cmd.exe, PowerShell) and `mempalace` (Git bash, POSIX sh).
+   * Written only when the content changed, via temp + rename: a shell may be reading it.
+   * Returns the directory, or null (no hive, or the write failed).
+   */
+  writeMemoryShim(shimScript: string): string | null {
+    const root = this.root();
+    if (!root) return null;
+    const dir = join(root, 'bin', 'memory');
+    const exe = process.execPath;
+    const files: Array<[string, string, number]> = process.platform === 'win32'
+      ? [
+          ['mempalace.cmd', `@echo off\r\nset ELECTRON_RUN_AS_NODE=1\r\n"${exe}" "${shimScript}" %*\r\n`, 0o644],
+          ['mempalace', `#!/bin/sh\nELECTRON_RUN_AS_NODE=1 exec "${exe.replace(/\\/g, '/')}" "${shimScript.replace(/\\/g, '/')}" "$@"\n`, 0o755]
+        ]
+      : [['mempalace', `#!/bin/sh\nELECTRON_RUN_AS_NODE=1 exec "${exe}" "${shimScript}" "$@"\n`, 0o755]];
+    try {
+      mkdirSync(dir, { recursive: true });
+      for (const [name, content, mode] of files) {
+        const p = join(dir, name);
+        let cur: string | null = null;
+        try { cur = readFileSync(p, 'utf8'); } catch { /* not yet written */ }
+        if (cur === content) continue;
+        const tmp = `${p}.${process.pid}.tmp`;
+        writeFileSync(tmp, content, 'utf8');
+        if (process.platform !== 'win32') chmodSync(tmp, mode);
+        renameSync(tmp, p);
+      }
+      return dir;
+    } catch (e) {
+      console.error('[hive] writeMemoryShim failed:', e);
+      return null;
+    }
+  }
+
   /** The launcher path if it is actually on disk, else null (→ callers fall back
    *  to bare `node`, i.e. exactly the pre-fix behavior — never worse than before). */
   private nodeLauncher(): string | null {

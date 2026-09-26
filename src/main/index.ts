@@ -1,13 +1,17 @@
-import { app, BrowserWindow, clipboard, dialog, ipcMain, Menu, powerMonitor, powerSaveBlocker, screen, shell, Notification } from 'electron';
+import { app, BrowserWindow, clipboard, dialog, ipcMain, Menu, powerMonitor, powerSaveBlocker, screen, shell, Notification, utilityProcess } from 'electron';
+import { NativeMemoryWiring, toUnpacked } from './nativeMemory/mainWiring';
+import type { WorkerHandle } from './nativeMemory/service';
 import { spawn } from 'node:child_process';
 import {
   rmSync, existsSync, readFileSync, readdirSync, statSync, cpSync, writeFileSync,
   unlinkSync, mkdirSync, renameSync, createWriteStream, copyFileSync, lstatSync,
-  readlinkSync, symlinkSync, appendFileSync
+  readlinkSync, symlinkSync, appendFileSync, mkdtempSync
 } from 'node:fs';
 import { randomBytes, createHash, timingSafeEqual } from 'node:crypto';
 import { join, resolve, sep, basename, dirname, isAbsolute } from 'node:path';
-import { homedir } from 'node:os';
+import { homedir, tmpdir } from 'node:os';
+import { runMemorySmoke, smokeTarget } from './nativeMemory/smoke';
+import { benchTarget, runMemoryBenchHost } from './nativeMemory/bench';
 import { request as httpsRequest } from 'node:https';
 import { PtyManager, type SpawnOptions } from './pty';
 import {
@@ -176,6 +180,19 @@ if (DEV_ISOLATION) {
     `[dev-isolation] MUNDER_DEV=1 — userData=${paths.userData} harnessHome=${paths.harnessHome} pipe=${paths.pipeName}` +
     (scrubbed.length ? ` (scrubbed inherited Stable env: ${scrubbed.join(', ')})` : '')
   );
+}
+
+// NATIVE-MEMORY gate-2 smoke (smoke.ts): `--native-memory-smoke=<result.json>` is a windowless
+// self-test of the memory worker in a utility process. It must point userData at a fresh temp
+// folder HERE, before anything reads it, so no config, hive or palace of the user's is opened;
+// the ready handler then runs only the smoke and exits.
+const memorySmokeOut = smokeTarget(process.argv);
+// The speed-gate bench host (bench.ts): the same isolation as the smoke.
+const memoryBenchDir = benchTarget(process.argv);
+if (memorySmokeOut || memoryBenchDir) {
+  const smokeUserData = mkdtempSync(join(tmpdir(), 'munder-smoke-userdata-'));
+  app.setPath('userData', smokeUserData);
+  app.setPath('sessionData', smokeUserData);
 }
 
 // Keep the main process alive on an unexpected throw/rejection. The harness is a
@@ -619,6 +636,26 @@ const memory = new MemoryManager(
   () => { const c = readConfig(); return { enabled: c.semanticMemory !== false, model: c.embeddingModel ?? 'minilm' }; },
   (event) => hive.appendLog(event)
 );
+// NATIVE-MEMORY (1.1.54): the MemPalace replacement. Default mode `legacy` makes this inert:
+// no worker, no token, no PATH change, the /memory route answers 404. Past legacy, the engine
+// runs in a utility process forked on the first memory request (never at start-up).
+const nativeMemory = new NativeMemoryWiring({
+  hiveRoot: () => hive.root(),
+  palacePath: () => memory.palacePath(),
+  userData: app.getPath('userData'),
+  resourcesDir: app.isPackaged ? process.resourcesPath : join(app.getAppPath(), 'resources'),
+  workerEntry: join(__dirname, 'memoryWorker.js'),
+  fork: (entry) => utilityProcess.fork(entry, [], { serviceName: 'munder-memory', stdio: 'ignore' }) as unknown as WorkerHandle,
+  memoryBaseUrl: () => hookServer.memoryBaseUrl(),
+  legacyBin: () => memory.bin(),
+  writeShim: (shimScript) => hive.writeMemoryShim(shimScript),
+  log: (row) => hive.appendLog(row),
+  vecLoadablePath: () => {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    try { return toUnpacked((require('sqlite-vec') as { getLoadablePath(): string }).getLoadablePath()); } catch { return null; }
+  }
+});
+hookServer.setMemoryHandler((token, body) => nativeMemory.handle(token, body));
 // Enterprise Knowledge Graph — file-backed store + agent CLI (default OFF).
 const knowledge = new KnowledgeManager();
 /** Reads the reflect tunables from config each tick (defaults baked in here so a
@@ -773,6 +810,7 @@ function teardownPty(id: string): void {
     // Drop watchdog state so a dead agent can't get nudged or leak its grace.
     try { workerWake.forget(agentId, id); } catch { /* best-effort */ }
     try { forgetWakeRows(wakeRows, agentId); } catch { /* best-effort */ }
+    try { nativeMemory.agentExited(agentId); } catch { /* best-effort */ }
     // Drop breaker state so a dead agent can't leak/zombie a tripped level.
     try { breaker.forget(agentId); } catch { /* best-effort */ }
     // W1 — kill this agent's proxy-bridge sidecar (qwen), if any, so a dead
@@ -3285,6 +3323,16 @@ async function spawnAgentCore(opts: AgentSpawnOptions, owner: Electron.WebConten
       // Point the agent's mempalace CLI at the shared palace + the `kg` CLI at the
       // enterprise knowledge store (both no-ops / empty when their flags are off).
       opts.env = { ...(opts.env ?? {}), ...inj.env, ...memory.env(), ...knowledge.env() };
+      // NATIVE-MEMORY: past `legacy`, the agent's MEMORY_TOKEN and PATH with the mempalace
+      // shim first. Windows env keys are case-insensitive: PATH is set under the key the env
+      // already uses (usually `Path`), never as a second, conflicting one.
+      {
+        const base = opts.env as Record<string, string | undefined>;
+        const pathKey = Object.keys(base).find((k) => k.toUpperCase() === 'PATH')
+          ?? Object.keys(process.env).find((k) => k.toUpperCase() === 'PATH') ?? 'PATH';
+        const { PATH: shimPath, ...nm } = nativeMemory.spawnEnv(opts.hive.id, base[pathKey] ?? process.env[pathKey]);
+        opts.env = { ...base, ...nm, ...(shimPath ? { [pathKey]: shimPath } : {}) } as typeof opts.env;
+      }
     } catch (e) {
       // POLICY: hive provisioning is best-effort IN GENERAL — an unexpected failure is
       // logged here and never blocks a spawn — EXCEPT the F1 fail-closed Codex
@@ -5988,6 +6036,44 @@ function onSystemResume(reason: string): void {
 }
 
 app.whenReady().then(() => {
+  if (memoryBenchDir) {
+    void runMemoryBenchHost(memoryBenchDir, (hiveRoot, baseUrl, idleUnloadMs, dbFile) => {
+      const w = new NativeMemoryWiring({
+        hiveRoot: () => hiveRoot,
+        palacePath: () => null,
+        userData: app.getPath('userData'),
+        resourcesDir: app.isPackaged ? process.resourcesPath : join(app.getAppPath(), 'resources'),
+        workerEntry: join(__dirname, 'memoryWorker.js'),
+        fork: (entry) => utilityProcess.fork(entry, [], { serviceName: 'munder-memory-bench', stdio: 'ignore' }) as unknown as WorkerHandle,
+        memoryBaseUrl: baseUrl,
+        legacyBin: () => null,
+        writeShim: () => null,
+        log: () => undefined,
+        vecLoadablePath: () => {
+          // eslint-disable-next-line @typescript-eslint/no-require-imports
+          try { return toUnpacked((require('sqlite-vec') as { getLoadablePath(): string }).getLoadablePath()); } catch { return null; }
+        }
+      });
+      if (idleUnloadMs || dbFile) {
+        const orig = w.workerConfig.bind(w);
+        w.workerConfig = () => {
+          const c = dbFile ? w.workerConfigFor(hiveRoot, dbFile) : orig();
+          return c ? { ...c, ...(idleUnloadMs ? { idleUnloadMs } : {}) } : c;
+        };
+      }
+      return w;
+    }).then(() => app.exit(0), () => app.exit(1));
+    return;
+  }
+  if (memorySmokeOut) {
+    void runMemorySmoke(memorySmokeOut, {
+      fork: () => utilityProcess.fork(join(__dirname, 'memoryWorker.js'), [], { serviceName: 'munder-memory-smoke', stdio: 'ignore' }) as unknown as WorkerHandle,
+      configFor: (hiveRoot, dbFile) => nativeMemory.workerConfigFor(hiveRoot, dbFile),
+      appVersion: app.getVersion(),
+      packaged: app.isPackaged
+    }).then((ok) => app.exit(ok ? 0 : 1), () => app.exit(1));
+    return;
+  }
   // MUNDER_DEV=1 — second, LIVE isolation check. The bootstrap above checked the
   // paths we intended to use; this checks the paths the app actually resolved
   // (config clamp, hive root, palace, pipe) now that config/hive are wired. A
@@ -6153,6 +6239,8 @@ app.on('will-quit', (e) => {
     Promise.race([
       analytics.endSession(),
       new Promise<void>((r) => setTimeout(r, 1200))
-    ])
+    ]),
+    // NATIVE-MEMORY: drain in-flight memory requests, then stop the worker (bounded).
+    nativeMemory.shutdown().catch(() => undefined)
   ]).then(finish, finish);
 });

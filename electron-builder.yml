@@ -17,6 +17,11 @@ publish:
 # Notarize + staple after signing, but only when APPLE_* creds are in the env
 # (the hook no-ops otherwise, so contributor builds still work). Root-level hook.
 afterSign: build/notarize.cjs
+# NATIVE-MEMORY prune (spec section 5): keep only the TARGET platform/arch CPU runtime of
+# onnxruntime-node (and drop DirectML, a GPU provider the engine never asks for). A hook, not a
+# `files` list: a platform-level `files` REPLACES the top-level list (measured: it packed docs/,
+# blog/ and the model twice into app.asar).
+afterPack: build/afterPack-memory-prune.cjs
 
 # Register the munderdifflin:// URL scheme (shareable-hires deep link) in the
 # packaged app: CFBundleURLTypes on macOS, registry entries via NSIS on Windows.
@@ -58,11 +63,27 @@ extraResources:
   # repo resources/skills). Directory copy preserves the <id>/SKILL.md tree.
   - from: resources/skills
     to: skills
+  # NATIVE-MEMORY: the agent-facing `mempalace` shim (run on Electron-as-Node from <hive>/bin/memory)
+  # and the ONE bundled embedding model + its digest manifest (provisioned before a build by
+  # scripts/fetch-memory-model.cjs; the app never downloads a model at runtime).
+  - from: resources/mempalace-shim.cjs
+    to: mempalace-shim.cjs
+  - from: resources/models
+    to: models
+    filter:
+      - native-memory-manifest.json
+      - all-MiniLM-L6-v2/config.json
+      - all-MiniLM-L6-v2/tokenizer.json
+      - all-MiniLM-L6-v2/tokenizer_config.json
+      - all-MiniLM-L6-v2/onnx/model.onnx
 
 asarUnpack:
   - "**/node_modules/node-pty/**"
   # better-sqlite3 is native (bindings/prebuild need the .node on the real FS).
   - "**/node_modules/better-sqlite3/**"
+  # NATIVE-MEMORY: native files must be on the real filesystem (a DLL cannot load from an asar).
+  - "**/node_modules/onnxruntime-node/bin/**"
+  - "**/node_modules/sqlite-vec-*/**"
 
 # Rebuild native deps (node-pty) for the target during packaging.
 npmRebuild: true

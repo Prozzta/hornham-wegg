@@ -144,6 +144,13 @@ export const HOOK_HTTP_RELISTEN_DELAYS_MS = [250, 1_000, 2_000, 5_000, 10_000, 1
 /** The broker's URLs: /hook/<agentId>/<32-hex token> (Claude HTTP hooks) and
  *  /mcp/<agentId>/<token> (Codex mcp_tool hooks, P3). */
 const HOOK_ROUTE = /^\/(hook|mcp|status)\/([^/?#]+)\/([0-9a-f]{32})$/;
+/** NATIVE-MEMORY: the `mempalace` shim's endpoint. The caller is identified by its MEMORY_TOKEN
+ *  alone (the handler resolves it); no agent id in the URL to trust. */
+const MEMORY_ROUTE = /^\/memory\/([0-9a-f]{32})$/;
+/** A memory request is a query, not a document. */
+export const MEMORY_HTTP_BODY_MAX = 64 * 1024;
+
+export type MemoryHttpHandler = (token: string, body: unknown) => Promise<{ status: number; body: unknown }>;
 
 /** The in-terminal context gauge the status line prints (the same text the command shim
  *  printed): "ctx 45k/200k (22%)", or "" without a usable context_window. */
@@ -292,6 +299,43 @@ export class HookServer {
   private transportCounts = new Map<string, Record<HookTransport, number>>();
   private countsMinute = 0;
   private oversizeLogged = new Set<string>();
+  /** NATIVE-MEMORY: set by main when the engine is past `legacy`; null = the route is 404. */
+  private memoryHandler: MemoryHttpHandler | null = null;
+
+  setMemoryHandler(h: MemoryHttpHandler | null): void {
+    this.memoryHandler = h;
+  }
+
+  /** The base URL the shim posts to (`<base>/<token>`), or null when the broker is down. */
+  memoryBaseUrl(): string | null {
+    return this.httpDown || !this.httpPort ? null : `http://127.0.0.1:${this.httpPort}/memory`;
+  }
+
+  private onMemory(token: string, req: IncomingMessage, res: ServerResponse): void {
+    const reply = (status: number, body: unknown): void => {
+      if (res.headersSent) return;
+      res.writeHead(status, { 'content-type': 'application/json' });
+      res.end(JSON.stringify(body ?? {}));
+    };
+    const handler = this.memoryHandler;
+    if (!handler || req.method !== 'POST') { req.resume(); reply(handler ? 405 : 404, {}); return; }
+    const chunks: Buffer[] = [];
+    let size = 0;
+    let tooBig = false;
+    req.on('data', (d: Buffer) => {
+      if (tooBig) return;
+      size += d.length;
+      if (size > MEMORY_HTTP_BODY_MAX) { tooBig = true; reply(413, {}); req.resume(); return; }
+      chunks.push(d);
+    });
+    req.on('end', () => {
+      if (tooBig) return;
+      let body: unknown = null;
+      try { body = JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}'); } catch { body = null; }
+      handler(token, body).then((r) => reply(r.status, r.body), () => reply(500, { exit: 4, error: 'memory handler failed' }));
+    });
+    req.on('error', () => { /* client went away */ });
+  }
   private brokerDownLogged = false;
   private portStolenLogged = false;
   /** Agents whose hook URLs named a port another process took: they need a respawn. */
@@ -401,6 +445,8 @@ export class HookServer {
       res.writeHead(status, { 'content-type': 'application/json' });
       res.end(JSON.stringify(body ?? {}));
     };
+    const mem = req.url ? MEMORY_ROUTE.exec(req.url) : null;
+    if (mem) { this.onMemory(mem[1], req, res); return; }
     const m = req.url ? HOOK_ROUTE.exec(req.url) : null;
     if (!m) { req.resume(); reply(404, {}); return; }
     const route = m[1];

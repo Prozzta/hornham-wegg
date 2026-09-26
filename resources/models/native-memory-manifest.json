@@ -1,0 +1,26 @@
+{
+  "manifestVersion": 1,
+  "model": {
+    "dir": "all-MiniLM-L6-v2",
+    "source": "https://huggingface.co/Xenova/all-MiniLM-L6-v2",
+    "variant": "fp32",
+    "onnxSha256": "759c3cd2b7fe7e93933ad23c4c9181b7396442a2ed746ec7c1d46192c469c46e",
+    "tokenizerSha256": "da0e79933b9ed51798a3ae27893d3c5fa4a201126cef75586296df9b4d2c62a0",
+    "files": {
+      "onnx/model.onnx": "759c3cd2b7fe7e93933ad23c4c9181b7396442a2ed746ec7c1d46192c469c46e",
+      "tokenizer.json": "da0e79933b9ed51798a3ae27893d3c5fa4a201126cef75586296df9b4d2c62a0",
+      "config.json": "7135149f7cffa1a573466c6e4d8423ed73b62fd2332c575bf738a0d033f70df7",
+      "tokenizer_config.json": "9261e7d79b44c8195c1cada2b453e55b00aeb81e907a6664974b4d7776172ab3"
+    }
+  },
+  "vec0": {
+    "win32-x64": { "package": "sqlite-vec-windows-x64", "file": "vec0.dll", "sha256": "fcf98662a7ad9dce394b96a88f91032047823831b951c76636787c312a6476e6" }
+  },
+  "ort": {
+    "version": "1.21.0",
+    "win32-x64": {
+      "bin/napi-v3/win32/x64/onnxruntime.dll": "cf96b2b7de5328adafe79f9b1d818abdc04931cbcb39c6a6c9ae2ddc872ef63b",
+      "bin/napi-v3/win32/x64/onnxruntime_binding.node": "05c102e658b33f0d8294b11ded5a53d4c3266182cf27eee60742e42ddf5c9462"
+    }
+  }
+}
