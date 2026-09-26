@@ -150,35 +150,40 @@ if (scaleMode !== '1' && scaleMode !== 'micro') {
         }
       }
     });
-    const total = fs.readdirSync(path.join(userData, 'threads'))
-      .filter((name) => /^agent-/.test(name))
-      .reduce((sum, id) => sum + fs.statSync(path.join(userData, 'threads', id, 'active.jsonl')).size, 0);
+    let total = 0;
+    for (const id of await fsp.readdir(path.join(userData, 'threads'))) {
+      if (/^agent-/.test(id)) total += (await fsp.stat(path.join(userData, 'threads', id, 'active.jsonl'))).size;
+    }
     assert.ok(total >= fixtureBytes * 0.99, `stored ${total} bytes, expected near ${fixtureBytes}`);
     assert.ok(total <= storeModule.GLOBAL_CAP, 'fixture remains under the global cap; this does not exercise global pruning');
 
     const sweepStart = Date.now();
-    for (let i = 0; i < AGENTS; i += 1) {
-      const dir = path.join(userData, 'threads', `orphan-${i}`);
-      fs.mkdirSync(dir, { recursive: true });
-      fs.writeFileSync(path.join(dir, 'manifest-v1.json'), '{}');
-      fs.utimesSync(dir, new Date(sweepStart - 2_000), new Date(sweepStart - 2_000));
-    }
+    const orphanSetup = await measure(async () => {
+      for (let i = 0; i < AGENTS; i += 1) {
+        const dir = path.join(userData, 'threads', `orphan-${i}`);
+        await fsp.mkdir(dir, { recursive: true });
+        await fsp.writeFile(path.join(dir, 'manifest-v1.json'), '{}');
+        await fsp.utimes(dir, new Date(sweepStart - 2_000), new Date(sweepStart - 2_000));
+      }
+    });
     const sweep = await measure(async () => {
       const removed = await store.sweepOrphans((id) => id === 'michael' || id.startsWith('agent-') || id.endsWith('0'), sweepStart - 1_000);
       assert.equal(removed.length, 270, 'registered candidates remain while every other direct manifest orphan is removed');
     });
     await immediate();
     whole.disable();
-    const wholeWindow = { elapsedMs: stream.elapsedMs + storePhase.elapsedMs + sweep.elapsedMs, p99Ms: whole.percentile(99) / 1e6, maxMs: whole.max / 1e6 };
-    for (const [name, result] of Object.entries({ stream, store: storePhase, sweep, whole: wholeWindow })) {
-      assert.ok(result.maxMs <= LOOP_CEILING_MS, `${name} loop max ${result.maxMs.toFixed(2)}ms exceeds ${LOOP_CEILING_MS}ms`);
-    }
+    const wholeWindow = { elapsedMs: stream.elapsedMs + storePhase.elapsedMs + orphanSetup.elapsedMs + sweep.elapsedMs, p99Ms: whole.percentile(99) / 1e6, maxMs: whole.max / 1e6 };
+    // Print measured phase data before enforcing the release gate so a failed
+    // diagnostic capture still identifies which phase needs attention.
     console.log(JSON.stringify({
       mode: scaleMode, fixtureBytes: total, streamBytes: fixtureBytes, chunks: batches.length, agents: AGENTS,
       workerCumulativeBatchP95Ms: Number(workerP95.toFixed(3)), baselineMaxMs: BASELINE_MAX_MS,
       noiseAllowanceMs: NOISE_ALLOWANCE_MS, loopCeilingMs: LOOP_CEILING_MS,
-      idle: serialise(idle), stream: serialise(stream), store: serialise(storePhase), sweep: serialise(sweep), whole: serialise(wholeWindow)
+      idle: serialise(idle), stream: serialise(stream), store: serialise(storePhase), orphanSetup: serialise(orphanSetup), sweep: serialise(sweep), whole: serialise(wholeWindow)
     }));
+    for (const [name, result] of Object.entries({ stream, store: storePhase, orphanSetup, sweep, whole: wholeWindow })) {
+      assert.ok(result.maxMs <= LOOP_CEILING_MS, `${name} loop max ${result.maxMs.toFixed(2)}ms exceeds ${LOOP_CEILING_MS}ms`);
+    }
   } finally {
     await worker.terminate();
     fs.rmSync(temp, { recursive: true, force: true });
