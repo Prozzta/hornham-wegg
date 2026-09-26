@@ -111,13 +111,16 @@ test('F1 GATE (Jim\'s probe): with a large pre-existing log, an app append is su
 
 // ── F2 ────────────────────────────────────────────────────────────────────
 
-test('F2: rotation at the cap; the live file stays under it; rotated names sort in write order; log retention keeps N; legacy is never pruned', () => {
+test('F2: rotation at the cap; the live file stays under it; rotated names sort in write order; log retention keeps N; legacy is never pruned', async () => {
   const d = dir(); const p = path.join(d, 'log.jsonl');
   fs.writeFileSync(p, 'L'.repeat(2000) + '\n');   // pre-existing, over the test cap
   let t = 1000;
   const f = new AppendFile(p, { capBytes: 1000, keep: 3, keepOpen: true, now: () => ++t });
   for (let i = 0; i < 120; i++) f.append(JSON.stringify({ i, pad: 'x'.repeat(40) }) + '\n');
   f.close();
+  // N2 closes a rotated file asynchronously, and on Windows a pruned file stays listed until
+  // its handle closes. Here rotations come every few rows in ONE tick, so let the closes land.
+  await new Promise((r) => setTimeout(r, 100));
   const rot = rotatedFiles(p);
   assert.equal(rot.filter((r) => r.legacy).length, 1, 'the legacy file is kept');
   assert.equal(fs.readFileSync(rot.find((r) => r.legacy).path, 'utf8'), 'L'.repeat(2000) + '\n', 'byte-identical');
