@@ -28,6 +28,7 @@ function newestRollout(codexHome) {
 
 function tailOnce() {
   if (!source) return;
+  const startedAt = performance.now();
   const file = source.provider === 'codex' ? newestRollout(source.codexHome) : source.file;
   if (!file) return;
   let info; try { info = statSync(file); } catch { return; }
@@ -49,7 +50,7 @@ function tailOnce() {
   // structured-clone payload so a chatty transcript cannot monopolize main.
   const complete = lines.filter(Boolean);
   for (let i = 0; i < complete.length; i += 256) {
-    parentPort.postMessage({ type: 'lines', agentId: source.agentId, provider: source.provider, lines: complete.slice(i, i + 256) });
+    parentPort.postMessage({ type: 'lines', agentId: source.agentId, provider: source.provider, lines: complete.slice(i, i + 256), batchMs: performance.now() - startedAt });
   }
 }
 
