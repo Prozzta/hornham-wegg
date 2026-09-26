@@ -572,7 +572,7 @@ function buildArchive(deps: RealtimeActionDeps, r: ResolvedAgent): () => Promise
     if (res.ok) await deps.retireThread?.(r.id);
     attribute(deps, 'archive', r.id);
     return res.ok
-      ? `Archived ${r.name} — off the floor, history kept. Say unarchive to bring them back.`
+      ? `Archived ${r.name} — off the floor. Their private Talk history was removed; unarchive does not restore it.`
       : `Couldn't archive ${r.name}: ${res.error || 'unknown error'}.`;
   };
 }
@@ -624,7 +624,7 @@ function proposeDestructive(deps: RealtimeActionDeps, verb: string, a: Record<st
     const consequence = verb === 'clear_context'
       ? `That wipes ${r.name}'s working memory of the current conversation.`
       : verb === 'archive'
-        ? `That takes ${r.name} off the floor (history kept).`
+        ? `That takes ${r.name} off the floor and permanently removes their private Talk history.`
         : `That's destructive.`;
     return {
       ok: true,

@@ -52,6 +52,22 @@ test('THREAD-VIEW preserves history on lifecycle archive and deletes only an exp
   assert.match(read('src/renderer/src/components/FullscreenTerminal.tsx'), /await window\.cth\.threadRetire\(agent\.id\)/);
 });
 
+test('THREAD-VIEW retires only after a successful confirmed kill and never promises unarchive restores Talk', () => {
+  for (const file of [
+    'src/renderer/src/components/AgentDetailPanel.tsx',
+    'src/renderer/src/components/FullscreenTerminal.tsx'
+  ]) {
+    const source = read(file);
+    const kill = source.indexOf('const killed = await window.cth.killPty(agent.ptyId)');
+    const guard = source.indexOf('if (!killed.ok) return', kill);
+    const retire = source.indexOf('await window.cth.threadRetire(agent.id)', guard);
+    assert.ok(kill >= 0 && guard > kill && retire > guard, `${file} retires only after successful kill`);
+  }
+  const voice = read('src/main/realtimeActions.ts');
+  assert.match(voice, /private Talk history was removed; unarchive does not restore it/);
+  assert.doesNotMatch(voice, /history kept\. Say unarchive to bring them back/);
+});
+
 test('THREAD-VIEW receipt admission is one-time and machine beats Human in its numbered window', () => {
   const { store, dir } = loadThreadStore();
   try {
