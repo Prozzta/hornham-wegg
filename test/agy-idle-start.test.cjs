@@ -46,7 +46,7 @@ test('AGY spawns IDLE: `--agent munder-<id>` and NO initial prompt; the protocol
   assert.ok(i >= 0, `--agent passed: ${JSON.stringify(inj.args)}`);
   assert.equal(inj.args[i + 1], 'munder-phyllis-mu11xldm');
   const md = fs.readFileSync(agentFile(s.home, 'phyllis-mu11xldm'), 'utf8');
-  assert.match(md, /^---\nname: munder-phyllis-mu11xldm\ndescription: ".*Written by the Munder Difflin app.*"\nmainAgent: true\ninheritCustomizations: true\n---\n\n# Phyllis \(phyllis-mu11xldm\), a Munder Difflin hive agent\n\n/);
+  assert.match(md, /^---\nname: munder-phyllis-mu11xldm\ndescription: ".*Written by the Munder Difflin app.*"\nmainAgent: true\ninheritCustomizations: true\nsubagent: false\nhidden: true\n---\n\n# Phyllis \(phyllis-mu11xldm\), a Munder Difflin hive agent\n\n/);
   assert.match(md, /HIVE PROTOCOL/);
   assert.match(md, /You are "Phyllis" \(phyllis-mu11xldm\)/);
   assert.equal((md.match(/^# /gm) || []).length, 1, 'exactly ONE H1 section');
@@ -72,7 +72,50 @@ test('AGY custom agent: YAML-safe (JSON-quoted strings) and a prompt line starti
   assert.equal((md.match(/^# /gm) || []).length, 1);
   assert.match(md, /^\\# not a heading$/m);
   assert.match(md, /^\\## neither$/m);
-  assert.equal(HiveManager.agyAgentName('Weird_ID.9'), 'munder-weird-id-9');
+});
+
+test('N6: the id -> agy name mapping is the IDENTITY for a normal hive id, and collision-free otherwise (a hash suffix)', () => {
+  for (const id of ['phyllis-mu11xldm', 'god', 'a1', 'worker-7x9']) assert.equal(HiveManager.agyAgentName(id), `munder-${id}`);
+  const a = HiveManager.agyAgentName('A_b'); const b = HiveManager.agyAgentName('a-b');
+  assert.notEqual(a, b, 'two ids that sanitise alike never share one agent.md');
+  assert.match(a, /^munder-a-b-[0-9a-f]{8}$/);
+  assert.match(HiveManager.agyAgentName('x'.repeat(80)), /^munder-x{48}-[0-9a-f]{8}$/, 'bounded length');
+});
+
+test('V1: the agent is NOT offered as a subagent in the user\'s own agy sessions (subagent: false; verified in a jailed agy HOME) and is hidden from the /agents panel', () => {
+  const md = HiveManager.agyAgentMarkdown({ id: 'x1', name: 'X' }, 'p');
+  assert.match(md, /^subagent: false$/m);
+  assert.match(md, /^hidden: true$/m);
+  assert.match(md, /^mainAgent: true$/m, 'still selectable with --agent');
+});
+
+test('N5: the startup sweep removes OUR agents of hive agents no longer on the floor (unregistered or archived), keeps live ones and anything not ours; a non-live hive sweeps nothing', async (t) => {
+  const s = sandbox(t);
+  await s.hive.ensureAgent({ id: 'live-1', name: 'Live', provider: 'antigravity', cwd: s.home });
+  await s.hive.ensureAgent({ id: 'gone-1', name: 'Gone', provider: 'antigravity', cwd: s.home });
+  s.hive.setArchived('gone-1', true);
+  const orphan = agentFile(s.home, 'crashed-1');
+  fs.mkdirSync(path.dirname(orphan), { recursive: true });
+  fs.writeFileSync(orphan, HiveManager.agyAgentMarkdown({ id: 'crashed-1', name: 'C' }, 'p'));
+  const foreign = agentFile(s.home, 'users-own');
+  fs.mkdirSync(path.dirname(foreign), { recursive: true });
+  fs.writeFileSync(foreign, '---\nname: munder-users-own\n---\n# theirs\n');
+  assert.equal(s.hive.sweepAgyAgents(), 2);
+  assert.ok(fs.existsSync(agentFile(s.home, 'live-1')), 'a live agent keeps its agent');
+  assert.equal(fs.existsSync(agentFile(s.home, 'gone-1')), false, 'archived: removed');
+  assert.equal(fs.existsSync(orphan), false, 'unregistered crash leftover: removed');
+  assert.ok(fs.existsSync(foreign), 'not ours: never touched');
+  const nl = sandbox(t, { live: false });
+  const nlOrphan = agentFile(nl.home, 'crashed-2');
+  fs.mkdirSync(path.dirname(nlOrphan), { recursive: true });
+  fs.writeFileSync(nlOrphan, HiveManager.agyAgentMarkdown({ id: 'crashed-2', name: 'C' }, 'p'));
+  assert.equal(nl.hive.sweepAgyAgents(), 0);
+  assert.ok(fs.existsSync(nlOrphan));
+});
+
+test('N5 WIRING: index.ts sweeps once at startup, right after the statusline lease cleanup and before any spawn', () => {
+  const src = fs.readFileSync(path.join(REPO, 'src', 'main', 'index.ts'), 'utf8');
+  assert.match(src, /hive\.startAgyStatusline\(\);\s*\/\/[^\n]*\n\s*\/\/[^\n]*\n\s*try \{ hive\.sweepAgyAgents\(\); \}/);
 });
 
 test('A NON-LIVE hive (dev build, a probe, another hive) writes NO global agent and falls back to `-i` (the old path)', async (t) => {

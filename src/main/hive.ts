@@ -2352,7 +2352,34 @@ export class HiveManager {
    *  idempotent (only our own group is overwritten). */
   /** AGY-STARTUP-TURN: the per-agent agy custom agent's name (agy selects it by NAME). */
   static agyAgentName(agentId: string): string {
-    return `munder-${agentId.toLowerCase().replace(/[^a-z0-9-]/g, '-')}`.slice(0, 64);
+    // N6 (Jim): the name must identify ONE agent. A hive id is normally already [a-z0-9-]
+    // (identity); any other id gets a short hash suffix, so two ids that sanitise alike
+    // ("A_b", "a-b") never share one agent.md.
+    const base = agentId.toLowerCase().replace(/[^a-z0-9-]/g, '-');
+    if (base === agentId && base.length <= 56) return `munder-${base}`;
+    return `munder-${base.slice(0, 48)}-${createHash('sha256').update(agentId).digest('hex').slice(0, 8)}`;
+  }
+
+  /** N5 (Jim): at startup, remove OUR agy agents (marked) whose hive agent is not on the floor
+   *  any more (not registered, or archived): leftovers of a crash, where no PTY teardown ran.
+   *  Someone else's agent under a munder- name is never touched. Gated like every global write. */
+  sweepAgyAgents(): number {
+    if (!this.mayWriteGlobalConfig('Antigravity agent sweep')) return 0;
+    const dir = join(homedir(), '.gemini', 'config', 'agents');
+    const live = new Set(Object.entries(this.registry().agents).filter(([, a]) => !a.archived).map(([id]) => HiveManager.agyAgentName(id)));
+    let removed = 0;
+    let names: string[] = [];
+    try { names = readdirSync(dir).filter((n) => n.startsWith('munder-')); } catch { return 0; }
+    for (const n of names) {
+      if (live.has(n)) continue;
+      try {
+        const f = join(dir, n, 'agent.md');
+        if (!readFileSync(f, 'utf8').includes(HiveManager.AGY_AGENT_MARK)) continue;
+        rmSync(join(dir, n), { recursive: true, force: true });
+        removed++;
+      } catch { /* not ours / unreadable: leave it */ }
+    }
+    return removed;
   }
 
   /** The line that marks an agent.md as ours: only such a file is ever rewritten or removed. */
@@ -2376,6 +2403,11 @@ export class HiveManager {
       `description: ${JSON.stringify(`Munder Difflin hive agent ${meta.name} (${meta.id}): its standing hive instructions. ${HiveManager.AGY_AGENT_MARK}; removed when the agent leaves the floor.`)}`,
       'mainAgent: true',
       'inheritCustomizations: true',
+      // V1 (Jim; verified in a jailed agy HOME): without this, the agent is offered as a
+      // SUBAGENT in the user's own plain `agy` sessions. With it, only `--agent` selects it.
+      'subagent: false',
+      // Kept out of the user's /agents panel (harmless to --agent selection, verified).
+      'hidden: true',
       '---',
       '',
       `# ${meta.name} (${meta.id}), a Munder Difflin hive agent`,
@@ -2718,20 +2750,42 @@ export class HiveManager {
    *  safely, so null (the caller keeps the positional prompt). The value is a TOML basic string
    *  (JSON's escapes are valid TOML). */
   static withCodexDeveloperInstructions(config: string, text: string): string | null {
+    // N3 (Jim): the key may be written bare or quoted ("developer_instructions" / '...').
+    const KEY = /^\s*(["']?)developer_instructions\1\s*=\s*/;
     const lines = config.split(/\r?\n/);
+    // N2 (Jim): anything that can REPLACE or OVERRIDE our instructions makes the top-level key
+    // unreliable, so keep the positional prompt: a model_instructions_file (or its old name),
+    // or developer_instructions inside any table (a profile, possibly the default one).
+    if (lines.some((l) => /^\s*(["']?)(model_instructions_file|experimental_instructions_file)\1\s*=/.test(l))) return null;
     const firstTable = lines.findIndex((l) => /^\s*\[/.test(l));
     const topEnd = firstTable < 0 ? lines.length : firstTable;
+    if (lines.some((l, i) => i >= topEnd && KEY.test(l))) return null;
     const kept: string[] = [];
     for (let i = 0; i < lines.length; i++) {
-      if (i < topEnd && /^\s*developer_instructions\s*=/.test(lines[i])) {
-        const v = lines[i].replace(/^\s*developer_instructions\s*=\s*/, '');
+      if (i < topEnd && KEY.test(lines[i])) {
+        const v = lines[i].replace(KEY, '');
         // Multi-line strings (''' or """) cannot be removed line-wise with certainty.
         if (/^('''|""")/.test(v)) return null;
         continue;
       }
       kept.push(lines[i]);
     }
-    return `# --- munder-hive: this agent's standing hive instructions (auto-generated; do not edit) ---\ndeveloper_instructions = ${JSON.stringify(text)}\n\n${kept.join('\n')}`;
+    return `# --- munder-hive: this agent's standing hive instructions (auto-generated; do not edit) ---\ndeveloper_instructions = ${HiveManager.tomlString(text)}\n\n${kept.join('\n')}`;
+  }
+
+  /** A TOML basic string. JSON's escapes are valid TOML, but JSON leaves U+007F (DEL) raw, and
+   *  TOML forbids it unescaped (N4, Jim). */
+  static tomlString(text: string): string {
+    return JSON.stringify(text).replace(/\u007f/g, '\\u007F');
+  }
+
+  /** N1 (Jim): this agent's OWN developer instructions, read back from the line we write at the
+   *  top of its config.toml, or null. A resume that runs under ANOTHER agent's CODEX_HOME passes
+   *  them with `-c`, so it never silently takes that agent's identity. */
+  static ownCodexDeveloperInstructions(configText: string): string | null {
+    const m = /^# --- munder-hive: this agent's standing hive instructions[^\n]*\r?\ndeveloper_instructions = ("(?:[^"\\\r\n]|\\.)*")\s*$/m.exec(configText);
+    if (!m) return null;
+    try { return JSON.parse(m[1].replace(/\\u007F/g, '\\u007f')) as string; } catch { return null; }
   }
 
   private installCodexHooks(dir: string, agentId?: string, developerInstructions: string | null = null): { home: string; refusal?: string; developerInstructions?: boolean } {

@@ -3458,7 +3458,15 @@ async function spawnAgentCore(opts: AgentSpawnOptions, owner: Electron.WebConten
         console.warn(`[resume] codex session "${sid}" not found in any agent CODEX_HOME - starting fresh`);
         if (typedSid) resumeNotFound = true;
       } else {
-        if (ownerHome !== myHome) opts.env = { ...(opts.env ?? {}), CODEX_HOME: ownerHome };
+        if (ownerHome !== myHome) {
+          opts.env = { ...(opts.env ?? {}), CODEX_HOME: ownerHome };
+          // N1 (AGY-STARTUP-TURN, Codex): the owner home's config.toml carries the OWNER's
+          // developer_instructions. Pass THIS agent's own with -c (it overrides config.toml), so
+          // a cross-agent resume never silently runs under another agent's identity.
+          let own: string | null = null;
+          try { own = myHome ? HiveManager.ownCodexDeveloperInstructions(readFileSync(join(myHome, 'config.toml'), 'utf8')) : null; } catch { own = null; }
+          if (own) opts.args = [...(opts.args ?? []), '-c', `developer_instructions=${HiveManager.tomlString(own)}`];
+        }
         const args = opts.args ?? [];
         // Positional order matters: `codex resume [OPTIONS] [SESSION_ID] [PROMPT]`.
         // The hive identity prompt rides in `args` as a POSITIONAL (codex has no
@@ -5907,6 +5915,9 @@ function bootstrapHiveServices(): void {
   // the last AGY agent leaves. Startup only gives back a lease a dead run left behind.
   // After hookServer.start(), so a locator always names a listening pipe. Stable only.
   hive.startAgyStatusline();
+  // AGY-STARTUP-TURN N5: remove our agy custom agents a crashed run left behind (agents no longer
+  // on the floor). Before any spawn; gated like every global write; only our marked files.
+  try { hive.sweepAgyAgents(); } catch (e) { console.error('[hive] sweepAgyAgents failed:', e); }
   // Bind the telemetry collector BEFORE the renderer spawns any agent, then point
   // the hive at it so every subsequent spawn is instrumented. Best-effort — a bind
   // failure just leaves telemetry off (transcript reconciler stays). No breaker.start():

@@ -55,14 +55,50 @@ test('CODEX spawns without a first user turn: NO positional protocol; the protoc
   assert.ok(cfg.hooks && cfg.hooks.Stop, 'the lifecycle hooks are still wired');
 });
 
-test('CODEX: a single-line developer_instructions in the user seed is REPLACED (one key, no duplicate); one inside a [table] is left alone', async (t) => {
-  const s = sandbox(t, 'developer_instructions = "be terse"\nmodel = "m"\n\n[profiles.p]\ndeveloper_instructions = "profile-scoped"\n');
-  const inj = await s.hive.ensureAgent({ id: 'o1', name: 'Oscar', provider: 'codex', cwd: s.home });
-  const text = fs.readFileSync(path.join(inj.env.CODEX_HOME, 'config.toml'), 'utf8');
-  const cfg = toml.parse(text); // a duplicate top-level key would throw here
-  assert.match(cfg.developer_instructions, /You are "Oscar"/);
-  assert.equal(cfg.profiles.p.developer_instructions, 'profile-scoped');
-  assert.ok(!text.includes('be terse'));
+test('CODEX: a single-line top-level developer_instructions in the user seed is REPLACED (one key, no duplicate), bare or QUOTED (N3)', async (t) => {
+  for (const key of ['developer_instructions', '"developer_instructions"', "'developer_instructions'"]) {
+    const s = sandbox(t, `${key} = "be terse"\nmodel = "m"\n\n[mcp_servers.x]\ncommand = "x"\n`);
+    const inj = await s.hive.ensureAgent({ id: 'o1', name: 'Oscar', provider: 'codex', cwd: s.home });
+    const text = fs.readFileSync(path.join(inj.env.CODEX_HOME, 'config.toml'), 'utf8');
+    const cfg = toml.parse(text); // a duplicate top-level key would throw here
+    assert.match(cfg.developer_instructions, /You are "Oscar"/, key);
+    assert.ok(!text.includes('be terse'), key);
+  }
+});
+
+test('N2: instructions that could REPLACE or OVERRIDE ours (a profile\'s developer_instructions, model_instructions_file) -> the positional prompt stays, the seed untouched', async (t) => {
+  for (const seed of ['model = "m"\n\n[profiles.p]\ndeveloper_instructions = "profile-scoped"\n', 'model_instructions_file = "C:/x.md"\n', '[profiles.q]\nexperimental_instructions_file = "y.md"\n']) {
+    const s = sandbox(t, seed);
+    const inj = await s.hive.ensureAgent({ id: 'o3', name: 'Oz', provider: 'codex', cwd: s.home });
+    assert.ok(inj.args.some((a) => /HIVE PROTOCOL/.test(a)), `fallback for: ${seed}`);
+    const text = fs.readFileSync(path.join(inj.env.CODEX_HOME, 'config.toml'), 'utf8');
+    assert.ok(!text.includes('munder-hive: this agent'), 'ours not written');
+  }
+});
+
+test('N4: U+007F (DEL) is escaped (TOML forbids it raw; JSON leaves it), and the value round-trips', () => {
+  const s = 'a\u007fb';
+  const out = HiveManager.withCodexDeveloperInstructions('', s);
+  assert.ok(!out.includes('\u007f'), 'no raw DEL');
+  assert.match(out, /\\u007F/);
+  assert.equal(toml.parse(out).developer_instructions, s);
+});
+
+test('N1: ownCodexDeveloperInstructions reads back exactly what we wrote (for a cross-home resume\'s -c); null when ours is absent', () => {
+  const text = 'You are "A" (a1)\nline two \\ back\u007f';
+  const cfg = HiveManager.withCodexDeveloperInstructions('model = "m"\n', text);
+  assert.equal(HiveManager.ownCodexDeveloperInstructions(cfg), text);
+  assert.equal(HiveManager.ownCodexDeveloperInstructions('developer_instructions = "the user\'s own"\n'), null, 'only OUR marked line');
+  // the -c value is a TOML string codex parses back to the same text
+  assert.equal(toml.parse(`developer_instructions = ${HiveManager.tomlString(text)}`).developer_instructions, text);
+});
+
+test('N1 WIRING: a codex resume under ANOTHER agent\'s CODEX_HOME passes THIS agent\'s own developer_instructions with -c', () => {
+  const src = fs.readFileSync(path.join(__dirname, '..', 'src', 'main', 'index.ts'), 'utf8');
+  const block = src.slice(src.indexOf('if (ownerHome !== myHome) {'), src.indexOf("console.log('[resume] codex resume'"));
+  assert.match(block, /CODEX_HOME: ownerHome/);
+  assert.match(block, /HiveManager\.ownCodexDeveloperInstructions\(readFileSync\(join\(myHome, 'config\.toml'\), 'utf8'\)\)/);
+  assert.match(block, /'-c', `developer_instructions=\$\{HiveManager\.tomlString\(own\)\}`/);
 });
 
 test('CODEX: a MULTI-LINE developer_instructions in the seed cannot be replaced safely -> the positional prompt stays (the old path), the seed untouched', async (t) => {

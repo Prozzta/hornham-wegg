@@ -204,7 +204,7 @@ test('WIRING: index.ts supplies the predicate, and it is the ONLY place that doe
   // Every global writer goes through the gate. If a new one appears, it must be added
   // here deliberately: this list is the census.
   // AGY-STARTUP-TURN (1.1.55): the per-agent agy custom agent (write + removal) is global too.
-  for (const fn of ['private installAgyHooks(): void {', 'private installGrokHooks(): void {', 'private installAgyAgent(', '  removeAgyAgent(agentId: string): void {']) {
+  for (const fn of ['private installAgyHooks(): void {', 'private installGrokHooks(): void {', 'private installAgyAgent(', '  removeAgyAgent(agentId: string): void {', '  sweepAgyAgents(): number {']) {
     const body = hive.slice(hive.indexOf(fn), hive.indexOf(fn) + 400);
     assert.ok(body.includes('this.mayWriteGlobalConfig('), `${fn} must consult the gate`);
   }
@@ -217,6 +217,7 @@ test('WIRING: index.ts supplies the predicate, and it is the ONLY place that doe
   const homedirCalls = hive.split('\n')
     .filter((l) => l.includes('homedir()') && !l.trim().startsWith('//') && !l.trim().startsWith('*'));
   assert.deepEqual(homedirCalls.map((l) => l.trim()), [
+    "const dir = join(homedir(), '.gemini', 'config', 'agents');", // sweepAgyAgents - gated above
     "return join(homedir(), '.gemini', 'config', 'agents', HiveManager.agyAgentName(agentId));", // agyAgentDir: only installAgyAgent/removeAgyAgent, both gated above
     "const gem = join(homedir(), '.gemini');",           // installAgyHooks - gated above
     "const userHome = join(homedir(), '.codex');",       // Codex READS the credential (F1 policy)
