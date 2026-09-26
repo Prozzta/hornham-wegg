@@ -6,6 +6,81 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+> **The fork line.** From here up, entries are this fork's (Prozzta/hornham-wegg) independently
+> versioned 1.1.x releases, taken from their GitHub release notes. The fork is based on upstream
+> v0.4.5 (below). Earlier 1.1.x releases are described on the
+> [releases page](https://github.com/Prozzta/hornham-wegg/releases).
+
+## [1.1.52] — 2026-09-26
+
+**Removes the freeze when agents message each other, fixes MemPalace's memory spikes and bloated
+palace, and starts far fewer processes for agent hooks.** Source `595dd3b5`; rollback: 1.1.51.
+
+### Fixed
+
+- **No freeze when a message moves between agents.** Every routed hive message ended in a
+  `git commit` on the app's main thread, which froze the app for 1.7–3 s each time. Commits now
+  run in the background (the freeze went from about 2.1 s to about 11 ms), and messages that
+  arrive close together share one commit.
+- **Less typing lag.** The Floor-tab dispatch box no longer redraws the whole dashboard on each
+  keystroke (−60% work per key). The private roster note is saved when you pause, click away,
+  close it or quit, so it is never lost.
+- **Codex agents return to idle.** The app reads Codex's own record of when a turn finished and
+  ignores late events from a turn that has already ended.
+- **MemPalace memory spikes.** A bloated palace (673 MB for about 30 MB of content) is rebuilt
+  from its own database, verified row for row, and swapped in; the old palace is kept as a backup
+  until a later launch. Mines are judged by the daemon's job state, so the ~850 MB daemon is no
+  longer restarted in a loop, and quitting mid-mine leaves nothing running. Every step is logged
+  to `log.jsonl`.
+- **AGY hooks actually run.** AGY had been rejecting the app's whole hook list over a format
+  detail, so AGY agents got no gate, no steer and no end-of-reply signal. Operator steers now
+  reach AGY on its documented injection point.
+
+### Changed
+
+- **Far fewer processes for agent hooks.** Claude hooks post to the app over local HTTP (about
+  1 ms, down from about 450 ms and two processes per hook). Codex tool hooks go through an in-app
+  endpoint, and AGY's after-tool and status-line hooks through a tiny batch file. If the listener
+  is down, agents fall back to the old hooks.
+
+## [1.1.51] — 2026-09-25
+
+**Fixes the Codex terminal reloads and the remaining lag that grew with activity.** Source
+`94753c4e`; rollback: 1.1.50.
+
+### Fixed
+
+- **Codex terminals no longer reload when you use the agent controls.** Codex replays its whole
+  history on any terminal resize. Confirmation notes, status text and the message-box header used
+  to grow and shrink next to the terminal; each click on stop / block tools / allow tools cost
+  two full replays. They now float or stay on one line, so the terminal's grid stays still.
+- **No more whole-app redraw per output line.** Agent updates that changed nothing re-rendered
+  the entire app. They are now skipped: renderer CPU −60% while watching a streaming agent, −55%
+  with 6 busy agents.
+- The open-terminal error no longer blocks the operator controls, and it clears after 4 s.
+
+### Changed
+
+- **Scrollback 100,000 → 10,000 lines per terminal.** Memory growth from Codex replays went from
+  +450 MB to +70 MB.
+
+## [1.1.50] — 2026-09-25
+
+**Fixes the renderer/GPU lag that remained after the 1.1.49 main-thread fix.** Source
+`eb214f33`; rollback: 1.1.49.
+
+### Fixed
+
+- **Office floor frame budget.** The floor redrew at the display's refresh rate (165 fps
+  measured) on a 2× canvas. It is now capped at 30 fps: idle renderer 40% → 10%, GPU 26% → 5% of
+  a core.
+- **No more Codex transcript replays on queued messages.** The pending-message list floats over
+  the terminal instead of resizing it, and pty resizes are coalesced: 11 messages to a busy agent
+  caused 27 replays before and 0 now.
+- **Batched terminal output.** Pty output reaches the renderer in a few messages instead of one
+  per ~170-byte chunk (a 3.26 MB burst: 20,683 messages → 197). Keystroke echo is still sent
+  immediately.
+
 ## [0.4.5] — 2026-08-22
 
 **The release that fixes the things you trusted and were quietly wrong.** Cost reporting was off

@@ -23,8 +23,7 @@ and unattended.
 
 <p>
   <a href="./LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-F4D35E.svg?style=flat-square&labelColor=6E1423"></a>
-  <img alt="Version: 1.1.47" src="https://img.shields.io/badge/version-1.1.47-F4D35E.svg?style=flat-square&labelColor=6E1423">
-  <img alt="Status: 1.1.48 integrating" src="https://img.shields.io/badge/next-1.1.48%20integrating-F4F1EA.svg?style=flat-square&labelColor=6E1423">
+  <img alt="Version: 1.1.52" src="https://img.shields.io/badge/version-1.1.52-F4D35E.svg?style=flat-square&labelColor=6E1423">
   <img alt="Fork of chaitanyagiri/munder-difflin" src="https://img.shields.io/badge/fork%20of-chaitanyagiri%2Fmunder--difflin-F4F1EA.svg?style=flat-square&labelColor=6E1423">
 </p>
 
@@ -71,7 +70,7 @@ the fork's ledger and release runbooks:
   (upstream #459). This fork rebuilt it, and the packaged release gate — the actual
   installer artifact, real model calls — condensed a real ~1 MB agent memory
   **959,571 → 91,364 bytes (~90% smaller) in 3 passes with 0 of 3,781 lines lost**;
-  the same full 48-check gate passes again on the current 1.1.48 integration build.
+  the same full 48-check gate passed again on the 1.1.48 build before it shipped.
 - **The no-change standup: from ~214k tokens to zero.** The stock scheduled standup
   was measured at **213,949 token units per no-change run — 855,796 per day** at the
   then-live six-hour cadence. A deterministic, locally computed floor-state
@@ -141,19 +140,30 @@ wholesale merges. The shape of the line, as evidence for the three ideas above:
 - **The scheduler delta gate** — the no-change-standup fingerprint and the
   heartbeat-off-by-default cost analysis behind the second idea, shipped with the
   measured numbers.
-- **Memory condensation that cannot lose memory** (1.1.47, the current release) —
+- **Memory condensation that cannot lose memory** (1.1.47) —
   condense rebuilt on headless `claude --print` with double-validated structured
   output; a verify-don't-trust gate that rejects any rewrite that doesn't round-trip
   byte-for-byte, backed by lossless backups and an atomic swap; bounded splitting so an
   oversized section converges across passes instead of wedging; and packaged release
   canaries (a cold-boot wake gate and a real-model condense gate) that exercise the
   actual installer artifact, not the dev build.
-- **In integration — 1.1.48 (not yet shipped)** — current Claude models (Opus 5.5,
+- **Models and the Antigravity provider** (1.1.48) — current Claude models (Opus 5.5,
   Fable 5.1, verified against the CLI's own registry), per-agent model persistence,
   message-router robustness, the Antigravity provider integration (two never-merged
   capacity pools, a default-closed global-config guard, native-lifecycle wake
-  coordination closing the false-active stall), and a committed hand-mutant gate. The
-  merged tree re-runs the full packaged canaries before anything ships.
+  coordination closing the false-active stall), and a committed hand-mutant gate.
+- **Performance, measured** (1.1.49–1.1.51) — a log that grew forever and a whole-file
+  read of it that froze the main thread (reads 460× faster, log rows −91% with every
+  wake event kept); the office floor capped at 30 fps (renderer 40% → 10% of a core
+  idle); batched terminal output; and no more Codex transcript replays from terminal
+  resizes (27 replays for 11 queued messages → 0).
+- **A floor that doesn't stall itself** (1.1.52, the current release) — hive commits
+  moved off the main thread (a ~2.1 s freeze per routed message → ~11 ms); agent hooks
+  delivered to the app without starting processes (~450 ms → ~1 ms per Claude hook);
+  MemPalace mining judged by the daemon's job state, with a bloated palace (673 MB for
+  ~30 MB of content) rebuilt, verified row for row and swapped in automatically; and
+  Antigravity hooks that actually load, so gates, steers and end-of-turn signals reach
+  AGY agents.
 
 Every milestone carries a dated human acceptance and evidence tag in the fork's
 internal mission ledger; this README keeps only the shape.
@@ -265,10 +275,29 @@ Two data planes feed one renderer:
   a typed `window.cth` bridge ([`src/preload/index.ts`](./src/preload/index.ts)), which
   also exposes sandboxed filesystem and git helpers.
 - **Hive / event plane.** `hive.ts` is the on-disk multi-agent layer; `hooks.ts` runs the
-  hook server that provider bridges POST lifecycle payloads to. `reflect.ts` owns memory
+  hook server that provider bridges deliver lifecycle payloads to. `reflect.ts` owns memory
   condensation. The router delivers messages, drains provider outboxes, the GOD agent
   adjudicates, and idle/inbox wakeups keep workers draining mail — with the wake
   coordinator as the single authority on when an agent may be prompted.
+- **Hook transports.** Each provider reaches the hook server the cheapest way it supports:
+  - **Claude** posts to a loopback HTTP route (`/hook/<id>/<token>`), authenticated by a
+    per-spawn token in the URL.
+  - **Codex** tool hooks are `mcp_tool` hooks into an in-app MCP endpoint (`/mcp/…`); the
+    payload is rebuilt from Codex's rollout and named as Codex's own command hooks name it.
+  - **Antigravity** observational hooks and its status line go one-way through a small
+    `agy-oneway.cmd` (cmd built-ins, no Node start), written in AGY's documented hooks
+    schema.
+  - Hooks that must answer (a deny, a block, a steer) keep the command shim, and every agent
+    falls back to it when the broker is down. A per-minute `hook-transport` row in
+    `log.jsonl` shows which route each agent's hooks took.
+- **The hive committer.** The harness is the hive repo's only committer. Commits run in the
+  background: messages that arrive close together share one commit, delivery never waits
+  for git, and the last commit is flushed on quit.
+- **Semantic memory.** `memory.ts` drives the MemPalace CLI and its resident daemon: changed
+  memory files are mined incrementally as background daemon jobs, judged by the job's state
+  rather than by silence. A bloated palace is rebuilt from its own database into a staging
+  copy, verified per collection, and swapped in; each step (`palace-repair-*`,
+  `palace-swap-*`, `palace-reclaim`) is logged to `log.jsonl`.
 
 The renderer is presentation: main remains the sole submission authority, and nothing
 the UI displays can cause or prevent a wake.
