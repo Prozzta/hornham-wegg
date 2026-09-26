@@ -532,7 +532,7 @@ const automaticSubmit = new AutomaticSubmitOwner(buildOwnerDeps({
   ptyForAgent: (agentId) => ptyForAgent(agentId),
   providerForPty: (ptyId) => ptyProvider.get(ptyId),
   requestScreenReading: (ptyId, needle) => screenReadings.request(ptyId, needle),
-  onCommitted: (agentId, text) => threadView.recordReceipt(agentId, text, 'machine'),
+  onCommitted: (agentId, text) => threadView.commitSubmission(agentId, text),
   onOutcome: (r) => {
     // An outcome can raise an INTERFERED hold or settle one: the impact string moves.
     pushAgentImpact();

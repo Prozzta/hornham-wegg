@@ -59,6 +59,21 @@ test('THREAD-VIEW receipt admission is one-time and machine beats Human in its n
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
 
+test('THREAD-VIEW starts queued Human UI TTL at COMMIT, not enqueue', () => {
+  const { store, dir } = loadThreadStore();
+  const originalNow = Date.now;
+  try {
+    let now = 1_000;
+    Date.now = () => now;
+    const view = new store.ThreadViewStore(path.join(dir, 'userData', 'threads'));
+    view.recordReceipt('michael', 'queued Human message', 'human-ui');
+    now += 10 * 60_000; // agent is mid-run; enqueue-time TTL must not discard it.
+    assert.equal(view.commitSubmission('michael', 'queued Human message'), 'human-ui');
+    now += 1_000;
+    assert.ok(view.consumeHumanReceipt('michael', 'queued Human message', now));
+  } finally { Date.now = originalNow; fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
 test('THREAD-VIEW uses only a temp userData root and evicts completed per-agent segments at 8 MiB', async () => {
   const { store, dir } = loadThreadStore();
   try {

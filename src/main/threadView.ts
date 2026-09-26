@@ -26,6 +26,8 @@ export interface ThreadReceipt {
   kind: 'human-ui' | 'human-terminal' | 'machine';
   /** Monotonic, per-agent terminal receipt number.  This is evidence, not UI state. */
   terminalWindow?: number;
+  /** UI enqueue is not delivery: its TTL begins only after the owning submission commits. */
+  committedAt?: number;
   consumed?: boolean;
 }
 
@@ -79,15 +81,34 @@ export class ThreadViewStore {
 
   recordReceipt(agentId: string, text: string, kind: ThreadReceipt['kind']): ThreadReceipt {
     const now = Date.now();
-    const list = (this.receipts.get(agentId) ?? []).filter((r) => now - r.at <= RECEIPT_TTL_MS).slice(-RECEIPT_LIMIT + 1);
+    const list = (this.receipts.get(agentId) ?? []).filter((r) => !receiptExpired(r, now)).slice(-RECEIPT_LIMIT + 1);
     // Terminal input has a deliberately short, numbered evidence window.  A later
     // provider echo cannot accidentally promote a stale terminal line into Talk.
     const terminalWindow = kind === 'human-terminal'
       ? (this.terminalReceiptWindows.get(agentId) ?? 0) + 1
       : undefined;
     if (terminalWindow !== undefined) this.terminalReceiptWindows.set(agentId, terminalWindow);
-    const receipt = { id: randomUUID(), agentId, textHash: hash(text), at: now, kind, terminalWindow };
+    const receipt = {
+      id: randomUUID(), agentId, textHash: hash(text), at: now, kind, terminalWindow,
+      ...(kind === 'human-ui' ? {} : { committedAt: now })
+    };
     list.push(receipt); this.receipts.set(agentId, list); return receipt;
+  }
+
+  /** Called only after AutomaticSubmitOwner has sent Enter.  A queued Human receipt
+   * is promoted at this exact edge; otherwise this committed text is machine-origin. */
+  commitSubmission(agentId: string, text: string): 'human-ui' | 'machine' {
+    const now = Date.now();
+    const list = this.receipts.get(agentId) ?? [];
+    const pending = list.find((r) => !r.consumed && r.kind === 'human-ui'
+      && r.committedAt === undefined && r.textHash === hash(text));
+    if (pending) {
+      pending.committedAt = now;
+      pending.at = now;
+      return 'human-ui';
+    }
+    this.recordReceipt(agentId, text, 'machine');
+    return 'machine';
   }
 
   /** Matches only a one-time Human receipt. A same-window machine receipt wins. */
@@ -235,6 +256,13 @@ function receiptWindowMs(receipt: ThreadReceipt): number {
   return receipt.kind === 'human-terminal' || receipt.kind === 'machine'
     ? TERMINAL_RECEIPT_WINDOW_MS
     : RECEIPT_TTL_MS;
+}
+
+function receiptExpired(receipt: ThreadReceipt, now: number): boolean {
+  // Pending UI work is bounded by count, rather than an arbitrary timeout while the
+  // agent is busy or a Human-resolved INTERFERED hold is still awaiting delivery.
+  if (receipt.kind === 'human-ui' && receipt.committedAt === undefined) return false;
+  return now - (receipt.committedAt ?? receipt.at) > receiptWindowMs(receipt);
 }
 
 function textOf(value: unknown): string {
