@@ -80,6 +80,23 @@ export interface HiveMessage {
   requires_reply: boolean;
   needs_human: boolean;
   created_at: string;
+  /** MIDTURN-MAIL-BLIND (1.1.55): the ids of earlier messages this one cancels or corrects
+   *  (a retraction, a changed decision). Optional; the router uses it to flag a reply that was
+   *  written before its sender read this. */
+  supersedes?: string[];
+  /** Set by the ROUTER, never trusted from a sender: this message answers one that the sender's
+   *  own unread inbox had already superseded when it was sent (see routeMessage). */
+  superseded_by?: string;
+}
+
+/** A sender's `supersedes` (a string or an array), bounded: up to 10 non-empty ids of at most
+ *  200 characters. Anything else is dropped rather than failing the whole message. */
+export function normalizeSupersedes(v: unknown): { supersedes?: string[] } {
+  const list = (Array.isArray(v) ? v : typeof v === 'string' ? [v] : [])
+    .filter((x): x is string => typeof x === 'string' && x.trim().length > 0 && x.length <= 200)
+    .map((x) => x.trim())
+    .slice(0, 10);
+  return list.length ? { supersedes: list } : {};
 }
 
 /** One hive message reshaped for the voice read-layer (`hive:messages`): the
@@ -1728,8 +1745,33 @@ export class HiveManager {
       hops: typeof partial.hops === 'number' ? partial.hops : 0,
       requires_reply: partial.requires_reply ?? ['request', 'query', 'propose'].includes(act),
       needs_human: partial.needs_human ?? false,
-      created_at: partial.created_at ?? new Date().toISOString()
+      created_at: partial.created_at ?? new Date().toISOString(),
+      ...normalizeSupersedes(partial.supersedes)
     };
+  }
+
+  /**
+   * MIDTURN-MAIL-BLIND L2: the message in the SENDER's still-unread inbox that supersedes the
+   * one `msg` answers, if any. The case it catches: A asks B for X; B starts working; A sends
+   * "cancel X" (supersedes: [X]); B, mid-turn, never sees it and sends its result for X. The
+   * cancel is then sitting unread in B's inbox (not in inbox/.done) at the moment B's reply is
+   * routed. A superseding message that B has already READ (moved to .done) is not a match: then
+   * the reply was sent knowingly. Reads only B's inbox directory (a handful of files).
+   */
+  private unreadSupersederFor(msg: HiveMessage): HiveMessage | null {
+    const target = msg.in_reply_to;
+    if (!target) return null;
+    const inbox = join(this.agentDir(msg.from), 'inbox');
+    let files: string[];
+    try { files = readdirSync(inbox).filter((f) => f.endsWith('.json')); } catch { return null; }
+    for (const f of files) {
+      try {
+        const m = JSON.parse(readFileSync(join(inbox, f), 'utf8')) as Partial<HiveMessage>;
+        const sup = normalizeSupersedes(m.supersedes).supersedes;
+        if (sup && sup.includes(target) && typeof m.id === 'string') return m as HiveMessage;
+      } catch { /* a file being written: not a match this time */ }
+    }
+    return null;
   }
 
   /** Atomically deliver a message into a recipient agent's inbox.
@@ -1768,6 +1810,18 @@ export class HiveManager {
   }
 
   private routeMessage(msg: HiveMessage): void {
+    // The router alone sets superseded_by: a sender cannot pre-mark its own mail.
+    delete msg.superseded_by;
+    // MIDTURN-MAIL-BLIND L2: a reply to a request that was cancelled or corrected while its
+    // sender was mid-turn is still DELIVERED (its content may still matter), but flagged in the
+    // subject and the superseded_by field, so the requester sees at once it answers a superseded
+    // ask. The sender is told by the superseding message itself, already unread in its inbox.
+    const sup = this.unreadSupersederFor(msg);
+    if (sup) {
+      msg.superseded_by = sup.id;
+      msg.subject = `[superseded by ${sup.id} (${sup.from}: ${String(sup.subject ?? '').slice(0, 80)}): sent before ${msg.from} read it] ${msg.subject}`;
+      try { this.appendLog({ kind: 'superseded-delivery', id: msg.id, from: msg.from, to: msg.to, inReplyTo: msg.in_reply_to, supersededBy: sup.id }); } catch { /* noop */ }
+    }
     if (msg.hops > HOP_CAP) {
       // loop guard — drop a runaway message rather than let agents ping-pong.
       // There's no human queue to fall back on; the god agent owns conflicts.
@@ -3187,11 +3241,15 @@ Write one JSON file into \`outbox/\` (any filename ending in \`.json\`):
   "subject": "one-line summary",
   "body": "the details",
   "conversation": "carry this across a thread (optional)",
-  "in_reply_to": "<message id you're replying to> (optional)"
+  "in_reply_to": "<message id you're replying to> (optional)",
+  "supersedes": ["<id of an earlier message this one cancels or corrects>"] (optional)
 }
 \`\`\`
 
 The harness fills in \`id\`, \`from\`, \`hops\`, and timestamps.
+
+A message that answers a request its sender had already been sent a \`supersedes\` for, still
+unread, is delivered flagged: the harness sets \`superseded_by\` and prefixes the subject.
 
 ## Rules of the road
 - Only \`request\`, \`query\`, and \`propose\` expect a reply. \`inform\` and \`done\` are terminal —
