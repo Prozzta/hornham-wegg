@@ -125,6 +125,7 @@ async function settingsFor(t, broker) {
   const hive = new HiveManager(() => home);
   if (broker !== undefined) hive.setHookBroker(broker);
   const spawn = await hive.ensureAgent({ id: 'a1', name: 'A', provider: 'claude', cwd: home });
+  hive.dispose();
   const raw = fs.readFileSync(path.join(home, 'hive/agents/a1/settings.json'), 'utf8');
   return { settings: JSON.parse(raw), raw, spawn };
 }
@@ -264,6 +265,7 @@ test('N3: the shim strips an incoming provider_agent_id, and a provider id equal
 test('archiving an agent revokes its hook token (a respawn mints a new one)', async (t) => {
   const home = fs.mkdtempSync(path.join(JAIL, 'h-'));
   const hive = new HiveManager(() => home);
+  t.after(() => hive.dispose());
   const revoked = [];
   hive.setHookBroker({ urlFor: () => null, revoke: (id) => revoked.push(id) });
   await hive.ensureAgent({ id: 'a1', name: 'A', provider: 'claude', cwd: home });

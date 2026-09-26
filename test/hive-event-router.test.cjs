@@ -44,7 +44,7 @@ function fakeRuntime() {
 
 async function floor(t, { emit } = {}) {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'md-event-router-'));
-  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  t.after(() => { hive.dispose(); fs.rmSync(home, { recursive: true, force: true }); });
   const rt = fakeRuntime();
   const hive = new HiveManager(() => home, emit, rt.runtime);
   await hive.ensureAgent({ id: 'god-1', name: 'Michael', provider: 'claude', cwd: home, isGod: true });

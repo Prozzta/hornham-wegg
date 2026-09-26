@@ -42,7 +42,7 @@ function tmpHome() {
 
 async function floor(t, getConfig = () => CONFIG) {
   const home = tmpHome();
-  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  t.after(() => { hive.dispose(); fs.rmSync(home, { recursive: true, force: true }); });
   const hive = new HiveManager(() => home);
   await hive.ensureAgent({ id: 'jim-1', name: 'Jim', provider: 'claude', cwd: home });
   const server = new HookServer(hive, () => null, getConfig, undefined, undefined);
@@ -104,7 +104,7 @@ test('SubagentStop behaves the same as Stop', async (t) => {
 
 test('notifications setting off suppresses the OS toast but the hook still resolves', async (t) => {
   const home = tmpHome();
-  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  t.after(() => { hive.dispose(); fs.rmSync(home, { recursive: true, force: true }); });
   const hive = new HiveManager(() => home);
   await hive.ensureAgent({ id: 'jim-1', name: 'Jim', provider: 'claude', cwd: home });
   const server = new HookServer(hive, () => null, () => ({ notifications: false }), undefined, undefined);
@@ -146,7 +146,7 @@ test('a /model change pins only the divergence and returning to default clears i
 
 test('recordModel refuses a non-Claude registry provider', async (t) => {
   const home = tmpHome();
-  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  t.after(() => { hive.dispose(); fs.rmSync(home, { recursive: true, force: true }); });
   const hive = new HiveManager(() => home);
   // Keep this synthetic: spawning agy would install its global hook bridge.
   await hive.ensureAgent({ id: 'agy-1', name: 'Agy', provider: 'claude', cwd: home });

@@ -14,7 +14,6 @@
  * prompts surface in the agent's own terminal (and can be approved remotely via
  * `/remote-control`). The hive keeps no separate approval queue — a message aimed
  * at "human" is routed to the god/orchestrator, the human's proxy on the floor.
- *   - single-committer git with retry/backoff + stale-lock recovery
  *
  * Everything here runs in the Electron main process.
  */
@@ -26,7 +25,8 @@ import {
 } from 'node:fs';
 import { join, dirname, isAbsolute } from 'node:path';
 import { homedir } from 'node:os';
-import { spawnSync, spawn, type ChildProcess } from 'node:child_process';
+import { spawn, type ChildProcess } from 'node:child_process';
+import { AppendFile, LOG_KEEP_ROTATED, rotatedFiles } from './appendLog';
 import { randomBytes, createHash } from 'node:crypto';
 import {
   DEV_ISOLATION, sanitizeCodexConfigForDev, hookPipeId,
@@ -56,7 +56,6 @@ import {
 const AGY_LEASE_HEARTBEAT_MS = 60 * 60 * 1000;
 import { AGY_STATUSLINE_SHIM } from './agyStatuslineShim';
 import { geminiHome } from './capacityScope';
-import { HiveCommitter, type GitResult } from './hiveCommitter';
 import { codexMcpHookToml, MCP_HOOK_EVENTS, type McpHookEvent } from './codexHookMcp';
 
 /** The subset of HarnessConfig the hive consumes for the default-MCP merge.
@@ -116,6 +115,13 @@ export interface HumanQA {
   askedAt?: string;
   answeredAt?: string;
   dismissedAt?: string;
+  /** ASKME-REVAMP (optional; a string-only entry still works): choices shown as buttons, */
+  /** the index of the recommended one, whether several may be picked, and the indexes the */
+  /** human picked (written with `a`, which carries the chosen labels and any note). */
+  options?: Array<{ label: string; detail?: string }>;
+  recommended?: number;
+  multi?: boolean;
+  chosen?: number[];
 }
 
 export interface HiveTask {
@@ -443,20 +449,43 @@ export class HiveManager {
   }
 
   private readonly routerRuntime: RouterRuntime;
-  /** MESSAGE-LAG-152: every hive commit goes through here: coalesced, async, single-flight,
-   *  never on the main thread's critical path (see hiveCommitter.ts). */
   /** HOOK-BROKER: the in-process HTTP hook endpoint (HookServer), injected by main. Null in
    *  tests and until wired; every spawn then writes command hooks exactly as before. */
   private hookBroker: HookBroker | null = null;
+  /** LOG-STALL-AV: the kept-open, rotated append files, per hive root (see appendLog.ts). */
+  private readonly appendFiles = new Map<string, AppendFile>();
+  private keepAppendOpen = true;
+  private appendFileFor(path: string, keep: number): AppendFile {
+    let f = this.appendFiles.get(path);
+    if (!f) { f = new AppendFile(path, { keep, keepOpen: this.keepAppendOpen }); this.appendFiles.set(path, f); }
+    return f;
+  }
+  /** The log and ledger descriptors stay open by default (no antivirus rescan per row). Off
+   *  opens and closes per row (the old cost); kept for a caller that measures that path. */
+  keepAppendFilesOpen(on: boolean): void {
+    if (on === this.keepAppendOpen) return;
+    this.closeAppendFiles();
+    this.keepAppendOpen = on;
+  }
+  /** Close the kept-open log and ledger descriptors. Rows are already on disk; the next row
+   *  reopens. */
+  closeAppendFiles(): void {
+    for (const f of this.appendFiles.values()) f.close();
+    this.appendFiles.clear();
+  }
+  /**
+   * Release what this manager holds open in the hive folder (Jim, LOG-STALL-AUDIT-153 B1/B3):
+   * the log and ledger descriptors. Call it BEFORE deleting or copying the folder (reset,
+   * change home) and at quit: Windows cannot remove a directory while a file in it is open,
+   * and a copy must see the rows. Safe to call more than once; a later row simply reopens.
+   */
+  dispose(): void {
+    this.closeAppendFiles();
+  }
   setHookBroker(broker: HookBroker | null): void {
     this.hookBroker = broker;
   }
 
-  private readonly committer = new HiveCommitter({
-    root: () => this.root(),
-    prepare: (root, git) => this.prepareRepo(root, git),
-    log: (line) => console.warn(line)
-  });
   private routerTimer: unknown = null;
   /** One non-recursive watcher per active outbox, keyed by its absolute path. */
   private readonly outboxWatchers = new Map<string, Pick<FSWatcher, 'close' | 'on'>>();
@@ -740,14 +769,6 @@ export class HiveManager {
     // so it tracks the bundled list).
     writeFileSync(join(root, 'COMMANDS.md'), COMMANDS_MD, 'utf8');
 
-    // Keep the churny/ephemeral live files out of the hive git repo.
-    const gitignore = join(root, '.gitignore');
-    const want = ['fleet.json', 'hooks.sock', 'cost-ledger.jsonl', '.DS_Store'];
-    let lines: string[] = [];
-    if (existsSync(gitignore)) { try { lines = readFileSync(gitignore, 'utf8').split('\n'); } catch { lines = []; } }
-    const missing = want.filter((w) => !lines.includes(w));
-    if (missing.length) writeFileSync(gitignore, [...lines.filter(Boolean), ...missing].join('\n') + '\n', 'utf8');
-
     // The hook shim: a dumb pipe between a `claude` hook and our UDS. Refreshed
     // on every bootstrap so it tracks code changes.
     mkdirSync(join(root, 'bin'), { recursive: true });
@@ -760,10 +781,29 @@ export class HiveManager {
     // …and the PATH-visible `node` fallback for the agent's OWN subprocesses.
     this.writeRuntimeShims();
 
-    if (!existsSync(join(root, '.git'))) {
-      this.git(['init', '-q'], root);
-      this.commit('hive: init');
-    }
+    // 1.1.53 (the Human's decision): the hive is no longer a git repo the app maintains. Nothing
+    // read its history, and every commit cost ~59 process starts (git plus the identity-guard
+    // hooks), each an antivirus scan. A new hive is not git-initialised; an existing hive/.git
+    // is LEFT ON DISK untouched (the Human can remove it), and its hooks simply stop firing.
+    //
+    // What survives from the old commit prep: every agent's MINE ignore file (mempalace mine
+    // honours .gitignore; it keeps Codex homes and raw inbox JSON out of the palace). Agents that
+    // are not running never pass through spawn, so they are refreshed once per process here.
+    this.refreshMineIgnores(root);
+  }
+
+  /** Has the once-per-process mine-ignore refresh run? */
+  private mineIgnoresRefreshed = false;
+
+  /** Ensure every agent dir's .gitignore (read by mempalace mine, not by git) is current. */
+  private refreshMineIgnores(root: string): void {
+    if (this.mineIgnoresRefreshed) return;
+    this.mineIgnoresRefreshed = true;
+    const agentsDir = join(root, 'agents');
+    try {
+      if (!existsSync(agentsDir)) return;
+      for (const id of readdirSync(agentsDir)) ensureMineIgnore(join(agentsDir, id));
+    } catch { /* best-effort */ }
   }
 
   /** Validate an agent's cwd the way a spawn does — it must be an ABSOLUTE path
@@ -876,7 +916,6 @@ export class HiveManager {
     if (!cwd.valid) {
       this.appendLog({ kind: 'cwd_invalid', agentId: meta.id, cwd: meta.cwd, issue: cwd.issue });
     }
-    this.commit(`hive: register ${meta.id}`);
 
     const env: Record<string, string> = {
       AGENT_ID: meta.id,
@@ -1107,7 +1146,6 @@ export class HiveManager {
       this.writeJson(join(root, 'registry.json'), reg);
       writeFileSync(join(this.agentDir(id), 'identity.md'), this.identityText(agent), 'utf8');
       this.appendLog({ kind: 'role', agentId: id, role: next });
-      this.commit(`hive: role ${id}`);
       return { ok: true };
     } catch (e) {
       return { ok: false, error: e instanceof Error ? e.message : String(e) };
@@ -1133,7 +1171,6 @@ export class HiveManager {
       agent.lastSeen = Date.now();
       this.atomicWriteJson(join(root, 'registry.json'), reg);
       this.appendLog({ kind: 'archive', agentId: id, archived });
-      this.commit(`hive: ${archived ? 'archive' : 'unarchive'} ${id}`);
     } catch { /* best-effort — never crash a lifecycle handler */ }
   }
 
@@ -1216,7 +1253,6 @@ export class HiveManager {
       }
 
       this.appendLog({ kind: 'rename', agentId: id, previousName, name: nextName });
-      this.commit(`hive: rename ${id}`);
       return { ok: true, name: nextName };
     } catch {
       return { ok: false, error: 'Could not rename agent' };
@@ -1241,7 +1277,6 @@ export class HiveManager {
       agent.lastSeen = Date.now();
       this.atomicWriteJson(join(root, 'registry.json'), reg);
       this.appendLog({ kind: 'session', agentId, sessionId });
-      this.commit(`hive: session ${agentId}`);
     } catch { /* best-effort — never crash a hook handler */ }
   }
 
@@ -1270,7 +1305,6 @@ export class HiveManager {
         agent.lastSeen = Date.now();
         this.atomicWriteJson(join(root, 'registry.json'), reg);
         this.appendLog({ kind: 'model', agentId, model: null });
-        this.commit(`hive: model default ${agentId}`);
         return;
       }
       if (agent.model?.trim().toLowerCase() === key) return;
@@ -1278,7 +1312,6 @@ export class HiveManager {
       agent.lastSeen = Date.now();
       this.atomicWriteJson(join(root, 'registry.json'), reg);
       this.appendLog({ kind: 'model', agentId, model: next });
-      this.commit(`hive: model ${agentId}`);
     } catch { /* best-effort â€” never crash a status line */ }
   }
 
@@ -1312,6 +1345,13 @@ export class HiveManager {
     const hook = (matcher?: string) => hookUrl
       ? { ...(matcher ? { matcher } : {}), hooks: [{ type: 'http', url: hookUrl, timeout: HOOK_HTTP_TIMEOUT_S }] }
       : entry(matcher);
+    // 1.1.53 AV R1: with the broker up (on Windows), the status line is a sourced builtins-only
+    // script that POSTs to the broker: 0 processes per refresh instead of ~5 (incl. Electron as
+    // Node). The status line cannot simply go: it is the only source of the subscription's
+    // rate_limits (the capacity seam), the model and the exact context window.
+    const statusParts = brokerUrlParts(hookUrl);
+    const statusScript = statusParts ? this.writeClaudeStatusScript() : null;
+    const statusCommand = statusParts && statusScript ? claudeStatusCommand(statusScript, statusParts) : `${cmd} --status`;
     const mcpServers = this.buildDefaultMcpServers(cwd, cfg);
     return {
       // Match the TUI's truecolor palette to the harness terminal theme —
@@ -1336,7 +1376,7 @@ export class HiveManager {
       // the only clean programmatic source for the session's REAL context
       // window. The shim prints a compact in-terminal gauge and forwards the
       // payload to the harness (agent-card context gauge, exact limit).
-      statusLine: { type: 'command', command: `${cmd} --status`, padding: 0 },
+      statusLine: { type: 'command', command: statusCommand, padding: 0 },
       hooks: {
         Stop: [hook()],
         SubagentStop: [hook()],
@@ -1589,7 +1629,7 @@ export class HiveManager {
     // us) was invisible to every investigation.
     const rt = this.runtimeInfo();
     const runtimeLine = rt
-      ? `RUNNING BUILD: Munder Difflin v${rt.version}, ${rt.packaged ? 'packaged app' : 'local dev build'}${rt.appPath ? `, from ${rt.appPath}` : ''}. Say this version if asked which one is running, and do not assume behaviour from an older one. A local dev build inherits the launching shell's environment (umask included) where a packaged app does not, so file modes and inherited env can legitimately differ between the two. \`log.jsonl\` records an \`app-start\` event on every launch, which is how you spot a restart or a build switch.`
+      ? `RUNNING BUILD: Munder Difflin v${rt.version}, ${rt.packaged ? 'packaged app' : 'local dev build'}${rt.appPath ? `, from ${rt.appPath}` : ''}. Say this version if asked which one is running, and do not assume behaviour from an older one. A local dev build inherits the launching shell's environment (umask included) where a packaged app does not, so file modes and inherited env can legitimately differ between the two. \`log.jsonl\` records an \`app-start\` event on every launch, which is how you spot a restart or a build switch (it rotates at 8 MB: search \`log*.jsonl\` for older rows).`
       : '';
     // Item 11: god could not find the spawn queue. The mechanism has worked since
     // v0.4.4, but nothing told him it existed — the prompt said "spawn" without
@@ -1604,7 +1644,7 @@ export class HiveManager {
       : '';
     const godLine = meta.isGod
       ? 'You are the GOD / ORCHESTRATOR of this hive — your job is to ORCHESTRATE, not to implement: maintain live situational awareness and delegate the work. (1) AWARENESS — always know what is going on: keep an accurate picture of every agent (active vs archived/idle), the task board, and all in-flight work; drain your inbox continually and triage every other agent\'s requests, answering clarifications so the team runs autonomously. (2) DELEGATE — decompose work and fan it out to the hive agents via their inboxes (route messages and assign owners; do not do their jobs); do NOT take on grunt implementation yourself. Stay aware of who is already on the floor and delegate OPPORTUNISTICALLY: BEFORE you spawn anything, CHECK THE LIVE ROSTER (active agents in registry.json + their state in fleet.json) and prefer routing to an EXISTING agent that fits — above all when the request names one ("ask Pam to…", "have Jim…"), route to that agent instead of reflexively creating a new one. Reuse an idle or already-running agent whose role matches; only spawn a fresh agent when no existing one is a sensible fit, and say that you checked. One capable owner beats a duplicate. (3) OWN ONLY THE IMPORTANT, high-leverage things — task decomposition, dispatch decisions, sign-offs, conflict resolution, branch integration, and final QA — and remain the sole scribe of board.md. You are otherwise fully autonomous — there is NO separate approval queue. For the genuinely critical (destructive actions, spending real money, scope changes, unresolvable conflicts), ask the human directly in your own session and let the tool-permission prompt gate the action; the human approves natively, including remotely from their phone via /remote-control. Keep the team unblocked. When you DISPATCH a task, write it as a 4-part contract so the agent can run autonomously: (1) OBJECTIVE — the concrete goal; (2) OUTPUT — the expected deliverable/format; (3) TOOLS — what to use or avoid, and any references to read instead of re-deriving; (4) BOUNDARIES — scope limits + the definition of done. Pass references (file paths, message ids, board sections), not pasted content — keep dispatches short.'
-        + ` MONITOR the floor by reading ${inRoot('fleet.json')} (live per-agent tokens, cost, status, last tool, breaker level, inbox backlog) and ${inRoot('registry.json')} — note that running 'claude agents' will NOT list your hive's sibling agents. A full Claude Code command reference is at ${inRoot('COMMANDS.md')} (slash commands act ONLY on your own session; CLI commands run in your shell and can target the fleet). You periodically receive scheduler / "Heartbeat" standup requests — on each, review every agent via fleet.json, re-engage anyone stalled, over-budget, or breaker-armed, and keep board.md and tasks.json accurate. In tasks.json, ALWAYS set each task's "assignee" to the worker's agent id the moment you dispatch it, and NEVER clear it on status changes — a done card must still say who did the work (the human reads the board by who-did-what). HUMAN FEEDBACK is first-class in the ledger: when a task can only proceed with the human's input — a QUESTION to answer OR an ACTION only the human can perform (create an account, approve a purchase, provide credentials/screenshots, test on their device) — set its status to "blocked" and append the concrete ask to the card's "humanQA" array (push {"q":"...","askedAt":"<iso>"}; phrase actions as clear to-dos; keep every past entry — the history documents the card's decisions). The harness surfaces open questions on the office floor's ASK ME board; the human's answer lands in the same entry ("a") AND arrives as an inbox message to you — read it, act on it, and unblock the card so work continues. Do NOT park human questions in separate files (no HumanQuestion.md) and never sit waiting on the human in your own session. Steward the token budget.`
+        + ` MONITOR the floor by reading ${inRoot('fleet.json')} (live per-agent tokens, cost, status, last tool, breaker level, inbox backlog) and ${inRoot('registry.json')} — note that running 'claude agents' will NOT list your hive's sibling agents. A full Claude Code command reference is at ${inRoot('COMMANDS.md')} (slash commands act ONLY on your own session; CLI commands run in your shell and can target the fleet). You periodically receive scheduler / "Heartbeat" standup requests — on each, review every agent via fleet.json, re-engage anyone stalled, over-budget, or breaker-armed, and keep board.md and tasks.json accurate. In tasks.json, ALWAYS set each task's "assignee" to the worker's agent id the moment you dispatch it, and NEVER clear it on status changes — a done card must still say who did the work (the human reads the board by who-did-what). HUMAN FEEDBACK is first-class in the ledger: when a task can only proceed with the human's input — a QUESTION to answer OR an ACTION only the human can perform (create an account, approve a purchase, provide credentials/screenshots, test on their device) — set its status to "blocked" and append the concrete ask to the card's "humanQA" array (push {"q":"...","askedAt":"<iso>"}; write q as a short first-line headline, then a body with blank-line paragraphs and "- " bullets (markdown: **bold**, inline code, https links); when the human should pick between concrete choices add "options":[{"label":"...","detail":"..."}] (plus optional "recommended":<index> and "multi":true) — the ASK ME card shows them as buttons and still accepts a free-text note; phrase actions as clear to-dos; keep every past entry — the history documents the card's decisions). The harness surfaces open questions on the office floor's ASK ME board; the human's answer lands in the same entry ("a") AND arrives as an inbox message to you — read it, act on it, and unblock the card so work continues. Do NOT park human questions in separate files (no HumanQuestion.md) and never sit waiting on the human in your own session. Steward the token budget.`
       : meta.isAssistant
       ? 'You are Michael\'s PREP ASSISTANT. You will be handed short, possibly vague instructions (each begins with "ENRICH TASK:"). For each one: (1) figure out which project it concerns and cd into the most relevant repo — you start in Michael\'s home directory; (2) gather concrete context READ-ONLY (exact file paths, current state, relevant code, conventions, active branch, gotchas) — NEVER modify, create, or delete files; (3) rewrite the instruction into ONE clear, self-contained prompt that Michael can execute autonomously, preserving the user\'s original intent without inventing scope. Then deliver it: write ONE message JSON into your outbox with "to":"god", "act":"request", a short subject, and the finished prompt as the body. Do NOT perform the task yourself — your only output is the improved prompt sent to Michael.'
       : 'For anything ambiguous, cross-cutting, or needing sign-off, address a message to "god".';
@@ -1686,7 +1726,6 @@ export class HiveManager {
   send(partial: Partial<HiveMessage>, from = 'system'): HiveMessage {
     const msg = this.normalize(partial, from);
     this.routeMessage(msg);
-    this.commit(`hive: msg ${msg.from}→${msg.to} (${msg.act})`);
     return msg;
   }
 
@@ -2056,7 +2095,6 @@ export class HiveManager {
       if (!liveOutboxFiles.has(full)) this.outboxDeliveredArchives.delete(full);
     }
     if (routed > 0 || rejected > 0 || archived > 0) {
-      this.commit(`hive: routed ${routed} message(s), rejected ${rejected}, archived ${archived}`);
     }
     return routed;
   }
@@ -2077,8 +2115,8 @@ export class HiveManager {
     return root ? this.readJson(join(root, 'tasks.json'), { tasks: [] }) : { tasks: [] };
   }
 
-  /** Persist the task ledger to hive/tasks.json and commit it. Mirrors the
-   *  board/message persist pattern: write JSON, log the change, single-commit.
+  /** Persist the task ledger to hive/tasks.json. Mirrors the board/message persist
+   *  pattern: write JSON, log the change.
    *
    *  MERGES by card id instead of clobbering. Callers hold PARTIAL models of a
    *  card — the renderer's kanban parser knows nine fields, the god writes as
@@ -2099,7 +2137,6 @@ export class HiveManager {
     const merged = mergeTaskLedger(current?.tasks, tasks);
     this.writeJson(path, { tasks: merged });
     this.appendLog({ kind: 'tasks', count: merged.length });
-    this.commit(`hive: tasks (${merged.length})`);
   }
 
   /** Append one card against the latest on-disk ledger. Renderer callers must
@@ -2310,6 +2347,29 @@ export class HiveManager {
   //
   // hive.ts only INVOKES the lease at startup, before an interactive AGY spawn, and on
   // shutdown. Every decision about the user's settings lives in agyStatuslineOwnership.ts.
+
+  /** AV R1: write `<hive>/bin/claude-status.sh` and return its path with forward slashes (what the
+   *  status-line shell reads), or null (not Windows, no hive, or a path needing quoting). */
+  private writeClaudeStatusScript(): string | null {
+    const root = this.root();
+    if (process.platform !== 'win32' || !root) return null;
+    const path = join(root, 'bin', 'claude-status.sh').replace(/\\/g, '/');
+    if (/[\s"'`$\\]/.test(path)) return null;
+    try {
+      mkdirSync(join(root, 'bin'), { recursive: true });
+      // Other agents' status shells SOURCE this file on every refresh, so it is never
+      // rewritten in place (a torn read): unchanged content is left alone, and a change
+      // lands whole via a temp file + rename.
+      let current: string | null = null;
+      try { current = readFileSync(path, 'utf8'); } catch { /* not yet written */ }
+      if (current !== CLAUDE_STATUS_SH) {
+        const tmp = `${path}.${process.pid}.tmp`;
+        writeFileSync(tmp, CLAUDE_STATUS_SH, 'utf8');
+        renameSync(tmp, path);
+      }
+      return path;
+    } catch { return null; }
+  }
 
   /** P4: write `agy-oneway.cmd` for this hive's pipe and return its path, or null (not Windows,
    *  no hive, or a path AGY could not run unquoted: then the shim is used, as before). */
@@ -2915,10 +2975,22 @@ export class HiveManager {
    */
   logTail(n = 200): unknown[] {
     const root = this.root();
-    if (!root || !existsSync(join(root, 'log.jsonl'))) return [];
-    const file = join(root, 'log.jsonl');
+    if (!root || n <= 0) return [];
+    const live = join(root, 'log.jsonl');
+    // LOG-STALL-AV: the log rotates, so a tail that the live file cannot fill continues into
+    // the rotated files, newest first. Each is read with the same bounded tail window.
+    const files = [...rotatedFiles(live).map((r) => r.path), ...(existsSync(live) ? [live] : [])];
     const parse = (l: string): unknown => { try { return JSON.parse(l); } catch { return { raw: l }; } };
-    if (n <= 0) return [];
+    let rows: unknown[] = [];
+    for (let i = files.length - 1; i >= 0 && rows.length < n; i--) {
+      rows = [...this.fileTail(files[i], n - rows.length, parse), ...rows];
+    }
+    return rows;
+  }
+
+  /** The last `n` rows of one log file (bounded tail read; the logic logTail always had). */
+  private fileTail(file: string, n: number, parse: (l: string) => unknown): unknown[] {
+    if (n <= 0 || !existsSync(file)) return [];
     try {
       const size = statSync(file).size;
       if (size === 0) return [];
@@ -2966,7 +3038,8 @@ export class HiveManager {
     const root = this.root();
     if (!root) return;
     const line = JSON.stringify({ ts: Date.now(), ...event }) + '\n';
-    try { appendFileSync(join(root, 'log.jsonl'), line, 'utf8'); } catch { /* noop */ }
+    // A kept-open descriptor, rotated at 8 MB: no open/close (so no antivirus rescan) per row.
+    this.appendFileFor(join(root, 'log.jsonl'), LOG_KEEP_ROTATED).append(line);
   }
 
   /**
@@ -2982,8 +3055,8 @@ export class HiveManager {
    * at the hive ROOT, so `mempalace mine` (which only scans per-agent dirs) never
    * ingests it — no palace noise, no MINE_IGNORE entry needed.
    *
-   * Like appendLog: append to disk now (durable immediately), let it ride the
-   * next natural commit. Best-effort — never throws into the beat.
+   * Like appendLog: append to disk now (durable immediately). Best-effort — never throws
+   * into the beat.
    */
   appendCostLedger(sample: AgentUsageSample): void {
     const root = this.root();
@@ -3002,7 +3075,9 @@ export class HiveManager {
       model: sample.model,
       usd: sample.usd
     };
-    try { appendFileSync(join(root, 'cost-ledger.jsonl'), JSON.stringify(row) + '\n', 'utf8'); } catch { /* noop */ }
+    // Kept open and rotated like the log, but every rotated ledger is KEPT: the lifetime cost
+    // is folded from all of them (costLifetime.ts reads across the rotation).
+    this.appendFileFor(join(root, 'cost-ledger.jsonl'), Infinity).append(JSON.stringify(row) + '\n');
   }
 
   // — json + atomic io —
@@ -3018,97 +3093,6 @@ export class HiveManager {
     renameSync(tmp, p);
   }
 
-  // — git —
-  /** SYNCHRONOUS git, kept for exactly one call: `git init` when a hive is first created
-   *  (once per hive, ever). Every commit goes through the async committer instead. */
-  private git(args: string[], cwd: string): { ok: boolean; out: string; err: string } {
-    const res = spawnSync('git', ['-c', 'commit.gpgsign=false', '-c', 'user.name=Hive', '-c', 'user.email=hive@local', ...args], {
-      cwd, encoding: 'utf8', timeout: 8000
-    });
-    return { ok: res.status === 0, out: res.stdout ?? '', err: res.stderr ?? '' };
-  }
-
-  /** Has the one-time cost-ledger untrack pass run in this process yet? */
-  private untrackedCostLedger = false;
-
-  /**
-   * Stop versioning the cost ledger.
-   *
-   * `cost-ledger.jsonl` is append-only and gains a row per usage sample, so a
-   * repo that tracks it stores a fresh copy of the WHOLE file on every hive
-   * commit — and the hive commits constantly. A quarter-gigabyte ledger with a
-   * few thousand commits behind it is several hundred gigabytes of blob that
-   * git has to walk, which is what turns a routine `gc` into a multi-gigabyte
-   * `pack-objects` run. The ignore line in ensureHive keeps new copies out;
-   * this drops the one already in the index, because git keeps recording a
-   * file it is already tracking no matter what .gitignore says — so the ignore
-   * line alone reads as a fix while the repo goes on growing. The ledger stays
-   * on disk, so the cost history the app reads is untouched.
-   */
-  private async untrackCostLedger(git: (args: string[]) => Promise<GitResult>): Promise<void> {
-    if (this.untrackedCostLedger) return;
-    this.untrackedCostLedger = true;
-    // Probe before mutating: `rm --cached` on a repo that never tracked it
-    // would still rewrite the index on every launch, inside the retry path.
-    const tracked = await git(['ls-files', '--', 'cost-ledger.jsonl']);
-    if (!tracked.ok || !tracked.out.trim()) return;
-    await git(['rm', '--cached', '-q', '--ignore-unmatch', '--', 'cost-ledger.jsonl']);
-    console.warn('[hive] untracked the cost ledger from the hive repo');
-  }
-
-  /** Has the one-time Codex-home untrack pass run in this process yet? */
-  private untrackedCodexHomes = false;
-
-  /**
-   * Stop versioning Codex worker homes that are ALREADY in the index.
-   *
-   * Adding `.codex/` to each agent's .gitignore only keeps NEW paths out; git
-   * happily keeps recording a file it is already tracking, so a hive that
-   * predates that ignore line goes on committing every SQLite and transcript
-   * revision exactly as before — the .gitignore reads as a fix while the repo
-   * keeps growing. This closes that: once per process, refresh every agent's
-   * ignore file (agents that are not running never pass through spawn, and the
-   * mine loop only reaches them if mempalace is installed) and drop any tracked
-   * `.codex` path from the index. The files stay on disk, so `codex --resume`
-   * is unaffected; only their history stops.
-   */
-  private async untrackCodexHomes(root: string, git: (args: string[]) => Promise<GitResult>): Promise<void> {
-    if (this.untrackedCodexHomes) return;
-    this.untrackedCodexHomes = true;
-    const agentsDir = join(root, 'agents');
-    if (!existsSync(agentsDir)) return;
-    try {
-      for (const id of readdirSync(agentsDir)) ensureMineIgnore(join(agentsDir, id));
-    } catch { /* best-effort */ }
-    // Probe before mutating: `rm --cached` on a clean repo would still rewrite
-    // the index on every launch, and this runs inside the commit retry path.
-    const tracked = await git(['ls-files', '--', 'agents/*/.codex']);
-    if (!tracked.ok || !tracked.out.trim()) return;
-    await git(['rm', '-r', '--cached', '-q', '--ignore-unmatch', '--', 'agents/*/.codex']);
-    console.warn('[hive] untracked previously-committed Codex homes from the hive repo');
-  }
-
-  /** The one-time index tidying, run by the committer (async, in its single flight) before
-   *  the process's first commit. */
-  private async prepareRepo(root: string, git: (args: string[]) => Promise<GitResult>): Promise<void> {
-    await this.untrackCostLedger(git);
-    await this.untrackCodexHomes(root, git);
-  }
-
-  /**
-   * Ask for all hive changes to be committed. MESSAGE-LAG-152: this used to run
-   * `git add -A` + `git commit` synchronously, on Electron main, from the router's hot
-   * path (1.7-3.2 s per routed message, all IPC stalled). It is now a request: it returns at
-   * once, and the committer coalesces requests into one async commit. Nothing waits for it.
-   */
-  commit(message: string): void {
-    this.committer.request(message);
-  }
-
-  /** Commit everything requested so far (for quit). Never rejects. */
-  flushCommits(): Promise<void> {
-    return this.committer.flush();
-  }
 }
 
 // ─── PROTOCOL.md (written into the hive, readable by every agent) ────────────
@@ -3142,8 +3126,8 @@ const COMMANDS_MD = renderCommandsMd();
 const PROTOCOL_MD = `# Hive protocol
 
 You are one of several Claude agents sharing this hive. Coordination is entirely
-file-based; the harness (main process) is the only thing that runs git and the
-only thing that moves messages between agents.
+file-based; the harness (main process) is the only thing that moves messages
+between agents.
 
 ## Your workspace — \`agents/<your-id>/\`
 - \`identity.md\`  — who you are (read-only; the harness writes it).
@@ -3204,7 +3188,7 @@ content, and \`/compact\` your own session when context gets heavy.
 You (god) are responsible for situational awareness. To see the live state of every agent, read
 \`fleet.json\` in the hive root — it is refreshed continuously with each agent's tokens, cost, status,
 breaker level, last tool, last-active time, and inbox backlog. Pair it with \`registry.json\` (the roster)
-and \`log.jsonl\` (the event feed). IMPORTANT: \`claude agents\` will NOT show your hive's sibling
+and \`log.jsonl\` (the event feed; it rotates at 8 MB, so older rows are in \`log.*.jsonl\`, search \`log*.jsonl\`). IMPORTANT: \`claude agents\` will NOT show your hive's sibling
 sessions (they're spawned independently) — \`fleet.json\` is your source of truth for them. For a deeper
 look at one agent, read its \`agents/<id>/memory.md\` and \`inbox/\`, or send it a \`query\`. A full
 Claude Code command reference (slash = your own session only; CLI = your shell, can target the fleet)
@@ -3262,6 +3246,22 @@ write there become searchable by every agent. You don't run \`mine\` yourself.
 // A minimal pipe: read the hook payload on stdin, tag it with this agent's id,
 // forward it to the hive's UDS, and relay the response back to `claude`. All the
 // real logic lives in the main process (HookServer). Never blocks a stop on error.
+/** 1.1.53 AV R1: the Claude status line as a SOURCED shell script (builtins only, no process).
+ *  LF line endings are load-bearing (bash reads a CR as part of the command). */
+export const CLAUDE_STATUS_SH = "# Munder Difflin: the Claude status line (1.1.53 AV R1). Generated; do not edit.\n# SOURCED by the shell Claude runs the statusLine command in (\". <this> port id token\"),\n# and it uses shell BUILTINS only, so a refresh starts no process: before, each one\n# started hive-node.cmd and the ~180 MB Electron binary as Node (~5 processes, ~630 ms).\n# It reads the status JSON from stdin, POSTs it to the app's loopback hook broker over\n# bash's /dev/tcp, and prints the reply (the context gauge). Any failure prints nothing.\n__munder_status() {\n  local LC_ALL=C body='' line\n  while IFS= read -r line || [ -n \"$line\" ]; do body+=\"$line\"$'\\n'; done\n  { exec 3<>\"/dev/tcp/127.0.0.1/$1\"; } 2>/dev/null || return 0\n  printf 'POST /status/%s/%s HTTP/1.0\\r\\nHost: 127.0.0.1\\r\\nContent-Type: application/json\\r\\nContent-Length: %d\\r\\n\\r\\n%s' \"$2\" \"$3\" \"${#body}\" \"$body\" >&3\n  while IFS= read -r -t 2 line <&3; do line=${line%$'\\r'}; [ -z \"$line\" ] && break; done\n  while IFS= read -r -t 2 line <&3 || [ -n \"$line\" ]; do printf '%s' \"$line\"; done\n  exec 3<&- 3>&-\n  return 0\n}\n__munder_status \"$@\"\nunset -f __munder_status\n";
+
+/** The broker URL's parts, for the status-line command; null when the URL is not ours or an
+ *  id could need shell quoting (the caller then keeps the command shim). */
+export function brokerUrlParts(url: string | null): { port: number; agentId: string; token: string } | null {
+  const m = url ? /^http:\/\/127\.0\.0\.1:(\d{1,5})\/hook\/([A-Za-z0-9._-]+)\/([0-9a-f]{32})$/.exec(url) : null;
+  return m ? { port: Number(m[1]), agentId: m[2], token: m[3] } : null;
+}
+
+/** The statusLine command that sources the script: every part is quote-free by construction. */
+export function claudeStatusCommand(scriptPath: string, parts: { port: number; agentId: string; token: string }): string {
+  return `. '${scriptPath}' ${parts.port} ${parts.agentId} ${parts.token}`;
+}
+
 export const HOOK_SHIM = `#!/usr/bin/env node
 'use strict';
 const net = require('net');

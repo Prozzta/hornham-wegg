@@ -40,6 +40,7 @@ async function floor(t) {
   t.after(() => {
     if (priorHome === undefined) delete process.env.HOME; else process.env.HOME = priorHome;
     if (priorUserProfile === undefined) delete process.env.USERPROFILE; else process.env.USERPROFILE = priorUserProfile;
+    hive.dispose();
     fs.rmSync(home, { recursive: true, force: true });
   });
   const hive = new HiveManager(() => home, () => {});
@@ -122,6 +123,7 @@ test('empty and missing logs answer like the naive version', async (t) => {
   assert.deepEqual(hive.logTail(10), naiveTail(log, 10), 'truly empty file');
   assert.deepEqual(hive.logTail(10), [], 'and an empty file really is no rows');
 
+  hive.dispose();
   fs.rmSync(log);
   assert.deepEqual(hive.logTail(10), [], 'missing log file');
 

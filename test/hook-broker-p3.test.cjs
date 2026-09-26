@@ -201,6 +201,7 @@ async function codexConfig(broker) {
   const hive = new HiveManager(() => home);
   hive.setHookBroker(broker);
   await hive.ensureAgent({ id: 'cx', name: 'C', provider: 'codex', cwd: home });
+  hive.dispose();
   return fs.readFileSync(path.join(home, 'hive', 'agents', 'cx', '.codex', 'config.toml'), 'utf8');
 }
 

@@ -143,7 +143,17 @@ export const HOOK_HTTP_BODY_MAX = 8 * 1024 * 1024;
 export const HOOK_HTTP_RELISTEN_DELAYS_MS = [250, 1_000, 2_000, 5_000, 10_000, 12_000];
 /** The broker's URLs: /hook/<agentId>/<32-hex token> (Claude HTTP hooks) and
  *  /mcp/<agentId>/<token> (Codex mcp_tool hooks, P3). */
-const HOOK_ROUTE = /^\/(hook|mcp)\/([^/?#]+)\/([0-9a-f]{32})$/;
+const HOOK_ROUTE = /^\/(hook|mcp|status)\/([^/?#]+)\/([0-9a-f]{32})$/;
+
+/** The in-terminal context gauge the status line prints (the same text the command shim
+ *  printed): "ctx 45k/200k (22%)", or "" without a usable context_window. */
+export function statusGauge(p: Record<string, unknown>): string {
+  const cw = (p.context_window && typeof p.context_window === 'object' ? p.context_window : {}) as Record<string, unknown>;
+  const used = cw.total_input_tokens, size = cw.context_window_size;
+  if (typeof used !== 'number' || typeof size !== 'number' || !(size > 0)) return '';
+  const pct = Math.round((used / size) * 100);
+  return 'ctx ' + Math.round(used / 1000) + 'k/' + Math.round(size / 1000) + 'k (' + pct + '%)';
+}
 /** How long a Codex tool hook waits for its rollout item before it is delivered degraded. */
 export const MCP_ROLLOUT_RETRY_MS = 20;
 
@@ -435,6 +445,14 @@ export class HookServer {
         if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) payload = parsed as Record<string, unknown>;
       } catch { /* an unreadable body is an empty hook */ }
       applyUrlIdentity(payload, agentId);
+      if (route === 'status') {
+        // AV R1: the Claude status line (claude-status.sh). Handled as the Status event the
+        // command shim sent; the reply is the gauge TEXT the script prints into the TUI.
+        payload.hook_event_name = 'Status';
+        try { this.handle(this.stampArrival(payload as HookPayload, 'http')); } catch { /* never break a status tick */ }
+        if (!res.headersSent) { res.writeHead(200, { 'content-type': 'text/plain; charset=utf-8' }); res.end(statusGauge(payload)); }
+        return;
+      }
       let out: unknown = {};
       try { out = this.handle(this.stampArrival(payload as HookPayload, 'http')); } catch { out = {}; }
       reply(200, out);

@@ -537,23 +537,24 @@ test('READ_AT: the shim stamps it, and the hook server threads it into the norma
 
 // ─── N9: god's ruling, pinned ───────────────────────────────────────────────
 
-test('N9: PreInvocation is NOT a coordinator active edge, and ACTIVE_EVENTS is exactly these five', () => {
-  // god's ruling (2026-09-24), pinned so a future change cannot quietly undo it: agy's
-  // Stop fires only on process EXIT, so a fallback ACTIVE edge with no guaranteed matching
-  // TERMINAL would re-arm the absorbing-active stall precisely when the statusline
-  // transport is the broken thing. PreInvocation stays a RENDERER-only display signal.
+test('N9 (superseded 2026-09-26): PreInvocation IS a coordinator active edge, and ACTIVE_EVENTS is exactly these six', () => {
+  // god's ruling of 2026-09-24 kept PreInvocation out because agy's Stop then fired only on
+  // process EXIT, so an active edge had no guaranteed terminal. Since 1.1.52 (Y2) agy's
+  // hooks load and a Stop arrives at the end of EVERY turn (Jim, WAKE-BUGS-152 (1): Phyllis
+  // 06:29:54, 07:06:38, 07:07:41), and god's 1.1.53 ruling (AGY-FALSEACTIVE-STALL) adds
+  // PreInvocation as agy's real turn start: the one signal that may re-open a turn inside
+  // the Stop-settle window, and that confirms our own submit. The count is still pinned.
   const wake = src('src/main/workerWake.ts');
   const members = between(wake, 'const ACTIVE_EVENTS = new Set(', ');');
-  assert.ok(!/PreInvocation/.test(members), 'PreInvocation must never join ACTIVE_EVENTS');
-  for (const e of ['UserPromptSubmit', 'PreToolUse', 'PostToolUse', 'PreCompact', 'PostCompact']) {
-    assert.ok(members.includes(`'${e}'`), `${e} is still an active edge`);
+  for (const e of ['UserPromptSubmit', 'PreInvocation', 'PreToolUse', 'PostToolUse', 'PreCompact', 'PostCompact']) {
+    assert.ok(members.includes(`'${e}'`), `${e} is an active edge`);
   }
-  assert.equal((members.match(/'/g) ?? []).length / 2, 5, 'exactly five, so an addition fails here');
+  assert.equal((members.match(/'/g) ?? []).length / 2, 6, 'exactly six, so an addition fails here');
 
-  // And behaviourally: PreInvocation moves nothing in the coordinator.
+  // And behaviourally: PreInvocation is a turn start (active, not a retry edge).
   const f = floor();
   assert.equal(f.coordinator.noteHook('a1', 'PreInvocation', undefined, NOW), false, 'not a retry edge');
-  assert.equal(f.coordinator.state('a1').lifecycle, 'unknown', 'and not an active assertion');
+  assert.equal(f.coordinator.state('a1').lifecycle, 'active', 'an active assertion');
   // The renderer keeps it, as god ruled - display only.
   assert.match(src('src/renderer/src/hooks/useHive.ts'), /e\.event === 'PreInvocation'/);
 });

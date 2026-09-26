@@ -221,6 +221,7 @@ test('config: AGY PostToolUse/PostInvocation are the one-way command; PreToolUse
     for (const ev of Object.keys(hooks)) { assert.equal(handlerOf(ev).type, 'command'); assert.doesNotMatch(cmdOf(ev), /["']/, 'AGY passes quotes literally'); }
     const bat = fs.readFileSync(path.join(home, 'hive', 'bin', 'agy-oneway.cmd'), 'utf8');
     assert.match(bat, /\(\(echo %1 %2 %AGENT_ID%& findstr \/v \/c:@@m@@\) > \\\\\.\\pipe\\munder-difflin-[0-9a-f]+\) 2>nul/);
+    hive.dispose();
   } finally { process.env.HOME = JAIL; process.env.USERPROFILE = JAIL; }
 });
 

@@ -62,6 +62,32 @@ export const WORKER_WAKE_HITL_REARM_MS = 5 * 60_000;
  */
 export const PROVIDER_IDLE_CONFIRM_MS = 5_000;
 
+/**
+ * AGY-FALSEACTIVE-STALL (Jim, WAKE-BUGS-152 (1)). How long after a terminal Stop a provider
+ * `running` reading is presumed to describe the turn that Stop just ended. On the live floor
+ * AGY went on rendering `running` for up to 2.6 s after its own Stop hook, and that stale
+ * tick opened a new active epoch nothing would ever close. A reading inside this window
+ * opens nothing unless a turn start (our COMMITTED submit, UserPromptSubmit, PreInvocation)
+ * came after the Stop.
+ */
+export const STOP_SETTLE_MS = 5_000;
+
+/**
+ * CODEX-FALSEACTIVE-153 (Jim). Our own `COMMITTED` is evidence that the Enter went out, not
+ * that the provider started a turn: Dwight's typed nudge never became a Codex turn, and with
+ * no turn nothing could ever close the epoch. For a provider that reports turn starts, the
+ * epoch our submit opens is PROVISIONAL until the provider confirms one; unconfirmed this
+ * long, the lifecycle goes back to `unknown` and the claim's ids are re-pended ONCE.
+ */
+export const SUBMIT_CONFIRM_MS = 60_000;
+
+/**
+ * WAKE-NO-PENDING-IDS hardening (Jim, WAKE-BUGS-152 (2)). An id announced this long ago and
+ * still on disk when the agent is idle again was overlooked (or its turn failed); it is
+ * re-pended ONCE, so it is announced one more time and never looped.
+ */
+export const REANNOUNCE_AFTER_MS = 3 * 60_000;
+
 /** A hook event message that means "the agent needs the human" — permission /
  *  approve / confirm prompts (mirrors the renderer's needsHuman detection in
  *  useHive.ts). Anything matching the idle-waiting shape is NOT a HITL hold. */
@@ -102,7 +128,7 @@ export function classifyHook(event: string | undefined, message: string | undefi
  * starts supplies `UserPromptSubmit` (and then `PreToolUse`) immediately, and stays
  * unclaimable through any length of silent tool until it says `Stop`.
  */
-const ACTIVE_EVENTS = new Set(['UserPromptSubmit', 'PreToolUse', 'PostToolUse', 'PreCompact', 'PostCompact']);
+const ACTIVE_EVENTS = new Set(['UserPromptSubmit', 'PreInvocation', 'PreToolUse', 'PostToolUse', 'PreCompact', 'PostCompact']);
 
 /**
  * The canonical provider-native lifecycle, as the AGY statusline normaliser states it.
@@ -142,6 +168,10 @@ export interface WakeClaim {
   /** Sorted, unique. Never enlarged after the claim. */
   ids: readonly string[];
   cause: WakeCause;
+  /** The ids of an earlier nudge that was typed but never confirmed as a provider turn.
+   *  That nudge may still sit UNSENT in the composer, so the owner must see it absent from
+   *  the prompt before typing this one (never double-typed). Absent = no such check. */
+  recheck?: readonly string[];
 }
 
 export type InterferenceHow = 'SEND_AGAIN' | 'ALREADY_HANDLED';
@@ -168,7 +198,36 @@ interface AgentWake {
   /** The Codex turn the lifecycle is active FOR, when a hook named it (null otherwise).
    *  B1 closes a lost Stop only with a completion of exactly this turn. */
   openTurnId: string | null;
+  /** When the last terminal Stop was recorded (0 = none). */
+  stoppedAt: number;
+  /** When the provider last said a turn STARTED (an active hook, a confirming reading). */
+  turnStartAt: number;
+  /** The active epoch was opened by our COMMITTED and the provider has not confirmed a
+   *  turn yet (only for a provider that reports turn starts). */
+  provisional: boolean;
+  /** When the current in-flight claim was taken (a turn start after it confirms it). */
+  claimedAt: number;
+  /** The ids of the commit that opened the provisional epoch. */
+  commitIds: readonly string[];
+  /** An idle reading refused only by the confirm grace, applied on a later beat unless
+   *  something newer said active (0 = none). */
+  pendingIdleAt: number;
+  /** id -> when it was announced (COMMITTED). */
+  announcedAt: Map<string, number>;
+  /** Ids already re-pended once (unconfirmed submit or stale announcement). Never again. */
+  reannounced: Set<string>;
+  /** See WakeClaim.recheck; carried until a claim that checked it COMMITS. */
+  recheck: readonly string[] | null;
+  /** AGY's last invocation hook was PreInvocation (a model call is running): a deferred
+   *  idle is not applied until PostInvocation or a Stop says it ended. */
+  invoking: boolean;
 }
+
+/** What a reconcile beat changed for one agent (null = nothing). */
+export type WakeBeatEdge =
+  | { kind: 'deferred-idle' }
+  | { kind: 'submit-unconfirmed'; ids: readonly string[] }
+  | { kind: 'reannounce'; ids: readonly string[] };
 
 /** How many closed turn ids are remembered per agent. Only a straggler of a RECENT turn
  *  can still be in flight, so a short window is enough. */
@@ -198,10 +257,44 @@ export class WorkerWakeWatchdog {
   private rec(agentId: string): AgentWake {
     let r = this.agents.get(agentId);
     if (!r) {
-      r = { pending: new Set(), announced: new Set(), inFlight: null, held: null, lifecycle: 'unknown', lastHumanNeedsAt: 0, lastReconcileAttemptAt: 0, providerSession: null, activeSince: 0, closedTurns: [], openTurnId: null };
+      r = {
+        pending: new Set(), announced: new Set(), inFlight: null, held: null, lifecycle: 'unknown', lastHumanNeedsAt: 0, lastReconcileAttemptAt: 0, providerSession: null, activeSince: 0, closedTurns: [], openTurnId: null,
+        stoppedAt: 0, turnStartAt: 0, provisional: false, claimedAt: 0, commitIds: [], pendingIdleAt: 0, announcedAt: new Map(), reannounced: new Set(), recheck: null, invoking: false
+      };
       this.agents.set(agentId, r);
     }
     return r;
+  }
+
+  /** The provider said a turn started: a provisional epoch is confirmed, and an idle
+   *  reading deferred before this is overtaken. */
+  private turnStarted(r: AgentWake, at: number): void {
+    r.turnStartAt = Math.max(r.turnStartAt, at);
+    r.provisional = false;
+    if (r.pendingIdleAt > 0 && at > r.pendingIdleAt) r.pendingIdleAt = 0;
+  }
+
+  /** The lifecycle leaves `active`: every epoch-scoped fact goes with it. */
+  private endEpoch(r: AgentWake, to: WakeLifecycle): void {
+    r.lifecycle = to;
+    r.provisional = false;
+    r.pendingIdleAt = 0;
+  }
+
+  /** Ids announced more than REANNOUNCE_AFTER_MS ago, still on disk, never re-pended:
+   *  back to pending, once each. */
+  private requeueStale(r: AgentWake, now: number): string[] {
+    const ids: string[] = [];
+    for (const id of [...r.announced]) {
+      const at = r.announcedAt.get(id) ?? 0;
+      if (r.reannounced.has(id) || !(at > 0 && now - at >= REANNOUNCE_AFTER_MS)) continue;
+      r.announced.delete(id);
+      r.announcedAt.delete(id);
+      r.reannounced.add(id);
+      r.pending.add(id);
+      ids.push(id);
+    }
+    return ids.sort();
   }
 
   private known(r: AgentWake, id: string): boolean {
@@ -215,7 +308,9 @@ export class WorkerWakeWatchdog {
     this.spawnedAt.set(ptyId, at);
     if (!agentId) return;
     const r = this.rec(agentId);
-    r.lifecycle = 'unknown';
+    this.endEpoch(r, 'unknown');
+    r.recheck = null;   // the new incarnation's composer is empty; the old one died with it
+    r.invoking = false;
     // A new PTY incarnation is a new provider session. Forget the old one BEFORE any
     // tick of the new one arrives: keeping it would make the first tick of the fresh
     // session look like a mismatch and be discarded, and the agent would then have no
@@ -251,8 +346,13 @@ export class WorkerWakeWatchdog {
     const r = this.rec(agentId);
     if (event === 'Stop') {
       if (fullyIdle === false) return false;   // the provider says the turn is not over
-      r.lifecycle = 'idle';
+      this.endEpoch(r, 'idle');
       r.openTurnId = null;
+      r.stoppedAt = at;
+      r.invoking = false;
+      // The turn is over and the agent is idle: an id it was told about minutes ago and
+      // left on disk gets one more announcement (bounded: once per id).
+      this.requeueStale(r, at);
       if (turnId && !r.closedTurns.includes(turnId)) {
         r.closedTurns.push(turnId);
         if (r.closedTurns.length > CLOSED_TURN_MEMORY) r.closedTurns.shift();
@@ -271,10 +371,15 @@ export class WorkerWakeWatchdog {
     if (event === 'SubagentStop') return r.lifecycle === 'idle';   // never turns active into idle
     if (event === 'Notification') {
       if (classifyHook(event, message) === 'needsHuman') { r.lastHumanNeedsAt = at; return false; }
-      r.lifecycle = 'idle';
+      this.endEpoch(r, 'idle');
       return true;
     }
+    // Jim (WAKE-CONFIRM-AUDIT-153 note 1): AGY brackets every model call with Pre/PostInvocation,
+    // and its running ticks can pause >5 s inside one. A deferred idle must not land there.
+    if (event === 'PostInvocation') { r.invoking = false; return false; }
     if (ACTIVE_EVENTS.has(event)) {
+      if (event === 'PreInvocation') r.invoking = true;
+      this.turnStarted(r, at);   // the provider's own turn start: confirms our submit
       r.lifecycle = 'active'; r.activeSince = at;
       r.openTurnId = turnId ?? null;   // no id (Claude, our own submit): the turn is unnamed
       return false;
@@ -284,7 +389,7 @@ export class WorkerWakeWatchdog {
     // let a stale `active` from the old session survive into the new one either — a
     // --resume'd agent would inherit exactly the same deadlock. Not a retry edge: nothing
     // is known to be idle yet, so the reconciliation beat decides, behind boot grace.
-    if (event === 'SessionStart' || event === 'SessionEnd') { r.lifecycle = 'unknown'; return false; }
+    if (event === 'SessionStart' || event === 'SessionEnd') { this.endEpoch(r, 'unknown'); r.invoking = false; return false; }
     return false;
   }
 
@@ -350,17 +455,35 @@ export class WorkerWakeWatchdog {
     //     a tick generated after the Enter but before the state flips is both truthful and
     //     about the previous turn. Refuse - never defer - for the grace; the next tick
     //     after it decides. See PROVIDER_IDLE_CONFIRM_MS.
+    //
+    // (3) DEFER, NEVER DROP (AGY-FALSEACTIVE-STALL (b)). "The next tick after the grace
+    //     decides" assumed ticks keep coming; AGY goes silent while idle, so a refused
+    //     idle was the last word and the epoch never closed. A grace-refused reading is
+    //     remembered and applied by the next beat after the grace (`beat`), unless
+    //     something newer said active first. The beat already runs: no new timer.
     if (status === 'idle') {
       if (r.activeSince > 0 && at < r.activeSince) return false;
       if (r.lifecycle === 'active' && r.activeSince > 0 && at - r.activeSince < PROVIDER_IDLE_CONFIRM_MS) {
+        r.pendingIdleAt = Math.max(r.pendingIdleAt, at);
         return false;
       }
-      r.lifecycle = 'idle';
+      this.closeUnconfirmed(r);
+      this.endEpoch(r, 'idle');
       r.activeSince = 0;
       return true;
     }
-    if (r.lifecycle !== 'active') r.activeSince = at;   // a new epoch, not a repeat of one
+    // (4) STOP IS TERMINAL PROOF (AGY-FALSEACTIVE-STALL (a)). AGY goes on rendering
+    //     `running` for seconds after its own Stop; that reading is about the turn the Stop
+    //     ended. Inside STOP_SETTLE_MS of a Stop it opens nothing, unless a turn start came
+    //     after the Stop (which, being active, is not re-opened here anyway), and it is
+    //     never taken as confirmation of our submit.
+    const afterStop = r.stoppedAt > 0 && at < r.stoppedAt + STOP_SETTLE_MS;
+    if (r.lifecycle !== 'active') {
+      if (afterStop && r.turnStartAt <= r.stoppedAt) return false;
+      r.activeSince = at;   // a new epoch, not a repeat of one
+    }
     r.lifecycle = 'active';
+    if (!afterStop && at >= r.activeSince && at >= r.claimedAt) this.turnStarted(r, at);
     if (status === 'waiting_for_confirmation') r.lastHumanNeedsAt = at;
     return false;
   }
@@ -381,7 +504,7 @@ export class WorkerWakeWatchdog {
     const r = this.agents.get(agentId);
     if (!r || r.lifecycle !== 'active') return false;
     if (r.openTurnId ? r.openTurnId !== turnId : !(r.activeSince > 0 && at > r.activeSince)) return false;
-    r.lifecycle = 'idle';
+    this.endEpoch(r, 'idle');
     r.activeSince = 0;
     r.openTurnId = null;
     if (!r.closedTurns.includes(turnId)) {
@@ -389,6 +512,68 @@ export class WorkerWakeWatchdog {
       if (r.closedTurns.length > CLOSED_TURN_MEMORY) r.closedTurns.shift();
     }
     return true;
+  }
+
+  /**
+   * CODEX-FALSEACTIVE-153: Codex's rollout says a turn STARTED at `at` (task_started). A start
+   * after the claim confirms the provisional epoch our submit opened. Returns true when it
+   * confirmed one. Never opens, closes or re-pends anything.
+   */
+  noteProviderTurnStarted(agentId: string | undefined, at: number): boolean {
+    if (!agentId || !Number.isFinite(at)) return false;
+    const r = this.agents.get(agentId);
+    if (!r || r.lifecycle !== 'active' || !r.provisional || !(r.claimedAt > 0 && at >= r.claimedAt)) return false;
+    this.turnStarted(r, at);
+    return true;
+  }
+
+  /**
+   * One reconcile beat for one agent (call after `reconcile`, so ids that left the disk are
+   * gone). At most one edge, in this order:
+   *
+   *  - deferred-idle       an idle reading refused by the confirm grace, with nothing newer
+   *                        saying active, is applied now that the grace is over;
+   *  - submit-unconfirmed  our COMMITTED epoch was never confirmed by the provider within
+   *                        SUBMIT_CONFIRM_MS: lifecycle unknown (quiescence rules apply
+   *                        again), the claim's ids back to pending ONCE, and the next claim
+   *                        must first see the unsent nudge absent from the prompt;
+   *  - reannounce          idle, and ids announced REANNOUNCE_AFTER_MS ago are still on
+   *                        disk: back to pending, once each.
+   */
+  beat(agentId: string, now = Date.now()): WakeBeatEdge | null {
+    const r = this.agents.get(agentId);
+    if (!r) return null;
+    if (r.lifecycle === 'active' && r.pendingIdleAt > 0 && !r.invoking && now - r.activeSince >= PROVIDER_IDLE_CONFIRM_MS) {
+      this.closeUnconfirmed(r);
+      this.endEpoch(r, 'idle');
+      r.activeSince = 0;
+      return { kind: 'deferred-idle' };
+    }
+    if (r.lifecycle === 'active' && r.provisional && now - r.activeSince >= SUBMIT_CONFIRM_MS) {
+      const ids: string[] = [];
+      for (const id of r.commitIds) {
+        if (!r.announced.has(id) || r.reannounced.has(id)) continue;
+        r.announced.delete(id);
+        r.announcedAt.delete(id);
+        r.reannounced.add(id);
+        r.pending.add(id);
+        ids.push(id);
+      }
+      this.closeUnconfirmed(r);
+      this.endEpoch(r, 'unknown');
+      return { kind: 'submit-unconfirmed', ids };
+    }
+    if (r.lifecycle === 'idle' && !r.inFlight && !r.held) {
+      const ids = this.requeueStale(r, now);
+      if (ids.length) return { kind: 'reannounce', ids };
+    }
+    return null;
+  }
+
+  /** A provisional epoch ends without the provider ever confirming a turn: the nudge that
+   *  opened it may still be unsent in the composer, so the next claim checks first. */
+  private closeUnconfirmed(r: AgentWake): void {
+    if (r.provisional && r.commitIds.length) r.recheck = r.commitIds;
   }
 
   /**
@@ -400,7 +585,8 @@ export class WorkerWakeWatchdog {
     const current = new Set(currentInboxIds.filter((id) => typeof id === 'string' && id.length > 0));
     const r = this.rec(agentId);
     for (const id of [...r.pending]) if (!current.has(id)) r.pending.delete(id);
-    for (const id of [...r.announced]) if (!current.has(id)) r.announced.delete(id);
+    for (const id of [...r.announced]) if (!current.has(id)) { r.announced.delete(id); r.announcedAt.delete(id); }
+    for (const id of [...r.reannounced]) if (!current.has(id)) r.reannounced.delete(id);
     if (r.held && !r.held.ids.some((id) => current.has(id))) r.held = null;
     for (const id of current) if (!this.known(r, id)) r.pending.add(id);
   }
@@ -446,22 +632,45 @@ export class WorkerWakeWatchdog {
     this.lastWhy.delete(f.agentId);
     const ids = [...r.pending].sort();
     r.pending.clear();
-    const claim: WakeClaim = Object.freeze({ agentId: f.agentId, requestId: inboxWakeRequestId(f.agentId, ids), ids: Object.freeze(ids), cause });
+    r.claimedAt = now;
+    // A re-announced id was COMMITTED once under the plain request id, and the owner replays
+    // a remembered COMMITTED for that id without typing: the second announcement is a new
+    // request. Once per id, so one suffix is enough.
+    const again = ids.some((id) => r.reannounced.has(id));
+    const requestId = inboxWakeRequestId(f.agentId, ids) + (again ? ':again' : '');
+    const claim: WakeClaim = Object.freeze({
+      agentId: f.agentId, requestId, ids: Object.freeze(ids), cause,
+      ...(r.recheck ? { recheck: r.recheck } : {})
+    });
     r.inFlight = claim;
     return claim;
   }
 
-  /** The owner's outcome for a claim. Only the CURRENT in-flight claim is settled. */
-  settle(claim: WakeClaim, outcomeKind: string, at = Date.now()): void {
+  /**
+   * The owner's outcome for a claim. Only the CURRENT in-flight claim is settled.
+   *
+   * `confirms`: this agent's provider reports its own turn starts (a UserPromptSubmit or
+   * PreInvocation hook, Codex's task_started). Then a COMMITTED epoch is PROVISIONAL until
+   * one arrives (see SUBMIT_CONFIRM_MS). A provider with no such signal keeps the plain
+   * reading - COMMITTED is active until its Stop - since waiting for a confirmation that can
+   * never come would re-announce every turn.
+   */
+  settle(claim: WakeClaim, outcomeKind: string, at = Date.now(), confirms = false): void {
     const r = this.agents.get(claim.agentId);
     if (!r || r.inFlight?.requestId !== claim.requestId) return;
     r.inFlight = null;
     if (outcomeKind === 'COMMITTED') {
-      for (const id of claim.ids) r.announced.add(id);
+      for (const id of claim.ids) { r.announced.add(id); r.announcedAt.set(id, at); }
       r.lifecycle = 'active';          // a turn just started; new mail waits for its Stop
       r.activeSince = at;              // and THIS is the edge terminal proof must be newer than
+      r.pendingIdleAt = 0;
+      // Already confirmed if the provider's turn start beat our settle here.
+      r.provisional = confirms && !(r.claimedAt > 0 && r.turnStartAt >= r.claimedAt);
+      r.commitIds = claim.ids;
+      if (claim.recheck) r.recheck = null;   // the prompt was seen clear, and this went out
     } else if (outcomeKind === 'HUMAN_HANDLED') {
-      for (const id of claim.ids) r.announced.add(id);
+      for (const id of claim.ids) { r.announced.add(id); r.announcedAt.set(id, at); }
+      r.recheck = null;
     } else if (outcomeKind === 'INTERFERED') {
       r.held = claim;                  // no automatic retry until a human rules
     } else {
@@ -478,7 +687,8 @@ export class WorkerWakeWatchdog {
     if (how === 'SEND_AGAIN') {
       for (const id of held.ids) if (!r.announced.has(id)) r.pending.add(id);
     } else {
-      for (const id of held.ids) r.announced.add(id);
+      for (const id of held.ids) { r.announced.add(id); r.announcedAt.set(id, Date.now()); }
+      r.recheck = null;                // a person dealt with the prompt
     }
     return true;
   }
@@ -489,7 +699,7 @@ export class WorkerWakeWatchdog {
   }
 
   /** Read-only view for diagnostics and tests. */
-  state(agentId: string): { pending: string[]; announced: string[]; inFlight: WakeClaim | null; held: WakeClaim | null; lifecycle: WakeLifecycle; providerSession: string | null } {
+  state(agentId: string): { pending: string[]; announced: string[]; inFlight: WakeClaim | null; held: WakeClaim | null; lifecycle: WakeLifecycle; providerSession: string | null; provisional: boolean } {
     const r = this.agents.get(agentId);
     return {
       pending: r ? [...r.pending].sort() : [],
@@ -497,7 +707,8 @@ export class WorkerWakeWatchdog {
       inFlight: r?.inFlight ?? null,
       held: r?.held ?? null,
       lifecycle: r?.lifecycle ?? 'unknown',
-      providerSession: r?.providerSession ?? null
+      providerSession: r?.providerSession ?? null,
+      provisional: r?.provisional ?? false
     };
   }
 

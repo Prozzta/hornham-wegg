@@ -97,6 +97,7 @@ import { CodexRolloutLifecycleSource } from './codexRolloutLifecycle';
 import { InboxWakeBridge } from './inboxWakeBridge';
 import { WakeStallWatch } from './wakeStall';
 import { newBreadcrumbMemory, shouldLogBreadcrumb } from './wakeBreadcrumb';
+import { forgetWakeRows, newWakeRowState, planWakeRow, takeFolded } from './wakeRowPolicy';
 import { WakeTelemetry } from './wakeTelemetry';
 import { inboxNudgeText } from '../shared/hiveNudge';
 import { fetchHireManifest, readHireManifestFiles } from './hire';
@@ -398,6 +399,10 @@ const codexLifecycle = new CodexRolloutLifecycleSource();
 // hive event log instead, which agents and the human already read, so ONE canary run
 // says which stage is inert. Remove with this branch.
 const wakeDiagSeen = newBreadcrumbMemory();
+// LOG-STALL-AV F3: event-path wake rows are logged on EDGES only (wakeRowPolicy.ts); the folded
+// ones are counted into one `wake-folded` row per minute.
+const wakeRows = newWakeRowState();
+let wakeFoldedMinute = Math.floor(Date.now() / 60_000);
 // WAKE TELEMETRY (D8). Observability only — it counts, it never decides, and the wake path
 // never reads it. See wakeTelemetry.ts.
 const wakeTelemetry = new WakeTelemetry(Date.now());
@@ -426,7 +431,14 @@ function wakeDiag(stage: string, fields: Record<string, unknown>): void {
     // version of it that shipped in 1.1.48 suppressed nothing at all — is in
     // wakeBreadcrumb.ts; this is only the voice.
     if (!shouldLogBreadcrumb(wakeDiagSeen, stage, fields)) return;
-    hive.appendLog({ kind: 'wake', stage, ...fields });
+    const minute = Math.floor(Date.now() / 60_000);
+    if (minute !== wakeFoldedMinute) {
+      const counts = takeFolded(wakeRows);
+      if (counts) hive.appendLog({ kind: 'wake-folded', minute: wakeFoldedMinute, counts });
+      wakeFoldedMinute = minute;
+    }
+    const row = planWakeRow(wakeRows, stage, fields);
+    if (row) hive.appendLog({ kind: 'wake', stage, ...row });
   } catch { /* the diagnosis must never break the path it is watching */ }
 }
 
@@ -510,6 +522,14 @@ inboxWake = new InboxWakeBridge({
     const home = hive.codexHomeFor(agentId);
     return home ? codexLifecycle.probe(home) : undefined;
   },
+  // CODEX-FALSEACTIVE-153: the providers whose own turn start reaches main (Claude and Codex
+  // UserPromptSubmit, Codex task_started, AGY PreInvocation). Only for these is a COMMITTED
+  // wake provisional until confirmed; any other provider keeps "active until Stop".
+  confirmsTurnStart: (agentId) => {
+    const ptyId = ptyForAgent(agentId);
+    const provider = ptyId ? ptyProvider.get(ptyId) : undefined;
+    return provider === 'claude' || provider === 'codex' || provider === 'antigravity';
+  },
   inboxIds: (agentId) => hive.inbox(agentId).map((m) => m.id).filter(Boolean),
   facts: (agentId) => {
     const ptyId = ptyForAgent(agentId);
@@ -592,6 +612,7 @@ const hookServer = new HookServer(
 // HOOK-BROKER: Claude agents POST their hooks to the HookServer in-process (0 processes per
 // hook). The hive asks for a per-spawn URL; with the broker not listening it gets null and
 // writes the command hooks exactly as before.
+// LOG-STALL-AV F1: the app keeps log.jsonl / cost-ledger.jsonl open (closed on quit).
 hive.setHookBroker({ urlFor: (id) => hookServer.hookUrl(id), mcpFor: (id) => hookServer.mcpEndpoint(id), revoke: (id) => hookServer.revokeHookToken(id) });
 const memory = new MemoryManager(
   () => readConfig().harnessHome,
@@ -751,6 +772,7 @@ function teardownPty(id: string): void {
     }
     // Drop watchdog state so a dead agent can't get nudged or leak its grace.
     try { workerWake.forget(agentId, id); } catch { /* best-effort */ }
+    try { forgetWakeRows(wakeRows, agentId); } catch { /* best-effort */ }
     // Drop breaker state so a dead agent can't leak/zombie a tripped level.
     try { breaker.forget(agentId); } catch { /* best-effort */ }
     // W1 — kill this agent's proxy-bridge sidecar (qwen), if any, so a dead
@@ -3790,6 +3812,8 @@ ipcMain.handle('config:changeHome', async (_evt, payload: unknown) => {
   try { stopWebhookServer(); } catch (e) { console.error('[changeHome] webhook.stop:', e); }
   try { memory.stop(); } catch (e) { console.error('[changeHome] memory.stop:', e); }
   try { reflector.stop(); } catch (e) { console.error('[changeHome] reflector.stop:', e); }
+  // Close the hive's kept-open log and ledger before the copy (and the relaunch).
+  try { hive.dispose(); } catch (e) { console.error('[changeHome] hive.dispose:', e); }
 
   if (mode === 'move' && oldHome) {
     try {
@@ -4355,6 +4379,8 @@ ipcMain.handle('app:resetAll', () => {
   try { reflector.stop(); } catch (e) { console.error('[reset] reflector.stop:', e); }
   try { persist.close(); } catch (e) { console.error('[reset] persist.close:', e); }
   try { ptyManager.killAll(); } catch (e) { console.error('[reset] killAll:', e); }
+  // The hive's kept-open log and ledger: an open file makes the rm below fail (ENOTEMPTY).
+  try { hive.dispose(); } catch (e) { console.error('[reset] hive.dispose:', e); }
   // Erase the hive (Michael's + every agent's memory, inboxes, tasks, board,
   // git history) and the semantic-memory palace. Only these harness-created
   // subdirs are removed — never the user's whole harnessHome folder.
@@ -6122,18 +6148,11 @@ app.on('will-quit', (e) => {
   if (analyticsFlushed) return;
   analyticsFlushed = true;
   e.preventDefault();
-  const finish = (): void => app.exit(0);
+  const finish = (): void => { try { hive.dispose(); } catch { /* rows are on disk */ } app.exit(0); };
   Promise.all([
     Promise.race([
       analytics.endSession(),
       new Promise<void>((r) => setTimeout(r, 1200))
-    ]),
-    // MESSAGE-LAG-152: the hive's coalesced commit gets its last flush here, bounded. The
-    // state itself is already on disk; an unfinished commit is picked up by the next
-    // launch's first one (`add -A`), so the bound costs history granularity, never state.
-    Promise.race([
-      hive.flushCommits(),
-      new Promise<void>((r) => setTimeout(r, 8000))
     ])
   ]).then(finish, finish);
 });
