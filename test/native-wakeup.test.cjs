@@ -124,3 +124,82 @@ test('(a) WIRING: index.ts prewarms once, 30 s after the first window finished l
   const worker = fs.readFileSync(path.join(REPO, 'src', 'main', 'nativeMemory', 'worker.ts'), 'utf8');
   assert.match(worker, /void engine\.backfill\(\)\.catch/, 'the forked worker backfills at startup');
 });
+
+// ── N1 (Jim, god andyn1wait): a wake-up waits (bounded) for its caller's own wing ─────────
+
+const { WAKE_WAIT_MS } = loadTs('src/main/nativeMemory/engine.ts');
+const { WAKE_UP_DEADLINE_MS, SEARCH_DEADLINE_COLD_MS } = loadTs('src/main/nativeMemory/service.ts');
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+/** A fake store that answers wakeUp from what the backfill has COMMITTED (per wing). */
+function committingStore() {
+  const shas = new Map(); const committed = [];
+  return {
+    committed,
+    setMeta() {}, sourceShas: () => shas, removeSource() {},
+    planDiff: (p, chunks) => ({ path: p, keep: [], add: chunks, remove: [] }),
+    applyDiff: (meta, plan) => { shas.set(meta.path, meta.sha256); for (const c of plan.add) committed.push({ wing: meta.wing, room: meta.room, source: meta.path, content: c.content }); return true; },
+    wakeUp: (wing) => committed.filter((c) => !wing || c.wing === wing), search: () => []
+  };
+}
+function slowEngine(root, store, { embedMs = 30, wakeWaitMs } = {}) {
+  return new MemoryEngine({ hiveRoot: root, store, embedder: { loaded: true, embed: async (t) => { await sleep(embedMs); return t.map(() => new Float32Array(384)); }, unload: async () => {} },
+    // Real timers, UNREF'd: the model's idle-unload timer (minutes) must not keep the test process alive.
+    countTokens: words, mode: () => 'native', watch: null, setTimer: (fn, ms) => (ms === 0 ? setImmediate(fn) : setTimeout(fn, ms).unref()), clearTimer: (t) => clearTimeout(t), ...(wakeWaitMs ? { wakeWaitMs } : {}) });
+}
+
+test('N1: on a FILLING index a wake-up waits for its OWN wing and answers with its notes, well inside the bound', async () => {
+  const root = hive({ 'agents/a1/memory.md': '# a1\nalpha notes', 'agents/a2/memory.md': '# a2\nbeta notes', 'agents/a3/memory.md': '# a3\nGAMMA OWN NOTES' });
+  const store = committingStore();
+  const eng = slowEngine(root, store);
+  const bf = eng.backfill();
+  const t0 = Date.now();
+  const r = await eng.wakeUp('a3');
+  const ms = Date.now() - t0;
+  assert.match(r.text, /GAMMA OWN NOTES/, 'its own notes, not "No memories yet"');
+  assert.ok(ms < WAKE_WAIT_MS, `answered in ${ms} ms`);
+  await bf;
+});
+
+test('N1: when its wing cannot finish in time, the wake-up still answers at about the BOUND (with whatever exists)', async () => {
+  const big = Array.from({ length: 40 }, (_, i) => `## part ${i}\n${'word '.repeat(150)}`).join('\n\n');
+  const root = hive({ 'agents/a1/memory.md': big, 'agents/a3/memory.md': `# a3\n${big}` });
+  const store = committingStore();
+  const eng = slowEngine(root, store, { embedMs: 40, wakeWaitMs: 300 });
+  const bf = eng.backfill();
+  const t0 = Date.now();
+  const r = await eng.wakeUp('a3');
+  const ms = Date.now() - t0;
+  assert.ok(ms >= 250 && ms < 1500, `bounded: ${ms} ms`);
+  assert.equal(r.exit, 0);
+  await bf;
+});
+
+test('N1: a SEARCH never waits for a wing; and with no backfill running a wake-up does not wait at all', async () => {
+  const big = Array.from({ length: 40 }, (_, i) => `## part ${i}\n${'word '.repeat(150)}`).join('\n\n');
+  const root = hive({ 'agents/a3/memory.md': big });
+  const store = committingStore();
+  const eng = slowEngine(root, store, { embedMs: 40, wakeWaitMs: 2000 });
+  const bf = eng.backfill();
+  const t0 = Date.now();
+  await eng.search({ query: 'q', caller: 'a3' });
+  assert.ok(Date.now() - t0 < 1000, 'a search does not wait for the wing');
+  await bf;
+  const t1 = Date.now();
+  await eng.wakeUp('a3');
+  assert.ok(Date.now() - t1 < 200, 'nothing pending: immediate');
+});
+
+test('N1: main\'s wake-up deadline covers the wait + the cold budget, and mainWiring uses it for wake-up only', () => {
+  assert.ok(WAKE_UP_DEADLINE_MS >= WAKE_WAIT_MS + SEARCH_DEADLINE_COLD_MS, `${WAKE_UP_DEADLINE_MS} >= ${WAKE_WAIT_MS} + ${SEARCH_DEADLINE_COLD_MS}`);
+  const src = fs.readFileSync(path.join(REPO, 'src', 'main', 'nativeMemory', 'mainWiring.ts'), 'utf8');
+  assert.match(src, /v\.op === 'search' \? undefined : v\.op === 'wake-up' \? WAKE_UP_DEADLINE_MS : 2_000/);
+});
+
+test('B4 (Jim, optional pin): a bad wing name is never recorded as preferred', () => {
+  const eng = engineFor(hive(THREE), recordingStore());
+  for (const bad of ['../etc', 'a b', '', null, undefined, 'x'.repeat(121)]) eng.preferWing(bad);
+  assert.equal(eng.preferredWings.size, 0);
+  eng.preferWing('a3');
+  assert.deepEqual([...eng.preferredWings], ['a3']);
+});

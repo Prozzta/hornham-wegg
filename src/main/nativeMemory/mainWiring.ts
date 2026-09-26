@@ -13,7 +13,7 @@
 import { createHash } from 'node:crypto';
 import { existsSync, readFileSync } from 'node:fs';
 import { delimiter, join } from 'node:path';
-import { classifyQuery, EXIT, MemoryTokens, MODE_FILE, NativeMemoryClient, parseMode, reviewCaptureActive, validateRequest, type MemoryMode, type WorkerHandle } from './service';
+import { classifyQuery, EXIT, MemoryTokens, MODE_FILE, NativeMemoryClient, parseMode, reviewCaptureActive, validateRequest, WAKE_UP_DEADLINE_MS, type MemoryMode, type WorkerHandle } from './service';
 import type { WorkerConfig } from './worker';
 
 export interface RuntimeManifest {
@@ -170,7 +170,9 @@ export class NativeMemoryWiring {
       });
       return { status: 200, body: { exit: EXIT.ok } };
     }
-    const r = await this.client.request(v.op, v.args, v.op === 'search' ? undefined : 2_000);
+    // NATIVE-WAKEUP N1: a wake-up may wait up to WAKE_WAIT_MS for its wing on a filling index,
+    // so its deadline covers that wait plus the cold budget. status keeps 2 s; search its own.
+    const r = await this.client.request(v.op, v.args, v.op === 'search' ? undefined : v.op === 'wake-up' ? WAKE_UP_DEADLINE_MS : 2_000);
     return { status: 200, body: { exit: r.exit, text: r.text, json: r.json, error: r.error } };
   }
 
