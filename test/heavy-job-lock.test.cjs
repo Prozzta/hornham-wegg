@@ -16,7 +16,7 @@ const loadTs = require('./load-ts.cjs');
 const electron = require.resolve('electron');
 require.cache[electron] = { id: electron, filename: electron, loaded: true, exports: { Notification: class { show() {} static isSupported() { return false; } } } };
 
-const { classifyCommand, classifyHeavy, isBackground, heavyLimit, HeavyJobLock, HEAVY_TTL_MS, HEAVY_SCAN_MISSES } = loadTs('src/main/heavyJob.ts');
+const { classifyCommand, classifyHeavy, isBackground, heavyLimit, HeavyJobLock, HEAVY_TTL_MS, HEAVY_SCAN_MISSES, HEAVY_SCAN_MS } = loadTs('src/main/heavyJob.ts');
 const { HiveManager } = loadTs('src/main/hive.ts');
 const { HookServer } = loadTs('src/main/hooks.ts');
 const REPO = path.resolve(__dirname, '..');
@@ -33,7 +33,9 @@ const HEAVY = [
   ['node _work/speed-driver.cjs --exe x', 'bench'], ['node scripts/native-memory-parity.cjs', 'bench'], ['node test/tools/inbox-wake-mutants.cjs', 'bench'],
   ['node C:/Dunder/_work/andy-mem154-measure/parity-embed.cjs', 'bench'], ['"Munder Difflin.exe" --native-memory-bench=C:/t', 'bench'],
   ['bash -c "npm ci"', 'install'], ['cmd //c "npm run build"', 'build'], ['powershell -NoProfile -Command "npm test"', 'suite'],
-  ['node --test test/*.test.cjs &', 'suite']
+  ['node --test test/*.test.cjs &', 'suite'],
+  // Jim MF2: floor commands he probed
+  ['node test/tools/run-tests.cjs', 'suite'], ['THREAD_VIEW_SCALE=1 node --test test/thread-view-scale.test.cjs', 'bench']
 ];
 const LIGHT = [
   'node --test test/one.test.cjs', 'node --test test/a.test.cjs test/b.test.cjs', 'node --test --test-name-pattern "x y" test/a.test.cjs',
@@ -41,7 +43,9 @@ const LIGHT = [
   'npx tsc --noEmit -p tsconfig.node.json', 'vitest run src/a.test.ts', 'node scripts/release-markers.cjs node_modules resources/models',
   'git log --oneline -3', 'ls node_modules', 'node -e "console.log(1)"', 'npm view electron version', '',
   // Jim N4: the patterns audits actually run
-  'node --test test/a.cjs test/b.cjs', 'node C:/Users/x/scratch/xmut.cjs', 'git -C C:/Dunder/_work/wt diff --stat', 'npm run typecheck'
+  'node --test test/a.cjs test/b.cjs', 'node C:/Users/x/scratch/xmut.cjs', 'git -C C:/Dunder/_work/wt diff --stat', 'npm run typecheck',
+  // Jim MF2 + H6
+  'npm run test:focused -- wake', 'npm test -- test/one.test.cjs', 'node test/tools/run-tests.cjs wake', 'git commit -m "fix; npm ci later"'
 ];
 
 test('CLASSIFIER: every heavy command in the corpus is heavy, with its kind', () => {
@@ -141,21 +145,41 @@ test('BACKGROUND: its PostToolUse does NOT free the slot; the process check does
   await x.l.scan();
   assert.equal(x.l.snapshot().length, 1, 'its test run is still a descendant of its PTY');
   procs = procs.filter((p) => p.pid !== 11);   // the run finished (jim's npm ci is NOT andy's)
-  for (let i = 0; i < HEAVY_SCAN_MISSES - 1; i++) { await x.l.scan(); assert.equal(x.l.snapshot().length, 1, 'one miss is not enough'); }
+  x.tick(HEAVY_SCAN_MS);                         // a miss counts once the holder is a scan interval old
+  // H3 pin (Jim): exactly TWO misses, not one.
+  assert.equal(HEAVY_SCAN_MISSES, 2);
+  await x.l.scan();
+  assert.equal(x.l.snapshot().length, 1, 'ONE miss is not enough');
   await x.l.scan();
   assert.equal(x.l.snapshot().length, 0, 'freed');
   assert.equal(x.logs.at(-1).reason, 'process-exit');
   assert.ok(probes >= HEAVY_SCAN_MISSES + 1);
 });
 
-test('the process check runs ONLY while a slot is held, and only probes when a holder is backgrounded', async () => {
+test('the process check runs ONLY while a slot is held (never when nothing is held); a young holder\'s miss does not count yet', async () => {
   let probes = 0;
-  const x = lock(1, { roots: () => [], probe: async () => { probes++; return []; } });
+  const x = lock(1, { roots: () => [{ agentId: 'a', pid: 10 }], probe: async () => { probes++; return []; } });
+  await x.l.scan();
+  assert.equal(probes, 0, 'nothing held: no process listing');
   assert.equal(x.timers.length, 0, 'nothing held: no timer');
   x.l.acquire('a', H, 'npm ci', '1', false);
   assert.equal(x.timers.length, 1, 'armed while held');
+  await x.l.scan(); await x.l.scan();
+  assert.equal(x.l.snapshot().length, 1, 'younger than one scan interval: misses do not count yet');
+  assert.equal(probes, 2);
+});
+
+test('Jim MF1: a FOREGROUND call whose PostToolUse never comes (Esc, a timeout, a degraded Codex hook) is freed by the watcher, not pinned for the TTL', async () => {
+  let procs = [{ pid: 10, parentPid: 1, commandLine: 'bash' }, { pid: 11, parentPid: 10, commandLine: 'npm ci' }];
+  const x = lock(1, { roots: () => [{ agentId: 'a', pid: 10 }], probe: async () => procs });
+  x.l.acquire('a', H, 'npm ci', 'call-1', false);   // no callDone will ever arrive
+  x.tick(HEAVY_SCAN_MS);
   await x.l.scan();
-  assert.equal(probes, 0, 'a foreground holder needs no process listing');
+  assert.equal(x.l.snapshot().length, 1, 'still running: kept');
+  procs = [procs[0]];
+  await x.l.scan(); await x.l.scan();
+  assert.equal(x.l.snapshot().length, 0, 'the job is gone: freed although its call never closed');
+  assert.equal(x.logs.at(-1).reason, 'process-exit');
 });
 
 test('PTY EXIT and the TTL free a slot', () => {
@@ -252,6 +276,7 @@ test('Jim N2: a foreground call whose heavy job outlives it (a detached child) K
   assert.equal(x.l.snapshot()[0].background, true);
   assert.ok(x.logs.some((r) => r.action === 'orphan-kept'));
   procs = [procs[0]];
+  x.tick(HEAVY_SCAN_MS);
   for (let i = 0; i < HEAVY_SCAN_MISSES; i++) await x.l.scan();
   assert.equal(x.l.snapshot().length, 0);
   // and with no heavy child the foreground call frees it after the one check
@@ -282,4 +307,25 @@ test('Jim N1 (HOOK): a CODEX (mcp) heavy call is left for the watcher (its PostT
   assert.equal(r.hookSpecificOutput?.permissionDecision, undefined, 'degraded: allowed');
   const log = fs.readFileSync(path.join(s.hive?.root?.() ?? '', 'log.jsonl'), 'utf8');
   assert.match(log, /"kind":"heavy-lock","action":"degraded","agentId":"a2"/);
+});
+
+// ── Jim HEAVY-LOCK-155-AUDIT (CHANGES): MF1 hook paths ───────────────────────────────────
+
+test('Jim MF1a: a call the HITL gate DENIES never takes a slot (the heavy acquire runs after every other PreToolUse deny)', async (t) => {
+  const { s, l } = await server(t, 1);
+  s.control = { takeSteer: () => null, shouldHalt: () => false, toolDecision: () => ({ deny: true, reason: 'paused by the operator' }) };
+  const r = s.handle({ agent_id: 'a1', hook_event_name: 'PreToolUse', tool_name: 'Bash', tool_input: { command: 'npm ci' }, transport: 'http' });
+  assert.equal(r.hookSpecificOutput.permissionDecision, 'deny');
+  assert.match(r.hookSpecificOutput.permissionDecisionReason, /paused by the operator/);
+  assert.equal(l.snapshot().length, 0, 'no slot for a call that never runs');
+});
+
+test('Jim MF1b: a FAILED heavy call (PostToolUseFailure, e.g. a suite exiting 1) frees its slot; Claude\'s settings register that event', async (t) => {
+  const { s, l } = await server(t, 1);
+  s.handle({ agent_id: 'a1', hook_event_name: 'PreToolUse', tool_name: 'Bash', tool_input: { command: 'node --test test/*.test.cjs' }, tool_use_id: 'u9', transport: 'http' });
+  assert.equal(l.snapshot().length, 1);
+  s.handle({ agent_id: 'a1', hook_event_name: 'PostToolUseFailure', tool_name: 'Bash', tool_input: { command: 'node --test test/*.test.cjs' }, tool_use_id: 'u9', transport: 'http' });
+  assert.equal(l.snapshot().length, 0);
+  const hiveSrc = fs.readFileSync(path.join(REPO, 'src', 'main', 'hive.ts'), 'utf8');
+  assert.match(hiveSrc, /PostToolUse: \[hook\('\*'\)\],[\s\S]{0,400}PostToolUseFailure: \[hook\('\*'\)\],/);
 });

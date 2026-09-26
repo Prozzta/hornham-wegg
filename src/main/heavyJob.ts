@@ -59,6 +59,11 @@ function segments(cmd: string): string[] {
 const WRAPPERS = new Set(['bash', 'sh', 'zsh', 'cmd', 'cmd.exe', 'powershell', 'powershell.exe', 'pwsh', 'pwsh.exe', 'bash.exe']);
 const BENCH_SCRIPT = /(mutant|mutation|replay|bench|backfill|parity|speed|stress|soak)[^\\/]*\.(c?m?js|ts)$/i;
 export const SUITE_MANY_FILES = 20;
+/** A whole-suite runner script (heavy when run with no filter). */
+const SUITE_RUNNER = /(^|[\\/])(run-?tests?|test-?runner|run-?all(-?tests)?)\.[cm]?[jt]s$/i;
+/** Jim MF2: an opt-in scale/bench gate in the env prefix (THREAD_VIEW_SCALE=1 node --test x) makes
+ *  even a single test file a bench. */
+const BENCH_ENV = /^[A-Z0-9_]*(SCALE|BENCH|STRESS|SOAK)[A-Z0-9_]*=(1|true|yes|on)$/i;
 /** node flags that take their value as the NEXT argument (so that value is not a test file). */
 const NODE_VALUE_FLAGS = new Set(['--test-name-pattern', '--test-skip-pattern', '--test-reporter', '--test-reporter-destination', '--test-concurrency', '--test-timeout', '--test-shard', '--import', '--require', '-r', '--loader', '--experimental-loader', '--env-file', '--conditions', '-C', '--input-type']);
 
@@ -79,6 +84,10 @@ function leading(ws: string[]): string[] {
 function classifyWords(ws0: string[], depth: number): HeavyClass {
   const ws = leading(ws0);
   if (!ws.length) return { heavy: false };
+  // An opt-in scale/bench env gate before the command (Jim MF2).
+  const prefix = ws0.slice(0, ws0.length - ws.length);
+  const gate = prefix.find((w) => BENCH_ENV.test(w));
+  if (gate) return { heavy: true, kind: 'bench', why: `${gate.split('=')[0]} (an opt-in bench gate)` };
   const bin = ws[0].replace(/\\/g, '/').split('/').pop()!.toLowerCase().replace(/\.(exe|cmd)$/, '');
   const args = ws.slice(1);
   // One level of a shell wrapper: bash -c "...", cmd /c ..., powershell -Command ...
@@ -96,11 +105,14 @@ function classifyWords(ws0: string[], depth: number): HeavyClass {
       // `npm install` with no package = a full install; with packages it is still an install
       return { heavy: true, kind: 'install', why: `${bin} ${sub}` };
     }
-    if (sub === 'test' || sub === 't') return { heavy: true, kind: 'suite', why: `${bin} test` };
+    // Jim MF2: a test run with a FILTER after `--` (npm run test:focused -- wake) is a focused run:
+    // light. Without one it is the suite: heavy.
+    const filtered = args.includes('--') && args.indexOf('--') < args.length - 1;
+    if (sub === 'test' || sub === 't') return filtered ? { heavy: false } : { heavy: true, kind: 'suite', why: `${bin} test` };
     if (sub === 'run' || sub === 'run-script') {
       const script = args.slice(args.indexOf(sub) + 1).find((a) => !a.startsWith('-')) ?? '';
       if (/^(build|dist)(:.*)?$/.test(script)) return { heavy: true, kind: 'build', why: `${bin} run ${script}` };
-      if (/^test(:.*)?$/.test(script)) return { heavy: true, kind: 'suite', why: `${bin} run ${script}` };
+      if (/^test(:.*)?$/.test(script)) return filtered ? { heavy: false } : { heavy: true, kind: 'suite', why: `${bin} run ${script}` };
     }
     return { heavy: false };
   }
@@ -130,6 +142,11 @@ function classifyWords(ws0: string[], depth: number): HeavyClass {
     }
     const script = args.find((a) => !a.startsWith('-'));
     if (script && BENCH_SCRIPT.test(script)) return { heavy: true, kind: 'bench', why: `node ${script.replace(/\\/g, '/').split('/').pop()}` };
+    // Jim MF2: a whole-suite runner script with no filter argument is the suite.
+    if (script && SUITE_RUNNER.test(script)) {
+      const rest = args.slice(args.indexOf(script) + 1).filter((a) => !a.startsWith('-'));
+      if (!rest.length) return { heavy: true, kind: 'suite', why: `node ${script.replace(/\\/g, '/').split('/').pop()} (no filter)` };
+    }
     return { heavy: false };
   }
   return { heavy: false };
@@ -318,16 +335,24 @@ export class HeavyJobLock {
   /** One watcher tick (exported for tests). */
   async scan(): Promise<void> {
     this.expire();
-    const bg = [...this.holders.values()].filter((h) => h.background);
-    // God: the hidden process listing runs ONLY while a background holder exists.
-    if (!bg.length || !this.d.probe || !this.d.roots) return;
+    // Jim MF1 / god andyheavyfix: EVERY holder is checked, not only background ones: a foreground
+    // call whose PostToolUse never comes (a gate, Esc, a timeout, a degraded Codex hook) must not
+    // pin a slot for the whole TTL. The listing runs only while a slot is held. A miss counts only
+    // once the holder is at least one scan interval old (its job has had time to start).
+    const held = [...this.holders.values()];
+    if (!held.length || !this.d.probe || !this.d.roots) return;
     const busy = await this.heavyAgents();
     if (!busy) return;
-    for (const h of bg) {
+    const t = this.now();
+    for (const h of held) {
+      if (!this.holders.has(h.agentId)) continue;
       if (busy.has(h.agentId)) { h.misses = 0; h.seenRunning = true; continue; }
       h.seenRunning = false;
+      if (t - h.touched < HEAVY_SCAN_MS) continue;
       h.misses++;
-      if (h.misses >= HEAVY_SCAN_MISSES) { h.background = false; if (!h.calls.size) this.release(h.agentId, 'process-exit'); }
+      // No heavy process of the holder on HEAVY_SCAN_MISSES scans: its job is gone, whatever the
+      // call bookkeeping says (an open call here is one whose PostToolUse never came).
+      if (h.misses >= HEAVY_SCAN_MISSES) { h.calls.clear(); this.release(h.agentId, 'process-exit'); }
     }
   }
 
