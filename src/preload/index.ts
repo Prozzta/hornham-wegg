@@ -885,6 +885,8 @@ const api = {
     ipcRenderer.invoke('thread:layoutGet', agentId, fallback),
   threadLayoutSet: (agentId: string, layout: Partial<ThreadLayoutV1>, fallback: 'talk' | 'terminal'): Promise<ThreadLayoutV1 | null> =>
     ipcRenderer.invoke('thread:layoutSet', agentId, layout, fallback),
+  threadSweepOrphans: (): Promise<{ ok: boolean; removed?: string[]; error?: string }> =>
+    ipcRenderer.invoke('thread:sweepOrphans'),
   threadRecordHuman: (agentId: string, text: string, source: 'human-ui' | 'human-terminal'):
     Promise<{ ok: boolean; error?: string; event?: ThreadViewEvent }> => ipcRenderer.invoke('thread:recordHuman', agentId, text, source),
   hiveLog: (n?: number): Promise<unknown[]> => ipcRenderer.invoke('hive:log', n ?? 200),

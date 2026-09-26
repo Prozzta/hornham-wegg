@@ -123,6 +123,27 @@ test('THREAD-VIEW persists a separate validated per-agent view layout and remove
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
 
+test('THREAD-VIEW orphan sweep deletes only aged, manifest-bearing, registry-absent direct directories', async () => {
+  const { store, dir } = loadThreadStore();
+  try {
+    const threads = path.join(dir, 'userData', 'threads');
+    const view = new store.ThreadViewStore(threads);
+    await view.init();
+    for (const id of ['orphan', 'registered', 'no-manifest']) {
+      const agentDir = path.join(threads, id);
+      fs.mkdirSync(agentDir, { recursive: true });
+      if (id !== 'no-manifest') fs.writeFileSync(path.join(agentDir, 'manifest-v1.json'), '{}');
+    }
+    const old = new Date(Date.now() - 2_000);
+    for (const id of ['orphan', 'registered', 'no-manifest']) fs.utimesSync(path.join(threads, id), old, old);
+    const removed = await view.sweepOrphans((id) => id === 'registered', Date.now() - 1_000);
+    assert.deepEqual(removed, ['orphan']);
+    assert.ok(!fs.existsSync(path.join(threads, 'orphan')));
+    assert.ok(fs.existsSync(path.join(threads, 'registered')));
+    assert.ok(fs.existsSync(path.join(threads, 'no-manifest')));
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
 test('THREAD-VIEW uses only a temp userData root and evicts completed per-agent segments at 8 MiB', async () => {
   const { store, dir } = loadThreadStore();
   try {

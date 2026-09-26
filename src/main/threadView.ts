@@ -233,6 +233,34 @@ export class ThreadViewStore {
     await this.init();
   }
 
+  /** Conservative maintenance only. The caller supplies a live registry probe so
+   * each candidate is checked again immediately before deletion; inactive but
+   * registered agents are never candidates. */
+  async sweepOrphans(isRegistered: (agentId: string) => boolean, sweepStartedAt = Date.now()): Promise<string[]> {
+    const removed: string[] = [];
+    const entries = await readdir(this.root, { withFileTypes: true }).catch(() => [] as import('node:fs').Dirent[]);
+    for (const entry of entries) {
+      // Direct real directories only: never recurse or follow a junction/symlink.
+      if (!entry.isDirectory() || entry.isSymbolicLink()) continue;
+      let agentId: string;
+      try { agentId = safeId(entry.name); } catch { continue; }
+      if (isRegistered(agentId)) continue;
+      const dir = join(this.root, entry.name);
+      const dirInfo = await stat(dir).catch(() => undefined);
+      if (!dirInfo || dirInfo.mtimeMs >= sweepStartedAt) continue;
+      const manifest = await stat(join(dir, 'manifest-v1.json')).catch(() => undefined);
+      if (!manifest?.isFile()) continue;
+      // Registry must be read at the deletion edge, not only at scan start.
+      if (isRegistered(agentId)) continue;
+      await rm(dir, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });
+      this.receipts.delete(agentId); this.terminalReceiptWindows.delete(agentId);
+      if (this.layouts.delete(agentId)) await this.writeLayouts();
+      removed.push(agentId);
+    }
+    if (removed.length) await this.init();
+    return removed;
+  }
+
   private async loadLayouts(): Promise<void> {
     if (this.layoutsLoaded) return;
     this.layoutsLoaded = true;

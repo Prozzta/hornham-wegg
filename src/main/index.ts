@@ -4117,6 +4117,14 @@ ipcMain.handle('thread:layoutGet', async (_evt, id: unknown, fallback: unknown) 
 ipcMain.handle('thread:layoutSet', async (_evt, id: unknown, layout: unknown, fallback: unknown) =>
   typeof id === 'string' ? threadView.setLayout(id, layout, fallback === 'terminal' ? 'terminal' : 'talk') : null
 );
+ipcMain.handle('thread:sweepOrphans', async () => {
+  if (!hive.enabled()) return { ok: false, error: 'hive disabled (no registry)' };
+  try {
+    const sweepStartedAt = Date.now();
+    const removed = await threadView.sweepOrphans((id) => Boolean(hive.registry().agents[id]), sweepStartedAt);
+    return { ok: true, removed };
+  } catch (e) { return { ok: false, error: String(e) }; }
+});
 ipcMain.handle('thread:recordHuman', async (_evt, id: unknown, text: unknown, source: unknown) => {
   if (typeof id !== 'string' || typeof text !== 'string' || !text.trim()) return { ok: false, error: 'invalid thread message' };
   const kind = source === 'human-terminal' ? 'human-terminal' : 'human-ui';
