@@ -454,23 +454,33 @@ export class HiveManager {
   private hookBroker: HookBroker | null = null;
   /** LOG-STALL-AV: the kept-open, rotated append files, per hive root (see appendLog.ts). */
   private readonly appendFiles = new Map<string, AppendFile>();
-  private keepAppendOpen = false;
+  private keepAppendOpen = true;
   private appendFileFor(path: string, keep: number): AppendFile {
     let f = this.appendFiles.get(path);
     if (!f) { f = new AppendFile(path, { keep, keepOpen: this.keepAppendOpen }); this.appendFiles.set(path, f); }
     return f;
   }
-  /** The APP keeps the log and ledger descriptors open (no antivirus rescan per row). Off by
-   *  default so a caller that deletes the hive folder (tests) is never blocked by a held file. */
+  /** The log and ledger descriptors stay open by default (no antivirus rescan per row). Off
+   *  opens and closes per row (the old cost); kept for a caller that measures that path. */
   keepAppendFilesOpen(on: boolean): void {
     if (on === this.keepAppendOpen) return;
     this.closeAppendFiles();
     this.keepAppendOpen = on;
   }
-  /** Close the kept-open log and ledger descriptors (quit). Rows are already on disk. */
+  /** Close the kept-open log and ledger descriptors. Rows are already on disk; the next row
+   *  reopens. */
   closeAppendFiles(): void {
     for (const f of this.appendFiles.values()) f.close();
     this.appendFiles.clear();
+  }
+  /**
+   * Release what this manager holds open in the hive folder (Jim, LOG-STALL-AUDIT-153 B1/B3):
+   * the log and ledger descriptors. Call it BEFORE deleting or copying the folder (reset,
+   * change home) and at quit: Windows cannot remove a directory while a file in it is open,
+   * and a copy must see the rows. Safe to call more than once; a later row simply reopens.
+   */
+  dispose(): void {
+    this.closeAppendFiles();
   }
   setHookBroker(broker: HookBroker | null): void {
     this.hookBroker = broker;
@@ -1619,7 +1629,7 @@ export class HiveManager {
     // us) was invisible to every investigation.
     const rt = this.runtimeInfo();
     const runtimeLine = rt
-      ? `RUNNING BUILD: Munder Difflin v${rt.version}, ${rt.packaged ? 'packaged app' : 'local dev build'}${rt.appPath ? `, from ${rt.appPath}` : ''}. Say this version if asked which one is running, and do not assume behaviour from an older one. A local dev build inherits the launching shell's environment (umask included) where a packaged app does not, so file modes and inherited env can legitimately differ between the two. \`log.jsonl\` records an \`app-start\` event on every launch, which is how you spot a restart or a build switch.`
+      ? `RUNNING BUILD: Munder Difflin v${rt.version}, ${rt.packaged ? 'packaged app' : 'local dev build'}${rt.appPath ? `, from ${rt.appPath}` : ''}. Say this version if asked which one is running, and do not assume behaviour from an older one. A local dev build inherits the launching shell's environment (umask included) where a packaged app does not, so file modes and inherited env can legitimately differ between the two. \`log.jsonl\` records an \`app-start\` event on every launch, which is how you spot a restart or a build switch (it rotates at 8 MB: search \`log*.jsonl\` for older rows).`
       : '';
     // Item 11: god could not find the spawn queue. The mechanism has worked since
     // v0.4.4, but nothing told him it existed — the prompt said "spawn" without
@@ -2338,9 +2348,7 @@ export class HiveManager {
   // hive.ts only INVOKES the lease at startup, before an interactive AGY spawn, and on
   // shutdown. Every decision about the user's settings lives in agyStatuslineOwnership.ts.
 
-  /** P4: write `agy-oneway.cmd` for this hive's pipe and return its path, or null (not Windows,
-   *  no hive, or a path AGY could not run unquoted: then the shim is used, as before). */
-/** AV R1: write `<hive>/bin/claude-status.sh` and return its path with forward slashes (what the
+  /** AV R1: write `<hive>/bin/claude-status.sh` and return its path with forward slashes (what the
    *  status-line shell reads), or null (not Windows, no hive, or a path needing quoting). */
   private writeClaudeStatusScript(): string | null {
     const root = this.root();
@@ -2363,6 +2371,8 @@ export class HiveManager {
     } catch { return null; }
   }
 
+  /** P4: write `agy-oneway.cmd` for this hive's pipe and return its path, or null (not Windows,
+   *  no hive, or a path AGY could not run unquoted: then the shim is used, as before). */
   private writeAgyOneway(): string | null {
     const root = this.root();
     const sock = this.sockPath();
@@ -3178,7 +3188,7 @@ content, and \`/compact\` your own session when context gets heavy.
 You (god) are responsible for situational awareness. To see the live state of every agent, read
 \`fleet.json\` in the hive root — it is refreshed continuously with each agent's tokens, cost, status,
 breaker level, last tool, last-active time, and inbox backlog. Pair it with \`registry.json\` (the roster)
-and \`log.jsonl\` (the event feed). IMPORTANT: \`claude agents\` will NOT show your hive's sibling
+and \`log.jsonl\` (the event feed; it rotates at 8 MB, so older rows are in \`log.*.jsonl\`, search \`log*.jsonl\`). IMPORTANT: \`claude agents\` will NOT show your hive's sibling
 sessions (they're spawned independently) — \`fleet.json\` is your source of truth for them. For a deeper
 look at one agent, read its \`agents/<id>/memory.md\` and \`inbox/\`, or send it a \`query\`. A full
 Claude Code command reference (slash = your own session only; CLI = your shell, can target the fleet)

@@ -484,7 +484,8 @@ export type InterferenceReason =
   | 'CLEAR_WRITE_FAILED'
   | 'ERASE_NOT_VERIFIED'
   | 'ENTER_WRITE_FAILED'
-  | 'PRIOR_TEXT_ON_PROMPT';
+  | 'PRIOR_TEXT_ON_PROMPT'
+  | 'PRIOR_TEXT_UNREADABLE';
 
 export type SubmitOutcome =
   /** The Enter went out. The one outcome a caller may acknowledge a queue item on. */
@@ -550,6 +551,13 @@ export const SCREEN_ORACLE_TIMEOUT_MS = 2_000;
 /** How long a settled outcome stays replayable — long enough to cover a lost reply or a
  *  renderer reload, short enough that the map stays bounded. */
 export const OUTCOME_REPLAY_TTL_MS = 5 * 60_000;
+/** PRIOR TEXT (CODEX-FALSEACTIVE-153): an unreadable screen refuses, and the claim that carries
+ *  the prior text is asked again - but that claim is every later wake of the agent, so an
+ *  unreadable screen would block its new mail forever (Jim, WAKE-CONFIRM-AUDIT-153 note 2).
+ *  After this many consecutive unreadable checks, or this long since the first, the owner
+ *  holds it for a person instead (INTERFERED PRIOR_TEXT_UNREADABLE: visible, resolvable). */
+export const PRIOR_TEXT_UNREADABLE_MAX = 5;
+export const PRIOR_TEXT_UNREADABLE_HOLD_MS = 10 * 60_000;
 /** A human write this recent means the line is theirs, whatever the mirror says yet.
  *  Longer than the renderer's own ECHO_GRACE (1000 ms), inside which even the renderer
  *  does not trust the screen to overrule a keystroke. */
@@ -694,6 +702,8 @@ export class AutomaticSubmitOwner {
   private readonly chains = new Map<string, Promise<void>>();
   private readonly known = new Map<string, Known>();
   private readonly inhibited = new Map<string, HeldInterference>();
+  /** PRIOR TEXT: consecutive unreadable checks per PTY (see PRIOR_TEXT_UNREADABLE_MAX). */
+  private readonly priorUnreadable = new Map<string, { count: number; since: number }>();
 
   constructor(private readonly deps: OwnerDeps) {}
 
@@ -879,7 +889,18 @@ export class AutomaticSubmitOwner {
       if (needles.length === 0) return this.refuse(decision, 'PRIOR_TEXT_UNVERIFIED', 'no usable needle');
       for (const needle of needles) {
         const seen = await this.readScreen(ptyId, needle);
-        if (!seen) return this.refuse(decision, 'PRIOR_TEXT_UNVERIFIED', 'no screen reading');
+        if (!seen) {
+          const now = deps.now();
+          const u = this.priorUnreadable.get(ptyId) ?? { count: 0, since: now };
+          u.count += 1;
+          this.priorUnreadable.set(ptyId, u);
+          if (u.count >= PRIOR_TEXT_UNREADABLE_MAX || now - u.since >= PRIOR_TEXT_UNREADABLE_HOLD_MS) {
+            this.priorUnreadable.delete(ptyId);
+            return this.interfere({ req, ptyId, incarnation, decision, humanStage: deps.humanGeneration(ptyId) ?? 0 }, 'PRIOR_TEXT_UNREADABLE', `${u.count} unreadable checks over ${Math.round((now - u.since) / 1000)} s`);
+          }
+          return this.refuse(decision, 'PRIOR_TEXT_UNVERIFIED', 'no screen reading');
+        }
+        this.priorUnreadable.delete(ptyId);
         if (seen.onPromptRow) {
           return this.interfere({ req, ptyId, incarnation, decision, humanStage: deps.humanGeneration(ptyId) ?? 0 }, 'PRIOR_TEXT_ON_PROMPT', undefined);
         }

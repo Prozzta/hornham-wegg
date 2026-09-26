@@ -36,6 +36,7 @@ async function floor(t) {
     else process.env.HOME = priorHome;
     if (priorUserProfile === undefined) delete process.env.USERPROFILE;
     else process.env.USERPROFILE = priorUserProfile;
+    hive.dispose();
     fs.rmSync(home, { recursive: true, force: true });
   });
   const hive = new HiveManager(() => home);

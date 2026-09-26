@@ -75,7 +75,7 @@ async function run(cmd, env) {
 
 test('ensureHive writes an executable bundled-node launcher', async (t) => {
   const home = tmpHome();
-  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  t.after(() => { hive.dispose(); fs.rmSync(home, { recursive: true, force: true }); });
   const hive = new HiveManager(() => home);
   await hive.ensureAgent({ id: 'a1', name: 'A', provider: 'claude', cwd: home });
 
@@ -89,7 +89,7 @@ test('ensureHive writes an executable bundled-node launcher', async (t) => {
 
 test('the claude hook + statusLine commands run through the launcher', async (t) => {
   const home = tmpHome();
-  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  t.after(() => { hive.dispose(); fs.rmSync(home, { recursive: true, force: true }); });
   const hive = new HiveManager(() => home);
   await hive.ensureAgent({ id: 'a1', name: 'A', provider: 'claude', cwd: home });
 
@@ -106,7 +106,7 @@ test('the claude hook + statusLine commands run through the launcher', async (t)
 
 test('every hook installer routes through the launcher — none left on bare node', async (t) => {
   const home = tmpHome();
-  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  t.after(() => { hive.dispose(); fs.rmSync(home, { recursive: true, force: true }); });
   // AGY-HOOKS-GLOBAL-GUARD: the global hook installers refuse unless this hive IS the
   // configured harness home, and that predicate is default-closed. This test is ABOUT
   // what those installers write, so it declares itself the live hive - explicitly, which
@@ -146,7 +146,7 @@ test('every hook installer routes through the launcher — none left on bare nod
 
 test('Gemini gets isolated lifecycle settings and an interactive protocol seed', async (t) => {
   const home = tmpHome();
-  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  t.after(() => { hive.dispose(); fs.rmSync(home, { recursive: true, force: true }); });
   const hive = new HiveManager(() => home);
   const injection = await hive.ensureAgent({
     id: 'gemini-1',
@@ -172,7 +172,7 @@ test('Gemini gets isolated lifecycle settings and an interactive protocol seed',
 
 test('a hook fires with NO node on PATH, and its payload reaches HIVE_SOCK', { skip: !POSIX }, async (t) => {
   const home = tmpHome();
-  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  t.after(() => { hive.dispose(); fs.rmSync(home, { recursive: true, force: true }); });
   const hive = new HiveManager(() => home);
   await hive.ensureAgent({ id: 'a1', name: 'A', provider: 'claude', cwd: home });
 

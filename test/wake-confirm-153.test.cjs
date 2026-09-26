@@ -424,3 +424,65 @@ test('CODEX (2) a provisional agent is probed even with an empty inbox (it moved
   assert.equal(f.coordinator.state('dwight').lifecycle, 'active', 'confirmed, so no submit-unconfirmed');
   assert.ok(!f.diags.some((d) => d.stage === 'submit-unconfirmed'));
 });
+
+test('HARDENING (1): a deferred idle is NOT applied while AGY is mid-invocation (PreInvocation without its PostInvocation); PostInvocation or Stop releases it', () => {
+  const at = T('06:50:00.000');
+  const setup = () => {
+    const c = new WorkerWakeWatchdog();
+    c.noteHook('p', 'Stop', undefined, at - 60_000, true);
+    c.noteDelivery('p', 'm1');
+    c.settle(c.claim(fact('p'), 'hook', 'event', at - 10), 'COMMITTED', at);
+    c.noteHook('p', 'PreInvocation', undefined, at + 300);
+    c.noteProviderStatus('p', 'idle', at + 1000);   // grace-refused, and older than nothing newer
+    return c;
+  };
+  // The idle reading is NEWER than the PreInvocation, so the pending idle is kept; only the
+  // open invocation holds it back.
+  const mid = setup();
+  assert.equal(mid.beat('p', at + 20_000), null, 'a model call is running: no idle mid-turn');
+  assert.equal(mid.state('p').lifecycle, 'active');
+  mid.noteHook('p', 'PostInvocation', undefined, at + 21_000);
+  assert.deepEqual(mid.beat('p', at + 30_000), { kind: 'deferred-idle' }, 'released by PostInvocation');
+});
+
+test('HARDENING (2): PRIOR_TEXT_UNVERIFIED is bounded: the 5th consecutive unreadable check (or 10 min) is INTERFERED PRIOR_TEXT_UNREADABLE (held, visible), nothing typed', async () => {
+  assert.equal(OWN.PRIOR_TEXT_UNREADABLE_MAX, 5);
+  assert.equal(OWN.PRIOR_TEXT_UNREADABLE_HOLD_MS, 10 * 60_000);
+  const w = world({ screen: 'silent' });
+  const o = new OWN.AutomaticSubmitOwner(w.deps);
+  for (let k = 1; k < OWN.PRIOR_TEXT_UNREADABLE_MAX; k++) {
+    const out = await run(w, o.submit(sub({ requestId: `r${k}` })));
+    assert.equal(out.reason, 'PRIOR_TEXT_UNVERIFIED', `check ${k}: refused, retried later`);
+  }
+  const held = await run(w, o.submit(sub({ requestId: 'r5' })));
+  assert.equal(held.kind, 'INTERFERED');
+  assert.equal(held.reason, 'PRIOR_TEXT_UNREADABLE');
+  assert.ok(o.inhibition('pty-dwight'), 'held for a person, not refused forever');
+  assert.deepEqual(w.writes, []);
+  // By time: two unreadable checks 10 minutes apart.
+  const w2 = world({ screen: 'silent' });
+  const o2 = new OWN.AutomaticSubmitOwner(w2.deps);
+  assert.equal((await run(w2, o2.submit(sub({ requestId: 't1' })))).kind, 'REFUSED');
+  w2.vt += OWN.PRIOR_TEXT_UNREADABLE_HOLD_MS;
+  assert.equal((await run(w2, o2.submit(sub({ requestId: 't2' })))).reason, 'PRIOR_TEXT_UNREADABLE');
+  // A readable check in between resets the count.
+  const w3 = world({ screen: 'silent' });
+  const o3 = new OWN.AutomaticSubmitOwner(w3.deps);
+  for (let k = 1; k < OWN.PRIOR_TEXT_UNREADABLE_MAX; k++) await run(w3, o3.submit(sub({ requestId: `u${k}` })));
+  w3.screen = 'answers';
+  assert.equal((await run(w3, o3.submit(sub({ requestId: 'u-read' })))).kind, 'COMMITTED', 'a readable, clear prompt');
+  w3.screen = 'silent';
+  for (let k = 1; k < OWN.PRIOR_TEXT_UNREADABLE_MAX; k++) {
+    assert.equal((await run(w3, o3.submit(sub({ requestId: `v${k}` })))).reason, 'PRIOR_TEXT_UNVERIFIED', `the count restarted (${k})`);
+  }
+});
+
+test('HARDENING (2): the settle row names the owner\'s reason, so a held or refused wake says why in log.jsonl', async () => {
+  const decide = (req) => (req.priorText ? { kind: 'INTERFERED', reason: 'PRIOR_TEXT_UNREADABLE' } : { kind: 'COMMITTED' });
+  const f = floor({ decide });
+  await dwightCommitted(f);
+  f.now += SUBMIT_CONFIRM_MS;
+  f.bridge.reconcileAll(['dwight']);
+  await f.flush();
+  assert.ok(f.diags.some((d) => d.stage === 'settle' && d.outcome === 'INTERFERED' && d.reason === 'PRIOR_TEXT_UNREADABLE'));
+});

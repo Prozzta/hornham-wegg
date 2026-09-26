@@ -13,19 +13,26 @@
  * property the old append had: rows land in order, a reader (logTail, a test) sees a row the
  * moment appendLog returns, and a crash or quit loses nothing (no buffer to flush).
  *
- * KEEP-OPEN is what the APP turns on (HiveManager.keepAppendFilesOpen, set once in main). Off,
- * each row opens, writes and closes (the old cost, but on a rotated, bounded file): that is the
- * default so a library user or a test that deletes its hive folder is never blocked by a
- * descriptor it did not know was held (Windows cannot remove a directory with an open file).
+ * KEEP-OPEN is the default (Jim, LOG-STALL-AUDIT-153 B3): production and the tests run the same
+ * path. A holder must CLOSE before deleting or copying the folder (HiveManager.dispose), since
+ * Windows cannot remove a directory while a file in it is open. `keepOpen: false` opens, writes
+ * and closes per row (the old cost, on a bounded file).
  *
  * ROTATION bounds what any remaining scan (a reopen, a tail reader, a backup tool) can cost.
  * At the cap the live file is closed and renamed to `<base>.<stamp>.jsonl`; the next row
  * reopens a fresh live file. Rotated files are immutable. `keep` bounds how many are kept
  * (the oldest are deleted); the cost ledger keeps all (the lifetime cost is folded from it).
- * A pre-existing file already over the cap when first opened (today's 74 MB log) is rotated
- * to `<base>.legacy-<stamp>.jsonl`, which is NEVER deleted: that history is the Human's.
+ * A pre-existing file already over the cap when first opened, before any rotation ever ran
+ * (today's 74 MB log), is rotated to `<base>.legacy-<stamp>.jsonl`, which is NEVER deleted:
+ * that history is the Human's. (Once rotated files exist, an oversize live file is one whose
+ * rename was busy; it rotates normally and is pruned like any other.)
+ *
+ * At a rotation the live file is recreated at once (a reader never finds it missing), and the
+ * old descriptor is closed ASYNCHRONOUSLY: the scan the antivirus runs at that close (~300 ms
+ * at 8 MB) happens off the main thread. The rename works with the old descriptor still open
+ * (Node opens with share-delete on Windows).
  */
-import { closeSync, fstatSync, openSync, readdirSync, renameSync, rmSync, writeSync } from 'node:fs';
+import { close, closeSync, fstatSync, openSync, readdirSync, renameSync, rmSync, writeSync } from 'node:fs';
 import { basename, dirname, join } from 'node:path';
 
 /** Rotate a live append file at this size. */
@@ -60,7 +67,7 @@ export interface AppendFileOptions {
   /** Rotated files kept; Infinity keeps all. */
   keep?: number;
   now?: () => number;
-  /** Keep the descriptor open between rows (the app); otherwise close after each row. */
+  /** Keep the descriptor open between rows (the default); false closes after each row. */
   keepOpen?: boolean;
   /** For tests: count the opens (each one is what the antivirus scans). */
   onOpen?: () => void;
@@ -90,7 +97,7 @@ export class AppendFile {
       const n = writeSync(this.fd, line, null, 'utf8');
       this.size += n;
       if (this.size >= Math.max(this.cap, this.nextRotateAt)) this.rotate(false);
-      else if (!this.opts.keepOpen) this.closeFd();
+      else if (this.opts.keepOpen === false) this.closeFd();
     } catch {
       // A failed write drops the descriptor; the next row reopens (and so recovers from a
       // file removed or replaced underneath us).
@@ -117,15 +124,13 @@ export class AppendFile {
       this.firstOpen = false;
       // A file already over the cap at first open predates rotation: keep ALL of it, under a
       // name retention never deletes, and start a fresh live file.
-      if (this.size >= this.cap) {
-        this.rotate(true);
-        if (this.fd === null) this.open();   // the row that triggered the open still lands
-      }
+      if (this.size >= this.cap) this.rotate(rotatedFiles(this.path).length === 0);
     }
   }
 
   private rotate(legacy: boolean): void {
-    this.closeFd();
+    const old = this.fd;
+    this.fd = null;
     const stamp = this.now();
     const base = this.path.replace(/\.jsonl$/, '');
     const target = `${base}.${legacy ? 'legacy-' : ''}${stamp}.jsonl`;
@@ -133,12 +138,21 @@ export class AppendFile {
       renameSync(this.path, target);
     } catch {
       // Busy (another process holds it without share-delete): keep appending, retry later.
+      if (old !== null) { try { closeSync(old); } catch { /* gone */ } }
       this.fd = openSync(this.path, 'a');
       this.opts.onOpen?.();
       this.size = fstatSync(this.fd).size;
       this.nextRotateAt = this.size + Math.ceil(this.cap / 8);
       return;
     }
+    // The rotated file is complete: its close (and the scan that comes with it) runs off main.
+    if (old !== null) close(old, () => { /* best-effort */ });
+    // N3: recreate the live file now, so a reader (the heartbeat's mtime) never finds it missing.
+    this.fd = openSync(this.path, 'a');
+    this.opts.onOpen?.();
+    this.size = 0;
+    this.nextRotateAt = 0;
+    if (this.opts.keepOpen === false) this.closeFd();
     if (Number.isFinite(this.keep)) this.prune();
   }
 

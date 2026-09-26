@@ -124,9 +124,10 @@ export class InboxWakeBridge {
       submitted = Promise.resolve({ kind: 'FAILED' });
     }
     void submitted
-      .then((outcome) => outcome?.kind ?? 'FAILED', () => 'FAILED')
-      .then((kind) => {
-        this.deps.diag?.('settle', { agentId, cause, mode, outcome: kind, requestId: claim.requestId });
+      .then((outcome) => outcome ?? { kind: 'FAILED' }, () => ({ kind: 'FAILED' }))
+      .then((outcome: { kind: string; reason?: unknown }) => {
+        const kind = outcome.kind;
+        this.deps.diag?.('settle', { agentId, cause, mode, outcome: kind, ...(typeof outcome.reason === 'string' ? { reason: outcome.reason } : {}), requestId: claim.requestId });
         coordinator.settle(claim, kind, this.deps.now(), kind === 'COMMITTED' && (this.deps.confirmsTurnStart?.(agentId) ?? false));
         this.deps.log?.(`[inbox-wake] ${kind === 'COMMITTED' ? 'commit' : 'release'} ${agentId} cause=${cause} outcome=${kind}`);
       });

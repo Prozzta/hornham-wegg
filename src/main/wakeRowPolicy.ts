@@ -5,7 +5,11 @@
  * One delivered message wrote ~30 wake rows (p90 43): `hook` 8.2, `facts` 5.6, `no-claim` 5.6,
  * `enter` 2.3, `schedule` 1.4, `claim`/`submit`/`settle` 1 each. Each was a synchronous append
  * the antivirus rescanned. The rule now is EDGES ONLY:
- *   - `hook` and `provider-status` log only when they moved the lifecycle (`edge`).
+ *   - `hook` logs when it moved the lifecycle (`edge`), and every `Stop` (a non-edge Stop is
+ *     the provider saying "not over": the lifecycle audit needs it).
+ *   - `provider-status` logs on an edge AND whenever the status differs from the last one
+ *     logged for that agent (Jim, LOG-STALL-AUDIT-153 B2: the AGY stall was diagnosed from the
+ *     non-edge idle ticks the confirm grace refused). Identical repeats still fold.
  *   - `no-claim` logs the FIRST time each refusal reason appears for an agent since its last
  *     claim, and carries the agent's latest `facts`, so the row still says why and from what
  *     state. (Measured on the live log: reasons flap, e.g. active/recent-output, so logging
@@ -37,9 +41,11 @@ export interface WakeRowState {
   lastClaim: Map<string, Record<string, unknown>>;
   /** stage -> rows folded since the last summary. */
   folded: Map<string, number>;
+  /** agentId -> the provider status last logged. */
+  lastStatus: Map<string, string>;
 }
 
-export const newWakeRowState = (): WakeRowState => ({ lastRefusal: new Map(), lastBeat: '', lastFacts: new Map(), lastClaim: new Map(), folded: new Map() });
+export const newWakeRowState = (): WakeRowState => ({ lastRefusal: new Map(), lastBeat: '', lastFacts: new Map(), lastClaim: new Map(), folded: new Map(), lastStatus: new Map() });
 
 const ALWAYS_FOLDED = new Set(['enter', 'facts', 'submit']);
 
@@ -54,8 +60,14 @@ export function planWakeRow(state: WakeRowState, stage: string, fields: Record<s
   if (ALWAYS_FOLDED.has(stage)) return fold();
   switch (stage) {
     case 'hook':
-    case 'provider-status':
-      return fields.edge ? fields : fold();
+      return fields.edge || fields.event === 'Stop' ? fields : fold();
+    case 'provider-status': {
+      const status = String(fields.status ?? '');
+      const changed = state.lastStatus.get(agent) !== status;
+      if (!fields.edge && !changed) return fold();
+      state.lastStatus.set(agent, status);
+      return fields;
+    }
     case 'schedule':
       return fields.took === 'no-agent-id' ? fields : fold();
     case 'observer':
@@ -110,4 +122,5 @@ export function forgetWakeRows(state: WakeRowState, agentId: string): void {
   state.lastRefusal.delete(agentId);
   state.lastFacts.delete(agentId);
   state.lastClaim.delete(agentId);
+  state.lastStatus.delete(agentId);
 }

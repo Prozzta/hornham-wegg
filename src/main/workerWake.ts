@@ -218,6 +218,9 @@ interface AgentWake {
   reannounced: Set<string>;
   /** See WakeClaim.recheck; carried until a claim that checked it COMMITS. */
   recheck: readonly string[] | null;
+  /** AGY's last invocation hook was PreInvocation (a model call is running): a deferred
+   *  idle is not applied until PostInvocation or a Stop says it ended. */
+  invoking: boolean;
 }
 
 /** What a reconcile beat changed for one agent (null = nothing). */
@@ -256,7 +259,7 @@ export class WorkerWakeWatchdog {
     if (!r) {
       r = {
         pending: new Set(), announced: new Set(), inFlight: null, held: null, lifecycle: 'unknown', lastHumanNeedsAt: 0, lastReconcileAttemptAt: 0, providerSession: null, activeSince: 0, closedTurns: [], openTurnId: null,
-        stoppedAt: 0, turnStartAt: 0, provisional: false, claimedAt: 0, commitIds: [], pendingIdleAt: 0, announcedAt: new Map(), reannounced: new Set(), recheck: null
+        stoppedAt: 0, turnStartAt: 0, provisional: false, claimedAt: 0, commitIds: [], pendingIdleAt: 0, announcedAt: new Map(), reannounced: new Set(), recheck: null, invoking: false
       };
       this.agents.set(agentId, r);
     }
@@ -307,6 +310,7 @@ export class WorkerWakeWatchdog {
     const r = this.rec(agentId);
     this.endEpoch(r, 'unknown');
     r.recheck = null;   // the new incarnation's composer is empty; the old one died with it
+    r.invoking = false;
     // A new PTY incarnation is a new provider session. Forget the old one BEFORE any
     // tick of the new one arrives: keeping it would make the first tick of the fresh
     // session look like a mismatch and be discarded, and the agent would then have no
@@ -345,6 +349,7 @@ export class WorkerWakeWatchdog {
       this.endEpoch(r, 'idle');
       r.openTurnId = null;
       r.stoppedAt = at;
+      r.invoking = false;
       // The turn is over and the agent is idle: an id it was told about minutes ago and
       // left on disk gets one more announcement (bounded: once per id).
       this.requeueStale(r, at);
@@ -369,7 +374,11 @@ export class WorkerWakeWatchdog {
       this.endEpoch(r, 'idle');
       return true;
     }
+    // Jim (WAKE-CONFIRM-AUDIT-153 note 1): AGY brackets every model call with Pre/PostInvocation,
+    // and its running ticks can pause >5 s inside one. A deferred idle must not land there.
+    if (event === 'PostInvocation') { r.invoking = false; return false; }
     if (ACTIVE_EVENTS.has(event)) {
+      if (event === 'PreInvocation') r.invoking = true;
       this.turnStarted(r, at);   // the provider's own turn start: confirms our submit
       r.lifecycle = 'active'; r.activeSince = at;
       r.openTurnId = turnId ?? null;   // no id (Claude, our own submit): the turn is unnamed
@@ -380,7 +389,7 @@ export class WorkerWakeWatchdog {
     // let a stale `active` from the old session survive into the new one either — a
     // --resume'd agent would inherit exactly the same deadlock. Not a retry edge: nothing
     // is known to be idle yet, so the reconciliation beat decides, behind boot grace.
-    if (event === 'SessionStart' || event === 'SessionEnd') { this.endEpoch(r, 'unknown'); return false; }
+    if (event === 'SessionStart' || event === 'SessionEnd') { this.endEpoch(r, 'unknown'); r.invoking = false; return false; }
     return false;
   }
 
@@ -534,7 +543,7 @@ export class WorkerWakeWatchdog {
   beat(agentId: string, now = Date.now()): WakeBeatEdge | null {
     const r = this.agents.get(agentId);
     if (!r) return null;
-    if (r.lifecycle === 'active' && r.pendingIdleAt > 0 && now - r.activeSince >= PROVIDER_IDLE_CONFIRM_MS) {
+    if (r.lifecycle === 'active' && r.pendingIdleAt > 0 && !r.invoking && now - r.activeSince >= PROVIDER_IDLE_CONFIRM_MS) {
       this.closeUnconfirmed(r);
       this.endEpoch(r, 'idle');
       r.activeSince = 0;
