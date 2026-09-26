@@ -43,6 +43,7 @@ import {
 } from './git';
 import { HiveManager, type AgentMeta, type HiveMessage, type HiveTask } from './hive';
 import { ThreadViewStore, threadRoot } from './threadView';
+import { findNewestRollout } from './codexRolloutCapacity';
 import { HookServer } from './hooks';
 import { CapacityRuntime } from './capacityRuntime';
 import { CapacityStore, capacityStorePath } from './capacityPersistence';
@@ -357,6 +358,21 @@ const hive = new HiveManager(
 // module reaches HiveManager, so this can never point at the git-backed hive.
 const threadView = new ThreadViewStore(threadRoot(app.getPath('userData')));
 void threadView.init().catch((e) => console.error('[thread-view] init failed:', e));
+// Michael-only Phase 1 tail. Both sources are append-only and are read in 64 KiB
+// chunks by ThreadViewStore; source selection follows the live provider/session.
+async function pollMichaelThread(): Promise<void> {
+  const id = hive.registry().godId;
+  if (!id) return;
+  const provider = String(hive.registry().agents[id]?.provider ?? 'claude').toLowerCase();
+  if (provider === 'codex') {
+    const file = findNewestRollout(join(readConfig().harnessHome, 'agents', id, '.codex'));
+    if (file) await threadView.tail(file, (line) => threadView.ingestCodexLine(id, line));
+  } else {
+    const file = hookServer.transcriptPath(id);
+    if (file) await threadView.tail(file, (line) => threadView.ingestClaudeLine(id, line));
+  }
+}
+setInterval(() => { void pollMichaelThread().catch((e) => console.error('[thread-view] tail failed:', e)); }, 500).unref();
 const control = new ControlRegistry();
 // Stage 7A — the live observability tap. Receives Claude Code's first-party OTel
 // over loopback OTLP/JSON and exposes the locked usage-provider seam. resolveCwd

@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { mkdir, readFile, readdir, rename, rm, stat, writeFile, appendFile } from 'node:fs/promises';
+import { mkdir, readFile, readdir, rename, rm, stat, writeFile, appendFile, open } from 'node:fs/promises';
 import { basename, join, resolve, sep } from 'node:path';
 
 /** Private, bounded projection for the Human <-> one agent conversation.
@@ -48,6 +48,7 @@ function byteTrim(text: string): { text: string; truncated: boolean } {
 export class ThreadViewStore {
   private receipts = new Map<string, ThreadReceipt[]>();
   private admitted = new Set<string>();
+  private tails = new Map<string, { offset: number; remainder: string }>();
   private totalBytes = 0;
   private ledgerDirty = false;
   private ledgerTimer: NodeJS.Timeout | undefined;
@@ -130,6 +131,22 @@ export class ThreadViewStore {
     } else if (kind === 'agent_message' && this.admitted.has(agentId)) {
       await this.append(agentId, { speaker: 'agent', text, source: 'codex' });
     }
+  }
+
+  /** Incremental, complete-line tail: never loads a rollout/transcript whole. */
+  async tail(file: string, consume: (line: string) => Promise<void>): Promise<void> {
+    const previous = this.tails.get(file) ?? { offset: 0, remainder: '' };
+    const size = (await stat(file).catch(() => undefined))?.size;
+    if (size === undefined) return;
+    const offset = size < previous.offset ? 0 : previous.offset;
+    const length = Math.min(64 * 1024, Math.max(0, size - offset));
+    if (!length) return;
+    const handle = await open(file, 'r'); const buffer = Buffer.alloc(length);
+    try { await handle.read(buffer, 0, length, offset); } finally { await handle.close(); }
+    const all = previous.remainder + buffer.toString('utf8'); const lines = all.split('\n');
+    const remainder = lines.pop() ?? '';
+    this.tails.set(file, { offset: offset + length, remainder });
+    for (const line of lines) if (line) await consume(line);
   }
 
   async list(agentId: string, limit = 500): Promise<ThreadEvent[]> {
