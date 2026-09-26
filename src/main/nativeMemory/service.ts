@@ -30,6 +30,47 @@ export function parseMode(raw: string | null): MemoryMode {
   }
 }
 
+/**
+ * GATE 6 (god's gate-4 decision): the per-cohort parity rule is re-run on SHADOW real-query
+ * diagnostics before any cutover, so every shadow row carries its query's cohort. Classified
+ * from the query's SHAPE at capture time (no text is stored):
+ *   wing-scoped       --wing given
+ *   exact-identifier  a token that names something exactly (TICKET-12, a hex hash, 1.1.52,
+ *                     snake_case, a file extension)
+ *   punctuation       quotes, paths, colons, brackets, #
+ *   semantic          everything else
+ * and two OUTCOME cohorts, known only after legacy answered:
+ *   no-match          legacy returned nothing
+ *   stale             (set by the labeller at review: a hit on a removed/moved source)
+ */
+export type QueryCohort = 'wing-scoped' | 'exact-identifier' | 'punctuation' | 'semantic';
+
+export function classifyQuery(query: string, wing: string | null): QueryCohort {
+  if (wing) return 'wing-scoped';
+  if (/[A-Z]{2,}-[A-Z0-9]|\b[0-9a-f]{7,40}\b|\d+\.\d+\.\d+|[a-z]+_[a-z]+|\.(ts|md|json|jsonl|cjs|tsx|py)\b/.test(query)) return 'exact-identifier';
+  if (/["'`:\/\\()\[\]#]/.test(query)) return 'punctuation';
+  return 'semantic';
+}
+
+/**
+ * The OPT-IN review window for gate 6 (off by default). Shadow rows are redacted: a labeller
+ * cannot judge relevance from hashes, so while god/the Human enable
+ *   { "mode": "shadow", "reviewCaptureUntil": "<ISO date>" }
+ * in memory-engine.json, the WORKER also appends the query text and both engines' ranked hits to
+ * `<userData>/memory/<key>.shadow-review.jsonl` - outside the hive (legacy MemPalace mines agent
+ * folders), never in log.jsonl. Past the date it stops by itself.
+ */
+export function reviewCaptureActive(raw: string | null, now = Date.now()): boolean {
+  if (!raw) return false;
+  try {
+    const until = (JSON.parse(raw) as { reviewCaptureUntil?: unknown }).reviewCaptureUntil;
+    const t = typeof until === 'string' ? Date.parse(until) : NaN;
+    return Number.isFinite(t) && now < t;
+  } catch {
+    return false;
+  }
+}
+
 /** CLI exit codes (section 6). */
 export const EXIT = { ok: 0, usage: 2, unavailable: 3, degraded: 4, unauthorized: 5 } as const;
 
@@ -223,7 +264,11 @@ export function validateRequest(body: MemoryRequest, callerWing: string, servedP
   if (cmd === 'shadow') {
     const q = a.query;
     if (typeof q !== 'string' || !q.trim() || q.length > 2000) return { exit: EXIT.usage, error: 'shadow needs a query' };
-    return { op: 'hits', args: { query: q, wing: typeof a.wing === 'string' && WING.test(a.wing) ? a.wing : null, results: 10 } };
+    const wing = typeof a.wing === 'string' && WING.test(a.wing) ? a.wing : null;
+    const legacy = Array.isArray(a.legacy)
+      ? (a.legacy as unknown[]).slice(0, 10).map((x) => { const h = (x ?? {}) as Record<string, unknown>; return { rank: Number(h.rank) || 0, wing: String(h.wing ?? '').slice(0, 120), room: String(h.room ?? '').slice(0, 120), source: String(h.source ?? '').slice(0, 300) }; })
+      : [];
+    return { op: 'hits', args: { query: q, wing, results: 10, legacy } };
   }
   return { exit: EXIT.usage, error: `unsupported command ${String(cmd)}` };
 }

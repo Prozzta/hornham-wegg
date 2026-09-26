@@ -163,3 +163,11 @@ test('ROLLBACK SAFETY (static): no native-memory module names the palace, mempal
   const cfg = /export interface WorkerConfig \{([\s\S]*?)\n\}/.exec(worker)[1];
   assert.doesNotMatch(cfg, /palace/i, 'the worker is never told where the palace is');
 });
+
+test('GATE-6 REVIEW CAPTURE: only with the flag does the worker write query text + both rankings, beside the index in userData, never in the hive', { skip: !HAVE_ELECTRON || !HAVE_MODEL }, () => {
+  const j = run('review');
+  assert.equal(j.noFileWithoutFlag, true, 'default: nothing written');
+  assert.equal(j.rows, 1);
+  assert.deepEqual(j.row, { agent: 'a1', query: 'frobnicator', cohort: 'semantic', legacyN: 1, nativeTop: 'agents/a1/memory.md', hasText: true });
+  assert.equal(j.inHive, false);
+});

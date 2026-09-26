@@ -13,7 +13,7 @@
 import { createHash } from 'node:crypto';
 import { existsSync, readFileSync } from 'node:fs';
 import { delimiter, join } from 'node:path';
-import { EXIT, MemoryTokens, MODE_FILE, NativeMemoryClient, parseMode, validateRequest, type MemoryMode, type WorkerHandle } from './service';
+import { classifyQuery, EXIT, MemoryTokens, MODE_FILE, NativeMemoryClient, parseMode, reviewCaptureActive, validateRequest, type MemoryMode, type WorkerHandle } from './service';
 import type { WorkerConfig } from './worker';
 
 export interface RuntimeManifest {
@@ -55,12 +55,14 @@ export class NativeMemoryWiring {
     this.client = new NativeMemoryClient({ fork: () => d.fork(d.workerEntry), config: () => this.workerConfig(), log: d.log });
   }
 
-  mode(): MemoryMode {
+  private modeRaw(): string | null {
     const root = this.d.hiveRoot();
-    if (!root) return 'legacy';
-    let raw: string | null = null;
-    try { raw = readFileSync(join(root, MODE_FILE), 'utf8'); } catch { raw = null; }
-    return parseMode(raw);
+    if (!root) return null;
+    try { return readFileSync(join(root, MODE_FILE), 'utf8'); } catch { return null; }
+  }
+
+  mode(): MemoryMode {
+    return parseMode(this.modeRaw());
   }
 
   private runtimeManifest(): RuntimeManifest | null {
@@ -133,17 +135,25 @@ export class NativeMemoryWiring {
     const v = validateRequest((body ?? {}) as Record<string, unknown>, agentId, served);
     if ('exit' in v) return { status: 200, body: { exit: v.exit, error: v.error } };
     if (v.op === 'hits') {
-      // Shadow: compare with the legacy ranking the shim saw; store ONLY a redacted row.
-      const r = await this.client.request('hits', v.args, 2_000);
-      const b = (body ?? {}) as { args?: { legacy?: Array<{ rank: number; source: string; wing: string }>; legacyMs?: number } };
-      const legacy = Array.isArray(b.args?.legacy) ? b.args!.legacy!.slice(0, 10) : [];
+      // Shadow: compare with the legacy ranking the shim saw; store ONLY a redacted row (plus,
+      // inside an opt-in review window, the worker's private review file: see reviewCaptureActive).
+      const review = mode === 'shadow' && reviewCaptureActive(this.modeRaw());
+      const r = await this.client.request('hits', { ...v.args, review, agent: agentId }, 2_000);
+      const b = (body ?? {}) as { args?: { legacyMs?: number } };
+      const legacy = (v.args.legacy as Array<{ rank: number; source: string; wing: string }>) ?? [];
       const native = Array.isArray(r.json) ? (r.json as Array<{ source: string; wing: string }>) : [];
       const lset = new Set(legacy.map((x) => `${x.wing}|${String(x.source).split('/').pop()}`));
       const overlap = native.filter((x) => lset.has(`${x.wing}|${x.source.split('/').pop()}`)).length;
       this.d.log({
         kind: 'native-memory-shadow', agent: agentId,
         queryHash: createHash('sha256').update(String(v.args.query)).digest('hex').slice(0, 16),
+        // Gate 6 needs per-cohort n: the cohort from the query's shape, no-match from the outcome.
+        cohort: legacy.length === 0 ? 'no-match' : classifyQuery(String(v.args.query), (v.args.wing as string | null) ?? null),
         legacyN: legacy.length, nativeN: native.length, overlapSources: overlap,
+        // Ranked, redacted: hashes of wing|source, so gate 6 can compute overlap / rank agreement.
+        legacyRanked: legacy.map((x) => createHash('sha256').update(`${x.wing}|${String(x.source).split('/').pop()}`).digest('hex').slice(0, 12)),
+        nativeRanked: native.map((x) => createHash('sha256').update(`${x.wing}|${x.source.split('/').pop()}`).digest('hex').slice(0, 12)),
+        reviewCaptured: review,
         legacyMs: typeof b.args?.legacyMs === 'number' ? b.args.legacyMs : null, nativeOk: r.ok, nativeError: r.error ?? null
       });
       return { status: 200, body: { exit: EXIT.ok } };

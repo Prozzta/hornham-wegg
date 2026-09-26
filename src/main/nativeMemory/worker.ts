@@ -17,6 +17,8 @@ import { OnnxEmbedder, type OrtLike } from './embedder';
 import { MemoryEngine } from './engine';
 import { NativeMemoryStore, type StoreOpenOptions } from './store';
 import { discoverSources, sha256 } from './sources';
+import { AppendFile } from '../appendLog';
+import { classifyQuery } from './service';
 import { WordPieceTokenizer, wordPieceConfigFromTokenizerJson } from './wordpiece';
 
 export interface WorkerConfig {
@@ -92,6 +94,9 @@ export async function runWorker(cfg: WorkerConfig, port: Port, deps: { Database:
   port.postMessage({ event: 'ready' });
 
   const reply = (id: number, r: Record<string, unknown>): void => port.postMessage({ id, ...r });
+  // Gate-6 review capture (opt-in window, see service.reviewCaptureActive): beside the index in
+  // userData, never in the hive. Kept open like the hive log (no rescan per row), rotated at 8 MB.
+  const reviewFile = new AppendFile(`${cfg.dbFile}.shadow-review.jsonl`, { keep: Infinity });
   port.on('message', (e) => {
     const m = e.data as WorkerMessage;
     if (!m || typeof m.id !== 'number' || typeof m.op !== 'string') return;
@@ -106,7 +111,19 @@ export async function runWorker(cfg: WorkerConfig, port: Port, deps: { Database:
         guard(engine.search({ query: String(a.query ?? ''), wing: (a.wing as string) ?? null, room: (a.room as string) ?? null, results: Number(a.results ?? 5), since: (a.since as string) ?? null, before: (a.before as string) ?? null }), (r) => ({ exit: r.exit, text: r.text, json: r.json }));
         break;
       case 'hits':
-        guard(engine.searchHits({ query: String(a.query ?? ''), wing: (a.wing as string) ?? null, results: Number(a.results ?? 10) }), (h) => ({ exit: 0, json: h.map((x) => ({ chunkId: x.chunkId, wing: x.wing, room: x.room, source: x.source, cosineSim: x.cosineSim, bm25: x.bm25, contentSha: sha256(x.content) })) }));
+        guard(engine.searchHits({ query: String(a.query ?? ''), wing: (a.wing as string) ?? null, results: Number(a.results ?? 10) }), (h) => {
+          const json = h.map((x) => ({ chunkId: x.chunkId, wing: x.wing, room: x.room, source: x.source, cosineSim: x.cosineSim, bm25: x.bm25, contentSha: sha256(x.content) }));
+          if (a.review === true) {
+            const legacy = Array.isArray(a.legacy) ? a.legacy : [];
+            const q = String(a.query ?? '');
+            reviewFile.append(JSON.stringify({
+              at: new Date().toISOString(), agent: a.agent ?? null, query: q, wing: a.wing ?? null,
+              cohort: legacy.length === 0 ? 'no-match' : classifyQuery(q, (a.wing as string) ?? null),
+              legacy, native: h.map((x, i) => ({ rank: i + 1, wing: x.wing, room: x.room, source: x.source, chunkId: x.chunkId, text: x.content }))
+            }) + '\n');
+          }
+          return { exit: 0, json };
+        });
         break;
       case 'wake-up':
         guard(engine.wakeUp((a.wing as string) ?? null), (r) => ({ exit: r.exit, text: r.text }));
@@ -126,6 +143,7 @@ export async function runWorker(cfg: WorkerConfig, port: Port, deps: { Database:
         guard(engine.compact((f) => openOrQuarantine(f, openOpts).store, renameSync, (f) => rmSync(f, { force: true })), (r) => ({ exit: 0, json: { result: r } }));
         break;
       case 'shutdown':
+        try { reviewFile.close(); } catch { /* closed */ }
         void engine.close().then(() => { try { engine.storeRef().close(); } catch { /* closed */ } reply(m.id, { ok: true, exit: 0 }); });
         break;
       default:

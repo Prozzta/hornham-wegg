@@ -535,3 +535,42 @@ test('PARITY STATS: a cohort whose queries have no relevant item (no-match) is r
   assert.equal(r.adjusted['no-match'].gated, false);
   assert.equal(r.adjusted['no-match'].pass, null);
 });
+
+// ── gate 6 (god's gate-4 decision): per-cohort shadow diagnostics ─────────
+
+test('GATE-6 DIAGNOSTICS: queries are classified into the spec cohorts by shape; the review window is opt-in, dated and self-expiring', () => {
+  const { classifyQuery, reviewCaptureActive } = loadTs('src/main/nativeMemory/service.ts');
+  assert.equal(classifyQuery('anything', 'jim-mtujpe28'), 'wing-scoped');
+  for (const q of ['LOG-STALL rotation', 'commit 4955862c', '1.1.52 palace repair', 'worker_wake stall', 'hooks.ts route']) assert.equal(classifyQuery(q, null), 'exact-identifier', q);
+  for (const q of ['"kept open" log', 'C:/Dunder path', 'why: the gate', 'item (b) decision']) assert.equal(classifyQuery(q, null), 'punctuation', q);
+  assert.equal(classifyQuery('how does the wake confirmation work', null), 'semantic');
+  const now = Date.parse('2026-09-27T00:00:00Z');
+  assert.equal(reviewCaptureActive(null, now), false, 'default: off');
+  assert.equal(reviewCaptureActive('{"mode":"shadow"}', now), false);
+  assert.equal(reviewCaptureActive('{"mode":"shadow","reviewCaptureUntil":"2026-09-28T00:00:00Z"}', now), true);
+  assert.equal(reviewCaptureActive('{"mode":"shadow","reviewCaptureUntil":"2026-09-26T00:00:00Z"}', now), false, 'expires by itself');
+  assert.equal(reviewCaptureActive('{"reviewCaptureUntil":"soon"}', now), false);
+});
+
+test('GATE-6 DIAGNOSTICS: the redacted shadow row carries the cohort and ranked source HASHES (never text); the review flag reaches the worker only inside the window', async () => {
+  const root = hive({ 'agents/a1/memory.md': 'm', 'memory-engine.json': '{"mode":"shadow"}' });
+  const { w, logs } = wiring(root);
+  const sent = [];
+  w.client.request = async (op, args) => { sent.push({ op, args }); return { ok: true, exit: 0, json: [{ wing: 'a1', source: 'agents/a1/memory.md' }] }; };
+  const tok = w.tokens.mint('a1');
+  await w.handle(tok, { cmd: 'shadow', args: { query: 'LOG-STALL secret text', legacy: [{ rank: 1, wing: 'a1', room: 'memory', source: 'memory.md' }], legacyMs: 1500 } });
+  assert.equal(logs[0].cohort, 'exact-identifier');
+  assert.equal(logs[0].legacyRanked.length, 1);
+  assert.deepEqual(logs[0].legacyRanked, logs[0].nativeRanked, 'same wing|source -> same hash');
+  assert.equal(logs[0].reviewCaptured, false);
+  assert.equal(sent[0].args.review, false);
+  assert.ok(!JSON.stringify(logs).includes('secret'));
+  await w.handle(tok, { cmd: 'shadow', args: { query: 'nothing found here', legacy: [] } });
+  assert.equal(logs[1].cohort, 'no-match', 'legacy answered nothing');
+  fs.writeFileSync(path.join(root, 'memory-engine.json'), JSON.stringify({ mode: 'shadow', reviewCaptureUntil: new Date(Date.now() + 3600e3).toISOString() }));
+  await w.handle(tok, { cmd: 'shadow', args: { query: 'q', legacy: [] } });
+  assert.equal(sent[2].args.review, true, 'inside the window the worker is told to capture');
+  assert.equal(sent[2].args.agent, 'a1');
+  assert.equal(logs[2].reviewCaptured, true);
+  assert.ok(!JSON.stringify(logs).includes('"q"'), 'the hive log still has no text');
+});

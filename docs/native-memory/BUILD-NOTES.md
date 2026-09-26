@@ -55,8 +55,8 @@
 All measurements were taken on **copies**. The live palace, the installed app and userData were never opened for writing; the live hive was only read, stat-ed and copied.
 
 **Tests**
-- `test/native-memory.test.cjs`: 29 tests, plain Node.
-- `test/native-memory-electron.test.cjs`: 13 tests, run under Electron-as-Node against the real shipped natives and model:
+- `test/native-memory.test.cjs`: 32 tests, plain Node.
+- `test/native-memory-electron.test.cjs`: 14 tests, run under Electron-as-Node against the real shipped natives and model:
   - the vec0 digest refusal;
   - chunk-diff;
   - search filters and hostile FTS input;
@@ -68,13 +68,14 @@ All measurements were taken on **copies**. The live palace, the installed app an
   - the full worker protocol;
   - the stale-plan and bad-count guards;
   - the model digest refusal;
-  - **rollback safety**.
+  - **rollback safety**;
+  - the gate-6 review capture (content, location, and nothing written by default).
 
 **Mutant census:** 38 mutants over the store, engine, allow-list, service, wiring, shim, worker, route, format and tokenizer.
 - **37 killed, 1 equivalent.** The equivalent one drops `isFile()` from the direct-`.md` filter, which the size/file check in `add()` already enforces.
 - The census found a **real bug, now fixed.** SQLite reuses the highest deleted rowids, so the stale-plan check comparing chunk ids alone could apply a plan made against chunks that had since been replaced. Plans now carry `id:contentSha` for every chunk they saw.
 
-**Typecheck / build / full suite:** typecheck 0, build 0; the full suite is **2,186 tests = 2,173 pass / 8 fail / 5 skipped, and the 8 failures are exactly the known 8** (the 1.1.53 baseline); `ALL 10 MARKERS OK` on the source tree and on the built layout.
+**Typecheck / build / full suite:** typecheck 0, build 0; the full suite is **2,190 tests = 2,177 pass / 8 fail / 5 skipped, and the 8 failures are exactly the known 8** (the 1.1.53 baseline); `ALL 10 MARKERS OK` on the source tree and on the built layout.
 
 **Migration** (gate 3, a copy of the live hive's Markdown: 625 files, 4.5 MB)
 
@@ -172,6 +173,34 @@ All measurements were taken on **copies**. The live palace, the installed app an
     - (b) accept on the overall result plus no cohort regression, with gate 6's shadow re-run on real queries as the confirmation;
     - (c) another rule.
 
+**God's decision on gate 4: option (b), CONDITIONAL. It is a gate-rule DEFERRAL, not a waiver.**
+- **1.1.54 may ship memory-154 ONLY legacy-default** (zero behaviour change), with `shadow` available.
+- **Basis:**
+  - overall native is significantly better on both metrics (both lower bounds > 0);
+  - no cohort shows a significant regression;
+  - kappa is 0.478;
+  - the per-cohort failures are CI width at n = 8–12.
+- **The per-cohort rule is NOT waived.** The spec's "95% CI lower bound ≥ −5 pts per cohort" moves to **gate 6**. It must pass on **shadow real-query** diagnostics, with enough queries per cohort, before any native or 10% cutover.
+- **Watch item:** semantic NDCG@5 (point estimate −4.6).
+- **The Human's spot-check (10 queries) is still required before the cut.**
+
+**How gate 6 gets its per-cohort n** (built in this branch):
+1. **Every shadow request writes a redacted row** to `log.jsonl` (`native-memory-shadow`). It carries:
+   - its **cohort**, classified from the query's shape at capture (`classifyQuery`: wing-scoped / exact-identifier / punctuation / semantic), or `no-match` when legacy returned nothing;
+   - both engines' **ranked source hashes** (`legacyRanked`, `nativeRanked`: sha256 of wing|source), plus latencies and overlap.
+   - **No query or chunk text.** The per-cohort n is therefore visible from the log alone.
+2. **Labelling needs text, so there is an opt-in, dated review window.**
+   - It is set with `{"mode":"shadow","reviewCaptureUntil":"<ISO date>"}` in `<hive>/memory-engine.json`, and **stops by itself** at the date.
+   - While it is open, the **worker** also appends the query text and both rankings (native with chunk text) to `<userData>/memory/<key>.shadow-review.jsonl`: beside the index, **never in the hive** (legacy mines agent folders), never in `log.jsonl`.
+   - The file is kept open and rotated like the hive log.
+3. **Reaching n.**
+   - Real `mempalace search` traffic is sparse: 6 intents in all the transcripts before this build.
+   - So the window is opened for a bounded period while agents work normally in shadow mode, and god and the Human decide its length and scope.
+   - The review file is then turned into engine-blind label sheets. The same tooling (`native-memory-parity.cjs` / `-stats.cjs`) adds a reader for it, and a labeller outside the build does the labelling.
+   - Gate 6 is scored per cohort on the real queries, with the ≥ −5 lower bound per cohort and a scorable n ≥ 8. At the observed variance, a certain pass needs more per cohort (see above).
+   - **If a cohort cannot reach n in a reasonable window, that is reported, never assumed.**
+4. **The rollout order is unchanged:** legacy (1.1.54 default) → shadow (diagnostics, the review window) → gate 6 → controlled cutover with the rollback drill.
+
 ## Rollback (1.1.54 → 1.1.53) and why it is safe
 
 **What 1.1.54 never touches:**
@@ -199,6 +228,6 @@ All measurements were taken on **copies**. The live palace, the installed app an
 
 ## Open
 
-1. **Gate 4:** scored; it FAILS on the per-cohort lower bound (semantic, wing-scoped, punctuation) while the overall result is significantly better. A decision is needed (see above). The Human spot-check (10 queries) is pending.
+1. **Gate 4:** decided, option (b) conditional: ship legacy-default only; the per-cohort rule moves to gate 6 on shadow real queries. **The Human spot-check (10 queries) is still required before the cut.**
 2. **Opt-ins:** whether the 2 nested deliverables and any top-level notes join the allow-list (god and the owners).
 3. **Not covered on this host:** the mac and Linux artifact smokes; the Defender/BitDefender install-time scan observation.

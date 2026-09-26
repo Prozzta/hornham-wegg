@@ -292,6 +292,27 @@ S.palaceUntouched = async () => {
   return { searchExit: s.exit, compacted, identical: JSON.stringify(before) === JSON.stringify(after), files: Object.keys(before).length, dbOutsidePalace: !inPalace(dbFile), hiveHasNoPalaceWrites: !fs.readdirSync(palace).some((n) => /sqlite|native|memory-engine/.test(n) && !['chroma.sqlite3'].includes(n)) };
 };
 
+S.review = async () => {
+  // Gate-6 review capture: only with review:true, the worker writes query text + both rankings to
+  // <dbFile>.shadow-review.jsonl (userData, beside the index), never into the hive.
+  if (!HAVE_MODEL) return { skipped: 'no model provisioned' };
+  const root = hive(path.join(scratch, 'hr'), { 'agents/a1/memory.md': '## x\n- the frobnicator rotates logs\n' });
+  const listeners = []; const sent = [];
+  const port = { on: (_e, fn) => listeners.push(fn), postMessage: (m) => sent.push(m) };
+  const dbFile = path.join(scratch, 'ud', 'memory', 'k.sqlite');
+  await runWorker({ hiveRoot: root, dbFile, modelDir: MODEL_DIR, modelSha256: MANIFEST.model.onnxSha256, vecPath, vecSha256: vecSha, modeFile: path.join(root, 'memory-engine.json') }, port, { Database, ort });
+  const ask = (id, op, args) => new Promise((resolve) => { const t = setInterval(() => { const r = sent.find((m) => m.id === id); if (r) { clearInterval(t); resolve(r); } }, 20); for (const l of listeners) l({ data: { id, op, args } }); });
+  await ask(1, 'backfill', {});
+  const file = `${dbFile}.shadow-review.jsonl`;
+  await ask(2, 'hits', { query: 'frobnicator', results: 3, review: false, legacy: [] });
+  const noFile = !fs.existsSync(file) || fs.statSync(file).size === 0;
+  await ask(3, 'hits', { query: 'frobnicator', results: 3, review: true, agent: 'a1', legacy: [{ rank: 1, wing: 'a1', room: 'memory', source: 'memory.md' }] });
+  await ask(4, 'shutdown', {});
+  const rows = fs.existsSync(file) ? fs.readFileSync(file, 'utf8').trim().split('\n').filter(Boolean).map((l) => JSON.parse(l)) : [];
+  const inHive = (function walk(d) { return fs.readdirSync(d, { withFileTypes: true }).some((e) => (e.isDirectory() ? walk(path.join(d, e.name)) : /shadow-review/.test(e.name))); })(root);
+  return { noFileWithoutFlag: noFile, rows: rows.length, row: rows[0] ? { agent: rows[0].agent, query: rows[0].query, cohort: rows[0].cohort, legacyN: rows[0].legacy.length, nativeTop: rows[0].native[0] && rows[0].native[0].source, hasText: !!(rows[0].native[0] && rows[0].native[0].text) } : null, inHive };
+};
+
 S.badModel = async () => {
   if (!HAVE_MODEL) return { skipped: 'no model provisioned' };
   const root = hive(path.join(scratch, 'hb'), { 'agents/a1/memory.md': '## x\n- y\n' });
