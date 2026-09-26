@@ -212,8 +212,8 @@ export interface HeavyLockDeps {
   clearTimer?: (t: unknown) => void;
   /** The PTY root pid of each agent (main's pty manager). */
   roots?: () => Array<{ agentId: string; pid: number }>;
-  /** A process listing (hidden; only ever called while a background holder exists). */
-  probe?: () => Promise<ProcRow[]>;
+  /** A process listing (hidden; only ever called while a slot is held). null = the listing FAILED. */
+  probe?: () => Promise<ProcRow[] | null>;
   log?: (row: Record<string, unknown>) => void;
 }
 
@@ -284,7 +284,7 @@ export class HeavyJobLock {
       void this.heavyAgents().then((busy) => {
         const cur = this.holders.get(agentId);
         if (!cur || cur.calls.size || cur.background) return;
-        if (busy?.has(agentId)) { cur.background = true; cur.seenRunning = true; this.log({ kind: 'heavy-lock', action: 'orphan-kept', agentId, heavyKind: cur.kind }); this.arm(); return; }
+        if (busy?.busy.has(agentId)) { cur.background = true; cur.seenRunning = true; this.log({ kind: 'heavy-lock', action: 'orphan-kept', agentId, heavyKind: cur.kind }); this.arm(); return; }
         this.release(agentId, 'posttool');
       });
       return;
@@ -299,10 +299,16 @@ export class HeavyJobLock {
    *  while its agent's PTY tree has ANY descendant CREATED at or after its acquire: exact for every
    *  wrapper, shim and tool, and conservative (the agent's other calls only extend the hold). The
    *  PTY root itself and its long-lived children (created earlier) never count. */
-  private async heavyAgents(): Promise<Set<string> | null> {
+  private async heavyAgents(): Promise<{ busy: Set<string>; seen: Set<string> } | null> {
     if (!this.d.probe || !this.d.roots) return null;
-    let procs: ProcRow[];
-    try { procs = await this.d.probe(); } catch { return null; }
+    let procs: ProcRow[] | null;
+    try { procs = await this.d.probe(); } catch { procs = null; }
+    // Jim MF4: a failed, empty or createdMs-less listing (most likely a TIMEOUT while heavy jobs load
+    // the machine) is UNKNOWN, never "nothing running": the caller counts no miss.
+    if (!procs || !procs.length || !procs.some((p) => typeof p.createdMs === 'number')) {
+      this.log({ kind: 'heavy-lock', action: 'probe-failed', rows: procs ? procs.length : null });
+      return null;
+    }
     const parent = new Map(procs.map((p) => [p.pid, p.parentPid]));
     const rootOf = new Map(this.d.roots().map((r) => [r.pid, r.agentId]));
     const ownerOf = (pid: number): string | null => {
@@ -312,13 +318,15 @@ export class HeavyJobLock {
       return null;
     };
     const busy = new Set<string>();
+    // The holders whose PTY root IS in this listing: only for them may an absence count as a miss.
+    const rootsSeen = new Set<string>(procs.flatMap((p) => { const a = rootOf.get(p.pid); return a ? [a] : []; }));
     for (const p of procs) {
       if (typeof p.createdMs !== 'number') continue;
       const a = ownerOf(p.pid);
       const h = a ? this.holders.get(a) : undefined;
       if (h && p.createdMs >= h.since - HEAVY_CREATED_SKEW_MS) busy.add(h.agentId);
     }
-    return busy;
+    return { busy, seen: rootsSeen };
   }
 
   /** The holder's PTY exited: its jobs are gone with it. */
@@ -356,12 +364,14 @@ export class HeavyJobLock {
     // once the holder is at least one scan interval old (its job has had time to start).
     const held = [...this.holders.values()];
     if (!held.length || !this.d.probe || !this.d.roots) return;
-    const busy = await this.heavyAgents();
-    if (!busy) return;
+    const probed = await this.heavyAgents();
+    if (!probed) return;   // Jim MF4: unknown, not a miss
+    const { busy, seen } = probed;
     const t = this.now();
     for (const h of held) {
       if (!this.holders.has(h.agentId)) continue;
       if (busy.has(h.agentId)) { h.misses = 0; h.seenRunning = true; continue; }
+      if (!seen.has(h.agentId)) continue;   // its PTY root is not in the listing: unknown, not a miss
       h.seenRunning = false;
       if (t - h.touched < HEAVY_SCAN_MS) continue;
       h.misses++;
@@ -374,16 +384,25 @@ export class HeavyJobLock {
   private log(row: Record<string, unknown>): void { try { this.d.log?.(row); } catch { /* best effort */ } }
 }
 
-/** The default process listing: one hidden, non-interactive PowerShell CIM query (Windows only). */
-export function probeProcesses(): Promise<ProcRow[]> {
-  if (process.platform !== 'win32') return Promise.resolve([]);
-  // CreationDate as epoch ms (PowerShell 5.1 serialises a DateTime as /Date(...)/, so convert here).
-  const script = "Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId,CommandLine,@{n='CreatedMs';e={ if ($_.CreationDate) { [int64](($_.CreationDate.ToUniversalTime() - [datetime]'1970-01-01').TotalMilliseconds) } else { $null } }} | ConvertTo-Json -Compress";
-  return new Promise((resolve) => execFile('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', script], { windowsHide: true, timeout: 10_000, maxBuffer: 16 * 1024 * 1024 }, (err, stdout) => {
-    if (err || !stdout.trim()) return resolve([]);
-    try {
-      const rows = JSON.parse(stdout) as Array<{ ProcessId: number; ParentProcessId: number; CommandLine: string | null; CreatedMs: number | null }>;
-      resolve((Array.isArray(rows) ? rows : [rows]).filter((r) => r && Number.isInteger(r.ProcessId)).map((r) => ({ pid: r.ProcessId, parentPid: r.ParentProcessId, commandLine: r.CommandLine ?? '', ...(typeof r.CreatedMs === 'number' ? { createdMs: r.CreatedMs } : {}) })));
-    } catch { resolve([]); }
+/** The listing script: one hidden, non-interactive PowerShell CIM query. CreationDate goes out as
+ *  epoch ms under the `CreatedMs` alias (PowerShell 5.1 would serialise a DateTime as /Date(...)/). */
+export const PROCESS_LISTING_SCRIPT = "Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId,CommandLine,@{n='CreatedMs';e={ if ($_.CreationDate) { [int64](($_.CreationDate.ToUniversalTime() - [datetime]'1970-01-01').TotalMilliseconds) } else { $null } }} | ConvertTo-Json -Compress";
+
+/** Parse the listing's ConvertTo-Json output (an array, or one bare object). null = unusable
+ *  (empty, unparseable, or no row carries a numeric CreatedMs): the watcher then counts no miss. */
+export function parseProcessListing(stdout: string): ProcRow[] | null {
+  if (!stdout || !stdout.trim()) return null;
+  let raw: unknown;
+  try { raw = JSON.parse(stdout); } catch { return null; }
+  const rows = (Array.isArray(raw) ? raw : [raw]) as Array<{ ProcessId?: unknown; ParentProcessId?: unknown; CommandLine?: unknown; CreatedMs?: unknown } | null>;
+  const out = rows.filter((r) => r && Number.isInteger(r.ProcessId)).map((r) => ({ pid: r!.ProcessId as number, parentPid: Number(r!.ParentProcessId), commandLine: typeof r!.CommandLine === 'string' ? r!.CommandLine : '', ...(typeof r!.CreatedMs === 'number' ? { createdMs: r!.CreatedMs } : {}) }));
+  return out.length && out.some((p) => typeof p.createdMs === 'number') ? out : null;
+}
+
+/** The default process listing (Windows only; null when it fails or times out). */
+export function probeProcesses(): Promise<ProcRow[] | null> {
+  if (process.platform !== 'win32') return Promise.resolve(null);
+  return new Promise((resolve) => execFile('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', PROCESS_LISTING_SCRIPT], { windowsHide: true, timeout: 10_000, maxBuffer: 16 * 1024 * 1024 }, (err, stdout) => {
+    resolve(err ? null : parseProcessListing(String(stdout)));
   }));
 }

@@ -375,3 +375,75 @@ test('MF3: the real listing carries CreationDate as epoch ms (hidden PowerShell,
   assert.match(src, /windowsHide: true/);
   assert.ok(!/classifyCommand\(p\.commandLine\)/.test(src), 'the watcher no longer classifies command lines');
 });
+
+// ── Jim re-check MF4: a failed listing is UNKNOWN (never a miss); the real listing text is parsed ──
+
+const { parseProcessListing, probeProcesses, PROCESS_LISTING_SCRIPT, HEAVY_CREATED_SKEW_MS } = loadTs('src/main/heavyJob.ts');
+
+// Real ConvertTo-Json -Compress output of the listing script, captured on this machine (2 rows).
+const REAL_LISTING = String.raw`[{"ProcessId":4,"ParentProcessId":0,"CommandLine":null,"CreatedMs":1790281982958},{"ProcessId":3648,"ParentProcessId":4748,"CommandLine":"C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe -NoProfile -NonInteractive -Command \"Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId,CommandLine,@{n=\u0027CreatedMs\u0027;e={ 1 }} | ConvertTo-Json -Compress\"","CreatedMs":1790448092922}]`;
+
+test('MF4 parser: the REAL listing text parses to rows WITH createdMs (the CreatedMs alias is what the parser reads)', () => {
+  const rows = parseProcessListing(REAL_LISTING);
+  assert.equal(rows.length, 2);
+  assert.deepEqual(rows[0], { pid: 4, parentPid: 0, commandLine: '', createdMs: 1790281982958 });
+  assert.equal(rows[1].pid, 3648); assert.equal(rows[1].parentPid, 4748); assert.equal(rows[1].createdMs, 1790448092922);
+  assert.match(rows[1].commandLine, /^C:\\Windows\\System32\\WindowsPowerShell/);
+  // one bare object (a one-process listing) is a row too
+  assert.deepEqual(parseProcessListing('{"ProcessId":7,"ParentProcessId":1,"CommandLine":"x","CreatedMs":5}'), [{ pid: 7, parentPid: 1, commandLine: 'x', createdMs: 5 }]);
+  // the script emits exactly the alias the parser reads (Jim X5: a broken alias must fail a test)
+  assert.ok(PROCESS_LISTING_SCRIPT.includes("@{n='CreatedMs';e={"), 'the script aliases CreationDate as CreatedMs');
+  assert.ok(PROCESS_LISTING_SCRIPT.includes('ConvertTo-Json -Compress'));
+});
+
+test('MF4 parser: an empty, unparseable or CreatedMs-less listing is UNUSABLE (null), never an empty "nothing runs" list', () => {
+  for (const bad of ['', '   ', 'Get-CimInstance : Access denied', '[{"ProcessId":4', 'null', '[]', String.raw`[{"ProcessId":4,"ParentProcessId":0,"CommandLine":null,"Created":1}]`]) assert.equal(parseProcessListing(bad), null, JSON.stringify(bad));
+});
+
+test('MF4: a FAILED, timed-out, empty or CreatedMs-less listing counts NO miss (logged probe-failed); the slot survives any number of them', async () => {
+  const good = [{ pid: 10, parentPid: 1, commandLine: 'claude.exe', createdMs: 1 }];
+  for (const [name, probe] of [['null (error / timeout)', async () => null], ['throws', async () => { throw new Error('boom'); }], ['empty', async () => []], ['no createdMs', async () => [{ pid: 10, parentPid: 1, commandLine: 'claude.exe' }]]]) {
+    const x = lock(1, { roots: () => [{ agentId: 'a', pid: 10 }], probe });
+    x.l.acquire('a', H, 'npm ci', 'c', true);
+    x.tick(HEAVY_SCAN_MS);
+    for (let i = 0; i < HEAVY_SCAN_MISSES + 3; i++) await x.l.scan();
+    assert.equal(x.l.snapshot().length, 1, `${name}: unknown is not a miss`);
+    assert.ok(x.logs.some((r) => r.action === 'probe-failed'), name);
+  }
+  // control: a good listing with no new descendant DOES free it
+  const y = lock(1, { roots: () => [{ agentId: 'a', pid: 10 }], probe: async () => good });
+  y.l.acquire('a', H, 'npm ci', 'c', true);
+  y.tick(HEAVY_SCAN_MS);
+  for (let i = 0; i < HEAVY_SCAN_MISSES; i++) await y.l.scan();
+  assert.equal(y.l.snapshot().length, 0);
+});
+
+test('MF4: a listing that does not contain the holder\'s PTY root counts no miss for THAT holder (another holder in it still can)', async () => {
+  const procs = [{ pid: 20, parentPid: 1, commandLine: 'claude.exe', createdMs: 1 }];
+  const x = lock(2, { roots: () => [{ agentId: 'a', pid: 10 }, { agentId: 'b', pid: 20 }], probe: async () => procs });
+  x.l.acquire('a', H, 'npm ci', 'c', true);
+  x.l.acquire('b', H, 'npm ci', 'd', true);
+  x.tick(HEAVY_SCAN_MS);
+  for (let i = 0; i < HEAVY_SCAN_MISSES + 2; i++) await x.l.scan();
+  assert.deepEqual(x.l.snapshot().map((h) => h.agentId), ['a'], 'a: root absent = unknown; b: root present, nothing new = freed');
+});
+
+test('Jim X2: the creation-time skew is exactly 2 s (created 2 s before the acquire counts, 2 s + 1 ms does not)', async () => {
+  assert.equal(HEAVY_CREATED_SKEW_MS, 2_000);
+  for (const [created, kept] of [[1_000_000 - 2_000, true], [1_000_000 - 2_001, false]]) {
+    const x = lock(1, { roots: () => [{ agentId: 'a', pid: 10 }], probe: async () => [{ pid: 10, parentPid: 1, commandLine: 'claude.exe', createdMs: 1 }, { pid: 11, parentPid: 10, commandLine: 'x', createdMs: created }] });
+    x.l.acquire('a', H, 'npm ci', 'c', true);   // since = 1_000_000
+    x.tick(HEAVY_SCAN_MS);
+    for (let i = 0; i < HEAVY_SCAN_MISSES; i++) await x.l.scan();
+    assert.equal(x.l.snapshot().length, kept ? 1 : 0, `created ${created}`);
+  }
+});
+
+test('MF4 LIVE (Windows): the real hidden listing returns this node process with its CreatedMs', { skip: process.platform !== 'win32' }, async () => {
+  const rows = await probeProcesses();
+  assert.ok(Array.isArray(rows) && rows.length > 10, 'a usable listing');
+  const me = rows.find((r) => r.pid === process.pid);
+  assert.ok(me, 'this process is listed');
+  assert.equal(typeof me.createdMs, 'number', 'the CreatedMs alias reaches the parser');
+  assert.ok(Math.abs(me.createdMs - (Date.now() - process.uptime() * 1000)) < 10_000, 'the same clock');
+});
