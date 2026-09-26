@@ -56,10 +56,15 @@ function parseArgs(argv) {
   if (i >= a.length) return out;
   out.cmd = a[i++];
   const positional = [];
+  let optionsDone = false;
   while (i < a.length) {
     const t = a[i];
+    // argparse's rules, so the same argv means the same thing to both engines: `--` ends the
+    // options, and a dash-led token that contains whitespace is positional text (an agent's
+    // quoted query like "--format json --session-id <uuid>"), not an option.
+    if (!optionsDone && t === '--') { optionsDone = true; i += 1; continue; }
     const eq = t.indexOf('=');
-    const flag = t.startsWith('--') ? (eq > 0 ? t.slice(0, eq) : t) : null;
+    const flag = !optionsDone && t.startsWith('--') && !/\s/.test(t) ? (eq > 0 ? t.slice(0, eq) : t) : null;
     const val = () => (eq > 0 ? t.slice(eq + 1) : take(i, flag));
     const step = () => (eq > 0 ? 1 : 2);
     if (flag === '--wing' || flag === '--room' || flag === '--since' || flag === '--before') { out.args[flag.slice(2)] = val(); i += step(); continue; }

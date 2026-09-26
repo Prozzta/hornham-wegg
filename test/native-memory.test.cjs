@@ -606,3 +606,12 @@ test('SMOKE / BENCH FLAGS are inert unless passed: no flag -> null; index.ts red
   assert.match(idx, /const memoryBenchDir = benchTarget\(process\.argv\);\r?\nif \(memorySmokeOut \|\| memoryBenchDir\) \{/, 'userData is redirected only when a flag is present');
   assert.match(idx, /app\.whenReady\(\)\.then\(\(\) => \{\r?\n  if \(memoryBenchDir\) \{/, 'the bench branch runs only with the flag');
 });
+
+test('SHIM parseArgs follows argparse (the legacy CLI): a dash-led token with whitespace is query text; `--` ends options; an unknown bare option is still unsupported (exit 2, as legacy)', () => {
+  const { parseArgs } = loadShim(() => ({}));
+  assert.equal(parseArgs(['search', '--format json --session-id <uuid>']).args.query, '--format json --session-id <uuid>');
+  assert.deepEqual(parseArgs(['search', '--format json --session-id <uuid>']).rest, []);
+  assert.equal(parseArgs(['search', '--', '--wing']).args.query, '--wing');
+  assert.equal(parseArgs(['search', '--', '--wing']).args.wing, undefined);
+  assert.deepEqual(parseArgs(['search', '--native-memory-smoke=']).rest, ['--native-memory-smoke='], 'unknown option: rejected, as argparse does');
+});

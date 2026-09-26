@@ -16,11 +16,12 @@ import { compactionDecision, NativeMemoryStore, type SearchHit } from './store';
 import { formatSearch, formatStatus, formatWakeUp, WAKE_MAX_CHARS } from './format';
 
 export const PRIORITY = { search: 0, wake: 1, status: 1, ingest: 2, backfill: 3, compact: 4 } as const;
-/** Chunks embedded per queue step before yielding (spec section 3: <= 8). 4, not 8: a search that
- *  arrives mid-backfill waits for at most one step, and measured with the shipped worker on the
- *  full hive copy an 8-chunk step (~190 ms) put that wait's p95 at 255 ms, over the 250 ms warm
- *  search deadline. */
-export const EMBED_BATCH = 4;
+/** Chunks embedded per queue step before yielding (spec section 3: <= 8). ONE: a search that
+ *  arrives mid-backfill waits for at most one step. Measured with the shipped worker on the full
+ *  hive copy, an 8-chunk step put the engine-side wait's p95 at 255 ms and a 4-chunk step (~100 ms)
+ *  still put the END-TO-END p95 during a backfill at 304 ms (the shim's own start is ~110-150 ms),
+ *  over the Human's 250 ms speed gate. A 1-chunk step is ~25 ms. */
+export const EMBED_BATCH = 1;
 /** A source changed on disk is ingested this long after its LAST change (spec: >= 2 s). */
 export const SOURCE_DEBOUNCE_MS = 2_000;
 /** Drop the model after this long without an embed (Jim R2: idle unload). */
