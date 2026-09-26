@@ -55,7 +55,11 @@ export default defineConfig({
     define: defineMain,
     build: {
       rollupOptions: {
-        input: { index: resolve(__dirname, 'src/main/index.ts') }
+        input: {
+          index: resolve(__dirname, 'src/main/index.ts'),
+          // NATIVE-MEMORY: the utility-process entry (forked lazily by main).
+          memoryWorker: resolve(__dirname, 'src/main/nativeMemory/worker.ts')
+        }
       }
     }
   },
