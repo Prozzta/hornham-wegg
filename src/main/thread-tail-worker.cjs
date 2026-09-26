@@ -6,10 +6,12 @@ const { existsSync, openSync, closeSync, readSync, readdirSync, statSync } = req
 const { join } = require('node:path');
 
 const CHUNK_BYTES = 64 * 1024;
+const CATCHUP_BYTES_PER_TICK = 1 * 1024 * 1024;
 const ROLLOUT_RESCAN_MS = 5_000;
 let source = null;
 const cursors = new Map();
 let rolloutCache = { home: '', file: null, scannedAt: 0 };
+let catchupBytes = 0;
 
 function newestRollout(codexHome) {
   const now = Date.now();
@@ -57,6 +59,10 @@ function tailOnce() {
   for (let i = 0; i < complete.length; i += 256) {
     parentPort.postMessage({ type: 'lines', agentId: source.agentId, provider: source.provider, lines: complete.slice(i, i + 256), batchMs: performance.now() - startedAt });
   }
+  catchupBytes += length;
+  // Drain a busy source promptly, but yield after 1 MiB so the worker never
+  // monopolises its event loop. The next 500 ms tick continues any remainder.
+  if (info.size > offset + length && catchupBytes < CATCHUP_BYTES_PER_TICK) setImmediate(tailOnce);
 }
 
 parentPort.on('message', (message) => {
@@ -64,10 +70,10 @@ parentPort.on('message', (message) => {
   // The production owner only sends `source`. `poll` makes the same bounded
   // tail operation directly measurable in the opt-in release-scale harness;
   // it never changes the selected source or bypasses its cursor semantics.
-  if (message.type === 'poll') { tailOnce(); return; }
+  if (message.type === 'poll') { catchupBytes = 0; tailOnce(); return; }
   if (message.type !== 'source') return;
   source = message.source && typeof message.source.agentId === 'string' ? message.source : null;
-  cursors.clear();
+  cursors.clear(); catchupBytes = 0;
   tailOnce();
 });
-setInterval(tailOnce, 500).unref();
+setInterval(() => { catchupBytes = 0; tailOnce(); }, 500).unref();

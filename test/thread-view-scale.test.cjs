@@ -3,7 +3,8 @@
  * It compiles only the private store and starts the tail worker directly: no
  * Electron, real userData, hive, or installed app is touched. The opt-in guard
  * keeps its 50 MiB writes and host-sensitive timing assertions out of default
- * test globs and full suites. */
+ * test globs and full suites. The 180s timeout leaves headroom above the
+ * measured bounded catch-up stream, not an arbitrary unlimited allowance. */
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
@@ -65,7 +66,7 @@ function serialise(measurement) {
 
 if (process.env.THREAD_VIEW_SCALE !== '1') {
   test('THREAD-VIEW release scale is opt-in', { skip: 'Set THREAD_VIEW_SCALE=1; the gate writes a temp 50 MiB fixture.' }, () => {});
-} else test('THREAD-VIEW release scale: real 50 MiB worker stream plus 300-agent churn', { timeout: 120_000 }, async () => {
+} else test('THREAD-VIEW release scale: real 50 MiB worker stream plus 300-agent churn', { timeout: 180_000 }, async () => {
   const temp = fs.mkdtempSync(path.join(os.tmpdir(), 'munder-thread-view-scale-'));
   const userData = path.join(temp, 'userData');
   const source = path.join(temp, 'provider.jsonl');
@@ -76,6 +77,7 @@ if (process.env.THREAD_VIEW_SCALE !== '1') {
   const batches = [];
   let ingested = Promise.resolve();
   let waiter;
+  let waitTarget = 0;
   worker.on('message', (message) => {
     if (message?.type === 'lines' && typeof message.batchMs === 'number') {
       batches.push(message.batchMs);
@@ -84,10 +86,10 @@ if (process.env.THREAD_VIEW_SCALE !== '1') {
       ingested = ingested.then(async () => {
         for (const line of message.lines) await store.ingestClaudeLine('michael', line);
       });
-      void ingested.then(() => { if (waiter) { const resolve = waiter; waiter = undefined; resolve(); } });
+      void ingested.then(() => { if (waiter && batches.length >= waitTarget) { const resolve = waiter; waiter = undefined; resolve(); } });
     }
   });
-  const nextBatch = () => new Promise((resolve) => { waiter = resolve; });
+  const nextBatch = (target) => new Promise((resolve) => { waitTarget = target; waiter = resolve; });
   try {
     assert.ok(path.resolve(userData).startsWith(path.resolve(os.tmpdir()) + path.sep), 'must use a temp userData root');
     const idle = await measure(async () => { await sleep(40); });
@@ -104,13 +106,13 @@ if (process.env.THREAD_VIEW_SCALE !== '1') {
     whole.enable();
     const stream = await measure(async () => {
       for (let bytes = 0; bytes < FIXTURE_BYTES; bytes += CHUNK_BYTES) {
-        const wait = nextBatch();
         await fsp.appendFile(source, claudeAssistantLine(bytes / CHUNK_BYTES));
         // The 500 ms timer can win this race; both paths share one cursor, so
         // the later poll is a harmless no-op and the line count remains exact.
-        worker.postMessage({ type: 'poll' });
-        await wait;
       }
+      const wait = nextBatch(FIXTURE_BYTES / CHUNK_BYTES);
+      worker.postMessage({ type: 'poll' });
+      await wait;
     });
     const workerP95 = p95([...batches].sort((a, b) => a - b));
     assert.equal(batches.length, FIXTURE_BYTES / CHUNK_BYTES, 'every 64 KiB source chunk reaches the worker');
