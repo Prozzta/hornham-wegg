@@ -892,6 +892,12 @@ function teardownPty(id: string): void {
     if (leftProvider === 'antigravity' && ![...ptyProvider.values()].includes('antigravity')) {
       try { hive.agyAgentsGone(); } catch (e) { console.error('[hive] agyAgentsGone failed:', e); }
     }
+    // AGY-STARTUP-TURN: the agent left the floor (killed or archived): remove its agy custom
+    // agent, unless another PTY of the same agent is still alive (a restart in place spawns
+    // the new one first, and agy may re-read its customizations mid-session).
+    if (leftProvider === 'antigravity' && ![...ptyToAgent.values()].includes(agentId)) {
+      try { hive.removeAgyAgent(agentId); } catch (e) { console.error('[hive] removeAgyAgent failed:', e); }
+    }
     // Drop watchdog state so a dead agent can't get nudged or leak its grace.
     try { workerWake.forget(agentId, id); } catch { /* best-effort */ }
     try { forgetWakeRows(wakeRows, agentId); } catch { /* best-effort */ }
@@ -3538,6 +3544,9 @@ async function spawnAgentCore(opts: AgentSpawnOptions, owner: Electron.WebConten
         if (typedSid) resumeNotFound = true;
       } else {
         if (ownerHome !== myHome) opts.env = { ...(opts.env ?? {}), CODEX_HOME: ownerHome };
+        // N1 (AGY-STARTUP-TURN, Codex): a resume under ANOTHER agent's CODEX_HOME carries THIS
+        // agent's own developer_instructions with -c (the owner's config.toml holds the owner's).
+        opts.args = HiveManager.codexResumeArgs(opts.args ?? [], myHome, ownerHome);
         const args = opts.args ?? [];
         // Positional order matters: `codex resume [OPTIONS] [SESSION_ID] [PROMPT]`.
         // The hive identity prompt rides in `args` as a POSITIONAL (codex has no
@@ -6025,6 +6034,9 @@ function bootstrapHiveServices(): void {
   // the last AGY agent leaves. Startup only gives back a lease a dead run left behind.
   // After hookServer.start(), so a locator always names a listening pipe. Stable only.
   hive.startAgyStatusline();
+  // AGY-STARTUP-TURN N5: remove our agy custom agents a crashed run left behind (agents no longer
+  // on the floor). Before any spawn; gated like every global write; only our marked files.
+  try { hive.sweepAgyAgents(); } catch (e) { console.error('[hive] sweepAgyAgents failed:', e); }
   // Bind the telemetry collector BEFORE the renderer spawns any agent, then point
   // the hive at it so every subsequent spawn is instrumented. Best-effort — a bind
   // failure just leaves telemetry off (transcript reconciler stays). No breaker.start():

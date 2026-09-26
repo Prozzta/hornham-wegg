@@ -1049,6 +1049,8 @@ export class HiveManager {
       // the global auth.json is still linked into that home — see installCodexHooks
       // and F1. Under MUNDER_DEV=1 it is not.) Both share the HIVE_SOCK wiring below.
       const preArgs: string[] = [];
+      // Codex: set when the protocol went into its developer_instructions (no positional prompt).
+      let developerInstructionsSet = false;
       // Dispatch on the structured bridge descriptor (the foundation's `bridgeOf`
       // derives {kind:'hooks'} from the legacy `hookBridge` for agy/codex, and
       // returns the explicit {kind:'proxy'} for qwen). Two ways a hookless CLI
@@ -1075,10 +1077,11 @@ export class HiveManager {
               this.reconcileAgyStatusline();
             }
             else if (desc.shim === 'codex') {
-              const codex = this.installCodexHooks(dir, meta.id);
+              const codex = this.installCodexHooks(dir, meta.id, preset.systemPromptChannel === 'codex-developer-instructions' ? prompt : null);
               // F1 fail-closed: provisioning refused, so this agent must not start.
               if (codex.refusal) return { args: [], env: {}, refusal: codex.refusal };
               env.CODEX_HOME = codex.home;
+              if (codex.developerInstructions) developerInstructionsSet = true;
               // Codex refuses to run hooks from a config dir without persisted
               // "hook trust" (normally an interactive gate). Our hooks.json is
               // hive-authored inside an isolated CODEX_HOME, so we bypass that gate
@@ -1158,6 +1161,17 @@ export class HiveManager {
       // type-into-tui (Crush): the bare TUI reads a positional as a Cobra subcommand
       // → `Unknown command`. So DROP the positional and hand the protocol back as
       // seedPrompt; the renderer types it into the TUI after boot (ondev-b).
+      // AGY-STARTUP-TURN: agy's real system channel. The protocol becomes the SYSTEM prompt of
+      // a per-agent custom agent, and agy starts with NO initial prompt, so it comes up idle
+      // (an `-i` prompt is a first USER turn, which AGY runs as a task). Refused (dev build,
+      // not the live hive) or failed: the initial-prompt path below, as before.
+      if (preset.systemPromptChannel === 'agy-custom-agent') {
+        const agent = this.installAgyAgent(meta, prompt);
+        if (agent) return { args: [...preArgs, '--agent', agent], env };
+      }
+      // Codex: the protocol is already its developer_instructions (installCodexHooks), so NO
+      // positional prompt: `codex` (and `codex resume <sid>`) start without a user turn.
+      if (developerInstructionsSet) return { args: [...preArgs], env };
       if (preset.seedDelivery === 'type-into-tui') return { args: [...preArgs], env, seedPrompt: prompt };
       // If a provider somehow exposes neither a flag nor a positional prompt, spawn bare.
       if (flag) return { args: [...preArgs, flag, prompt], env };
@@ -2445,6 +2459,117 @@ export class HiveManager {
    *  Runtime-scoped by AGENT_ID (the shim no-ops for non-hive agy sessions), so
    *  this global config never disturbs the user's own `agy` usage. Best-effort,
    *  idempotent (only our own group is overwritten). */
+  /** AGY-STARTUP-TURN: the per-agent agy custom agent's name (agy selects it by NAME). */
+  static agyAgentName(agentId: string): string {
+    // N6 (Jim): the name must identify ONE agent. A hive id is normally already [a-z0-9-]
+    // (identity); any other id gets a short hash suffix, so two ids that sanitise alike
+    // ("A_b", "a-b") never share one agent.md.
+    const base = agentId.toLowerCase().replace(/[^a-z0-9-]/g, '-');
+    if (base === agentId && base.length <= 56) return `munder-${base}`;
+    return `munder-${base.slice(0, 48)}-${createHash('sha256').update(agentId).digest('hex').slice(0, 8)}`;
+  }
+
+  /** N5 (Jim): at startup, remove OUR agy agents (marked) whose hive agent is not on the floor
+   *  any more (not registered, or archived): leftovers of a crash, where no PTY teardown ran.
+   *  Someone else's agent under a munder- name is never touched. Gated like every global write. */
+  sweepAgyAgents(): number {
+    if (!this.mayWriteGlobalConfig('Antigravity agent sweep')) return 0;
+    const dir = join(homedir(), '.gemini', 'config', 'agents');
+    const live = new Set(Object.entries(this.registry().agents).filter(([, a]) => !a.archived).map(([id]) => HiveManager.agyAgentName(id)));
+    let removed = 0;
+    let names: string[] = [];
+    try { names = readdirSync(dir).filter((n) => n.startsWith('munder-')); } catch { return 0; }
+    for (const n of names) {
+      if (live.has(n)) continue;
+      try {
+        const f = join(dir, n, 'agent.md');
+        if (!readFileSync(f, 'utf8').includes(HiveManager.AGY_AGENT_MARK)) continue;
+        rmSync(join(dir, n), { recursive: true, force: true });
+        removed++;
+      } catch { /* not ours / unreadable: leave it */ }
+    }
+    return removed;
+  }
+
+  /** The line that marks an agent.md as ours: only such a file is ever rewritten or removed. */
+  static readonly AGY_AGENT_MARK = 'Written by the Munder Difflin app';
+
+  private agyAgentDir(agentId: string): string {
+    return join(homedir(), '.gemini', 'config', 'agents', HiveManager.agyAgentName(agentId));
+  }
+
+  /** The agent.md for one hive agent: YAML frontmatter + ONE H1 whose body is the hive protocol
+   *  (agy's system prompt for this agent). Shape confirmed on the live CLI (AGY probe,
+   *  2026-09-26): discovered at ~/.gemini/config/agents/<name>/agent.md, selected with
+   *  `--agent <name>`, the body applied as instructions, no turn at start, the global hooks still
+   *  fire, and `--conversation` resume keeps it. Strings are JSON-quoted (valid YAML), and a
+   *  prompt line that starts with `#` is escaped so it cannot open a second section. */
+  static agyAgentMarkdown(meta: { id: string; name: string }, prompt: string): string {
+    const name = HiveManager.agyAgentName(meta.id);
+    return [
+      '---',
+      `name: ${name}`, // [a-z0-9-] only: plain YAML, exactly the probe-verified form
+      `description: ${JSON.stringify(`Munder Difflin hive agent ${meta.name} (${meta.id}): its standing hive instructions. ${HiveManager.AGY_AGENT_MARK}; removed when the agent leaves the floor.`)}`,
+      'mainAgent: true',
+      'inheritCustomizations: true',
+      // V1 (Jim; verified in a jailed agy HOME): without this, the agent is offered as a
+      // SUBAGENT in the user's own plain `agy` sessions. With it, only `--agent` selects it.
+      'subagent: false',
+      // Kept out of the user's /agents panel (harmless to --agent selection, verified).
+      'hidden: true',
+      '---',
+      '',
+      `# ${meta.name} (${meta.id}), a Munder Difflin hive agent`,
+      '',
+      prompt.replace(/^#/gm, '\\#'),
+      ''
+    ].join('\n');
+  }
+
+  /** Write (or refresh) this agent's agy custom agent and return its name, or null when the
+   *  global write is refused or fails (the caller then falls back to `-i`). Global config, so
+   *  it goes through `mayWriteGlobalConfig`. Rewritten only when the content changed (a new
+   *  prompt: another version, a renamed agent), via a temp file + rename. */
+  private installAgyAgent(meta: { id: string; name: string }, prompt: string): string | null {
+    if (!this.mayWriteGlobalConfig('Antigravity agent')) return null;
+    const dir = this.agyAgentDir(meta.id);
+    const file = join(dir, 'agent.md');
+    const body = HiveManager.agyAgentMarkdown(meta, prompt);
+    try {
+      if (existsSync(file)) {
+        const cur = readFileSync(file, 'utf8');
+        if (cur === body) return HiveManager.agyAgentName(meta.id);
+        // Someone else's agent under our name: never overwrite it.
+        if (!cur.includes(HiveManager.AGY_AGENT_MARK)) {
+          console.warn(`[hive] ${file} exists and is not ours: agy falls back to an initial prompt`);
+          return null;
+        }
+      }
+      mkdirSync(dir, { recursive: true });
+      writeFileSync(`${file}.tmp`, body, 'utf8');
+      renameSync(`${file}.tmp`, file);
+      return HiveManager.agyAgentName(meta.id);
+    } catch (e) {
+      console.error('[hive] installAgyAgent failed:', e);
+      return null;
+    }
+  }
+
+  /** Remove this agent's agy custom agent when it leaves the floor (killed or archived), so
+   *  they do not pile up in the user's `agy agents`. Only a file we wrote is removed. */
+  removeAgyAgent(agentId: string): void {
+    if (!this.mayWriteGlobalConfig('Antigravity agent removal')) return;
+    const dir = this.agyAgentDir(agentId);
+    const file = join(dir, 'agent.md');
+    try {
+      if (!existsSync(file)) return;
+      if (!readFileSync(file, 'utf8').includes(HiveManager.AGY_AGENT_MARK)) return;
+      rmSync(dir, { recursive: true, force: true });
+    } catch (e) {
+      console.error('[hive] removeAgyAgent failed:', e);
+    }
+  }
+
   private installAgyHooks(): void {
     const root = this.root();
     if (!root) return;
@@ -2727,7 +2852,65 @@ export class HiveManager {
    *
    *  Returns the CODEX_HOME path for the caller to put in the worker's env, or a
    *  refusal the caller must honour. */
-  private installCodexHooks(dir: string, agentId?: string): { home: string; refusal?: string } {
+  /** AGY-STARTUP-TURN (Codex): put `developer_instructions` at the TOP of a Codex config (a
+   *  top-level TOML key must precede the first [table]). A single-line top-level
+   *  `developer_instructions` already in the user's seed is replaced (a second one would be a
+   *  duplicate key, and Codex would refuse to start); a multi-line one cannot be replaced
+   *  safely, so null (the caller keeps the positional prompt). The value is a TOML basic string
+   *  (JSON's escapes are valid TOML). */
+  static withCodexDeveloperInstructions(config: string, text: string): string | null {
+    // N3 (Jim): the key may be written bare or quoted ("developer_instructions" / '...').
+    const KEY = /^\s*(["']?)developer_instructions\1\s*=\s*/;
+    const lines = config.split(/\r?\n/);
+    // N2 (Jim): anything that can REPLACE or OVERRIDE our instructions makes the top-level key
+    // unreliable, so keep the positional prompt: a model_instructions_file (or its old name),
+    // or developer_instructions inside any table (a profile, possibly the default one).
+    if (lines.some((l) => /^\s*(["']?)(model_instructions_file|experimental_instructions_file)\1\s*=/.test(l))) return null;
+    const firstTable = lines.findIndex((l) => /^\s*\[/.test(l));
+    const topEnd = firstTable < 0 ? lines.length : firstTable;
+    if (lines.some((l, i) => i >= topEnd && KEY.test(l))) return null;
+    const kept: string[] = [];
+    for (let i = 0; i < lines.length; i++) {
+      if (i < topEnd && KEY.test(lines[i])) {
+        const v = lines[i].replace(KEY, '');
+        // Multi-line strings (''' or """) cannot be removed line-wise with certainty.
+        if (/^('''|""")/.test(v)) return null;
+        continue;
+      }
+      kept.push(lines[i]);
+    }
+    return `# --- munder-hive: this agent's standing hive instructions (auto-generated; do not edit) ---\ndeveloper_instructions = ${HiveManager.tomlString(text)}\n\n${kept.join('\n')}`;
+  }
+
+  /** A TOML basic string. JSON's escapes are valid TOML, but JSON leaves U+007F (DEL) raw, and
+   *  TOML forbids it unescaped (N4, Jim). */
+  static tomlString(text: string): string {
+    return JSON.stringify(text).replace(/\u007f/g, '\\u007F');
+  }
+
+  /** N1 (Jim): the args of a `codex resume` whose session lives in `ownerHome`. When that is
+   *  ANOTHER agent's CODEX_HOME, its config.toml carries the OWNER's developer_instructions, so
+   *  THIS agent's own are appended with `-c` (a -c override beats config.toml), and a cross-agent
+   *  resume never silently runs under another agent's identity. Unchanged otherwise, or when this
+   *  agent has none of ours (then its positional prompt still carries its identity). */
+  static codexResumeArgs(args: string[], myHome: string | undefined, ownerHome: string): string[] {
+    if (!myHome || ownerHome === myHome) return args;
+    let own: string | null = null;
+    try { own = HiveManager.ownCodexDeveloperInstructions(readFileSync(join(myHome, 'config.toml'), 'utf8')); } catch { own = null; }
+    return own ? [...args, '-c', `developer_instructions=${HiveManager.tomlString(own)}`] : args;
+  }
+
+  /** N1 (Jim): this agent's OWN developer instructions, read back from the line we write at the
+   *  top of its config.toml, or null. A resume that runs under ANOTHER agent's CODEX_HOME passes
+   *  them with `-c`, so it never silently takes that agent's identity. */
+  static ownCodexDeveloperInstructions(configText: string): string | null {
+    const m = /^# --- munder-hive: this agent's standing hive instructions[^\n]*\r?\ndeveloper_instructions = ("(?:[^"\\\r\n]|\\.)*")\s*$/m.exec(configText);
+    if (!m) return null;
+    try { return JSON.parse(m[1].replace(/\\u007F/g, '\\u007f')) as string; } catch { return null; }
+  }
+
+  private installCodexHooks(dir: string, agentId?: string, developerInstructions: string | null = null): { home: string; refusal?: string; developerInstructions?: boolean } {
+    let devSet = false;
     const home = join(dir, '.codex');
     try {
       mkdirSync(home, { recursive: true });
@@ -2822,9 +3005,14 @@ export class HiveManager {
           config += `\n[[hooks.${ev}]]\n[[hooks.${ev}.hooks]]\ntype = "command"\ncommand = '${this.nodeRunUnquoted(shim)}'\ntimeout = 30\n`;
         }
       }
+      if (developerInstructions) {
+        const withDev = HiveManager.withCodexDeveloperInstructions(config, developerInstructions);
+        if (withDev !== null) { config = withDev; devSet = true; }
+        else console.warn(`[hive] ${join(home, 'config.toml')}: the seed defines developer_instructions on several lines; Codex keeps the positional prompt`);
+      }
       writeFileSync(join(home, 'config.toml'), config, 'utf8');
-    } catch (e) { console.error('[hive] installCodexHooks failed:', e); }
-    return { home };
+    } catch (e) { console.error('[hive] installCodexHooks failed:', e); devSet = false; }
+    return { home, ...(devSet ? { developerInstructions: true } : {}) };
   }
 
   /** Pi (earendil-works) bridge. Pi has a rich `pi.on(event, …)` lifecycle but no
