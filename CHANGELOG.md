@@ -6,6 +6,195 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+> **The fork line.** From here up, entries are this fork's (Prozzta/hornham-wegg) independently
+> versioned 1.1.x releases, taken from their GitHub release notes. The fork is based on upstream
+> v0.4.5 (below). Earlier 1.1.x releases are described on the
+> [releases page](https://github.com/Prozzta/hornham-wegg/releases).
+
+## [1.1.55] — 2026-09-26
+
+**Agents hear about new mail mid-turn, take turns with the machine's heavy jobs, and the Human
+gets a Talk view of the conversation with Michael.** Wakes are more reliable, Antigravity
+agents start idle with their instructions, and the native memory engine (still shipped off)
+can answer `mempalace wake-up` too. Rollback: 1.1.54.
+
+### Added
+
+- **Talk: the Human's conversation with Michael as a conversation.** A view beside the terminal
+  that shows the Human's turns and Michael's replies (Claude and Codex), including the questions
+  Michael asks, with the terminal still one click away. Its history is private to the app (never
+  in the hive), capped at 8 MB per agent, restored newest first and read a page at a time; it
+  survives archiving an agent and is deleted only when the Human retires that agent, which the
+  close dialog says.
+- **Mail that arrives during a turn is announced during that turn.** When a message lands in an
+  agent's inbox while it is working, the agent is told at its next tool call (the sender, the
+  subject and the id, a handful at most), so it reads it before it sends or finishes rather than
+  after. A message can say which earlier message it **supersedes**, and the notice says so.
+- **One heavy job at a time, enforced by the app.** An install, a build, a packaging run, a full
+  test suite or a benchmark now takes a slot before it starts. When the slots are taken, the
+  agent is told who holds them and to carry on with light work. Settings → Autonomy & Budgets →
+  **Heavy jobs at once** (Off, or 1 to 8; default 1). A slot is freed when the job ends: the
+  tool's own end, a watcher that checks every 20 s for the job's processes, the agent's terminal
+  closing, or after 60 minutes at most. The holders are shown in `fleet.json`.
+- **Antigravity agents start idle, with their instructions.** Each AGY agent is launched as its
+  own custom agent carrying its hive instructions, and waits for work instead of starting a turn
+  on its own. Codex agents receive the same instructions as developer instructions.
+- **The native memory engine answers `mempalace wake-up`** (when it is on): the app warms the
+  engine shortly after start and waits a few seconds at most for the agent's own notes to be
+  indexed, rather than answering with nothing.
+
+### Fixed
+
+- **Wakes that stuck on a line that was never sent.** When a provider left our wake text sitting
+  unsent in its input box, the app now sends it, but only when it can prove the text is its own
+  and no one has typed since. A stale Codex "task complete" is no longer taken as proof that a
+  wake started.
+- **Wake text in a narrow terminal** that wraps over several lines is read correctly.
+
+### Unchanged
+
+- **The native memory engine still ships off** (legacy by default), and the palace is never
+  touched.
+
+## [1.1.54] — 2026-09-26
+
+**A built-in replacement for the MemPalace search that agents run. It ships off: after the
+update everything runs exactly as in 1.1.53, and it is turned on in stages.** Source `4854278b`;
+rollback: 1.1.53, or `fallback-legacy` inside 1.1.54.
+
+### Added
+
+- **A native memory engine inside the app.** One background worker, started only on the first
+  memory request, holds the engine:
+  - SQLite full-text and vector search;
+  - one bundled embedding model (all-MiniLM-L6-v2), pinned by SHA-256 and never downloaded.
+
+  It indexes each agent's `memory.md` and top-level notes into its own disposable file in the
+  app's data folder.
+- **A `mempalace` shim for agents,** with 4 modes set in `<hive>/memory-engine.json`:
+  - `legacy`: the default, and what a missing file means;
+  - `shadow`: the Python CLI still answers, and the engine gets a redacted comparison with no text;
+  - `native`: the engine answers, with no Python;
+  - `fallback-legacy`: an immediate emergency brake.
+- **A staged rollout:** legacy → shadow → a per-cohort quality gate on real shadow queries →
+  native. An opt-in, dated review window supports the labelling. Its file stays in the app's
+  data folder, never in the hive, and is deleted after labelling.
+- **Measured on frozen copies:**
+  - over 373 real queries, every cohort's 95% lower bound is above zero (overall NDCG@5 +20.7
+    points, recall@10 +32.5);
+  - end-to-end warm p95 is about 127 ms (cmd) and 166 ms (bash), against about 1,750 ms for the
+    Python CLI;
+  - the index is 10.6 MB, against an 80 MB palace.
+
+### Unchanged
+
+- **The palace is never touched.** The engine never opens or changes the MemPalace store, and
+  legacy mining is unchanged, so a rollback finds the palace current.
+- **MemPalace and its Python CLI are still required** until the cutover to `native`.
+
+## [1.1.53] — 2026-09-26
+
+**Cuts the antivirus load of every hive message: no hive git, a status line that starts no
+processes, and a log written without rescans. Also stops agents getting stuck "active".** Source
+`79ee6b91`; rollback: 1.1.52.
+
+### Changed
+
+- **The Claude status line starts no processes.** It used to launch about 4 processes on every
+  refresh. It is now a small script that Claude's own shell reads in, posting to the app over
+  local HTTP (3.9 → 0 processes, 199 → 55 ms). The gauge looks the same.
+- **No git in the hive.** The app no longer commits, initialises or maintains a git repository in
+  the hive folder (it was about 2 commits per message, each around 59 processes plus antivirus
+  scans). An existing `hive/.git` is left untouched.
+- **The log is written without rescans.** `log.jsonl` and `cost-ledger.jsonl` stay open instead
+  of being opened and closed for every row (at 74 MB each open was rescanned for about 0.4 s; a
+  row now costs about 0.01 ms). Both roll over at 8 MB; an existing oversize file is kept whole as
+  `*.legacy-*.jsonl` and never deleted. The wake machinery logs only changes: about 4.5 rows per
+  message instead of 27.
+
+### Fixed
+
+- **Agents no longer stuck "active".** A leftover AGY "running" status just after its Stop no
+  longer re-opens the turn, and an early "idle" is applied a moment later instead of being
+  dropped. A wake that was typed but never became a turn within 60 s (Codex) is announced once
+  more; nothing is typed twice, since unsent text still on the prompt holds the wake for a person.
+  Mail an agent was told about but left in its inbox is announced once more when it goes idle.
+
+### Added
+
+- **Ask Me cards.** An agent's question shows as a card with its options, the recommended one
+  marked, and the answer goes back to the agent.
+
+## [1.1.52] — 2026-09-26
+
+**Removes the freeze when agents message each other, fixes MemPalace's memory spikes and bloated
+palace, and starts far fewer processes for agent hooks.** Source `595dd3b5`; rollback: 1.1.51.
+
+### Fixed
+
+- **No freeze when a message moves between agents.** Every routed hive message ended in a
+  `git commit` on the app's main thread, which froze the app for 1.7–3 s each time. Commits now
+  run in the background (the freeze went from about 2.1 s to about 11 ms), and messages that
+  arrive close together share one commit.
+- **Less typing lag.** The Floor-tab dispatch box no longer redraws the whole dashboard on each
+  keystroke (−60% work per key). The private roster note is saved when you pause, click away,
+  close it or quit, so it is never lost.
+- **Codex agents return to idle.** The app reads Codex's own record of when a turn finished and
+  ignores late events from a turn that has already ended.
+- **MemPalace memory spikes.** A bloated palace (673 MB for about 30 MB of content) is rebuilt
+  from its own database, verified row for row, and swapped in; the old palace is kept as a backup
+  until a later launch. Mines are judged by the daemon's job state, so the ~850 MB daemon is no
+  longer restarted in a loop, and quitting mid-mine leaves nothing running. Every step is logged
+  to `log.jsonl`.
+- **AGY hooks actually run.** AGY had been rejecting the app's whole hook list over a format
+  detail, so AGY agents got no gate, no steer and no end-of-reply signal. Operator steers now
+  reach AGY on its documented injection point.
+
+### Changed
+
+- **Far fewer processes for agent hooks.** Claude hooks post to the app over local HTTP (about
+  1 ms, down from about 450 ms and two processes per hook). Codex tool hooks go through an in-app
+  endpoint, and AGY's after-tool and status-line hooks through a tiny batch file. If the listener
+  is down, agents fall back to the old hooks.
+
+## [1.1.51] — 2026-09-25
+
+**Fixes the Codex terminal reloads and the remaining lag that grew with activity.** Source
+`94753c4e`; rollback: 1.1.50.
+
+### Fixed
+
+- **Codex terminals no longer reload when you use the agent controls.** Codex replays its whole
+  history on any terminal resize. Confirmation notes, status text and the message-box header used
+  to grow and shrink next to the terminal; each click on stop / block tools / allow tools cost
+  two full replays. They now float or stay on one line, so the terminal's grid stays still.
+- **No more whole-app redraw per output line.** Agent updates that changed nothing re-rendered
+  the entire app. They are now skipped: renderer CPU −60% while watching a streaming agent, −55%
+  with 6 busy agents.
+- The open-terminal error no longer blocks the operator controls, and it clears after 4 s.
+
+### Changed
+
+- **Scrollback 100,000 → 10,000 lines per terminal.** Memory growth from Codex replays went from
+  +450 MB to +70 MB.
+
+## [1.1.50] — 2026-09-25
+
+**Fixes the renderer/GPU lag that remained after the 1.1.49 main-thread fix.** Source
+`eb214f33`; rollback: 1.1.49.
+
+### Fixed
+
+- **Office floor frame budget.** The floor redrew at the display's refresh rate (165 fps
+  measured) on a 2× canvas. It is now capped at 30 fps: idle renderer 40% → 10%, GPU 26% → 5% of
+  a core.
+- **No more Codex transcript replays on queued messages.** The pending-message list floats over
+  the terminal instead of resizing it, and pty resizes are coalesced: 11 messages to a busy agent
+  caused 27 replays before and 0 now.
+- **Batched terminal output.** Pty output reaches the renderer in a few messages instead of one
+  per ~170-byte chunk (a 3.26 MB burst: 20,683 messages → 197). Keystroke echo is still sent
+  immediately.
+
 ## [0.4.5] — 2026-08-22
 
 **The release that fixes the things you trusted and were quietly wrong.** Cost reporting was off
