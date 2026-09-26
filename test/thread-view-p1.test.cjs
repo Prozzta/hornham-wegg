@@ -44,6 +44,11 @@ test('Michael starts on Talk without terminal resize churn', () => {
   assert.match(talk, /onThreadEvent/);
   assert.doesNotMatch(talk, /setInterval\(load, 2000\)/, 'Talk must use normalized delta delivery, not history polling');
   assert.match(read('src/main/threadView.ts'), /this\.onAppend\?\.\(agentId, row\)/);
+  const main = read('src/main/index.ts');
+  assert.match(main, /new MessageChannelMain\(\)/, 'Talk deltas travel through a dedicated MessageChannel port');
+  assert.match(main, /new Worker\(join\(__dirname, 'thread-tail-worker\.cjs'\)\)/, 'provider file reads run outside main');
+  assert.doesNotMatch(main, /threadView\.tail\(/, 'main must not tail provider files itself');
+  assert.match(read('src/main/thread-tail-worker.cjs'), /for \(let i = 0; i < complete\.length; i \+= 256\)/, 'the worker must batch without dropping a busy 64 KiB read');
 });
 
 test('THREAD-VIEW preserves history on lifecycle archive and deletes only an explicit Human retire', () => {

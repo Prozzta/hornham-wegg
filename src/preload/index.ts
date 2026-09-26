@@ -95,6 +95,27 @@ export interface ThreadLayoutV1 {
   lastSelectedAt: number;
 }
 
+type ThreadEventPayload = { agentId: string; event: ThreadViewEvent };
+const threadEventListeners = new Set<(payload: ThreadEventPayload) => void>();
+let threadEventPort: MessagePort | undefined;
+
+// The main process transfers a fresh port after every renderer load. Keep this
+// subscription entirely local to preload: normalized events never use an IPC
+// broadcast and raw provider rows never cross the bridge.
+ipcRenderer.on('thread:port', (event) => {
+  const port = event.ports[0] as MessagePort | undefined;
+  if (!port) return;
+  try { threadEventPort?.close(); } catch { /* replaced port */ }
+  threadEventPort = port;
+  port.onmessage = (message) => {
+    const payload = message.data as ThreadEventPayload;
+    if (!payload || typeof payload.agentId !== 'string' || !payload.event || typeof payload.event.id !== 'string') return;
+    for (const listener of threadEventListeners) listener(payload);
+  };
+  port.start();
+});
+ipcRenderer.send('thread:portReady');
+
 /** A hive message reshaped for the voice read-layer (`hive:messages`). `subject`
  *  and `body` are REDACTED in the main process before crossing this boundary —
  *  the renderer never receives a raw body or a secret. Mirror of `VoiceMessage`
@@ -881,10 +902,9 @@ const api = {
   hiveBoard: (): Promise<string> => ipcRenderer.invoke('hive:board'),
   hiveTasks: (): Promise<unknown> => ipcRenderer.invoke('hive:tasks'),
   threadList: (agentId: string): Promise<ThreadViewEvent[]> => ipcRenderer.invoke('thread:list', agentId),
-  onThreadEvent: (cb: (payload: { agentId: string; event: ThreadViewEvent }) => void): (() => void) => {
-    const listener = (_e: IpcRendererEvent, payload: { agentId: string; event: ThreadViewEvent }) => cb(payload);
-    ipcRenderer.on('thread:event', listener);
-    return () => ipcRenderer.removeListener('thread:event', listener);
+  onThreadEvent: (cb: (payload: ThreadEventPayload) => void): (() => void) => {
+    threadEventListeners.add(cb);
+    return () => threadEventListeners.delete(cb);
   },
   threadLayoutGet: (agentId: string, fallback: 'talk' | 'terminal'): Promise<ThreadLayoutV1 | null> =>
     ipcRenderer.invoke('thread:layoutGet', agentId, fallback),

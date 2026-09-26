@@ -1,7 +1,8 @@
-import { app, BrowserWindow, clipboard, dialog, ipcMain, Menu, powerMonitor, powerSaveBlocker, screen, shell, Notification, utilityProcess } from 'electron';
+import { app, BrowserWindow, clipboard, dialog, ipcMain, Menu, MessageChannelMain, powerMonitor, powerSaveBlocker, screen, shell, Notification, utilityProcess, type MessagePortMain, type WebContents } from 'electron';
 import { NativeMemoryWiring, toUnpacked } from './nativeMemory/mainWiring';
 import type { WorkerHandle } from './nativeMemory/service';
 import { spawn } from 'node:child_process';
+import { Worker } from 'node:worker_threads';
 import {
   rmSync, existsSync, readFileSync, readdirSync, statSync, cpSync, writeFileSync,
   unlinkSync, mkdirSync, renameSync, createWriteStream, copyFileSync, lstatSync,
@@ -43,7 +44,6 @@ import {
 } from './git';
 import { HiveManager, type AgentMeta, type HiveMessage, type HiveTask } from './hive';
 import { ThreadViewStore, threadRoot } from './threadView';
-import { findNewestRollout } from './codexRolloutCapacity';
 import { HookServer } from './hooks';
 import { CapacityRuntime } from './capacityRuntime';
 import { CapacityStore, capacityStorePath } from './capacityPersistence';
@@ -356,27 +356,86 @@ const hive = new HiveManager(
 // when deciding hook returns.
 // Private Human↔agent conversation projection. userData is selected before this
 // module reaches HiveManager, so this can never point at the git-backed hive.
-const threadView = new ThreadViewStore(threadRoot(app.getPath('userData')), (agentId, event) => {
-  try { liveWebContents()?.send('thread:event', { agentId, event }); } catch { /* window gone */ }
-});
-void threadView.init().catch((e) => console.error('[thread-view] init failed:', e));
-// Michael-only Phase 1 tail. Both sources are append-only and are read in 64 KiB
-// chunks by ThreadViewStore; source selection follows the live provider/session.
-async function pollMichaelThread(): Promise<void> {
-  const id = hive.registry().godId;
-  if (!id) return;
-  const provider = String(hive.registry().agents[id]?.provider ?? 'claude').toLowerCase();
-  if (provider === 'codex') {
-    const home = readConfig().harnessHome;
-    if (!home) return;
-    const file = findNewestRollout(join(home, 'agents', id, '.codex'));
-    if (file) await threadView.tail(file, (line) => threadView.ingestCodexLine(id, line));
-  } else {
-    const file = hookServer.transcriptPath(id);
-    if (file) await threadView.tail(file, (line) => threadView.ingestClaudeLine(id, line));
+class ThreadEventChannel {
+  private port: MessagePortMain | undefined;
+  private ownerId: number | undefined;
+  attach(contents: WebContents, replace = false): void {
+    if (contents.isDestroyed() || (!replace && this.ownerId === contents.id && this.port)) return;
+    try { this.port?.close(); } catch { /* previous renderer closed */ }
+    const { port1, port2 } = new MessageChannelMain();
+    this.port = port1; this.ownerId = contents.id;
+    contents.once('destroyed', () => {
+      if (this.ownerId !== contents.id) return;
+      try { this.port?.close(); } catch { /* already closed */ }
+      this.port = undefined; this.ownerId = undefined;
+    });
+    try { contents.postMessage('thread:port', null, [port2]); }
+    catch { try { port1.close(); } catch { /* no receiver */ } this.port = undefined; this.ownerId = undefined; }
+  }
+  publish(agentId: string, event: import('./threadView').ThreadEvent): void {
+    const contents = liveWebContents();
+    if (!contents) return;
+    this.attach(contents);
+    try { this.port?.postMessage({ agentId, event }); }
+    catch { this.port = undefined; this.ownerId = undefined; }
   }
 }
-setInterval(() => { void pollMichaelThread().catch((e) => console.error('[thread-view] tail failed:', e)); }, 500).unref();
+
+type ThreadTailSource =
+  | { agentId: string; provider: 'claude'; file: string }
+  | { agentId: string; provider: 'codex'; codexHome: string };
+
+/** The sidecar owns transcript/rollout filesystem reads. Main receives a bounded
+ * line batch and remains the sole receipt-admission/private-storage owner. */
+class ThreadTailWorker {
+  private readonly worker = new Worker(join(__dirname, 'thread-tail-worker.cjs'));
+  private sourceKey = '';
+  private processing = Promise.resolve();
+  constructor(private readonly consume: (source: ThreadTailSource, lines: string[]) => Promise<void>) {
+    this.worker.unref();
+    this.worker.on('message', (message: unknown) => {
+      const row = message as { type?: unknown; agentId?: unknown; provider?: unknown; lines?: unknown };
+      if (row?.type !== 'lines' || typeof row.agentId !== 'string' || (row.provider !== 'claude' && row.provider !== 'codex') || !Array.isArray(row.lines)) return;
+      const lines = row.lines.filter((line): line is string => typeof line === 'string').slice(0, 256);
+      const source = row.provider === 'codex'
+        ? { agentId: row.agentId, provider: 'codex', codexHome: '' } as ThreadTailSource
+        : { agentId: row.agentId, provider: 'claude', file: '' } as ThreadTailSource;
+      this.processing = this.processing.then(() => this.consume(source, lines)).catch((e) => console.error('[thread-view] ingest failed:', e));
+    });
+    this.worker.on('error', (e) => console.error('[thread-view] tail worker failed:', e));
+  }
+  setSource(source: ThreadTailSource | null): void {
+    const key = source ? JSON.stringify(source) : '';
+    if (key === this.sourceKey) return;
+    this.sourceKey = key;
+    this.worker.postMessage({ type: 'source', source });
+  }
+}
+
+const threadEvents = new ThreadEventChannel();
+const threadView = new ThreadViewStore(threadRoot(app.getPath('userData')), (agentId, event) => threadEvents.publish(agentId, event));
+void threadView.init().catch((e) => console.error('[thread-view] init failed:', e));
+const threadTailer = new ThreadTailWorker(async (source, lines) => {
+  for (const line of lines) {
+    if (source.provider === 'codex') await threadView.ingestCodexLine(source.agentId, line);
+    else await threadView.ingestClaudeLine(source.agentId, line);
+  }
+});
+// Registry selection is cheap main-owned state. The worker does every directory
+// walk/stat/open/read and emits bounded complete-line batches from each 64 KiB tick.
+function refreshMichaelThreadSource(): void {
+  const registry = hive.registry();
+  const id = registry.godId;
+  if (!id) return threadTailer.setSource(null);
+  const provider = String(registry.agents[id]?.provider ?? 'claude').toLowerCase();
+  if (provider === 'codex') {
+    const home = readConfig().harnessHome;
+    return threadTailer.setSource(home ? { agentId: id, provider: 'codex', codexHome: join(home, 'agents', id, '.codex') } : null);
+  }
+  const file = hookServer.transcriptPath(id);
+  threadTailer.setSource(file ? { agentId: id, provider: 'claude', file } : null);
+}
+setInterval(() => { try { refreshMichaelThreadSource(); } catch (e) { console.error('[thread-view] source refresh failed:', e); } }, 500).unref();
 const control = new ControlRegistry();
 // Stage 7A — the live observability tap. Receives Claude Code's first-party OTel
 // over loopback OTLP/JSON and exposes the locked usage-provider seam. resolveCwd
@@ -4113,6 +4172,7 @@ ipcMain.handle('hive:messages', (_evt, opts: unknown) =>
 ipcMain.handle('thread:list', async (_evt, id: unknown) =>
   typeof id === 'string' ? threadView.list(id) : []
 );
+ipcMain.on('thread:portReady', (event) => threadEvents.attach(event.sender, true));
 ipcMain.handle('thread:layoutGet', async (_evt, id: unknown, fallback: unknown) =>
   typeof id === 'string' ? threadView.layout(id, fallback === 'terminal' ? 'terminal' : 'talk') : null
 );
