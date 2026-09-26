@@ -130,8 +130,12 @@ export interface AgentProviderPreset {
    *  first USER turn, which AGY executes as a task). `'agy-custom-agent'` = a per-agent
    *  Markdown custom agent (`~/.gemini/config/agents/<name>/agent.md`, H1 body = system
    *  prompt) selected with `agy --agent <name>`. When the global write is refused (a dev
-   *  build, a non-live hive), the spawn falls back to `initialPromptFlag`. */
-  systemPromptChannel?: 'agy-custom-agent';
+   *  build, a non-live hive), the spawn falls back to `initialPromptFlag`.
+   *  `'codex-developer-instructions'` = Codex's `developer_instructions` config key (a
+   *  DEVELOPER-role message, not a turn) in the agent's own CODEX_HOME config.toml; the
+   *  positional prompt is then dropped. It falls back to the positional prompt when the key
+   *  cannot be written safely (the user's seed defines it on several lines). */
+  systemPromptChannel?: 'agy-custom-agent' | 'codex-developer-instructions';
   /** How the hive protocol seed is delivered for a CLI that takes NEITHER a flag
    *  nor a positional seed. `'type-into-tui'` = the CLI is a bare interactive TUI
    *  that rejects a positional initial prompt (Crush: its first positional is read
@@ -231,6 +235,10 @@ export const AGENT_PROVIDER_PRESETS: AgentProviderPreset[] = [
     // Inbox drains via the codex-hook bridge's Stop→drain (the renderer's idle
     // inbox-wake nudge remains as a harmless fallback for an idle worker).
     canReceiveInbox: true,
+    // The hive protocol is Codex's `developer_instructions` in the agent's CODEX_HOME (a
+    // developer message, not a first user turn; confirmed on codex-cli 0.154.0 by the Codex
+    // probe, 2026-09-26). The positional prompt is only the fallback.
+    systemPromptChannel: 'codex-developer-instructions',
     initialPromptFlag: undefined,
     positionalInitialPrompt: true,
     // Codex's long-context coding model for the orchestrator role. // TODO-verify

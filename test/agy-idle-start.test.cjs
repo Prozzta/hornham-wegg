@@ -116,5 +116,6 @@ test('PRESET: antigravity uses the custom-agent system channel; `-i` stays only 
   const agy = providerPreset('antigravity');
   assert.equal(agy.systemPromptChannel, 'agy-custom-agent');
   assert.equal(agy.initialPromptFlag, '-i');
-  for (const id of ['gemini', 'codex', 'grok', 'qwen']) assert.equal(providerPreset(id).systemPromptChannel, undefined, id);
+  for (const id of ['gemini', 'grok', 'qwen']) assert.equal(providerPreset(id).systemPromptChannel, undefined, id);
+  assert.equal(providerPreset('codex').systemPromptChannel, 'codex-developer-instructions', 'codex has its own channel (codex-developer-instructions.test.cjs)');
 });

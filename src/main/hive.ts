@@ -1017,6 +1017,8 @@ export class HiveManager {
       // the global auth.json is still linked into that home — see installCodexHooks
       // and F1. Under MUNDER_DEV=1 it is not.) Both share the HIVE_SOCK wiring below.
       const preArgs: string[] = [];
+      // Codex: set when the protocol went into its developer_instructions (no positional prompt).
+      let developerInstructionsSet = false;
       // Dispatch on the structured bridge descriptor (the foundation's `bridgeOf`
       // derives {kind:'hooks'} from the legacy `hookBridge` for agy/codex, and
       // returns the explicit {kind:'proxy'} for qwen). Two ways a hookless CLI
@@ -1043,10 +1045,11 @@ export class HiveManager {
               this.reconcileAgyStatusline();
             }
             else if (desc.shim === 'codex') {
-              const codex = this.installCodexHooks(dir, meta.id);
+              const codex = this.installCodexHooks(dir, meta.id, preset.systemPromptChannel === 'codex-developer-instructions' ? prompt : null);
               // F1 fail-closed: provisioning refused, so this agent must not start.
               if (codex.refusal) return { args: [], env: {}, refusal: codex.refusal };
               env.CODEX_HOME = codex.home;
+              if (codex.developerInstructions) developerInstructionsSet = true;
               // Codex refuses to run hooks from a config dir without persisted
               // "hook trust" (normally an interactive gate). Our hooks.json is
               // hive-authored inside an isolated CODEX_HOME, so we bypass that gate
@@ -1134,6 +1137,9 @@ export class HiveManager {
         const agent = this.installAgyAgent(meta, prompt);
         if (agent) return { args: [...preArgs, '--agent', agent], env };
       }
+      // Codex: the protocol is already its developer_instructions (installCodexHooks), so NO
+      // positional prompt: `codex` (and `codex resume <sid>`) start without a user turn.
+      if (developerInstructionsSet) return { args: [...preArgs], env };
       if (preset.seedDelivery === 'type-into-tui') return { args: [...preArgs], env, seedPrompt: prompt };
       // If a provider somehow exposes neither a flag nor a positional prompt, spawn bare.
       if (flag) return { args: [...preArgs, flag, prompt], env };
@@ -2705,7 +2711,31 @@ export class HiveManager {
    *
    *  Returns the CODEX_HOME path for the caller to put in the worker's env, or a
    *  refusal the caller must honour. */
-  private installCodexHooks(dir: string, agentId?: string): { home: string; refusal?: string } {
+  /** AGY-STARTUP-TURN (Codex): put `developer_instructions` at the TOP of a Codex config (a
+   *  top-level TOML key must precede the first [table]). A single-line top-level
+   *  `developer_instructions` already in the user's seed is replaced (a second one would be a
+   *  duplicate key, and Codex would refuse to start); a multi-line one cannot be replaced
+   *  safely, so null (the caller keeps the positional prompt). The value is a TOML basic string
+   *  (JSON's escapes are valid TOML). */
+  static withCodexDeveloperInstructions(config: string, text: string): string | null {
+    const lines = config.split(/\r?\n/);
+    const firstTable = lines.findIndex((l) => /^\s*\[/.test(l));
+    const topEnd = firstTable < 0 ? lines.length : firstTable;
+    const kept: string[] = [];
+    for (let i = 0; i < lines.length; i++) {
+      if (i < topEnd && /^\s*developer_instructions\s*=/.test(lines[i])) {
+        const v = lines[i].replace(/^\s*developer_instructions\s*=\s*/, '');
+        // Multi-line strings (''' or """) cannot be removed line-wise with certainty.
+        if (/^('''|""")/.test(v)) return null;
+        continue;
+      }
+      kept.push(lines[i]);
+    }
+    return `# --- munder-hive: this agent's standing hive instructions (auto-generated; do not edit) ---\ndeveloper_instructions = ${JSON.stringify(text)}\n\n${kept.join('\n')}`;
+  }
+
+  private installCodexHooks(dir: string, agentId?: string, developerInstructions: string | null = null): { home: string; refusal?: string; developerInstructions?: boolean } {
+    let devSet = false;
     const home = join(dir, '.codex');
     try {
       mkdirSync(home, { recursive: true });
@@ -2800,9 +2830,14 @@ export class HiveManager {
           config += `\n[[hooks.${ev}]]\n[[hooks.${ev}.hooks]]\ntype = "command"\ncommand = '${this.nodeRunUnquoted(shim)}'\ntimeout = 30\n`;
         }
       }
+      if (developerInstructions) {
+        const withDev = HiveManager.withCodexDeveloperInstructions(config, developerInstructions);
+        if (withDev !== null) { config = withDev; devSet = true; }
+        else console.warn(`[hive] ${join(home, 'config.toml')}: the seed defines developer_instructions on several lines; Codex keeps the positional prompt`);
+      }
       writeFileSync(join(home, 'config.toml'), config, 'utf8');
-    } catch (e) { console.error('[hive] installCodexHooks failed:', e); }
-    return { home };
+    } catch (e) { console.error('[hive] installCodexHooks failed:', e); devSet = false; }
+    return { home, ...(devSet ? { developerInstructions: true } : {}) };
   }
 
   /** Pi (earendil-works) bridge. Pi has a rich `pi.on(event, …)` lifecycle but no
