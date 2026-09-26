@@ -365,7 +365,9 @@ async function pollMichaelThread(): Promise<void> {
   if (!id) return;
   const provider = String(hive.registry().agents[id]?.provider ?? 'claude').toLowerCase();
   if (provider === 'codex') {
-    const file = findNewestRollout(join(readConfig().harnessHome, 'agents', id, '.codex'));
+    const home = readConfig().harnessHome;
+    if (!home) return;
+    const file = findNewestRollout(join(home, 'agents', id, '.codex'));
     if (file) await threadView.tail(file, (line) => threadView.ingestCodexLine(id, line));
   } else {
     const file = hookServer.transcriptPath(id);
