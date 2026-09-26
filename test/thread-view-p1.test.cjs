@@ -53,6 +53,16 @@ test('Michael starts on Talk without terminal resize churn', () => {
   assert.match(read('src/main/thread-tail-worker.cjs'), /for \(let i = 0; i < complete\.length; i \+= 256\)/, 'the worker must batch without dropping a busy 64 KiB read');
 });
 
+test('THREAD-VIEW Talk is a thin humanQA card consumer and preserves raw option indexes on answer', () => {
+  const talk = read('src/renderer/src/components/ThreadTalkPanel.tsx');
+  assert.match(talk, /HumanQuestionCard/);
+  assert.match(talk, /normalizeHumanQA\(raw\)/, 'only the rendered card receives a normalized entry');
+  assert.match(talk, /recordAnswer\(question\.task\.humanQA \?\? \[\], question\.raw, answer/, 'writes use the stored raw entry');
+  assert.match(talk, /answerMail\(question\.task, question\.raw, answer\)/, 'mail uses the stored raw entry');
+  assert.match(talk, /hiveTasks\(\)/);
+  assert.doesNotMatch(talk, /setInterval\(/, 'Talk may not introduce a task-ledger polling loop');
+});
+
 test('THREAD-VIEW preserves history on lifecycle archive and deletes only an explicit Human retire', () => {
   const main = read('src/main/index.ts');
   const lifecycle = main.slice(main.indexOf("ipcMain.handle('hive:setArchived'"), main.indexOf("ipcMain.handle('thread:retire'"));
