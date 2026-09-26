@@ -532,13 +532,8 @@ const automaticSubmit = new AutomaticSubmitOwner(buildOwnerDeps({
   ptyForAgent: (agentId) => ptyForAgent(agentId),
   providerForPty: (ptyId) => ptyProvider.get(ptyId),
   requestScreenReading: (ptyId, needle) => screenReadings.request(ptyId, needle),
+  onCommitted: (agentId, text) => threadView.recordReceipt(agentId, text, 'machine'),
   onOutcome: (r) => {
-    // A programmatic submit is not Human speech.  Record its exact payload before a
-    // provider transcript can echo it; a same-window matching machine receipt wins
-    // over an identical Human hash, so automation can never be relabelled as Human.
-    if (r.outcome.kind === 'COMMITTED') {
-      threadView.recordReceipt(r.agentId, r.text, 'machine');
-    }
     // An outcome can raise an INTERFERED hold or settle one: the impact string moves.
     pushAgentImpact();
     if (r.outcome.kind === 'COMMITTED') return;

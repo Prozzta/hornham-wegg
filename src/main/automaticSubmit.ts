@@ -436,6 +436,8 @@ export interface OwnerDeps {
   setTimer: (fn: () => void, ms: number) => unknown;
   /** Told of every settled outcome. Diagnostics and UI; never a decision input. */
   onOutcome?: (record: OutcomeRecord) => void;
+  /** Main-only classification hook; it never changes delivery or outcome semantics. */
+  onCommitted?: (agentId: string, text: string) => void;
 }
 
 // ─── Requests and outcomes ────────────────────────────────────────────────────────────
@@ -509,8 +511,6 @@ export interface OutcomeRecord {
   agentId: string;
   ptyId: string | null;
   admissionClass: AdmissionClass;
-  /** Exact programmatic payload; main-only observers may classify it, never render it. */
-  text: string;
   outcome: SubmitOutcome;
   at: number;
 }
@@ -745,10 +745,13 @@ export class AutomaticSubmitOwner {
         && this.known.get(req.requestId)?.promise === promise) {
         this.known.delete(req.requestId);
       }
+      if (outcome.kind === 'COMMITTED') {
+        try { this.deps.onCommitted?.(req.agentId, req.text); } catch { /* projection cannot affect a sent turn */ }
+      }
       try {
         this.deps.onOutcome?.({
           requestId: req.requestId, agentId: req.agentId, ptyId,
-          admissionClass: req.admissionClass, text: req.text, outcome, at: settled.at
+          admissionClass: req.admissionClass, outcome, at: settled.at
         });
       } catch { /* diagnostics never decide */ }
       return outcome;
@@ -800,7 +803,7 @@ export class AutomaticSubmitOwner {
       const outcome: SubmitOutcome = { kind: 'HUMAN_HANDLED' };
       this.known.set(held.requestId, { binding: held.binding, promise: Promise.resolve(outcome), settled: { at } });
       try {
-        this.deps.onOutcome?.({ requestId: held.requestId, agentId: held.agentId, ptyId, admissionClass: held.admissionClass, text: '', outcome, at });
+        this.deps.onOutcome?.({ requestId: held.requestId, agentId: held.agentId, ptyId, admissionClass: held.admissionClass, outcome, at });
       } catch { /* diagnostics never decide */ }
     }
     return true;
