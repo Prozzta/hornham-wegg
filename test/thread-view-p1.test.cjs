@@ -66,6 +66,10 @@ test('THREAD-VIEW retires only after a successful confirmed kill and never promi
   const voice = read('src/main/realtimeActions.ts');
   assert.match(voice, /private Talk history was removed; unarchive does not restore it/);
   assert.doesNotMatch(voice, /history kept\. Say unarchive to bring them back/);
+  for (const file of [
+    'src/renderer/src/components/AgentDetailPanel.tsx',
+    'src/renderer/src/components/FullscreenTerminal.tsx'
+  ]) assert.match(read(file), /private Talk history deleted/);
 });
 
 test('THREAD-VIEW receipt admission is one-time and machine beats Human in its numbered window', () => {

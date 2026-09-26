@@ -115,7 +115,7 @@ export function AgentDetailPanel({ agent }: AgentDetailPanelProps) {
 
   const onKill = async () => {
     if (!agent.ptyId) return;
-    if (!confirm(`Close ${agent.name}? The PTY process will terminate and the agent is archived (kept in history, off the floor).`)) return;
+    if (!confirm(`Close ${agent.name}? The PTY process will terminate, the agent will be archived, and their private Talk history deleted.`)) return;
     // The kill is the authoritative close. Do not erase Talk until it succeeded:
     // a failed/stalled kill leaves the agent live and potentially still talking.
     const killed = await window.cth.killPty(agent.ptyId);
