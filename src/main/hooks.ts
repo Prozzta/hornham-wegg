@@ -725,21 +725,25 @@ export class HookServer {
   }
 
   /** The notice for inbox files that appeared since this turn began and were not announced yet,
-   *  or null. Each file is announced ONCE. A superseding message says what it supersedes. */
-  private midTurnMail(agentId: string): string | null {
+   *  or null. Each file is announced ONCE (a `peek` shows it without consuming it: the
+   *  PreToolUse notice, so the PostToolUse after it still delivers it if a CLI ignores
+   *  PreToolUse context). A superseding message says what it supersedes. Sender-controlled
+   *  text is escaped so it cannot close the <inbox-update> tag (N2). */
+  private midTurnMail(agentId: string, peek = false): string | null {
     const t = this.turns.get(agentId);
     if (!t?.open) return null;
     const fresh = (this.hive.inboxFileNames?.(agentId) ?? []).filter((f) => !t.known.has(f) && !t.noticed.has(f)).sort();
     if (!fresh.length) return null;
-    for (const f of fresh) t.noticed.add(f);
+    if (!peek) for (const f of fresh) t.noticed.add(f);
+    const esc = (s: string): string => s.replace(/</g, '&lt;').replace(/>/g, '&gt;');
     const lines = fresh.slice(0, HookServer.MIDTURN_MAIL_MAX_LISTED).map((f) => {
       const h = this.hive.inboxHeader?.(agentId, f) ?? null;
-      if (!h) return `- ${f}`;
-      const sup = h.supersedes?.length ? ` (SUPERSEDES ${h.supersedes.join(', ')})` : '';
-      return `- from ${h.from}: "${h.subject.slice(0, 160)}" [${h.id}]${sup}`;
+      if (!h) return `- ${esc(f)}`;
+      const sup = h.supersedes?.length ? ` (SUPERSEDES ${esc(h.supersedes.join(', '))})` : '';
+      return `- from ${esc(h.from)}: "${esc(h.subject.slice(0, 160))}" [${esc(h.id)}]${sup}`;
     });
     if (fresh.length > lines.length) lines.push(`- and ${fresh.length - lines.length} more`);
-    try { this.hive.appendLog({ kind: 'midturn-mail-notice', agentId, count: fresh.length }); } catch { /* noop */ }
+    if (!peek) { try { this.hive.appendLog({ kind: 'midturn-mail-notice', agentId, count: fresh.length }); } catch { /* noop */ } }
     return `<inbox-update>\n${fresh.length} new message(s) arrived in your inbox during this turn:\n${lines.join('\n')}\nRead them before you send or finish: one may change or cancel what you are doing.\n</inbox-update>`;
   }
 
@@ -962,7 +966,13 @@ export class HookServer {
     // one-way hook (its reply is not read) or a subagent's.
     const mail = (event === 'PostToolUse' || event === 'PreInvocation') && agentId && !fromSubagent && p.transport !== 'pipe-oneway'
       ? this.midTurnMail(agentId)
-      : null;
+      // N1 (Jim): the SEND moment is a tool call, so PreToolUse carries it too, as a PEEK (not
+      // consumed: the PostToolUse after it still delivers it). CLAUDE ONLY (the http transport):
+      // AGY's shim turns any PreToolUse reply object into a decision and fails CLOSED (a notice
+      // would DENY the tool), and Codex's PreToolUse context handling is unverified.
+      : event === 'PreToolUse' && agentId && !fromSubagent && p.transport === 'http'
+        ? this.midTurnMail(agentId, true)
+        : null;
 
     // Keep god's roster CURRENT. fleet.json is always fresh on disk, but god's
     // context is not: after a restart it resumes a transcript describing the old

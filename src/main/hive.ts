@@ -1774,17 +1774,54 @@ export class HiveManager {
    * the reply was sent knowingly. Reads only B's inbox directory (a handful of files).
    */
   private unreadSupersederFor(msg: HiveMessage): HiveMessage | null {
-    const target = msg.in_reply_to;
-    if (!target) return null;
+    if (!msg.in_reply_to) return null;
+    // N3 (Jim): the reply's in_reply_to AND up to 3 of its ancestors, so a cancel of the ORIGINAL
+    // dispatch also flags a reply to a request derived from it. An ancestor is found hive-wide by
+    // its file name (<id>.json in some agent's inbox or inbox/.done): stats only, no parsing.
+    const targets = new Set<string>([msg.in_reply_to]);
+    let cur: string | null = msg.in_reply_to;
+    for (let hop = 0; hop < HiveManager.SUPERSEDE_ANCESTOR_HOPS && cur; hop++) {
+      const parent: string | null = this.findDeliveredMessage(cur)?.in_reply_to ?? null;
+      if (!parent || targets.has(parent)) break;
+      targets.add(parent);
+      cur = parent;
+    }
     const inbox = join(this.agentDir(msg.from), 'inbox');
     let files: string[];
     try { files = readdirSync(inbox).filter((f) => f.endsWith('.json')); } catch { return null; }
-    for (const f of files) {
+    // N4 (Jim): a bounded synchronous parse, on the routing path: the newest 50 files (ids are
+    // time-stamped, so the name order is the arrival order), none over 64 KB.
+    files.sort();
+    for (const f of files.slice(-HiveManager.SUPERSEDE_SCAN_MAX_FILES).reverse()) {
       try {
-        const m = JSON.parse(readFileSync(join(inbox, f), 'utf8')) as Partial<HiveMessage>;
+        const full = join(inbox, f);
+        if (statSync(full).size > HiveManager.SUPERSEDE_SCAN_MAX_BYTES) continue;
+        const m = JSON.parse(readFileSync(full, 'utf8')) as Partial<HiveMessage>;
         const sup = normalizeSupersedes(m.supersedes).supersedes;
-        if (sup && sup.includes(target) && typeof m.id === 'string') return m as HiveMessage;
+        if (sup && sup.some((s) => targets.has(s)) && typeof m.id === 'string') return m as HiveMessage;
       } catch { /* a file being written: not a match this time */ }
+    }
+    return null;
+  }
+
+  static readonly SUPERSEDE_ANCESTOR_HOPS = 3;
+  static readonly SUPERSEDE_SCAN_MAX_FILES = 50;
+  static readonly SUPERSEDE_SCAN_MAX_BYTES = 64 * 1024;
+
+  /** A delivered message by id: <id>.json in any agent's inbox or inbox/.done, or null. */
+  private findDeliveredMessage(id: string): Partial<HiveMessage> | null {
+    if (!/^[A-Za-z0-9._-]{1,200}$/.test(id)) return null;
+    const root = this.root();
+    if (!root) return null;
+    let agents: string[] = [];
+    try { agents = readdirSync(join(root, 'agents')); } catch { return null; }
+    for (const a of agents) {
+      for (const p of [join(root, 'agents', a, 'inbox', `${id}.json`), join(root, 'agents', a, 'inbox', '.done', `${id}.json`)]) {
+        try {
+          if (!existsSync(p) || statSync(p).size > HiveManager.SUPERSEDE_SCAN_MAX_BYTES) continue;
+          return JSON.parse(readFileSync(p, 'utf8')) as Partial<HiveMessage>;
+        } catch { /* unreadable: keep looking */ }
+      }
     }
     return null;
   }
@@ -1834,7 +1871,10 @@ export class HiveManager {
     const sup = this.unreadSupersederFor(msg);
     if (sup) {
       msg.superseded_by = sup.id;
-      msg.subject = `[superseded by ${sup.id} (${sup.from}: ${String(sup.subject ?? '').slice(0, 80)}): sent before ${msg.from} read it] ${msg.subject}`;
+      // N2 (Jim): the quoted parts are sender-controlled: escape < and > (agents may read the
+      // subject inside tagged context).
+      const esc = (s: string): string => s.replace(/</g, '&lt;').replace(/>/g, '&gt;');
+      msg.subject = `[superseded by ${esc(sup.id)} (${esc(String(sup.from))}: ${esc(String(sup.subject ?? '').slice(0, 80))}): sent before ${msg.from} read it] ${msg.subject}`;
       try { this.appendLog({ kind: 'superseded-delivery', id: msg.id, from: msg.from, to: msg.to, inReplyTo: msg.in_reply_to, supersededBy: sup.id }); } catch { /* noop */ }
     }
     if (msg.hops > HOP_CAP) {
