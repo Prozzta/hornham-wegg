@@ -50,6 +50,10 @@ export const PER_AGENT_CAP = 8 * 1024 * 1024;
 export const GLOBAL_CAP = 128 * 1024 * 1024;
 const MAX_EVENT_TEXT_BYTES = 64 * 1024;
 const LIST_PAGE_BYTES = 128 * 1024;
+// A Talk restore may span several pages and segments, but never makes main parse
+// an unbounded private projection in one IPC request.
+const LIST_MAX_BYTES = 2 * 1024 * 1024;
+const LIST_LINE_OVERLAP_BYTES = MAX_EVENT_TEXT_BYTES + 4 * 1024;
 export const RECEIPT_TTL_MS = 2 * 60_000;
 export const TERMINAL_RECEIPT_WINDOW_MS = 10_000;
 export const RECEIPT_LIMIT = 200;
@@ -182,6 +186,10 @@ export class ThreadViewStore {
    * message text and Codex event_msg. response_item/tool records never reach Talk. */
   async ingestClaudeLine(agentId: string, line: string): Promise<void> {
     let row: any; try { row = JSON.parse(line); } catch { return; }
+    // Claude injects meta user records between a Human turn and its response.
+    // They are neither Human speech nor a Hive/machine turn, so they must not
+    // consume or clear the current admission window.
+    if (row?.type === 'user' && isClaudeMetaUser(row)) return;
     const text = textOf(row?.message?.content ?? row?.content);
     if (!text) return;
     if (row?.type === 'user') {
@@ -226,24 +234,40 @@ export class ThreadViewStore {
     const dir = this.agentDir(agentId);
     const names = (await readdir(dir).catch(() => [] as string[])).filter((n) => n.endsWith('.jsonl')).sort().reverse();
     const rows: ThreadEvent[] = [];
+    const seen = new Set<string>();
+    let remainingBytes = LIST_MAX_BYTES;
     for (const name of names) {
-      if (rows.length >= limit) break;
+      if (rows.length >= limit || remainingBytes <= 0) break;
       const file = join(dir, name);
       const info = await stat(file).catch(() => undefined);
       if (!info) continue;
-      // Main never parses an agent's whole 8 MiB projection. A page exceeds
-      // the 64 KiB event payload cap, so the final complete line is intact.
-      const start = Math.max(0, info.size - LIST_PAGE_BYTES);
-      const bytes = Buffer.alloc(info.size - start);
       const handle = await open(file, 'r').catch(() => undefined);
       if (!handle) continue;
-      try { await handle.read(bytes, 0, bytes.length, start); } finally { await handle.close(); }
-      const lines = bytes.toString('utf8').split('\n');
-      if (start) lines.shift(); // page begins partway through an older line
-      for (let i = lines.length - 1; i >= 0 && rows.length < limit; i -= 1) {
-        if (!lines[i]) continue;
-        try { rows.push(JSON.parse(lines[i]) as ThreadEvent); } catch { /* torn line: retry on next read */ }
-      }
+      try {
+        // Walk backward within each segment. The forward overlap completes the
+        // one event which crosses a page edge; stable ids discard that overlap
+        // when it appears again in the newer page.
+        let end = info.size;
+        while (end > 0 && rows.length < limit && remainingBytes > 0) {
+          const start = Math.max(0, end - Math.min(LIST_PAGE_BYTES, end));
+          const readEnd = Math.min(info.size, end + LIST_LINE_OVERLAP_BYTES);
+          const readLength = readEnd - start;
+          if (readLength > remainingBytes) break;
+          const bytes = Buffer.alloc(readLength);
+          await handle.read(bytes, 0, readLength, start);
+          remainingBytes -= readLength;
+          const lines = bytes.toString('utf8').split('\n');
+          if (start) lines.shift(); // page began partway through an older line
+          for (let i = lines.length - 1; i >= 0 && rows.length < limit; i -= 1) {
+            if (!lines[i]) continue;
+            try {
+              const row = JSON.parse(lines[i]) as ThreadEvent;
+              if (!seen.has(row.id)) { seen.add(row.id); rows.push(row); }
+            } catch { /* torn writer line: retry later */ }
+          }
+          end = start;
+        }
+      } finally { await handle.close(); }
     }
     return rows.sort((a, b) => a.at - b.at).slice(-Math.max(1, Math.min(limit, 1000)));
   }
@@ -358,6 +382,14 @@ export class ThreadViewStore {
       this.totalBytes = Math.max(0, this.totalBytes - item.size);
     }
   }
+}
+
+function isClaudeMetaUser(row: any): boolean {
+  if (row?.isMeta === true || row?.message?.isMeta === true) return true;
+  const subtype = String(row?.subtype ?? row?.message?.subtype ?? '').toLowerCase();
+  if (subtype === 'system-reminder' || subtype === 'local-command') return true;
+  const content = textOf(row?.message?.content ?? row?.content).trim().toLowerCase();
+  return content.startsWith('<system-reminder') || content.startsWith('<local-command');
 }
 
 function receiptWindowMs(receipt: ThreadReceipt): number {

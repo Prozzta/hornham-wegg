@@ -4,9 +4,11 @@ const fs = require('node:fs');
 const path = require('node:path');
 const os = require('node:os');
 const ts = require('typescript');
+const { Worker } = require('node:worker_threads');
 
 const root = path.resolve(__dirname, '..');
 const read = (p) => fs.readFileSync(path.join(root, p), 'utf8');
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 function loadThreadStore() {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'munder-thread-view-'));
@@ -26,6 +28,8 @@ test('THREAD-VIEW keeps private history outside hive and bounds it', () => {
   assert.doesNotMatch(source, /harnessHome|agents\/.*thread/);
   const list = source.slice(source.indexOf('async list('), source.indexOf('async archive('));
   assert.match(list, /LIST_PAGE_BYTES/);
+  assert.match(list, /LIST_MAX_BYTES/);
+  assert.match(list, /while \(end > 0/, 'history must page backward within a segment');
   assert.match(list, /await handle\.read\(/);
   assert.doesNotMatch(list, /readFile\(/, 'initial Talk history must not parse the whole projection on main');
 });
@@ -136,6 +140,63 @@ test('THREAD-VIEW closes each provider admission latch on a non-Human turn', asy
     assert.ok(result.includes('REPLY-TO-HUMAN-AGAIN'));
     assert.equal(result.includes('REPLY-TO-HIVE-NUDGE'), false, 'a nudge clears the previous Human admission for both providers');
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('THREAD-VIEW preserves a Human admission across Claude meta user records', async () => {
+  const { store: module, dir } = loadThreadStore();
+  const store = new module.ThreadViewStore(path.join(dir, 'userData', 'threads'));
+  try {
+    const human = 'Human meta-safe turn';
+    store.recordReceipt('michael', human, 'human-terminal');
+    await store.ingestClaudeLine('michael', JSON.stringify({ type: 'user', timestamp: Date.now(), message: { content: human } }));
+    await store.ingestClaudeLine('michael', JSON.stringify({ type: 'user', isMeta: true, message: { content: '<system-reminder>context</system-reminder>' } }));
+    await store.ingestClaudeLine('michael', JSON.stringify({ type: 'user', message: { subtype: 'local-command', content: 'ignored local command' } }));
+    await store.ingestClaudeLine('michael', JSON.stringify({ type: 'assistant', timestamp: Date.now(), message: { content: 'REPLY-AFTER-META' } }));
+    assert.deepEqual((await store.list('michael')).map((row) => row.text), ['REPLY-AFTER-META']);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('THREAD-VIEW pages contiguous history backward across page and segment boundaries', async () => {
+  const { store: module, dir } = loadThreadStore();
+  const store = new module.ThreadViewStore(path.join(dir, 'userData', 'threads'));
+  try {
+    const agentDir = path.join(dir, 'userData', 'threads', 'michael');
+    fs.mkdirSync(agentDir, { recursive: true });
+    const rows = Array.from({ length: 700 }, (_, n) => JSON.stringify({ id: `id-${n}`, at: n, speaker: 'agent', source: 'claude', text: `${n}:${'x'.repeat(512)}` }) + '\n');
+    fs.writeFileSync(path.join(agentDir, 'closed-1.jsonl'), rows.slice(0, 350).join(''));
+    fs.writeFileSync(path.join(agentDir, 'active.jsonl'), rows.slice(350).join(''));
+    const listed = await store.list('michael', 1000);
+    assert.deepEqual(listed.map((row) => row.at), Array.from({ length: 700 }, (_, n) => n));
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('THREAD-VIEW tailer starts existing files at EOF but replays a rollout discovered later', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'munder-thread-worker-'));
+  const worker = new Worker(path.join(root, 'src', 'main', 'thread-tail-worker.cjs'));
+  const received = [];
+  worker.on('message', (row) => { if (row?.type === 'lines') received.push(...row.lines); });
+  try {
+    const transcript = path.join(dir, 'existing.jsonl');
+    fs.writeFileSync(transcript, 'old-at-start\n');
+    worker.postMessage({ type: 'source', source: { agentId: 'michael', provider: 'claude', file: transcript } });
+    await sleep(40);
+    assert.deepEqual(received, [], 'existing startup history must not replay');
+    fs.appendFileSync(transcript, 'live-after-selection\n');
+    worker.postMessage({ type: 'poll' });
+    for (let i = 0; i < 20 && !received.length; i += 1) await sleep(10);
+    assert.deepEqual(received, ['live-after-selection']);
+
+    received.length = 0;
+    const codexHome = path.join(dir, 'codex');
+    worker.postMessage({ type: 'source', source: { agentId: 'michael', provider: 'codex', codexHome } });
+    await sleep(20);
+    const rollout = path.join(codexHome, 'sessions', '2026', '09', '27', 'rollout-new.jsonl');
+    fs.mkdirSync(path.dirname(rollout), { recursive: true });
+    fs.writeFileSync(rollout, 'first-after-rollout-appears\n');
+    worker.postMessage({ type: 'poll' });
+    for (let i = 0; i < 20 && !received.length; i += 1) await sleep(10);
+    assert.deepEqual(received, ['first-after-rollout-appears']);
+  } finally { await worker.terminate(); fs.rmSync(dir, { recursive: true, force: true }); }
 });
 
 test('THREAD-VIEW starts queued Human UI TTL at COMMIT, not enqueue', () => {

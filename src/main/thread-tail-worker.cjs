@@ -40,8 +40,8 @@ function tailOnce() {
   if (!file) return;
   let info; try { info = statSync(file); } catch { return; }
   const prior = cursors.get(file);
-  // Start a newly selected rollout at its beginning. Receipt admission still
-  // filters history, while EOF would lose the first Human turn after respawn.
+  // A rollout discovered after source selection starts at its beginning so its
+  // first Human turn is not lost. The initial file is seeded at EOF below.
   if (!prior) { cursors.clear(); cursors.set(file, { offset: 0, remainder: '' }); }
   const current = cursors.get(file);
   const offset = info.size < current.offset ? 0 : current.offset;
@@ -49,7 +49,7 @@ function tailOnce() {
   if (!length) return;
   const buffer = Buffer.allocUnsafe(length);
   let fd; try { fd = openSync(file, 'r'); readSync(fd, buffer, 0, length, offset); } catch { return; } finally { if (fd !== undefined) try { closeSync(fd); } catch {} }
-  const all = prior.remainder + buffer.toString('utf8');
+  const all = current.remainder + buffer.toString('utf8');
   const lines = all.split('\n');
   const remainder = lines.pop() || '';
   cursors.set(file, { offset: offset + length, remainder });
@@ -74,6 +74,12 @@ parentPort.on('message', (message) => {
   if (message.type !== 'source') return;
   source = message.source && typeof message.source.agentId === 'string' ? message.source : null;
   cursors.clear(); catchupBytes = 0;
+  // Existing startup history is not a new conversation. Seed its cursor at
+  // EOF; only a rollout that appears after this selection is replayed from 0.
+  const initial = source && (source.provider === 'codex' ? newestRollout(source.codexHome) : source.file);
+  if (initial) {
+    try { cursors.set(initial, { offset: statSync(initial).size, remainder: '' }); } catch { /* writer rotated */ }
+  }
   tailOnce();
 });
 setInterval(() => { catchupBytes = 0; tailOnce(); }, 500).unref();

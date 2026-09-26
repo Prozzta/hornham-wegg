@@ -2,9 +2,10 @@
  * Command: THREAD_VIEW_SCALE=1 node --test test/thread-view-scale.test.cjs
  * It compiles only the private store and starts the tail worker directly: no
  * Electron, real userData, hive, or installed app is touched. The opt-in guard
- * keeps its 50 MiB writes and host-sensitive timing assertions out of default
- * test globs and full suites. The 180s timeout leaves headroom above the
- * measured bounded catch-up stream, not an arbitrary unlimited allowance. */
+ * keeps its writes and host-sensitive timing assertions out of default test
+ * globs and full suites. `micro` is the 100-chunk preflight; `1` is the
+ * separately authorised 50 MiB run. The 600s timeout has abort cleanup and
+ * is measured-headroom for bounded 1 MiB/tick catch-up, not an unlimited run. */
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
@@ -19,8 +20,9 @@ const root = path.resolve(__dirname, '..');
 const read = (file) => fs.readFileSync(path.join(root, file), 'utf8');
 const MIB = 1024 * 1024;
 const AGENTS = 300;
-const FIXTURE_BYTES = 50 * MIB;
 const CHUNK_BYTES = 64 * 1024;
+const FULL_CHUNKS = (50 * MIB) / CHUNK_BYTES;
+const MICRO_CHUNKS = 100;
 // N2: declared before execution. v1.1.52's recorded max was about 64 ms;
 // this isolated Node gate permits 20 ms of host scheduling noise.
 const BASELINE_MAX_MS = 64;
@@ -40,10 +42,11 @@ function p95(rows) { return rows[Math.min(rows.length - 1, Math.ceil(rows.length
 const immediate = () => new Promise((resolve) => setImmediate(resolve));
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-function claudeAssistantLine(n) {
-  const prefix = `{"type":"assistant","timestamp":${Date.now()},"message":{"content":"`;
+function claudeLine(type, n, label) {
+  const prefix = `{"type":"${type}","timestamp":${Date.now()},"message":{"content":"`;
   const suffix = `","n":${n}}}`;
-  return prefix + 'x'.repeat(CHUNK_BYTES - Buffer.byteLength(prefix) - Buffer.byteLength(suffix) - 1) + suffix + '\n';
+  const text = label + 'x'.repeat(CHUNK_BYTES - Buffer.byteLength(prefix) - Buffer.byteLength(label) - Buffer.byteLength(suffix) - 1);
+  return { line: prefix + text + suffix + '\n', text };
 }
 
 async function measure(action) {
@@ -64,9 +67,13 @@ function serialise(measurement) {
   return Object.fromEntries(Object.entries(measurement).map(([key, value]) => [key, Number(value.toFixed(3))]));
 }
 
-if (process.env.THREAD_VIEW_SCALE !== '1') {
-  test('THREAD-VIEW release scale is opt-in', { skip: 'Set THREAD_VIEW_SCALE=1; the gate writes a temp 50 MiB fixture.' }, () => {});
-} else test('THREAD-VIEW release scale: real 50 MiB worker stream plus 300-agent churn', { timeout: 180_000 }, async () => {
+const scaleMode = process.env.THREAD_VIEW_SCALE;
+if (scaleMode !== '1' && scaleMode !== 'micro') {
+  test('THREAD-VIEW release scale is opt-in', { skip: 'Set THREAD_VIEW_SCALE=micro for 100 chunks, or =1 for the separately authorised 50 MiB run.' }, () => {});
+} else {
+  const chunks = scaleMode === 'micro' ? MICRO_CHUNKS : FULL_CHUNKS;
+  const fixtureBytes = chunks * CHUNK_BYTES;
+  test(`THREAD-VIEW ${scaleMode === 'micro' ? 'micro' : 'release'} scale: ${chunks} worker chunks plus 300-agent churn`, { timeout: 600_000 }, async (t) => {
   const temp = fs.mkdtempSync(path.join(os.tmpdir(), 'munder-thread-view-scale-'));
   const userData = path.join(temp, 'userData');
   const source = path.join(temp, 'provider.jsonl');
@@ -90,13 +97,15 @@ if (process.env.THREAD_VIEW_SCALE !== '1') {
     }
   });
   const nextBatch = (target) => new Promise((resolve) => { waitTarget = target; waiter = resolve; });
+  const abort = () => new Promise((_, reject) => {
+    if (t.signal.aborted) return reject(t.signal.reason ?? new Error('scale test aborted'));
+    t.signal.addEventListener('abort', () => reject(t.signal.reason ?? new Error('scale test aborted')), { once: true });
+  });
+  const throwIfAborted = () => { if (t.signal.aborted) throw (t.signal.reason ?? new Error('scale test aborted')); };
   try {
     assert.ok(path.resolve(userData).startsWith(path.resolve(os.tmpdir()) + path.sep), 'must use a temp userData root');
     const idle = await measure(async () => { await sleep(40); });
     await fsp.writeFile(source, '');
-    const human = 'scale-human';
-    store.recordReceipt('michael', human, 'human-terminal');
-    await store.ingestClaudeLine('michael', JSON.stringify({ type: 'user', timestamp: Date.now(), message: { content: human } }));
     worker.postMessage({ type: 'source', source: { agentId: 'michael', provider: 'claude', file: source } });
     await sleep(20); // queue ordering establishes the worker's initial EOF cursor
 
@@ -105,23 +114,35 @@ if (process.env.THREAD_VIEW_SCALE !== '1') {
     const whole = monitorEventLoopDelay({ resolution: 1 });
     whole.enable();
     const stream = await measure(async () => {
-      for (let bytes = 0; bytes < FIXTURE_BYTES; bytes += CHUNK_BYTES) {
-        await fsp.appendFile(source, claudeAssistantLine(bytes / CHUNK_BYTES));
-        // The 500 ms timer can win this race; both paths share one cursor, so
-        // the later poll is a harmless no-op and the line count remains exact.
-      }
-      const wait = nextBatch(FIXTURE_BYTES / CHUNK_BYTES);
+      const writer = await fsp.open(source, 'a');
+      try {
+        for (let n = 0; n < chunks; n += 1) {
+          throwIfAborted();
+          // Each 20-row window has one Human input, one admitted reply, a
+          // machine nudge that closes admission, and 17 non-admitted replies.
+          // Thus the full 50 MiB fixture has 40 admitted replies (~2.5 MiB)
+          // and 95% rows that do not reach private Talk storage.
+          const slot = n % 20;
+          const row = slot === 0 ? claudeLine('user', n, `scale-human-${n}:`)
+            : slot === 2 ? claudeLine('user', n, `scale-machine-nudge-${n}:`)
+            : claudeLine('assistant', n, `scale-assistant-${n}:`);
+          if (slot === 0) store.recordReceipt('michael', row.text, 'human-terminal');
+          await writer.write(row.line);
+          if ((n + 1) % 100 === 0) console.log(JSON.stringify({ phase: 'stream-write', chunks: n + 1 }));
+        }
+      } finally { await writer.close(); }
+      const wait = nextBatch(chunks);
       worker.postMessage({ type: 'poll' });
-      await wait;
+      await Promise.race([wait, abort()]);
     });
     const workerP95 = p95([...batches].sort((a, b) => a - b));
-    assert.equal(batches.length, FIXTURE_BYTES / CHUNK_BYTES, 'every 64 KiB source chunk reaches the worker');
+    assert.equal(batches.length, chunks, 'every 64 KiB source chunk reaches the worker');
     assert.ok(workerP95 < 10, `worker cumulative batch p95 ${workerP95.toFixed(2)}ms >= 10ms per 64 KiB chunk`);
 
-    // Event text is capped at 64 KiB. Three valid events per agent make a
-    // 50 MiB fixture under both the 8 MiB/agent and 128 MiB global caps.
+    // Event text is capped at 64 KiB. Three valid events per agent make the
+    // fixture fit under both the 8 MiB/agent and 128 MiB global caps.
     const eventsPerAgent = 3;
-    const bytesEach = Math.ceil(FIXTURE_BYTES / (AGENTS * eventsPerAgent));
+    const bytesEach = Math.ceil(fixtureBytes / (AGENTS * eventsPerAgent));
     const storePhase = await measure(async () => {
       for (let i = 0; i < AGENTS; i += 1) {
         for (let event = 0; event < eventsPerAgent; event += 1) {
@@ -132,7 +153,7 @@ if (process.env.THREAD_VIEW_SCALE !== '1') {
     const total = fs.readdirSync(path.join(userData, 'threads'))
       .filter((name) => /^agent-/.test(name))
       .reduce((sum, id) => sum + fs.statSync(path.join(userData, 'threads', id, 'active.jsonl')).size, 0);
-    assert.ok(total >= FIXTURE_BYTES * 0.99, `stored ${total} bytes, expected near ${FIXTURE_BYTES}`);
+    assert.ok(total >= fixtureBytes * 0.99, `stored ${total} bytes, expected near ${fixtureBytes}`);
     assert.ok(total <= storeModule.GLOBAL_CAP, 'fixture remains under the global cap; this does not exercise global pruning');
 
     const sweepStart = Date.now();
@@ -153,7 +174,7 @@ if (process.env.THREAD_VIEW_SCALE !== '1') {
       assert.ok(result.maxMs <= LOOP_CEILING_MS, `${name} loop max ${result.maxMs.toFixed(2)}ms exceeds ${LOOP_CEILING_MS}ms`);
     }
     console.log(JSON.stringify({
-      fixtureBytes: total, streamBytes: FIXTURE_BYTES, chunks: batches.length, agents: AGENTS,
+      mode: scaleMode, fixtureBytes: total, streamBytes: fixtureBytes, chunks: batches.length, agents: AGENTS,
       workerCumulativeBatchP95Ms: Number(workerP95.toFixed(3)), baselineMaxMs: BASELINE_MAX_MS,
       noiseAllowanceMs: NOISE_ALLOWANCE_MS, loopCeilingMs: LOOP_CEILING_MS,
       idle: serialise(idle), stream: serialise(stream), store: serialise(storePhase), sweep: serialise(sweep), whole: serialise(wholeWindow)
@@ -162,4 +183,5 @@ if (process.env.THREAD_VIEW_SCALE !== '1') {
     await worker.terminate();
     fs.rmSync(temp, { recursive: true, force: true });
   }
-});
+  });
+}
