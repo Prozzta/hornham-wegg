@@ -47,6 +47,7 @@ function byteTrim(text: string): { text: string; truncated: boolean } {
 
 export class ThreadViewStore {
   private receipts = new Map<string, ThreadReceipt[]>();
+  private admitted = new Set<string>();
   private totalBytes = 0;
   private ledgerDirty = false;
   private ledgerTimer: NodeJS.Timeout | undefined;
@@ -105,6 +106,32 @@ export class ThreadViewStore {
     return row;
   }
 
+  /** Provider adapters intentionally display one source only: Claude transcript
+   * message text and Codex event_msg. response_item/tool records never reach Talk. */
+  async ingestClaudeLine(agentId: string, line: string): Promise<void> {
+    let row: any; try { row = JSON.parse(line); } catch { return; }
+    const text = textOf(row?.message?.content ?? row?.content);
+    if (!text) return;
+    if (row?.type === 'user') {
+      if (this.consumeHumanReceipt(agentId, text, Number(row?.timestamp) || Date.now())) this.admitted.add(agentId);
+      return;
+    }
+    if (row?.type === 'assistant' && this.admitted.has(agentId)) await this.append(agentId, { speaker: 'agent', text, source: 'claude' });
+  }
+
+  async ingestCodexLine(agentId: string, line: string): Promise<void> {
+    let row: any; try { row = JSON.parse(line); } catch { return; }
+    if (row?.type !== 'event_msg') return; // response_item duplicates messages; never display it.
+    const kind = row?.payload?.type;
+    const text = textOf(row?.payload?.message ?? row?.payload?.text ?? row?.payload?.content);
+    if (!text) return;
+    if (kind === 'user_message') {
+      if (this.consumeHumanReceipt(agentId, text, Date.parse(row?.timestamp) || Date.now())) this.admitted.add(agentId);
+    } else if (kind === 'agent_message' && this.admitted.has(agentId)) {
+      await this.append(agentId, { speaker: 'agent', text, source: 'codex' });
+    }
+  }
+
   async list(agentId: string, limit = 500): Promise<ThreadEvent[]> {
     const dir = this.agentDir(agentId);
     const names = (await readdir(dir).catch(() => [] as string[])).filter((n) => n.endsWith('.jsonl')).sort();
@@ -153,6 +180,12 @@ export class ThreadViewStore {
       await rm(item.path, { force: true }); this.totalBytes = Math.max(0, this.totalBytes - item.size);
     }
   }
+}
+
+function textOf(value: unknown): string {
+  if (typeof value === 'string') return value;
+  if (!Array.isArray(value)) return '';
+  return value.map((block: any) => block?.type === 'text' && typeof block.text === 'string' ? block.text : block?.type === 'image' ? '[image]' : '').filter(Boolean).join('\n');
 }
 
 export function threadRoot(userData: string): string { return resolve(userData, 'threads'); }
