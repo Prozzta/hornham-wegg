@@ -12,8 +12,6 @@ import { AskMeTab } from './AskMeTab';
 import { TriggersTab } from './triggers/TriggersTab';
 import { TriggerHistoryTab } from './triggers/TriggerHistoryTab';
 import { WorkersTab } from './WorkersTab';
-import { ThreadTalkPanel } from './ThreadTalkPanel';
-import type { ThreadLayoutV1 } from '../../../preload';
 import { SkillsTab } from './SkillsTab';
 import { acquireTerminal, disposeTerminal, resetTerminal } from './terminalPool';
 import { terminalInstanceKey } from './terminalRecovery';
@@ -47,7 +45,7 @@ import { canReceiveInbox } from '@shared/agentProvider';
 // Both the AskMe (#human) tab and the Triggers tab live here. Triggers replaced
 // the old Schedules tab: schedules are now one of four trigger types, and the
 // whole surface lives in ./triggers (see src/shared/triggers.ts for the contract).
-type CCTab = 'terminal' | 'talk' | 'floor' | 'tasks' | 'human' | 'triggers' | 'trigger-history'
+type CCTab = 'terminal' | 'floor' | 'tasks' | 'human' | 'triggers' | 'trigger-history'
   | 'memory' | 'graph' | 'activity' | 'skills' | 'workers';
 
 /** Fallback denominator for the per-agent token meter when no floor token budget
@@ -68,7 +66,6 @@ interface GHIssue {
 /** Canonical tab order. Not every entry is always shown — see `visibleTabs`. */
 const TABS: { key: CCTab; label: string; icon: Parameters<typeof Icon>[0]['name'] }[] = [
   { key: 'terminal', label: 'terminal', icon: 'terminal' },
-  { key: 'talk', label: 'talk', icon: 'bell' },
   { key: 'floor', label: 'monitor', icon: 'mcp' },
   { key: 'tasks', label: 'tasks', icon: 'check' },
   { key: 'human', label: 'ask me', icon: 'bell' },
@@ -86,36 +83,7 @@ const TABS: { key: CCTab; label: string; icon: Parameters<typeof Icon>[0]['name'
  *  fullscreen" placeholder instead — two live xterms on one pty fight over its
  *  cols/rows and corrupt the display. */
 export function CommandCenterPanel({ agent, fullscreen = false }: { agent: Agent; fullscreen?: boolean }) {
-  // Phase 1 decision: Michael opens on the readable Human conversation; other
-  // agents keep their existing Terminal default in AgentDetailPanel.
-  const [tab, setTab] = useState<CCTab>('talk');
-  const [threadLayout, setThreadLayout] = useState<ThreadLayoutV1 | null>(null);
-  // The per-agent layout is private userData state, separate from Talk JSONL and
-  // validated by main. It survives restart without joining roster/hive storage.
-  useEffect(() => {
-    let live = true;
-    void window.cth.threadLayoutGet(agent.id, 'talk').then((layout) => {
-      if (live && layout) { setThreadLayout(layout); setTab(layout.preferredView); }
-    }).catch(() => { /* default Talk remains safe */ });
-    return () => { live = false; };
-  }, [agent.id]);
-  const selectTab = (next: CCTab) => {
-    setTab(next);
-    if (next === 'talk' || next === 'terminal') {
-      const candidate = { preferredView: next, split: threadLayout?.split ?? null, lastSelectedAt: Date.now() };
-      setThreadLayout((previous) => previous ? { ...previous, ...candidate } : null);
-      void window.cth.threadLayoutSet(agent.id, candidate, 'talk').then((saved) => { if (saved) setThreadLayout(saved); });
-    }
-  };
-  const toggleThreadSplit = () => {
-    const split = threadLayout?.split
-      ? null
-      : { orientation: 'vertical' as const, talkDock: 'right' as const, ratio: 0.5 };
-    const preferredView: 'talk' | 'terminal' = tab === 'terminal' ? 'terminal' : 'talk';
-    const candidate = { preferredView, split, lastSelectedAt: Date.now() };
-    setThreadLayout((previous) => previous ? { ...previous, ...candidate } : null);
-    void window.cth.threadLayoutSet(agent.id, candidate, 'talk').then((saved) => { if (saved) setThreadLayout(saved); });
-  };
+  const [tab, setTab] = useState<CCTab>('terminal');
   // The trigger-history ledger has nothing to say until an outside party can
   // reach us, so its tab appears only once an org key or a webhook exists. This
   // is the first config-gated tab in the panel: TABS stays the canonical order
@@ -291,7 +259,7 @@ export function CommandCenterPanel({ agent, fullscreen = false }: { agent: Agent
         {visibleTabs.map((t) => (
           <button
             key={t.key}
-            onClick={() => selectTab(t.key)}
+            onClick={() => setTab(t.key)}
             style={{
               whiteSpace: 'nowrap',
               // grow to share any spare width (so the strip still spans the panel
@@ -315,22 +283,15 @@ export function CommandCenterPanel({ agent, fullscreen = false }: { agent: Agent
             <Icon name={t.icon} /> {t.label}
           </button>
         ))}
-        {(tab === 'talk' || tab === 'terminal') && agent.ptyId && (
-          <button
-            onClick={toggleThreadSplit}
-            title={threadLayout?.split ? 'Return to a single Talk or Terminal pane' : 'Show Talk and Terminal side by side'}
-            style={{ padding: '4px 8px 3px', border: '1px solid var(--cth-ink-300)', cursor: 'pointer', background: 'var(--cth-cream-200)', color: 'var(--cth-ink-900)', fontFamily: 'var(--cth-font-ui)', fontSize: 13 }}
-          >{threadLayout?.split ? 'single pane' : 'split pane'}</button>
-        )}
       </div>
 
       {/* Body */}
-      <div style={{ flex: 1, minHeight: 0, display: 'flex', flexDirection: threadLayout?.split && (tab === 'talk' || tab === 'terminal') ? threadLayout.split.orientation === 'vertical' ? 'row' : 'column' : 'column' }}>
-        {(tab === 'terminal' || (threadLayout?.split && tab === 'talk')) && (
+      <div style={{ flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column' }}>
+        {tab === 'terminal' && (
           isFullscreenedHere ? (
             <Centered>Terminal is open in fullscreen. Press Esc to bring it back.</Centered>
           ) : agent.ptyId ? (
-            <div style={{ flex: threadLayout?.split ? threadLayout.split.ratio : 1, minWidth: 0, minHeight: 0, display: 'flex', flexDirection: 'column' }}>
+            <>
               <div style={{ flex: 1, minHeight: 0, display: 'flex' }}>
                 <PtyTerminalView
                   key={terminalInstanceKey(agent.ptyId, agent.terminalGeneration)}
@@ -338,7 +299,6 @@ export function CommandCenterPanel({ agent, fullscreen = false }: { agent: Agent
                   onStreamData={onPtyStream}
                   onUserPrompt={(t) => {
                     updateAgent(agent.id, { lastPrompt: t });
-                    if (t.trim()) void window.cth.threadRecordHuman(agent.id, t, 'human-terminal');
                     if (t.trim().toLowerCase() === '/clear') {
                       updateAgent(agent.id, { contextTokens: 0, contextLimit: undefined, progress: 0 });
                     }
@@ -350,12 +310,11 @@ export function CommandCenterPanel({ agent, fullscreen = false }: { agent: Agent
                 />
               </div>
               <MessageQueueComposer agent={agent} />
-            </div>
+            </>
           ) : (
             <Centered>Michael has no live terminal.</Centered>
           )
         )}
-        {(tab === 'talk' || (threadLayout?.split && tab === 'terminal')) && <div style={{ flex: threadLayout?.split ? 1 - threadLayout.split.ratio : 1, minWidth: 0, minHeight: 0, display: 'flex' }}><ThreadTalkPanel agentId={agent.id} agentName={agent.name} /></div>}
         {tab === 'floor' && <FloorTab seed={dispatchSeed} />}
         {tab === 'tasks' && <TasksKanban />}
         {tab === 'human' && <AskMeTab />}

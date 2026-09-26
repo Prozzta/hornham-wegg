@@ -926,12 +926,8 @@ function Header({ agent, onEdit }: { agent: Agent; onEdit: () => void }) {
    *  button would read as "restart Michael" while looking like "close". */
   const onKill = async () => {
     if (!agent.ptyId) return;
-    if (!confirm(`Close ${agent.name}? The PTY process will terminate, the agent will be archived, and its Talk history is deleted.`)) return;
-    // Do not erase Talk before the close actually succeeds. A failed/stalled
-    // kill leaves a live agent which may still emit a complete Talk history.
-    const killed = await window.cth.killPty(agent.ptyId);
-    if (!killed.ok) return;
-    await window.cth.threadRetire(agent.id);
+    if (!confirm(`Close ${agent.name}? The PTY process will terminate and the agent is archived (kept in history, off the floor).`)) return;
+    await window.cth.killPty(agent.ptyId);
     disposeTerminal(agent.ptyId);
     // archiveAgent re-homes focus mode to the next agent, and only leaves it when
     // the last one is gone. Hard-nulling here threw that away, which is why
