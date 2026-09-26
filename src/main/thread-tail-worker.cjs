@@ -55,7 +55,12 @@ function tailOnce() {
 }
 
 parentPort.on('message', (message) => {
-  if (!message || message.type !== 'source') return;
+  if (!message) return;
+  // The production owner only sends `source`. `poll` makes the same bounded
+  // tail operation directly measurable in the opt-in release-scale harness;
+  // it never changes the selected source or bypasses its cursor semantics.
+  if (message.type === 'poll') { tailOnce(); return; }
+  if (message.type !== 'source') return;
   source = message.source && typeof message.source.agentId === 'string' ? message.source : null;
   cursors.clear();
   tailOnce();
