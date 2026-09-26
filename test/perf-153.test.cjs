@@ -7,7 +7,8 @@
  *      returns. Before: hive-node.cmd + Electron-as-Node per refresh (~5 processes, ~630 ms).
  *      It cannot simply be dropped: it is the only source of the subscription's rate_limits
  *      (the capacity seam), the model and the exact context window.
- *  R2  hive commits are batched harder (idle 30 s, max 2 min); flush on quit unchanged.
+ *  NO-GIT (the Human, replacing R2): the app no longer runs git in the hive at all; an existing
+ *      hive/.git is left on disk untouched.
  */
 const test = require('node:test');
 const assert = require('node:assert/strict');
@@ -27,7 +28,6 @@ test.after(() => { for (const [k, v] of Object.entries(realEnv)) { if (v === und
 
 const { HookServer, statusGauge } = loadTs('src/main/hooks.ts');
 const { HiveManager, CLAUDE_STATUS_SH, HOOK_SHIM, brokerUrlParts, claudeStatusCommand } = loadTs('src/main/hive.ts');
-const committer = loadTs('src/main/hiveCommitter.ts');
 const WIN = process.platform === 'win32';
 const BASH = 'C:/Program Files/Git/bin/bash.exe';
 const HAVE_BASH = WIN && fs.existsSync(BASH);
@@ -183,23 +183,83 @@ test('R1 STATIC: the script uses no external command (builtins, redirections and
   assert.doesNotMatch(code, /\b(cat|curl|wget|sed|awk|grep|tr|head|tail|nc|node|cmd|powershell|findstr)\b/);
 });
 
-// ── R2 ────────────────────────────────────────────────────────────────────
+// ── NO-GIT (the Human's decision, replacing R2) ───────────────────────────
 
-test('R2: the hive commit batches at idle 30 s / max 2 min by default; the identity-guard hooks still run (no --no-verify)', () => {
-  assert.equal(committer.COMMIT_IDLE_MS, 30_000);
-  assert.equal(committer.COMMIT_MAX_WAIT_MS, 120_000);
-  const src = fs.readFileSync(path.join(__dirname, '..', 'src', 'main', 'hiveCommitter.ts'), 'utf8');
-  assert.doesNotMatch(src.replace(/\/\/.*$|\/\*[\s\S]*?\*\//gm, ''), /--no-verify|core\.hooksPath/, 'the Human\'s guard is never bypassed');
+const cp = require('node:child_process');
+/** Every child_process entry point, intercepted: the git invocations made while `fn` runs. */
+async function gitCallsDuring(fn) {
+  const calls = [];
+  const names = ['spawn', 'spawnSync', 'execFile', 'execFileSync', 'exec', 'execSync'];
+  const real = {};
+  for (const n of names) {
+    real[n] = cp[n];
+    cp[n] = function (cmd, ...rest) {
+      const all = [String(cmd), ...(Array.isArray(rest[0]) ? rest[0].map(String) : [])].join(' ');
+      if (/(^|[\\/\s"'])git(\.exe)?(\s|"|'|$)/i.test(all)) calls.push({ fn: n, cmd: all.slice(0, 120) });
+      return real[n].call(this, cmd, ...rest);
+    };
+  }
+  try { await fn(); } finally { for (const n of names) cp[n] = real[n]; }
+  return calls;
+}
+const NOGIT_HIVE = () => loadTs('src/main/hive.ts').HiveManager;
+
+test('NO-GIT: a new hive, agents, mail (send + outbox routing), tasks, role, rename, archive, session and model run ZERO git; no .git is created', async () => {
+  const home = fs.mkdtempSync(path.join(JAIL, 'ng-'));
+  const Hive = NOGIT_HIVE();
+  const calls = await gitCallsDuring(async () => {
+    const hive = new Hive(() => home);
+    await hive.ensureAgent({ id: 'a1', name: 'A', provider: 'claude', cwd: home });
+    await hive.ensureAgent({ id: 'b2', name: 'B', provider: 'claude', cwd: home });
+    for (let i = 0; i < 5; i++) hive.send({ to: 'b2', act: 'inform', subject: `m${i}`, body: 'hi' }, 'a1');
+    // an agent-written outbox message, routed the way the router does it
+    fs.writeFileSync(path.join(home, 'hive', 'agents', 'a1', 'outbox', 'x.json'), JSON.stringify({ id: 'x', to: 'b2', act: 'inform', subject: 's', body: 'b', from: 'a1' }));
+    hive.routeOnce();
+    hive.writeTasks([{ id: 't1', title: 'T', status: 'todo', dependsOn: [], priority: 3, createdAt: new Date().toISOString() }]);
+    hive.patchAgentRole('a1', 'builder');
+    hive.renameAgent('a1', 'Alpha');
+    hive.recordSession('a1', 'sess-1');
+    hive.recordModel('a1', 'claude-opus-5-5', undefined);
+    hive.setArchived('b2', true);
+    await new Promise((r) => setTimeout(r, 300));   // anything deferred would fire here
+  });
+  assert.deepEqual(calls, [], 'no git process of any kind');
+  assert.equal(fs.existsSync(path.join(home, 'hive', '.git')), false, 'a new hive is not git-initialised');
+  assert.equal(fs.readdirSync(path.join(home, 'hive', 'agents', 'b2', 'inbox')).filter((f) => f.endsWith('.json')).length, 6, 'and the mail was delivered');
+  assert.ok(fs.existsSync(path.join(home, 'hive', 'tasks.json')));
 });
 
-test('R2: a default committer schedules its first commit 30 s after a request and never later than 120 s under a stream', async () => {
-  const timers = []; let now = 0;
-  const c = new committer.HiveCommitter({
-    root: () => JAIL, git: async () => ({ ok: true, out: '', err: '' }),
-    setTimer: (fn, ms) => { timers.push(ms); return { fn, ms }; }, clearTimer: () => {}, now: () => now, log: () => {}
+test('NO-GIT: an EXISTING hive/.git is left exactly as it was (never deleted, never written)', async () => {
+  const home = fs.mkdtempSync(path.join(JAIL, 'ng-'));
+  const git = path.join(home, 'hive', '.git');
+  fs.mkdirSync(path.join(git, 'hooks'), { recursive: true });
+  fs.writeFileSync(path.join(git, 'HEAD'), 'ref: refs/heads/master\n');
+  fs.writeFileSync(path.join(git, 'hooks', 'pre-commit'), '#!/bin/sh\nexit 0\n');
+  fs.writeFileSync(path.join(home, 'hive', '.gitignore'), 'mine\n');
+  const snap = () => { const out = {}; const walk = (d) => { for (const e of fs.readdirSync(d, { withFileTypes: true })) { const f = path.join(d, e.name); if (e.isDirectory()) walk(f); else out[path.relative(home, f)] = fs.readFileSync(f, 'utf8') + '|' + fs.statSync(f).mtimeMs; } }; walk(git); out['.gitignore'] = fs.readFileSync(path.join(home, 'hive', '.gitignore'), 'utf8'); return out; };
+  const before = snap();
+  const calls = await gitCallsDuring(async () => {
+    const hive = new (NOGIT_HIVE())(() => home);
+    await hive.ensureAgent({ id: 'a1', name: 'A', provider: 'claude', cwd: home });
+    hive.send({ to: 'a1', act: 'inform', subject: 's', body: 'b' }, 'system');
   });
-  c.request('one');
-  assert.equal(timers.at(-1), 30_000, 'a quiet 30 s after the first request');
-  now = 100_000; c.request('two');
-  assert.equal(timers.at(-1), 20_000, 'a stream still commits by 120 s after the OLDEST request');
+  assert.deepEqual(calls, []);
+  assert.deepEqual(snap(), before, 'the .git tree and the hive .gitignore are untouched');
+});
+
+test('NO-GIT: every agent\'s MINE ignore file (read by mempalace, not git) is still refreshed once per process, running or not', async () => {
+  const home = fs.mkdtempSync(path.join(JAIL, 'ng-'));
+  const idle = path.join(home, 'hive', 'agents', 'sleeper'); fs.mkdirSync(idle, { recursive: true });
+  const hive = new (NOGIT_HIVE())(() => home);
+  await hive.ensureAgent({ id: 'a1', name: 'A', provider: 'claude', cwd: home });
+  const ig = fs.readFileSync(path.join(idle, '.gitignore'), 'utf8');
+  assert.match(ig, /\.codex/, 'an agent that never spawns still gets its mine ignore');
+});
+
+test('NO-GIT STATIC: no git anywhere in the hive layer; the committer is gone; quit no longer waits on a flush', () => {
+  const src = fs.readFileSync(path.join(__dirname, '..', 'src', 'main', 'hive.ts'), 'utf8').replace(/\/\/.*$|\/\*[\s\S]*?\*\//gm, '');
+  assert.doesNotMatch(src, /spawnSync\(|['"]git['"]|HiveCommitter|flushCommits|\bcommit\(/);
+  assert.equal(fs.existsSync(path.join(__dirname, '..', 'src', 'main', 'hiveCommitter.ts')), false);
+  const idx = fs.readFileSync(path.join(__dirname, '..', 'src', 'main', 'index.ts'), 'utf8');
+  assert.doesNotMatch(idx, /flushCommits/);
 });

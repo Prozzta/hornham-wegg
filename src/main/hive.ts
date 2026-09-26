@@ -14,7 +14,6 @@
  * prompts surface in the agent's own terminal (and can be approved remotely via
  * `/remote-control`). The hive keeps no separate approval queue — a message aimed
  * at "human" is routed to the god/orchestrator, the human's proxy on the floor.
- *   - single-committer git with retry/backoff + stale-lock recovery
  *
  * Everything here runs in the Electron main process.
  */
@@ -26,7 +25,7 @@ import {
 } from 'node:fs';
 import { join, dirname, isAbsolute } from 'node:path';
 import { homedir } from 'node:os';
-import { spawnSync, spawn, type ChildProcess } from 'node:child_process';
+import { spawn, type ChildProcess } from 'node:child_process';
 import { randomBytes, createHash } from 'node:crypto';
 import {
   DEV_ISOLATION, sanitizeCodexConfigForDev, hookPipeId,
@@ -56,7 +55,6 @@ import {
 const AGY_LEASE_HEARTBEAT_MS = 60 * 60 * 1000;
 import { AGY_STATUSLINE_SHIM } from './agyStatuslineShim';
 import { geminiHome } from './capacityScope';
-import { HiveCommitter, type GitResult } from './hiveCommitter';
 import { codexMcpHookToml, MCP_HOOK_EVENTS, type McpHookEvent } from './codexHookMcp';
 
 /** The subset of HarnessConfig the hive consumes for the default-MCP merge.
@@ -450,8 +448,6 @@ export class HiveManager {
   }
 
   private readonly routerRuntime: RouterRuntime;
-  /** MESSAGE-LAG-152: every hive commit goes through here: coalesced, async, single-flight,
-   *  never on the main thread's critical path (see hiveCommitter.ts). */
   /** HOOK-BROKER: the in-process HTTP hook endpoint (HookServer), injected by main. Null in
    *  tests and until wired; every spawn then writes command hooks exactly as before. */
   private hookBroker: HookBroker | null = null;
@@ -459,11 +455,6 @@ export class HiveManager {
     this.hookBroker = broker;
   }
 
-  private readonly committer = new HiveCommitter({
-    root: () => this.root(),
-    prepare: (root, git) => this.prepareRepo(root, git),
-    log: (line) => console.warn(line)
-  });
   private routerTimer: unknown = null;
   /** One non-recursive watcher per active outbox, keyed by its absolute path. */
   private readonly outboxWatchers = new Map<string, Pick<FSWatcher, 'close' | 'on'>>();
@@ -747,14 +738,6 @@ export class HiveManager {
     // so it tracks the bundled list).
     writeFileSync(join(root, 'COMMANDS.md'), COMMANDS_MD, 'utf8');
 
-    // Keep the churny/ephemeral live files out of the hive git repo.
-    const gitignore = join(root, '.gitignore');
-    const want = ['fleet.json', 'hooks.sock', 'cost-ledger.jsonl', '.DS_Store'];
-    let lines: string[] = [];
-    if (existsSync(gitignore)) { try { lines = readFileSync(gitignore, 'utf8').split('\n'); } catch { lines = []; } }
-    const missing = want.filter((w) => !lines.includes(w));
-    if (missing.length) writeFileSync(gitignore, [...lines.filter(Boolean), ...missing].join('\n') + '\n', 'utf8');
-
     // The hook shim: a dumb pipe between a `claude` hook and our UDS. Refreshed
     // on every bootstrap so it tracks code changes.
     mkdirSync(join(root, 'bin'), { recursive: true });
@@ -767,10 +750,29 @@ export class HiveManager {
     // …and the PATH-visible `node` fallback for the agent's OWN subprocesses.
     this.writeRuntimeShims();
 
-    if (!existsSync(join(root, '.git'))) {
-      this.git(['init', '-q'], root);
-      this.commit('hive: init');
-    }
+    // 1.1.53 (the Human's decision): the hive is no longer a git repo the app maintains. Nothing
+    // read its history, and every commit cost ~59 process starts (git plus the identity-guard
+    // hooks), each an antivirus scan. A new hive is not git-initialised; an existing hive/.git
+    // is LEFT ON DISK untouched (the Human can remove it), and its hooks simply stop firing.
+    //
+    // What survives from the old commit prep: every agent's MINE ignore file (mempalace mine
+    // honours .gitignore; it keeps Codex homes and raw inbox JSON out of the palace). Agents that
+    // are not running never pass through spawn, so they are refreshed once per process here.
+    this.refreshMineIgnores(root);
+  }
+
+  /** Has the once-per-process mine-ignore refresh run? */
+  private mineIgnoresRefreshed = false;
+
+  /** Ensure every agent dir's .gitignore (read by mempalace mine, not by git) is current. */
+  private refreshMineIgnores(root: string): void {
+    if (this.mineIgnoresRefreshed) return;
+    this.mineIgnoresRefreshed = true;
+    const agentsDir = join(root, 'agents');
+    try {
+      if (!existsSync(agentsDir)) return;
+      for (const id of readdirSync(agentsDir)) ensureMineIgnore(join(agentsDir, id));
+    } catch { /* best-effort */ }
   }
 
   /** Validate an agent's cwd the way a spawn does — it must be an ABSOLUTE path
@@ -883,7 +885,6 @@ export class HiveManager {
     if (!cwd.valid) {
       this.appendLog({ kind: 'cwd_invalid', agentId: meta.id, cwd: meta.cwd, issue: cwd.issue });
     }
-    this.commit(`hive: register ${meta.id}`);
 
     const env: Record<string, string> = {
       AGENT_ID: meta.id,
@@ -1114,7 +1115,6 @@ export class HiveManager {
       this.writeJson(join(root, 'registry.json'), reg);
       writeFileSync(join(this.agentDir(id), 'identity.md'), this.identityText(agent), 'utf8');
       this.appendLog({ kind: 'role', agentId: id, role: next });
-      this.commit(`hive: role ${id}`);
       return { ok: true };
     } catch (e) {
       return { ok: false, error: e instanceof Error ? e.message : String(e) };
@@ -1140,7 +1140,6 @@ export class HiveManager {
       agent.lastSeen = Date.now();
       this.atomicWriteJson(join(root, 'registry.json'), reg);
       this.appendLog({ kind: 'archive', agentId: id, archived });
-      this.commit(`hive: ${archived ? 'archive' : 'unarchive'} ${id}`);
     } catch { /* best-effort — never crash a lifecycle handler */ }
   }
 
@@ -1223,7 +1222,6 @@ export class HiveManager {
       }
 
       this.appendLog({ kind: 'rename', agentId: id, previousName, name: nextName });
-      this.commit(`hive: rename ${id}`);
       return { ok: true, name: nextName };
     } catch {
       return { ok: false, error: 'Could not rename agent' };
@@ -1248,7 +1246,6 @@ export class HiveManager {
       agent.lastSeen = Date.now();
       this.atomicWriteJson(join(root, 'registry.json'), reg);
       this.appendLog({ kind: 'session', agentId, sessionId });
-      this.commit(`hive: session ${agentId}`);
     } catch { /* best-effort — never crash a hook handler */ }
   }
 
@@ -1277,7 +1274,6 @@ export class HiveManager {
         agent.lastSeen = Date.now();
         this.atomicWriteJson(join(root, 'registry.json'), reg);
         this.appendLog({ kind: 'model', agentId, model: null });
-        this.commit(`hive: model default ${agentId}`);
         return;
       }
       if (agent.model?.trim().toLowerCase() === key) return;
@@ -1285,7 +1281,6 @@ export class HiveManager {
       agent.lastSeen = Date.now();
       this.atomicWriteJson(join(root, 'registry.json'), reg);
       this.appendLog({ kind: 'model', agentId, model: next });
-      this.commit(`hive: model ${agentId}`);
     } catch { /* best-effort â€” never crash a status line */ }
   }
 
@@ -1700,7 +1695,6 @@ export class HiveManager {
   send(partial: Partial<HiveMessage>, from = 'system'): HiveMessage {
     const msg = this.normalize(partial, from);
     this.routeMessage(msg);
-    this.commit(`hive: msg ${msg.from}→${msg.to} (${msg.act})`);
     return msg;
   }
 
@@ -2070,7 +2064,6 @@ export class HiveManager {
       if (!liveOutboxFiles.has(full)) this.outboxDeliveredArchives.delete(full);
     }
     if (routed > 0 || rejected > 0 || archived > 0) {
-      this.commit(`hive: routed ${routed} message(s), rejected ${rejected}, archived ${archived}`);
     }
     return routed;
   }
@@ -2091,8 +2084,8 @@ export class HiveManager {
     return root ? this.readJson(join(root, 'tasks.json'), { tasks: [] }) : { tasks: [] };
   }
 
-  /** Persist the task ledger to hive/tasks.json and commit it. Mirrors the
-   *  board/message persist pattern: write JSON, log the change, single-commit.
+  /** Persist the task ledger to hive/tasks.json. Mirrors the board/message persist
+   *  pattern: write JSON, log the change.
    *
    *  MERGES by card id instead of clobbering. Callers hold PARTIAL models of a
    *  card — the renderer's kanban parser knows nine fields, the god writes as
@@ -2113,7 +2106,6 @@ export class HiveManager {
     const merged = mergeTaskLedger(current?.tasks, tasks);
     this.writeJson(path, { tasks: merged });
     this.appendLog({ kind: 'tasks', count: merged.length });
-    this.commit(`hive: tasks (${merged.length})`);
   }
 
   /** Append one card against the latest on-disk ledger. Renderer callers must
@@ -3046,97 +3038,6 @@ export class HiveManager {
     renameSync(tmp, p);
   }
 
-  // — git —
-  /** SYNCHRONOUS git, kept for exactly one call: `git init` when a hive is first created
-   *  (once per hive, ever). Every commit goes through the async committer instead. */
-  private git(args: string[], cwd: string): { ok: boolean; out: string; err: string } {
-    const res = spawnSync('git', ['-c', 'commit.gpgsign=false', '-c', 'user.name=Hive', '-c', 'user.email=hive@local', ...args], {
-      cwd, encoding: 'utf8', timeout: 8000
-    });
-    return { ok: res.status === 0, out: res.stdout ?? '', err: res.stderr ?? '' };
-  }
-
-  /** Has the one-time cost-ledger untrack pass run in this process yet? */
-  private untrackedCostLedger = false;
-
-  /**
-   * Stop versioning the cost ledger.
-   *
-   * `cost-ledger.jsonl` is append-only and gains a row per usage sample, so a
-   * repo that tracks it stores a fresh copy of the WHOLE file on every hive
-   * commit — and the hive commits constantly. A quarter-gigabyte ledger with a
-   * few thousand commits behind it is several hundred gigabytes of blob that
-   * git has to walk, which is what turns a routine `gc` into a multi-gigabyte
-   * `pack-objects` run. The ignore line in ensureHive keeps new copies out;
-   * this drops the one already in the index, because git keeps recording a
-   * file it is already tracking no matter what .gitignore says — so the ignore
-   * line alone reads as a fix while the repo goes on growing. The ledger stays
-   * on disk, so the cost history the app reads is untouched.
-   */
-  private async untrackCostLedger(git: (args: string[]) => Promise<GitResult>): Promise<void> {
-    if (this.untrackedCostLedger) return;
-    this.untrackedCostLedger = true;
-    // Probe before mutating: `rm --cached` on a repo that never tracked it
-    // would still rewrite the index on every launch, inside the retry path.
-    const tracked = await git(['ls-files', '--', 'cost-ledger.jsonl']);
-    if (!tracked.ok || !tracked.out.trim()) return;
-    await git(['rm', '--cached', '-q', '--ignore-unmatch', '--', 'cost-ledger.jsonl']);
-    console.warn('[hive] untracked the cost ledger from the hive repo');
-  }
-
-  /** Has the one-time Codex-home untrack pass run in this process yet? */
-  private untrackedCodexHomes = false;
-
-  /**
-   * Stop versioning Codex worker homes that are ALREADY in the index.
-   *
-   * Adding `.codex/` to each agent's .gitignore only keeps NEW paths out; git
-   * happily keeps recording a file it is already tracking, so a hive that
-   * predates that ignore line goes on committing every SQLite and transcript
-   * revision exactly as before — the .gitignore reads as a fix while the repo
-   * keeps growing. This closes that: once per process, refresh every agent's
-   * ignore file (agents that are not running never pass through spawn, and the
-   * mine loop only reaches them if mempalace is installed) and drop any tracked
-   * `.codex` path from the index. The files stay on disk, so `codex --resume`
-   * is unaffected; only their history stops.
-   */
-  private async untrackCodexHomes(root: string, git: (args: string[]) => Promise<GitResult>): Promise<void> {
-    if (this.untrackedCodexHomes) return;
-    this.untrackedCodexHomes = true;
-    const agentsDir = join(root, 'agents');
-    if (!existsSync(agentsDir)) return;
-    try {
-      for (const id of readdirSync(agentsDir)) ensureMineIgnore(join(agentsDir, id));
-    } catch { /* best-effort */ }
-    // Probe before mutating: `rm --cached` on a clean repo would still rewrite
-    // the index on every launch, and this runs inside the commit retry path.
-    const tracked = await git(['ls-files', '--', 'agents/*/.codex']);
-    if (!tracked.ok || !tracked.out.trim()) return;
-    await git(['rm', '-r', '--cached', '-q', '--ignore-unmatch', '--', 'agents/*/.codex']);
-    console.warn('[hive] untracked previously-committed Codex homes from the hive repo');
-  }
-
-  /** The one-time index tidying, run by the committer (async, in its single flight) before
-   *  the process's first commit. */
-  private async prepareRepo(root: string, git: (args: string[]) => Promise<GitResult>): Promise<void> {
-    await this.untrackCostLedger(git);
-    await this.untrackCodexHomes(root, git);
-  }
-
-  /**
-   * Ask for all hive changes to be committed. MESSAGE-LAG-152: this used to run
-   * `git add -A` + `git commit` synchronously, on Electron main, from the router's hot
-   * path (1.7-3.2 s per routed message, all IPC stalled). It is now a request: it returns at
-   * once, and the committer coalesces requests into one async commit. Nothing waits for it.
-   */
-  commit(message: string): void {
-    this.committer.request(message);
-  }
-
-  /** Commit everything requested so far (for quit). Never rejects. */
-  flushCommits(): Promise<void> {
-    return this.committer.flush();
-  }
 }
 
 // ─── PROTOCOL.md (written into the hive, readable by every agent) ────────────
@@ -3170,8 +3071,8 @@ const COMMANDS_MD = renderCommandsMd();
 const PROTOCOL_MD = `# Hive protocol
 
 You are one of several Claude agents sharing this hive. Coordination is entirely
-file-based; the harness (main process) is the only thing that runs git and the
-only thing that moves messages between agents.
+file-based; the harness (main process) is the only thing that moves messages
+between agents.
 
 ## Your workspace — \`agents/<your-id>/\`
 - \`identity.md\`  — who you are (read-only; the harness writes it).

@@ -6127,13 +6127,6 @@ app.on('will-quit', (e) => {
     Promise.race([
       analytics.endSession(),
       new Promise<void>((r) => setTimeout(r, 1200))
-    ]),
-    // MESSAGE-LAG-152: the hive's coalesced commit gets its last flush here, bounded. The
-    // state itself is already on disk; an unfinished commit is picked up by the next
-    // launch's first one (`add -A`), so the bound costs history granularity, never state.
-    Promise.race([
-      hive.flushCommits(),
-      new Promise<void>((r) => setTimeout(r, 8000))
     ])
   ]).then(finish, finish);
 });
