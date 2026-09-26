@@ -30,7 +30,8 @@ function copyMainSidecars() {
     // Knowledge Graph core: required by knowledge.ts at runtime (pure-JS, no
     // native deps), so it must be emitted next to the main bundle like the
     // Slack sidecar above.
-    ['src/main/kg-core.cjs', 'out/main/kg-core.cjs']
+    ['src/main/kg-core.cjs', 'out/main/kg-core.cjs'],
+    ['src/main/thread-tail-worker.cjs', 'out/main/thread-tail-worker.cjs']
   ];
   return {
     name: 'copy-main-cjs-sidecars',

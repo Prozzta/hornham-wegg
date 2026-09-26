@@ -331,7 +331,7 @@ export function realtimeActionTools(): ReturnType<typeof tool>[] {
     tool({
       name: 'archive_agent',
       description:
-        'Archive an agent — takes it off the floor, history kept (unarchive brings it back). DESTRUCTIVE — returns an echo-back and asks for verbal confirmation. After the user confirms, call confirm_action.',
+        'Archive an agent — takes it off the floor and permanently removes private Talk history; unarchive does not restore it. DESTRUCTIVE — returns an echo-back and asks for verbal confirmation. After the user confirms, call confirm_action.',
       parameters: {
         type: 'object',
         properties: { agentId: { type: 'string', description: 'Agent name or id to archive.' } },

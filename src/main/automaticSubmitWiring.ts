@@ -49,6 +49,7 @@ export interface OwnerWiring {
   now?: () => number;
   setTimer?: (fn: () => void, ms: number) => unknown;
   onOutcome?: (record: OutcomeRecord) => void;
+  onCommitted?: (agentId: string, text: string) => void;
 }
 
 export function buildOwnerDeps(w: OwnerWiring): OwnerDeps {
@@ -107,7 +108,8 @@ export function buildOwnerDeps(w: OwnerWiring): OwnerDeps {
       if (typeof t.unref === 'function') t.unref();
       return t;
     }),
-    onOutcome: w.onOutcome
+    onOutcome: w.onOutcome,
+    onCommitted: w.onCommitted
   };
 }
 
