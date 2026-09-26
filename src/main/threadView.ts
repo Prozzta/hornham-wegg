@@ -232,7 +232,11 @@ export class ThreadViewStore {
 
   async list(agentId: string, limit = 500): Promise<ThreadEvent[]> {
     const dir = this.agentDir(agentId);
-    const names = (await readdir(dir).catch(() => [] as string[])).filter((n) => n.endsWith('.jsonl')).sort().reverse();
+    const names = (await readdir(dir).catch(() => [] as string[]))
+      .filter((n) => n === 'active.jsonl' || /^closed-\d+\.jsonl$/.test(n))
+      // The active segment is always the most recent conversation. Closed
+      // segments follow by numeric rotation time, newest first.
+      .sort((a, b) => segmentNewestFirst(a, b));
     const rows: ThreadEvent[] = [];
     const seen = new Set<string>();
     let remainingBytes = LIST_MAX_BYTES;
@@ -390,6 +394,12 @@ function isClaudeMetaUser(row: any): boolean {
   if (subtype === 'system-reminder' || subtype === 'local-command') return true;
   const content = textOf(row?.message?.content ?? row?.content).trim().toLowerCase();
   return content.startsWith('<system-reminder') || content.startsWith('<local-command');
+}
+
+function segmentNewestFirst(a: string, b: string): number {
+  if (a === 'active.jsonl') return b === 'active.jsonl' ? 0 : -1;
+  if (b === 'active.jsonl') return 1;
+  return Number(b.slice(7, -6)) - Number(a.slice(7, -6));
 }
 
 function receiptWindowMs(receipt: ThreadReceipt): number {

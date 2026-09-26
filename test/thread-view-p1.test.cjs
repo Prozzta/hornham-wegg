@@ -156,17 +156,19 @@ test('THREAD-VIEW preserves a Human admission across Claude meta user records', 
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
 
-test('THREAD-VIEW pages contiguous history backward across page and segment boundaries', async () => {
+test('THREAD-VIEW restores the newest contiguous history across pages and segments', async () => {
   const { store: module, dir } = loadThreadStore();
   const store = new module.ThreadViewStore(path.join(dir, 'userData', 'threads'));
   try {
     const agentDir = path.join(dir, 'userData', 'threads', 'michael');
     fs.mkdirSync(agentDir, { recursive: true });
-    const rows = Array.from({ length: 700 }, (_, n) => JSON.stringify({ id: `id-${n}`, at: n, speaker: 'agent', source: 'claude', text: `${n}:${'x'.repeat(512)}` }) + '\n');
-    fs.writeFileSync(path.join(agentDir, 'closed-1.jsonl'), rows.slice(0, 350).join(''));
-    fs.writeFileSync(path.join(agentDir, 'active.jsonl'), rows.slice(350).join(''));
+    const rows = Array.from({ length: 3000 }, (_, n) => JSON.stringify({ id: `id-${n}`, at: n, speaker: 'agent', source: 'claude', text: `${n}:${'x'.repeat(512)}` }) + '\n');
+    fs.writeFileSync(path.join(agentDir, 'closed-100.jsonl'), rows.slice(0, 750).join(''));
+    fs.writeFileSync(path.join(agentDir, 'closed-200.jsonl'), rows.slice(750, 1500).join(''));
+    fs.writeFileSync(path.join(agentDir, 'closed-300.jsonl'), rows.slice(1500, 2250).join(''));
+    fs.writeFileSync(path.join(agentDir, 'active.jsonl'), rows.slice(2250).join(''));
     const listed = await store.list('michael', 1000);
-    assert.deepEqual(listed.map((row) => row.at), Array.from({ length: 700 }, (_, n) => n));
+    assert.deepEqual(listed.map((row) => row.at), Array.from({ length: 1000 }, (_, n) => n + 2000));
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
 
