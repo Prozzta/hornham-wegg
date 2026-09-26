@@ -23,7 +23,7 @@ and unattended.
 
 <p>
   <a href="./LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-F4D35E.svg?style=flat-square&labelColor=6E1423"></a>
-  <img alt="Version: 1.1.55" src="https://img.shields.io/badge/version-1.1.55-F4D35E.svg?style=flat-square&labelColor=6E1423">
+  <img alt="Version: 1.1.56" src="https://img.shields.io/badge/version-1.1.56-F4D35E.svg?style=flat-square&labelColor=6E1423">
   <img alt="Fork of chaitanyagiri/munder-difflin" src="https://img.shields.io/badge/fork%20of-chaitanyagiri%2Fmunder--difflin-F4F1EA.svg?style=flat-square&labelColor=6E1423">
 </p>
 
@@ -177,12 +177,15 @@ wholesale merges. The shape of the line, as evidence for the three ideas above:
   +20.7 points). It ships off: legacy by default (MemPalace and Python are still required
   until the cutover), then a staged rollout with an immediate `fallback-legacy` brake. The
   palace is never touched.
-- **Mail mid-turn, one heavy job at a time, and Talk** (1.1.55, the current release) — an
+- **Mail mid-turn, one heavy job at a time, and Talk** (1.1.55) — an
   agent is told about mail that arrives while it works, at its next tool call; installs,
   builds, full suites and benches take a slot (default one at a time, set in Settings), so
   agents stop loading the machine all at once; the Human reads the conversation with
   Michael in a Talk view beside the terminal; AGY and Codex agents start idle with
   their instructions; and wakes left unsent in a provider's input box are recovered.
+- **Talk taken out of the main app** (1.1.56, the current release) — it slowed the whole
+  app, most of all in the split view, so it is being rebuilt as a separate build. Everything
+  else in 1.1.55 stays, and Talk's history files on disk are left untouched.
 
 Every milestone carries a dated human acceptance and evidence tag in the fork's
 internal mission ledger; this README keeps only the shape.
@@ -369,10 +372,9 @@ Two data planes feed one renderer:
   (one hidden process listing every 20 s: the job counts as running while the agent's
   terminal has a process started after the slot was taken; a failed listing never frees a
   slot), by the terminal's exit, or after 60 minutes.
-- **Talk** (since 1.1.55). Main tails Michael's Claude or Codex transcript off the main
-  thread, normalises the messages and pushes them to the renderer. The history lives in the
-  app's data folder (never the hive), capped at 8 MB per agent; it is kept when an agent is
-  archived and deleted only when the Human retires it.
+- **Talk** (1.1.55 only; **removed in 1.1.56**, to return as a separate build). The main app
+  runs no Talk code. The private history 1.1.55 wrote under the app's data folder
+  (`threads`) is left on disk untouched.
 
 The renderer is presentation: main remains the sole submission authority, and nothing
 the UI displays can cause or prevent a wake.

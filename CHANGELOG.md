@@ -11,6 +11,26 @@ All notable changes to this project are documented here. The format is based on
 > v0.4.5 (below). Earlier 1.1.x releases are described on the
 > [releases page](https://github.com/Prozzta/hornham-wegg/releases).
 
+## [1.1.56] — 2026-09-26
+
+**Talk is removed from the main app while it is rebuilt as a separate build.** In 1.1.55 it slowed
+the whole app, most of all in the split view. Everything else in 1.1.55 stays. Rollback: 1.1.55.
+
+### Removed
+
+- **Talk** (the conversation view beside Michael's terminal). No Talk code runs: no transcript
+  tailing, no conversation store, no clean-up sweep, and no Talk panel. The Michael view is the
+  terminal again, and the message-queue composer works as before 1.1.55.
+- **Your Talk history is left untouched.** The private conversation files that 1.1.55 wrote to the
+  app's data folder (`threads`) are not read, moved or deleted. The standalone Talk build can use
+  them later, or you can delete the folder yourself.
+- Archiving an agent no longer mentions Talk history, because nothing removes it.
+
+### Unchanged
+
+- Everything else in 1.1.55: mid-turn mail notices, the heavy-job lock and its setting, AGY and
+  Codex agents starting idle, the native memory wake-up, and the wake fixes.
+
 ## [1.1.55] — 2026-09-26
 
 **Agents hear about new mail mid-turn, take turns with the machine's heavy jobs, and the Human
