@@ -87,6 +87,22 @@ export function App() {
     return () => window.removeEventListener('cth:open-settings', onOpenSettings);
   }, []);
 
+  // HEAVY-SETTING-NOT-SHOWN: Settings seeds its controls from the config it is handed, ONCE, when
+  // it mounts, and saves go straight to main (updateConfig) without touching `config` here. So
+  // handing it the startup snapshot showed every setting saved since launch at its OLD value on
+  // reopen (the Human's "Heavy jobs at once" 2 -> 1), although main had it. Re-read main's config
+  // each time Settings opens, and mount the modal only once that fresh copy is in hand.
+  const [settingsConfig, setSettingsConfig] = useState<HarnessConfig | null>(null);
+  useEffect(() => {
+    if (!settingsOpen) { setSettingsConfig(null); return; }
+    let cancelled = false;
+    window.cth.getConfig()
+      .then((fresh) => { if (!cancelled) { setSettingsConfig(fresh); setConfig(fresh); } })
+      .catch(() => { if (!cancelled) setSettingsConfig(config); }); // unreadable: the old behaviour
+    return () => { cancelled = true; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [settingsOpen]);
+
   // Initial config load
   useEffect(() => {
     let cancelled = false;
@@ -475,9 +491,9 @@ export function App() {
         />
       )}
 
-      {settingsOpen && (
+      {settingsOpen && settingsConfig && (
         <SettingsModal
-          config={config}
+          config={settingsConfig}
           initialSection={settingsSection}
           onClose={() => { setSettingsOpen(false); setSettingsSection(undefined); }}
         />
