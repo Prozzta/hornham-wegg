@@ -164,7 +164,7 @@ if (scaleMode !== '1' && scaleMode !== 'micro') {
       fs.utimesSync(dir, new Date(sweepStart - 2_000), new Date(sweepStart - 2_000));
     }
     const sweep = await measure(async () => {
-      const removed = await store.sweepOrphans((id) => id.startsWith('agent-') || id.endsWith('0'), sweepStart - 1_000);
+      const removed = await store.sweepOrphans((id) => id === 'michael' || id.startsWith('agent-') || id.endsWith('0'), sweepStart - 1_000);
       assert.equal(removed.length, 270, 'registered candidates remain while every other direct manifest orphan is removed');
     });
     await immediate();
