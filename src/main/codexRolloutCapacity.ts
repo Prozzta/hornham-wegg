@@ -52,7 +52,7 @@ interface HomeCache {
 }
 
 /** Newest `rollout-*.jsonl` under `<home>/sessions`, by mtime. */
-function findNewestRollout(codexHome: string): string | null {
+export function findNewestRollout(codexHome: string): string | null {
   const root = join(codexHome, 'sessions');
   if (!existsSync(root)) return null;
   let newest: { file: string; mtimeMs: number } | null = null;
@@ -84,7 +84,7 @@ function findNewestRollout(codexHome: string): string | null {
 }
 
 /** Read the last `TAIL_BYTES` of a file as text, without loading the whole rollout. */
-function readTail(file: string, bytes = TAIL_BYTES): string {
+export function readTail(file: string, bytes = TAIL_BYTES): string {
   let fd: number | null = null;
   try {
     const size = statSync(file).size;

@@ -93,6 +93,7 @@ import { RosterStore } from './roster';
 import { buildWorkerLaunch } from './workerLaunch';
 import { ControlRegistry } from './control';
 import { WorkerWakeWatchdog } from './workerWake';
+import { CodexRolloutLifecycleSource } from './codexRolloutLifecycle';
 import { InboxWakeBridge } from './inboxWakeBridge';
 import { WakeStallWatch } from './wakeStall';
 import { newBreadcrumbMemory, shouldLogBreadcrumb } from './wakeBreadcrumb';
@@ -388,6 +389,8 @@ function standingGoalFromRoster(agentId: string): string | null {
 // claims one batch here and submits it through the one owner (CAPACITY_GATED). HookServer
 // feeds it the hook stream, so a permission/HITL prompt blocks wakes.
 const workerWake = new WorkerWakeWatchdog();
+// FALSEACTIVE-STALL-2 (B1): Codex's own turn boundaries, read from a bounded rollout tail.
+const codexLifecycle = new CodexRolloutLifecycleSource();
 // ─── DIAGNOSIS ONLY (branch diag-1.1.46-wake) ───────────────────────────────
 // The 1.1.46 packaged canary produced no wakes and could not say why, because every
 // breadcrumb on the wake path is console.log and a packaged Windows Electron app has
@@ -502,6 +505,11 @@ const capacityStore = new CapacityStore(
 // delivery can land unobserved.
 inboxWake = new InboxWakeBridge({
   coordinator: workerWake,
+  // FALSEACTIVE-STALL-2 (B1): Codex's rollout closes a turn whose Stop was lost.
+  codexTurnProbe: (agentId) => {
+    const home = hive.codexHomeFor(agentId);
+    return home ? codexLifecycle.probe(home) : undefined;
+  },
   inboxIds: (agentId) => hive.inbox(agentId).map((m) => m.id).filter(Boolean),
   facts: (agentId) => {
     const ptyId = ptyForAgent(agentId);
@@ -557,7 +565,7 @@ const hookServer = new HookServer(
   standingGoalFromRoster,
   // Observed BEFORE the hook response; the bridge defers any retry with setImmediate, so
   // the Stop reply is never blocked and no turn is manufactured inside the hook.
-  (agentId, event, message, fullyIdle) => inboxWake?.onHook(agentId, event, message, fullyIdle),
+  (agentId, event, message, fullyIdle, turnId) => inboxWake?.onHook(agentId, event, message, fullyIdle, turnId),
   (agentId, obs) => { providerCapacity.ingest(agentId, obs); capacityStore.scheduleSave(); },
   // AGY 1.1.48 — ONE validated statusline tick, routed to its two consumers. Capacity
   // first: the allowance pair is a provider fact and is true for the account whether or
@@ -581,9 +589,14 @@ const hookServer = new HookServer(
     liveWebContents()?.send('hive:providerStatus', { agentId, status: tick.lifecycle });
   }
 );
+// HOOK-BROKER: Claude agents POST their hooks to the HookServer in-process (0 processes per
+// hook). The hive asks for a per-spawn URL; with the broker not listening it gets null and
+// writes the command hooks exactly as before.
+hive.setHookBroker({ urlFor: (id) => hookServer.hookUrl(id), mcpFor: (id) => hookServer.mcpEndpoint(id), revoke: (id) => hookServer.revokeHookToken(id) });
 const memory = new MemoryManager(
   () => readConfig().harnessHome,
-  () => { const c = readConfig(); return { enabled: c.semanticMemory !== false, model: c.embeddingModel ?? 'minilm' }; }
+  () => { const c = readConfig(); return { enabled: c.semanticMemory !== false, model: c.embeddingModel ?? 'minilm' }; },
+  (event) => hive.appendLog(event)
 );
 // Enterprise Knowledge Graph — file-backed store + agent CLI (default OFF).
 const knowledge = new KnowledgeManager();
@@ -4277,7 +4290,7 @@ function teardownAndQuit(): void {
   try { telemetry.stop(); } catch (e) { console.error('[quit] telemetry.stop:', e); }
   try { stopSlackServer(); } catch (e) { console.error('[quit] slack.stop:', e); }
   try { stopWebhookServer(); } catch (e) { console.error('[quit] webhook.stop:', e); }
-  try { memory.stop(); } catch (e) { console.error('[quit] memory.stop:', e); }
+  try { memory.stop({ quitting: true }); } catch (e) { console.error('[quit] memory.stop:', e); }
   try { reflector.stop(); } catch (e) { console.error('[quit] reflector.stop:', e); }
   try { persist.close(); } catch (e) { console.error('[quit] persist.close:', e); }
   try { hive.stopAllProxyBridges(); } catch (e) { console.error('[quit] stopAllProxyBridges:', e); }
@@ -6076,6 +6089,9 @@ app.on('will-quit', () => {
   // statusline pointing at Munder while Munder is closed. Idempotent: a no-op when the
   // teardown path already released it.
   try { hive.stopAgyStatusline(); } catch (e) { console.error('[will-quit] stopAgyStatusline:', e); }
+  // MINE-152: kill any mempalace mine/repair tree and stop the resident daemon (bounded,
+  // synchronous). Every quit path passes here; a second call is a no-op.
+  try { memory.stop({ quitting: true }); } catch (e) { console.error('[will-quit] memory.stop:', e); }
 });
 
 app.on('window-all-closed', () => {
@@ -6107,8 +6123,17 @@ app.on('will-quit', (e) => {
   analyticsFlushed = true;
   e.preventDefault();
   const finish = (): void => app.exit(0);
-  Promise.race([
-    analytics.endSession(),
-    new Promise<void>((r) => setTimeout(r, 1200))
+  Promise.all([
+    Promise.race([
+      analytics.endSession(),
+      new Promise<void>((r) => setTimeout(r, 1200))
+    ]),
+    // MESSAGE-LAG-152: the hive's coalesced commit gets its last flush here, bounded. The
+    // state itself is already on disk; an unfinished commit is picked up by the next
+    // launch's first one (`add -A`), so the bound costs history granularity, never state.
+    Promise.race([
+      hive.flushCommits(),
+      new Promise<void>((r) => setTimeout(r, 8000))
+    ])
   ]).then(finish, finish);
 });

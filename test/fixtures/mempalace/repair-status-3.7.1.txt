@@ -1,0 +1,21 @@
+
+=======================================================
+  MemPalace Repair -- Status
+=======================================================
+
+  Palace: C:/hive/palace
+
+  [drawers]
+    sqlite count:   3,317
+    hnsw count:     3,319
+    divergence:     -2
+    status:         OK
+    note:           HNSW 3,319 / sqlite 3,317 (within flush-lag tolerance) (HNSW has extra flushed elements; treating as safe)
+
+  [closets]
+    sqlite count:   478
+    hnsw count:     452
+    divergence:     26
+    status:         OK
+    note:           HNSW 452 / sqlite 478 (within flush-lag tolerance)
+

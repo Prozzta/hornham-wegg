@@ -118,7 +118,7 @@ test('THE LIVE HIVE STILL INSTALLS - the guard refuses the wrong hive, not the f
   for (const p of [agyConfig, agyCli]) {
     const group = JSON.parse(fs.readFileSync(p, 'utf8'))['munder-hive'];
     assert.ok(group && group.Stop, 'the munder-hive group is installed');
-    assert.ok(group.Stop[0].hooks[0].command.includes(s.hiveHome),
+    assert.ok(group.Stop[0].command.includes(s.hiveHome),  // FLAT (Y2: AGY's documented Stop shape)
       'and it points at THIS hive, not another');
   }
 });

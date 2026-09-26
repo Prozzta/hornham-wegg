@@ -17,6 +17,7 @@ import { isCompactionCommand } from '@shared/providerAutomation';
 import { preferredAgentRole } from '@shared/agentRole';
 import { isInboxNudge } from '@shared/hiveNudge';
 import { refocusAfterRemoval, focusOnLoad, restoreFocus } from './focusMode';
+import { isNoOpAgentPatch } from './agentPatch';
 
 export type ToolKind =
   | 'Read' | 'Edit' | 'Write' | 'Bash' | 'WebFetch' | 'WebSearch'
@@ -109,12 +110,6 @@ export interface Agent {
   seedPrompt?: string;
 }
 
-export interface FeedEntry {
-  agentId: string;
-  text: string;
-  ts: number;
-}
-
 /** A message the user has parked for an agent while its terminal was busy.
  *  Queued messages are drained one at a time when the agent next goes idle (see
  *  useHive's flush loop). */
@@ -172,7 +167,6 @@ interface State {
    *  auto-respawn). */
   restorableAgents: Agent[];
   selectedId: string | null;
-  feeds: Record<string, string[]>;
   addAgentOpen: boolean;
   fullscreenAgentId: string | null;
   /** Does the user work in focus mode by default? Persisted as a boolean, and
@@ -219,7 +213,6 @@ interface State {
    *  The agent id and all id-derived paths remain unchanged. */
   renameAgent: (id: string, name: string) => Promise<{ ok: boolean; error?: string }>;
   setAgentNote: (id: string, note: string) => void;
-  pushFeed: (id: string, line: string) => void;
   addAgent: (agent: Agent) => void;
   removeAgent: (id: string) => void;
   /** Archive an agent (its terminal was closed): move it from the active roster
@@ -387,7 +380,10 @@ const rosterMirror: {
 
 let rosterFlush: ReturnType<typeof setTimeout> | null = null;
 
-function flushRosterNow(): void {
+/** Write the roster mirror NOW. Exported for an editor that commits on beforeunload
+ *  (useCommittedDraft): its commit lands after this module's own beforeunload flush, so it
+ *  has to flush again or the mirror misses the last edit. */
+export function flushRosterNow(): void {
   if (rosterFlush) { clearTimeout(rosterFlush); rosterFlush = null; }
   try {
     void window.cth?.rosterWrite?.({
@@ -645,7 +641,6 @@ export const useStore = create<State>((set, get) => ({
   archivedAgents: initialArchivedAgents,
   restorableAgents: initialRestorableAgents,
   selectedId: initialSelectedId,
-  feeds: {},
   addAgentOpen: false,
   ccTabRequest: null,
   requestCommandCenterTab: (tab) =>
@@ -666,6 +661,12 @@ export const useStore = create<State>((set, get) => ({
   select: (id) => set((s) => { persistAgents(s.agents, id); return { selectedId: id, ccTabRequest: null }; }),
   updateAgent: (id, patch) =>
     set((s) => {
+      // ACTIVITY-LAG-151: a patch that changes nothing returns the SAME state, so zustand
+      // notifies no one. Without this every call built a new `agents` array, and App plus
+      // nine other components subscribe to that array: the pty parser's per-chunk
+      // {status:'working'} and every hook/statusline tick re-rendered the whole app for no
+      // change (measured: 300 whole-App renders for 300 output chunks).
+      if (isNoOpAgentPatch(s.agents, id, patch)) return s;
       const agents = s.agents.map(a => a.id === id ? { ...a, ...patch } : a);
       // Persist only when something DURABLE changed. `updateAgent` is also the
       // pty parser's per-chunk write (status/action/progress), so persisting
@@ -727,8 +728,6 @@ export const useStore = create<State>((set, get) => ({
       persistAgents(agents, s.selectedId);
       return { agents };
     }),
-  pushFeed: (id, line) =>
-    set((s) => ({ feeds: { ...s.feeds, [id]: [...(s.feeds[id] ?? []), line] } })),
   addAgent: (agent) =>
     set((s) => {
       // Idempotent by id: a MAIN-initiated spawn broadcast (hive:agentSpawned, e.g.
@@ -762,20 +761,18 @@ export const useStore = create<State>((set, get) => ({
         agents,
         archivedAgents,
         restorableAgents,
-        selectedId: agent.id,
-        feeds: { ...s.feeds, [agent.id]: s.feeds[agent.id] ?? [] }
+        selectedId: agent.id
       };
     }),
   removeAgent: (id) =>
     set((s) => {
       const agents = s.agents.filter(a => a.id !== id);
-      const { [id]: _gone, ...feeds } = s.feeds;
       const { [id]: _queueGone, ...messageQueues } = s.messageQueues;
       const selectedId = s.selectedId === id ? (agents[0]?.id ?? null) : s.selectedId;
       const fullscreenAgentId = refocusAfterRemoval(s.fullscreenAgentId, agents, selectedId);
       persistAgents(agents, selectedId);
       if (_queueGone) persistQueues(messageQueues);
-      return { agents, feeds, selectedId, messageQueues, fullscreenAgentId };
+      return { agents, selectedId, messageQueues, fullscreenAgentId };
     }),
   archiveAgent: (id) =>
     set((s) => {
@@ -793,14 +790,13 @@ export const useStore = create<State>((set, get) => ({
         currentStation: undefined
       };
       const archivedAgents = [...s.archivedAgents.filter((a) => a.id !== id), archivedEntry];
-      const { [id]: _feedGone, ...feeds } = s.feeds;
       const { [id]: _queueGone, ...messageQueues } = s.messageQueues;
       const selectedId = s.selectedId === id ? (agents[0]?.id ?? null) : s.selectedId;
       const fullscreenAgentId = refocusAfterRemoval(s.fullscreenAgentId, agents, selectedId);
       persistAgents(agents, selectedId);
       persistArchived(archivedAgents);
       if (_queueGone) persistQueues(messageQueues);
-      return { agents, archivedAgents, feeds, selectedId, messageQueues, fullscreenAgentId };
+      return { agents, archivedAgents, selectedId, messageQueues, fullscreenAgentId };
     }),
   removeArchivedAgent: (id) =>
     set((s) => {
@@ -943,15 +939,13 @@ export const useStore = create<State>((set, get) => ({
         ...s.restorableAgents.filter((r) => !dead.some((d) => d.id === r.id)),
         ...dead
       ];
-      const feeds: Record<string, string[]> = {};
-      for (const a of agents) feeds[a.id] = s.feeds[a.id] ?? [];
       const selectedId = agents.some((a) => a.id === s.selectedId)
         ? s.selectedId
         : (agents[0]?.id ?? null);
       const fullscreenAgentId = refocusAfterRemoval(s.fullscreenAgentId, agents, selectedId);
       persistAgents(agents, selectedId);
       persistRestorable(restorableAgents);
-      return { agents, feeds, selectedId, restorableAgents, fullscreenAgentId };
+      return { agents, selectedId, restorableAgents, fullscreenAgentId };
     }),
   setAddAgentOpen: (open) => set({ addAgentOpen: open }),
   hireQueue: EMPTY_HIRE_QUEUE,

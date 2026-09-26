@@ -56,6 +56,8 @@ import {
 const AGY_LEASE_HEARTBEAT_MS = 60 * 60 * 1000;
 import { AGY_STATUSLINE_SHIM } from './agyStatuslineShim';
 import { geminiHome } from './capacityScope';
+import { HiveCommitter, type GitResult } from './hiveCommitter';
+import { codexMcpHookToml, MCP_HOOK_EVENTS, type McpHookEvent } from './codexHookMcp';
 
 /** The subset of HarnessConfig the hive consumes for the default-MCP merge.
  *  Kept as a local shape so hive.ts never imports the foundation-owned config
@@ -255,6 +257,43 @@ function shortRand(): string {
  *  scratch state, and it stays on disk (so resume still works) either way. */
 const MINE_IGNORE_LINES = ['settings.json', 'cursor.json', 'inbox/', 'outbox/', '.codex/'];
 
+/**
+ * HOOK-BROKER P4 (AGY): `<hive>/bin/agy-oneway.cmd`, the cheap one-way delivery for AGY's
+ * observational hooks and its statusline. AGY 1.2.11 can only run commands (no http or MCP hook,
+ * no socket statusline), so every event is a process: this makes it cmd built-ins + findstr.exe
+ * (~34 ms, two small signed OS binaries) instead of cmd + the Electron shim (~450 ms).
+ *   - A .cmd, because AGY already runs our .cmd hooks, whatever way it launches commands, and
+ *     because AGY passes quote characters literally (so no quotes appear anywhere).
+ *   - AGENT_ID is read from the environment inside the batch (empty for a user's own session).
+ *   - One-way: nothing is printed (AGY fail-closes on stdout JSON) and no reply is read, so only
+ *     events that never need a directive come this way. The OUTER `2>nul` also swallows cmd's
+ *     own "cannot find the file" when the pipe is gone (measured: an inner one does not), and
+ *     `exit /b 0`: a closed app fails fast and silently.
+ */
+export function agyOnewayCmd(pipe: string): string {
+  return ['@echo off', `((echo %1 %2 %AGENT_ID%& findstr /v /c:@@m@@) > ${pipe}) 2>nul`, 'exit /b 0', ''].join('\r\n');
+}
+
+/** HOOK-BROKER: what the hive asks the in-process hook endpoint for at spawn. */
+export interface HookBroker {
+  /** A Claude agent's HTTP hook URL (fresh token), or null: command hooks. */
+  urlFor(agentId: string): string | null;
+  /** P3: a Codex agent's MCP endpoint + the token its mcp_tool hooks carry, or null. */
+  mcpFor?(agentId: string): { url: string; token: string } | null;
+  revoke(agentId: string): void;
+}
+
+/** HOOK-BROKER: how long Claude waits for an HTTP hook (seconds). A hung app never holds an
+ *  agent longer than this, and a failed HTTP hook is non-blocking in Claude. */
+export const HOOK_HTTP_TIMEOUT_S = 30;
+
+/** NO_PROXY with loopback added (merged with any existing value, no duplicates). */
+export function mergeNoProxy(existing: string | undefined): string {
+  const parts = (existing ?? '').split(',').map((x) => x.trim()).filter(Boolean);
+  for (const host of ['127.0.0.1', 'localhost']) if (!parts.includes(host)) parts.push(host);
+  return parts.join(',');
+}
+
 /** Idempotently ensure `<agentDir>/.gitignore` excludes the non-memory files.
  *  Append-only: writes only the missing lines, leaving any existing entries. */
 function ensureMineIgnore(agentDir: string): void {
@@ -404,6 +443,20 @@ export class HiveManager {
   }
 
   private readonly routerRuntime: RouterRuntime;
+  /** MESSAGE-LAG-152: every hive commit goes through here: coalesced, async, single-flight,
+   *  never on the main thread's critical path (see hiveCommitter.ts). */
+  /** HOOK-BROKER: the in-process HTTP hook endpoint (HookServer), injected by main. Null in
+   *  tests and until wired; every spawn then writes command hooks exactly as before. */
+  private hookBroker: HookBroker | null = null;
+  setHookBroker(broker: HookBroker | null): void {
+    this.hookBroker = broker;
+  }
+
+  private readonly committer = new HiveCommitter({
+    root: () => this.root(),
+    prepare: (root, git) => this.prepareRepo(root, git),
+    log: (line) => console.warn(line)
+  });
   private routerTimer: unknown = null;
   /** One non-recursive watcher per active outbox, keyed by its absolute path. */
   private readonly outboxWatchers = new Map<string, Pick<FSWatcher, 'close' | 'on'>>();
@@ -842,6 +895,10 @@ export class HiveManager {
     // PowerShell, so every such instruction was dead on a Windows floor. Commands
     // we write for an agent to run bake `nodeCommand()`'s absolute path instead.
     env.HIVE_NODE = this.nodeCommand();
+    // HOOK-BROKER: loopback must never go through a proxy. Claude refuses an HTTP hook when its
+    // proxy settings would route it, and uses the env proxy when one is set.
+    env.NO_PROXY = mergeNoProxy(process.env.NO_PROXY ?? process.env.no_proxy);
+    env.no_proxy = env.NO_PROXY;
     // Generic light/dark hint for TUIs that paint their own background. The app
     // defaults to light but every agent CLI assumed a dark terminal, so Crush and
     // OpenCode looked pasted into a light window. COLORFGBG is the classic
@@ -909,7 +966,7 @@ export class HiveManager {
               this.reconcileAgyStatusline();
             }
             else if (desc.shim === 'codex') {
-              const codex = this.installCodexHooks(dir);
+              const codex = this.installCodexHooks(dir, meta.id);
               // F1 fail-closed: provisioning refused, so this agent must not start.
               if (codex.refusal) return { args: [], env: {}, refusal: codex.refusal };
               env.CODEX_HOME = codex.home;
@@ -1025,7 +1082,9 @@ export class HiveManager {
     if (sock && shim) {
       env.HIVE_SOCK = sock;
       const settingsPath = join(dir, 'settings.json');
-      this.writeJson(settingsPath, this.hookSettings(shim, meta.cwd, opts.mcpDefaults, opts.theme));
+      // HOOK-BROKER: this spawn's HTTP hook URL (a fresh token), or null -> command hooks.
+      const hookUrl = this.hookBroker?.urlFor(meta.id) ?? null;
+      this.writeJson(settingsPath, this.hookSettings(shim, meta.cwd, opts.mcpDefaults, opts.theme, hookUrl));
       args.push('--settings', settingsPath);
     }
     return { args, env };
@@ -1067,6 +1126,8 @@ export class HiveManager {
     try {
       const reg = this.registry();
       const agent = reg.agents[id];
+      // An archived agent's hook token is revoked even when the flag is already set.
+      if (archived) this.hookBroker?.revoke(id);
       if (!agent || agent.archived === archived) return;
       agent.archived = archived;
       agent.lastSeen = Date.now();
@@ -1236,7 +1297,7 @@ export class HiveManager {
    *  (W3) the default MCP bundle merged into this PER-SESSION settings file. cwd
    *  scopes the filesystem/git servers; cfg (the consent map) gates which servers
    *  are written. Claude-only — this is invoked solely on the Claude spawn path. */
-  private hookSettings(shim: string, cwd: string, cfg: McpDefaultsMap, theme?: 'light' | 'dark'): unknown {
+  private hookSettings(shim: string, cwd: string, cfg: McpDefaultsMap, theme?: 'light' | 'dark', hookUrl: string | null = null): unknown {
     // Bundled node, NOT bare `node` — see nodeLauncherPath(). Claude runs each of
     // these through `sh -c` with a stripped PATH, where `node` is often absent.
     const cmd = this.nodeRun(shim);
@@ -1244,6 +1305,13 @@ export class HiveManager {
       ...(matcher ? { matcher } : {}),
       hooks: [{ type: 'command', command: cmd }]
     });
+    // HOOK-BROKER: with the broker up, a hook is a POST to the in-process HookServer (0
+    // processes). SessionStart stays a command (Claude does not run HTTP hooks for it), and
+    // so does the status line. An event is EITHER http OR command, never both. With no URL
+    // this function's output is byte-identical to before.
+    const hook = (matcher?: string) => hookUrl
+      ? { ...(matcher ? { matcher } : {}), hooks: [{ type: 'http', url: hookUrl, timeout: HOOK_HTTP_TIMEOUT_S }] }
+      : entry(matcher);
     const mcpServers = this.buildDefaultMcpServers(cwd, cfg);
     return {
       // Match the TUI's truecolor palette to the harness terminal theme —
@@ -1270,17 +1338,17 @@ export class HiveManager {
       // payload to the harness (agent-card context gauge, exact limit).
       statusLine: { type: 'command', command: `${cmd} --status`, padding: 0 },
       hooks: {
-        Stop: [entry()],
-        SubagentStop: [entry()],
-        PreToolUse: [entry('*')],
-        PostToolUse: [entry('*')],
-        UserPromptSubmit: [entry()],
-        Notification: [entry()],
+        Stop: [hook()],
+        SubagentStop: [hook()],
+        PreToolUse: [hook('*')],
+        PostToolUse: [hook('*')],
+        UserPromptSubmit: [hook()],
+        Notification: [hook()],
         SessionStart: [entry()],
         // #5C: surface mid-`/compact` so an agent boxing up its context reads as
         // 'compacting' on the floor instead of looking frozen.
-        PreCompact: [entry()],
-        PostCompact: [entry()]
+        PreCompact: [hook()],
+        PostCompact: [hook()]
       }
     };
   }
@@ -2205,14 +2273,23 @@ export class HiveManager {
       matcher: '*',
       hooks: [{ type: 'command', command: this.nodeRunUnquoted(shim, event), timeout: 0 }]
     });
-    const plain = (event: string) => ({
-      hooks: [{ type: 'command', command: this.nodeRunUnquoted(shim, event), timeout: 0 }]
-    });
+    // Y2 (Jim, live): AGY's hooks.md defines PreInvocation/PostInvocation/Stop as FLAT lists of
+    // handler objects; only the tool events are grouped (`matcher` + `hooks`). A wrapped entry on
+    // a flat event fails the parse ("command hook must specify 'command'") and AGY drops the WHOLE
+    // group, tool events included: no hive hook ever fired for AGY agents before this.
+    const plain = (event: string) => ({ type: 'command', command: this.nodeRunUnquoted(shim, event), timeout: 0 });
+    // HOOK-BROKER P4: the observational events go one-way (cheap); the ones that must be able to
+    // answer (a PreToolUse deny, a PreInvocation steer, a Stop block) keep the shim. A steer is
+    // never taken by a one-way hook (P4 audit Y1); AGY's documented injection point is
+    // PreInvocation (`injectSteps`), which fires before every model call.
+    const oneway = this.writeAgyOneway();
+    const cheapHandler = (event: string) => ({ type: 'command', command: `${oneway} agy ${event}`, timeout: 0 });
+    const cheapTool = (event: string) => ({ matcher: '*', hooks: [cheapHandler(event)] });
     const group = {
       PreToolUse: [tool('PreToolUse')],
-      PostToolUse: [tool('PostToolUse')],
+      PostToolUse: [oneway ? cheapTool('PostToolUse') : tool('PostToolUse')],
       PreInvocation: [plain('PreInvocation')],
-      PostInvocation: [plain('PostInvocation')],
+      PostInvocation: [oneway ? cheapHandler('PostInvocation') : plain('PostInvocation')],
       Stop: [plain('Stop')]
     };
     const gem = join(homedir(), '.gemini');
@@ -2233,6 +2310,27 @@ export class HiveManager {
   //
   // hive.ts only INVOKES the lease at startup, before an interactive AGY spawn, and on
   // shutdown. Every decision about the user's settings lives in agyStatuslineOwnership.ts.
+
+  /** P4: write `agy-oneway.cmd` for this hive's pipe and return its path, or null (not Windows,
+   *  no hive, or a path AGY could not run unquoted: then the shim is used, as before). */
+  private writeAgyOneway(): string | null {
+    const root = this.root();
+    const sock = this.sockPath();
+    if (process.platform !== 'win32' || !root || !sock) return null;
+    const path = join(root, 'bin', 'agy-oneway.cmd');
+    if (/[\s"']/.test(path) || /[\s"']/.test(sock)) return null;
+    try {
+      mkdirSync(join(root, 'bin'), { recursive: true });
+      writeFileSync(path, agyOnewayCmd(sock), 'utf8');
+      return path;
+    } catch { return null; }
+  }
+
+  /** The CURRENT AGY statusline lease's owner token (HookServer checks one-way status frames
+   *  against it), or null when no lease is held. */
+  agyStatuslineOwnerToken(): string | null {
+    try { return this.agyStatusline?.ownerToken() ?? null; } catch { return null; }
+  }
 
   /** Path of the endpoint locator a user's own AGY statusline reads. */
   private agyLocatorPath(root: string): string {
@@ -2267,6 +2365,9 @@ export class HiveManager {
       // AGY passes quote characters literally, so the command is UNQUOTED - which is only
       // possible when no path in it contains whitespace. Checked once, here, with a
       // representative token: if the answer is no, this run never leases at all.
+      // HOOK-BROKER P4: on Windows the statusline is the cheap one-way command (plus AGY's own
+      // default line beside it); elsewhere the node shim, as before.
+      const oneway = this.writeAgyOneway();
       if (!launcher || !buildStatuslineCommand(launcher, shim, '0'.repeat(32), locator)) {
         this.appendLog({ kind: 'agy-statusline', code: 'unsafe-command-path' });
         return;
@@ -2274,7 +2375,8 @@ export class HiveManager {
       const env: StatuslineEnv = {
         geminiHome: geminiHome(),
         // The exact installed string, owner token included, is the ownership identity.
-        commandFor: (token) => buildStatuslineCommand(launcher, shim, token, locator) as string,
+        commandFor: (token) => oneway ? `${oneway} agy-status ${token}` : buildStatuslineCommand(launcher, shim, token, locator) as string,
+        stackWithDefault: !!oneway,
         pid: process.pid,
         processStartedAt: PROCESS_STARTED_AT,
         now: () => Date.now(),
@@ -2418,7 +2520,7 @@ export class HiveManager {
    *
    *  Returns the CODEX_HOME path for the caller to put in the worker's env, or a
    *  refusal the caller must honour. */
-  private installCodexHooks(dir: string): { home: string; refusal?: string } {
+  private installCodexHooks(dir: string, agentId?: string): { home: string; refusal?: string } {
     const home = join(dir, '.codex');
     try {
       mkdirSync(home, { recursive: true });
@@ -2500,8 +2602,16 @@ export class HiveManager {
       if (shim) {
         const events = ['PreToolUse', 'PostToolUse', 'Stop', 'SubagentStop',
           'SessionStart', 'UserPromptSubmit', 'PreCompact', 'PostCompact'];
+        // HOOK-BROKER P3: with the broker up, the two high-volume tool hooks become mcp_tool
+        // calls into the in-app MCP endpoint (0 processes). Every other event keeps the
+        // command shim, and with no endpoint everything is the command shim, as before.
+        // Hook trust is not written: this spawn passes --dangerously-bypass-hook-trust.
+        const mcp = agentId ? this.hookBroker?.mcpFor?.(agentId) ?? null : null;
+        const mcpToml = mcp ? codexMcpHookToml(mcp.url, mcp.token) : null;
         config += '\n# --- munder-hive lifecycle hooks (auto-generated; do not edit) ---\n';
+        if (mcpToml) config += mcpToml.server;
         for (const ev of events) {
+          if (mcpToml && (MCP_HOOK_EVENTS as readonly string[]).includes(ev)) { config += mcpToml.hook(ev as McpHookEvent); continue; }
           config += `\n[[hooks.${ev}]]\n[[hooks.${ev}.hooks]]\ntype = "command"\ncommand = '${this.nodeRunUnquoted(shim)}'\ntimeout = 30\n`;
         }
       }
@@ -2908,7 +3018,9 @@ export class HiveManager {
     renameSync(tmp, p);
   }
 
-  // — git (single committer, retry + stale-lock recovery) —
+  // — git —
+  /** SYNCHRONOUS git, kept for exactly one call: `git init` when a hive is first created
+   *  (once per hive, ever). Every commit goes through the async committer instead. */
   private git(args: string[], cwd: string): { ok: boolean; out: string; err: string } {
     const res = spawnSync('git', ['-c', 'commit.gpgsign=false', '-c', 'user.name=Hive', '-c', 'user.email=hive@local', ...args], {
       cwd, encoding: 'utf8', timeout: 8000
@@ -2933,14 +3045,14 @@ export class HiveManager {
    * line alone reads as a fix while the repo goes on growing. The ledger stays
    * on disk, so the cost history the app reads is untouched.
    */
-  private untrackCostLedger(root: string): void {
+  private async untrackCostLedger(git: (args: string[]) => Promise<GitResult>): Promise<void> {
     if (this.untrackedCostLedger) return;
     this.untrackedCostLedger = true;
     // Probe before mutating: `rm --cached` on a repo that never tracked it
     // would still rewrite the index on every launch, inside the retry path.
-    const tracked = this.git(['ls-files', '--', 'cost-ledger.jsonl'], root);
+    const tracked = await git(['ls-files', '--', 'cost-ledger.jsonl']);
     if (!tracked.ok || !tracked.out.trim()) return;
-    this.git(['rm', '--cached', '-q', '--ignore-unmatch', '--', 'cost-ledger.jsonl'], root);
+    await git(['rm', '--cached', '-q', '--ignore-unmatch', '--', 'cost-ledger.jsonl']);
     console.warn('[hive] untracked the cost ledger from the hive repo');
   }
 
@@ -2960,7 +3072,7 @@ export class HiveManager {
    * `.codex` path from the index. The files stay on disk, so `codex --resume`
    * is unaffected; only their history stops.
    */
-  private untrackCodexHomes(root: string): void {
+  private async untrackCodexHomes(root: string, git: (args: string[]) => Promise<GitResult>): Promise<void> {
     if (this.untrackedCodexHomes) return;
     this.untrackedCodexHomes = true;
     const agentsDir = join(root, 'agents');
@@ -2970,34 +3082,32 @@ export class HiveManager {
     } catch { /* best-effort */ }
     // Probe before mutating: `rm --cached` on a clean repo would still rewrite
     // the index on every launch, and this runs inside the commit retry path.
-    const tracked = this.git(['ls-files', '--', 'agents/*/.codex'], root);
+    const tracked = await git(['ls-files', '--', 'agents/*/.codex']);
     if (!tracked.ok || !tracked.out.trim()) return;
-    this.git(['rm', '-r', '--cached', '-q', '--ignore-unmatch', '--', 'agents/*/.codex'], root);
+    await git(['rm', '-r', '--cached', '-q', '--ignore-unmatch', '--', 'agents/*/.codex']);
     console.warn('[hive] untracked previously-committed Codex homes from the hive repo');
   }
 
-  /** Commit all hive changes. No-op if there is nothing staged. */
-  commit(message: string): void {
-    const root = this.root();
-    if (!root || !existsSync(join(root, '.git'))) return;
-    this.untrackCostLedger(root);
-    this.untrackCodexHomes(root);
-    for (let attempt = 0; attempt < 5; attempt++) {
-      this.clearStaleLock(root);
-      const add = this.git(['add', '-A'], root);
-      const commit = this.git(['commit', '-q', '-m', message], root);
-      if (commit.ok) return;
-      if (/nothing to commit/i.test(commit.out + commit.err)) return;
-      if (!add.ok || /index\.lock/i.test(commit.err)) { sleepSync(50 * (attempt + 1)); continue; }
-      return; // a non-lock failure — give up quietly, the next mutation retries
-    }
+  /** The one-time index tidying, run by the committer (async, in its single flight) before
+   *  the process's first commit. */
+  private async prepareRepo(root: string, git: (args: string[]) => Promise<GitResult>): Promise<void> {
+    await this.untrackCostLedger(git);
+    await this.untrackCodexHomes(root, git);
   }
 
-  private clearStaleLock(root: string): void {
-    const lock = join(root, '.git', 'index.lock');
-    try {
-      if (existsSync(lock) && Date.now() - statSync(lock).mtimeMs > 10_000) rmSync(lock);
-    } catch { /* noop */ }
+  /**
+   * Ask for all hive changes to be committed. MESSAGE-LAG-152: this used to run
+   * `git add -A` + `git commit` synchronously, on Electron main, from the router's hot
+   * path (1.7-3.2 s per routed message, all IPC stalled). It is now a request: it returns at
+   * once, and the committer coalesces requests into one async commit. Nothing waits for it.
+   */
+  commit(message: string): void {
+    this.committer.request(message);
+  }
+
+  /** Commit everything requested so far (for quit). Never rejects. */
+  flushCommits(): Promise<void> {
+    return this.committer.flush();
   }
 }
 
@@ -3152,7 +3262,7 @@ write there become searchable by every agent. You don't run \`mine\` yourself.
 // A minimal pipe: read the hook payload on stdin, tag it with this agent's id,
 // forward it to the hive's UDS, and relay the response back to `claude`. All the
 // real logic lives in the main process (HookServer). Never blocks a stop on error.
-const HOOK_SHIM = `#!/usr/bin/env node
+export const HOOK_SHIM = `#!/usr/bin/env node
 'use strict';
 const net = require('net');
 const isStatus = process.argv.includes('--status');
@@ -3162,7 +3272,12 @@ process.stdin.on('data', (d) => { data += d; });
 process.stdin.on('end', () => {
   let payload = {};
   try { payload = JSON.parse(data || '{}'); } catch (_) {}
-  if (!payload.agent_id) payload.agent_id = process.env.AGENT_ID || null;
+  // CODEX-HOOK-AGENTID: the hive's own id always wins. A provider may put ITS agent_id in
+  // the payload (a Codex or Claude subagent); that value is kept as provider_agent_id.
+  const hiveId = process.env.AGENT_ID || null;
+  delete payload.provider_agent_id; // only this shim may set it (N3)
+  if (payload.agent_id && payload.agent_id !== hiveId) payload.provider_agent_id = payload.agent_id;
+  payload.agent_id = hiveId || payload.agent_id || null;
   const sock = process.env.HIVE_SOCK;
   if (isStatus) {
     // Status-line mode: Claude Code pipes the session status JSON (incl.
@@ -3214,7 +3329,7 @@ process.stdin.on('end', () => {
 // user's own agy usage — only hive workers (spawned with AGENT_ID set) bridge.
 // NOTE (agy bug, antigravity-cli#49): the loader reads ~/.gemini/antigravity-cli/
 // hooks.json but the trigger reads ~/.gemini/config/hooks.json — we write BOTH.
-const AGY_HOOK_SHIM = `#!/usr/bin/env node
+export const AGY_HOOK_SHIM = `#!/usr/bin/env node
 'use strict';
 const net = require('net');
 const event = process.argv[2] || 'Unknown';
@@ -3255,6 +3370,9 @@ process.stdin.on('end', () => {
       if (r.decision === 'block') out = { decision: 'block', reason: r.reason, stopReason: r.reason, systemMessage: r.reason };
       else if (r.hookSpecificOutput && r.hookSpecificOutput.permissionDecision === 'deny') out = { decision: 'deny', reason: r.hookSpecificOutput.permissionDecisionReason };
       else if (r.continue === false) out = { decision: 'block', stopReason: r.stopReason };
+      // PreInvocation's documented output (agy hooks.md): injectSteps. A userMessage persists in
+      // the conversation (an ephemeralMessage lasts one model call); an operator steer must stick.
+      else if (event === 'PreInvocation' && r.hookSpecificOutput && r.hookSpecificOutput.additionalContext) out = { injectSteps: [{ userMessage: r.hookSpecificOutput.additionalContext }] };
       else if (r.hookSpecificOutput && r.hookSpecificOutput.additionalContext) out = { systemMessage: r.hookSpecificOutput.additionalContext };
     } catch (_) {}
     if (out) { try { process.stdout.write(JSON.stringify(out)); } catch (_) {} }
@@ -3287,7 +3405,8 @@ var AUTO = process.env.HIVE_AUTO_APPROVE === '1';
 function post(payload) {
   try {
     if (!SOCK) return;
-    payload.agent_id = payload.agent_id || AGENT;
+    if (payload.agent_id && payload.agent_id !== AGENT) payload.provider_agent_id = payload.agent_id;
+    payload.agent_id = AGENT || payload.agent_id || null;
     var c = net.createConnection(SOCK, function () { try { c.end(JSON.stringify(payload) + '\\n'); } catch (e) {} });
     c.on('error', function () {});
   } catch (e) {}
@@ -3324,7 +3443,8 @@ const AGENT = process.env.AGENT_ID || null;
 function post(payload) {
   try {
     if (!SOCK) return;
-    payload.agent_id = payload.agent_id || AGENT;
+    if (payload.agent_id && payload.agent_id !== AGENT) payload.provider_agent_id = payload.agent_id;
+    payload.agent_id = AGENT || payload.agent_id || null;
     const c = createConnection(SOCK, () => { try { c.end(JSON.stringify(payload) + '\\n'); } catch (e) {} });
     c.on('error', () => {});
   } catch (e) {}

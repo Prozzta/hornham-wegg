@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import { Application, Container, Graphics, Ticker, Texture } from 'pixi.js';
+import { applyFloorFrameBudget } from './floorFrameBudget';
 // PixiJS uses new Function() internally, blocked by Electron CSP — this patches it.
 import 'pixi.js/unsafe-eval';
 import { useStore, type Agent } from '@/store/store';
@@ -1696,6 +1697,8 @@ export function OfficeFloor() {
         }
       };
       app.ticker.add(onTick);
+      // LAG-150: rAF runs at the display rate (165 fps measured); the floor needs 30.
+      applyFloorFrameBudget(app.ticker);
       // init() is async: the floor may already be behind a fullscreen terminal by
       // the time we get here, and app.init() starts the ticker itself.
       if (pausedRef.current) app.ticker.stop();

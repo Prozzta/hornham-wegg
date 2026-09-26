@@ -104,12 +104,12 @@ export function AgentDetailPanel({ agent }: AgentDetailPanelProps) {
       } else {
         setOpenTerminalState('error');
         setOpenTerminalError(result.error ?? 'unknown error');
-        setTimeout(() => setOpenTerminalState('idle'), 4000);
+        setTimeout(() => { setOpenTerminalState('idle'); setOpenTerminalError(undefined); }, 4000);
       }
     } catch (e) {
       setOpenTerminalState('error');
       setOpenTerminalError(e instanceof Error ? e.message : String(e));
-      setTimeout(() => setOpenTerminalState('idle'), 4000);
+      setTimeout(() => { setOpenTerminalState('idle'); setOpenTerminalError(undefined); }, 4000);
     }
   };
 
@@ -198,7 +198,9 @@ export function AgentDetailPanel({ agent }: AgentDetailPanelProps) {
               get; the tip names the folder you get it in. */}
           <span
             className="cth-tip cth-tip-wrap"
-            data-tip={`Open your system terminal app in ${agent.cwd} — a normal shell in this agent's folder, separate from the agent's own terminal.`}
+            data-tip={openTerminalError
+              ? `Could not open a system terminal: ${openTerminalError}`
+              : `Open your system terminal app in ${agent.cwd} — a normal shell in this agent's folder, separate from the agent's own terminal.`}
             aria-label="Open a system terminal in this agent's folder"
             style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}
           >
@@ -219,14 +221,22 @@ export function AgentDetailPanel({ agent }: AgentDetailPanelProps) {
         )}
       </div>
 
-      {openTerminalError && (
-        <div style={{
-          fontSize: 12, color: 'var(--cth-coral)',
-          padding: '2px 8px',
-          background: 'var(--cth-coral-light)',
-          whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis'
-        }}>{openTerminalError}</div>
-      )}
+      {/* CODEX-REDRAW-151: a zero-height anchor that is always there, so the error floats
+          over what follows instead of pushing the terminal down a row (a grid change, and a
+          full transcript replay for a Codex agent). It floats over the operator controls, so
+          it must never take the pointer (Jim, R-1: it trapped clicks on stop/pause/hold), and
+          it clears with the button state after 4 s; the full text is on the button's tip. */}
+      <div data-transient-anchor style={{ position: 'relative', height: 0 }}>
+        {openTerminalError && (
+          <div role="alert" style={{
+            position: 'absolute', top: 0, left: 0, right: 0, zIndex: 20, pointerEvents: 'none',
+            fontSize: 12, color: 'var(--cth-coral)',
+            padding: '2px 8px',
+            background: 'var(--cth-coral-light)',
+            whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis'
+          }}>{openTerminalError}</div>
+        )}
+      </div>
 
       {/* #7C — operator control (pause / halt / steer) for live agents */}
       {isReal && <AgentControlStrip agentId={agent.id} />}

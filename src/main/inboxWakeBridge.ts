@@ -45,6 +45,10 @@ export interface InboxWakeBridgeDeps {
    *  is precisely why the 1.1.46 canary could not say where the path died. This one writes
    *  to the hive event log instead, so the evidence survives the run. */
   diag?: (stage: string, fields: Record<string, unknown>) => void;
+  /** FALSEACTIVE-STALL-2 (B1): Codex's own record of its newest turn boundary for this agent,
+   *  read from a bounded rollout tail. Undefined = not a Codex agent (no probe). Optional so
+   *  every existing deployment and test runs unchanged. */
+  codexTurnProbe?: (agentId: string) => import('./codexRolloutLifecycle').CodexLifecycleProbe | undefined;
 }
 
 export class InboxWakeBridge {
@@ -129,12 +133,12 @@ export class InboxWakeBridge {
   }
 
   /** HookServer observation (before its response): record lifecycle, retry after the turn. */
-  onHook(agentId: string | undefined, event: string | undefined, message: string | undefined, fullyIdle?: boolean): void {
-    const edge = this.deps.coordinator.noteHook(agentId, event, message, this.deps.now(), fullyIdle);
+  onHook(agentId: string | undefined, event: string | undefined, message: string | undefined, fullyIdle?: boolean, turnId?: string): void {
+    const edge = this.deps.coordinator.noteHook(agentId, event, message, this.deps.now(), fullyIdle, turnId);
     // The lifecycle is sourced ONLY here, from the live hook stream - the one input no
     // in-harness test ever drove. Every hook boundary is recorded so a packaged run shows
     // whether Stop/Notification ever arrive at all, and what the lifecycle became.
-    this.deps.diag?.('hook', { agentId: agentId ?? null, event: event ?? null, edge });
+    this.deps.diag?.('hook', { agentId: agentId ?? null, event: event ?? null, edge, ...(turnId ? { turn: turnId } : {}) });
     if (edge && agentId) {
       this.scheduleWake(agentId, 'hook');
     }
@@ -180,9 +184,41 @@ export class InboxWakeBridge {
     }
   }
 
+  /** Agents a missing/unreadable rollout was already reported for (log once per agent). */
+  private readonly rolloutReported = new Set<string>();
+
+  /**
+   * FALSEACTIVE-STALL-2 (B1): before the beat's claim, an agent that is ACTIVE with mail
+   * waiting may have lost its Stop. Ask Codex's rollout (bounded tail) whether the open turn
+   * completed, and close it only with that proof. Everything else fails closed.
+   */
+  private closeLostCodexTurn(agentId: string): void {
+    const probeFn = this.deps.codexTurnProbe;
+    if (!probeFn) return;
+    const st = this.deps.coordinator.state(agentId);
+    if (st.lifecycle !== 'active') return;
+    if (this.deps.inboxIds(agentId).length === 0) return;   // nothing waiting: nothing is stuck
+    const probe = probeFn(agentId);
+    if (!probe) return;                                      // not a Codex agent
+    if (!probe.ok) {
+      if (!this.rolloutReported.has(agentId)) {
+        this.rolloutReported.add(agentId);
+        this.deps.diag?.('codex-rollout', { agentId, closed: false, why: probe.why });
+      }
+      return;
+    }
+    this.rolloutReported.delete(agentId);
+    const latest = probe.latest;
+    if (!latest || latest.kind !== 'complete') return;       // no boundary, or a turn is running
+    const closed = this.deps.coordinator.noteProviderTurnEnded(agentId, latest.turnId, latest.at);
+    if (closed) this.deps.diag?.('codex-rollout', { agentId, closed: true, turn: latest.turnId, at: latest.at });
+  }
+
   /** The reconciliation beat: the same path, in reconcile mode, over every live agent. */
   reconcileAll(agentIds: readonly string[]): void {
     for (const agentId of agentIds) {
+      try { this.closeLostCodexTurn(agentId); }
+      catch (e) { this.deps.diag?.('codex-rollout', { agentId, closed: false, why: 'probe-threw', error: String(e) }); }
       // Per agent, so one throwing agent cannot silently take the whole beat down with it
       // (today it does: runWorkerWakeBeat catches at the top and the rest of the fleet is
       // skipped every tick, forever). Reported, then rethrown - unchanged behaviour.

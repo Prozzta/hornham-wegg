@@ -57,7 +57,16 @@ window.__harnessRun = async () => {
     ] } } as never);
     bridge.snapshot = { autoDeliveryPaused: false, capacityHold: true, capacityEvidence: 'LIMITED_NO_KNOWN_RESET',
       interfered: { requestId: 'queue:a1:m1', reason: 'HUMAN_INPUT_AFTER_STAGE', at: 1 } };
-    createRoot(document.getElementById('root')!).render(<MessageQueueComposer agent={agent} />);
+    // Mounted as the app mounts it: at the foot of a column, under the terminal it serves
+    // (AgentDetailPanel / CommandCenterPanel / FullscreenTerminal). Since LAG-150 the pending
+    // list is an overlay rising over that terminal, so a composer mounted alone at the very
+    // top of the page would push its own list above the viewport, a layout no user has.
+    createRoot(document.getElementById('root')!).render(
+      <div style={{ height: '100vh', display: 'flex', flexDirection: 'column' }}>
+        <div data-stand-in="terminal" style={{ flex: 1, minHeight: 0 }} />
+        <MessageQueueComposer agent={agent} />
+      </div>
+    );
 
     const SEND = 'send queued message'; const DROP = 'already handled — drop';
     const heldTags = () => (pageText().match(/held — typed over, not submitted/g) ?? []).length;
