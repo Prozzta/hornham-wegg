@@ -356,7 +356,9 @@ const hive = new HiveManager(
 // when deciding hook returns.
 // Private Human↔agent conversation projection. userData is selected before this
 // module reaches HiveManager, so this can never point at the git-backed hive.
-const threadView = new ThreadViewStore(threadRoot(app.getPath('userData')));
+const threadView = new ThreadViewStore(threadRoot(app.getPath('userData')), (agentId, event) => {
+  try { liveWebContents()?.send('thread:event', { agentId, event }); } catch { /* window gone */ }
+});
 void threadView.init().catch((e) => console.error('[thread-view] init failed:', e));
 // Michael-only Phase 1 tail. Both sources are append-only and are read in 64 KiB
 // chunks by ThreadViewStore; source selection follows the live provider/session.

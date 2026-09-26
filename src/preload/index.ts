@@ -881,6 +881,11 @@ const api = {
   hiveBoard: (): Promise<string> => ipcRenderer.invoke('hive:board'),
   hiveTasks: (): Promise<unknown> => ipcRenderer.invoke('hive:tasks'),
   threadList: (agentId: string): Promise<ThreadViewEvent[]> => ipcRenderer.invoke('thread:list', agentId),
+  onThreadEvent: (cb: (payload: { agentId: string; event: ThreadViewEvent }) => void): (() => void) => {
+    const listener = (_e: IpcRendererEvent, payload: { agentId: string; event: ThreadViewEvent }) => cb(payload);
+    ipcRenderer.on('thread:event', listener);
+    return () => ipcRenderer.removeListener('thread:event', listener);
+  },
   threadLayoutGet: (agentId: string, fallback: 'talk' | 'terminal'): Promise<ThreadLayoutV1 | null> =>
     ipcRenderer.invoke('thread:layoutGet', agentId, fallback),
   threadLayoutSet: (agentId: string, layout: Partial<ThreadLayoutV1>, fallback: 'talk' | 'terminal'): Promise<ThreadLayoutV1 | null> =>

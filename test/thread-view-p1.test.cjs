@@ -41,6 +41,9 @@ test('Michael starts on Talk without terminal resize churn', () => {
   assert.match(commandCenter, /useState<CCTab>\('talk'\)/);
   assert.match(commandCenter, /ThreadTalkPanel/);
   assert.match(talk, /does not mount or[\s\S]*resize an xterm/);
+  assert.match(talk, /onThreadEvent/);
+  assert.doesNotMatch(talk, /setInterval\(load, 2000\)/, 'Talk must use normalized delta delivery, not history polling');
+  assert.match(read('src/main/threadView.ts'), /this\.onAppend\?\.\(agentId, row\)/);
 });
 
 test('THREAD-VIEW preserves history on lifecycle archive and deletes only an explicit Human retire', () => {

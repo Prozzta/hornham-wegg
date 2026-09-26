@@ -8,12 +8,20 @@ export function ThreadTalkPanel({ agentId, agentName }: { agentId: string; agent
   const [state, setState] = useState<'loading' | 'ready' | 'error'>('loading');
   useEffect(() => {
     let live = true;
-    const load = () => window.cth.threadList(agentId).then((rows) => {
-      if (!live) return; setEvents(rows); setState('ready');
+    const merge = (rows: ThreadViewEvent[]) => setEvents((previous) => {
+      const byId = new Map(previous.map((event) => [event.id, event]));
+      for (const row of rows) byId.set(row.id, row);
+      return [...byId.values()].sort((a, b) => a.at - b.at).slice(-1000);
+    });
+    // Subscribe before the snapshot. A row arriving during the read merges by id,
+    // so no event is lost and no repeating list/poll filesystem work is needed.
+    const unsubscribe = window.cth.onThreadEvent((payload) => {
+      if (live && payload.agentId === agentId) merge([payload.event]);
+    });
+    void window.cth.threadList(agentId).then((rows) => {
+      if (!live) return; merge(rows); setState('ready');
     }).catch(() => { if (live) setState('error'); });
-    void load();
-    const timer = window.setInterval(load, 2000);
-    return () => { live = false; window.clearInterval(timer); };
+    return () => { live = false; unsubscribe(); };
   }, [agentId]);
   if (state === 'error') return <ThreadEmpty title="Talk unavailable">Conversation history could not be read. Terminal remains available.</ThreadEmpty>;
   if (state === 'loading') return <ThreadEmpty title="Loading Talk">Reading private conversation history…</ThreadEmpty>;

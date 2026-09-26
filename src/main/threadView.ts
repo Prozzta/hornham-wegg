@@ -75,7 +75,10 @@ export class ThreadViewStore {
   private layouts = new Map<string, ThreadLayoutV1>();
   private layoutsLoaded = false;
 
-  constructor(private readonly root: string) {}
+  constructor(
+    private readonly root: string,
+    private readonly onAppend?: (agentId: string, event: ThreadEvent) => void
+  ) {}
   private agentDir(agentId: string): string { return join(this.root, safeId(agentId)); }
   private manifest(agentId: string): string { return join(this.agentDir(agentId), 'manifest-v1.json'); }
   private ledger(): string { return join(this.root, 'ledger-v1.json'); }
@@ -168,6 +171,9 @@ export class ThreadViewStore {
     this.totalBytes += Buffer.byteLength(line);
     await this.writeManifest(agentId);
     this.scheduleLedger();
+    // Emit only the normalized, already-persisted projection; raw provider rows
+    // never leave this store. The renderer merges by stable event id.
+    this.onAppend?.(agentId, row);
     return row;
   }
 
