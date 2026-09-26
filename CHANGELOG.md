@@ -11,6 +11,42 @@ All notable changes to this project are documented here. The format is based on
 > v0.4.5 (below). Earlier 1.1.x releases are described on the
 > [releases page](https://github.com/Prozzta/hornham-wegg/releases).
 
+## [1.1.54] — 2026-09-26
+
+**A built-in replacement for the MemPalace search that agents run. It ships off: after the
+update everything runs exactly as in 1.1.53, and it is turned on in stages.** Source `4854278b`;
+rollback: 1.1.53, or `fallback-legacy` inside 1.1.54.
+
+### Added
+
+- **A native memory engine inside the app.** One background worker, started only on the first
+  memory request, holds the engine:
+  - SQLite full-text and vector search;
+  - one bundled embedding model (all-MiniLM-L6-v2), pinned by SHA-256 and never downloaded.
+
+  It indexes each agent's `memory.md` and top-level notes into its own disposable file in the
+  app's data folder.
+- **A `mempalace` shim for agents,** with 4 modes set in `<hive>/memory-engine.json`:
+  - `legacy`: the default, and what a missing file means;
+  - `shadow`: the Python CLI still answers, and the engine gets a redacted comparison with no text;
+  - `native`: the engine answers, with no Python;
+  - `fallback-legacy`: an immediate emergency brake.
+- **A staged rollout:** legacy → shadow → a per-cohort quality gate on real shadow queries →
+  native. An opt-in, dated review window supports the labelling. Its file stays in the app's
+  data folder, never in the hive, and is deleted after labelling.
+- **Measured on frozen copies:**
+  - over 373 real queries, every cohort's 95% lower bound is above zero (overall NDCG@5 +20.7
+    points, recall@10 +32.5);
+  - end-to-end warm p95 is about 127 ms (cmd) and 166 ms (bash), against about 1,750 ms for the
+    Python CLI;
+  - the index is 10.6 MB, against an 80 MB palace.
+
+### Unchanged
+
+- **The palace is never touched.** The engine never opens or changes the MemPalace store, and
+  legacy mining is unchanged, so a rollback finds the palace current.
+- **MemPalace and its Python CLI are still required** until the cutover to `native`.
+
 ## [1.1.53] — 2026-09-26
 
 **Cuts the antivirus load of every hive message: no hive git, a status line that starts no

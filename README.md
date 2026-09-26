@@ -23,7 +23,7 @@ and unattended.
 
 <p>
   <a href="./LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-F4D35E.svg?style=flat-square&labelColor=6E1423"></a>
-  <img alt="Version: 1.1.53" src="https://img.shields.io/badge/version-1.1.53-F4D35E.svg?style=flat-square&labelColor=6E1423">
+  <img alt="Version: 1.1.54" src="https://img.shields.io/badge/version-1.1.54-F4D35E.svg?style=flat-square&labelColor=6E1423">
   <img alt="Fork of chaitanyagiri/munder-difflin" src="https://img.shields.io/badge/fork%20of-chaitanyagiri%2Fmunder--difflin-F4F1EA.svg?style=flat-square&labelColor=6E1423">
 </p>
 
@@ -164,13 +164,19 @@ wholesale merges. The shape of the line, as evidence for the three ideas above:
   ~30 MB of content) rebuilt, verified row for row and swapped in automatically; and
   Antigravity hooks that actually load, so gates, steers and end-of-turn signals reach
   AGY agents.
-- **Less work for the antivirus** (1.1.53, the current release) — no git in the hive at
+- **Less work for the antivirus** (1.1.53) — no git in the hive at
   all (about two commits per message, each about 59 scanned processes, gone); a Claude
   status line that starts no processes (3.9 → 0 per refresh); `log.jsonl` and the cost
   ledger kept open and rolled over at 8 MB instead of rescanned on every row (~0.4 s →
   ~0.01 ms), with wake logging cut to the rows that record a change (27 → 4.5 per
   message); an active turn that needs the provider's confirmation, so an agent can no
   longer be stuck "active" by a stale status or a swallowed Enter; and the Ask Me cards.
+- **Memory search without Python** (1.1.54, the current release) — a native engine in the
+  app replaces the MemPalace search agents run (warm end to end ~127 ms against ~1,750 ms
+  for the Python CLI; better ranking on every cohort of 373 real, labelled queries, NDCG@5
+  +20.7 points). It ships off: legacy by default (MemPalace and Python are still required
+  until the cutover), then a staged rollout with an immediate `fallback-legacy` brake. The
+  palace is never touched.
 
 Every milestone carries a dated human acceptance and evidence tag in the fork's
 internal mission ledger; this README keeps only the shape.
@@ -310,6 +316,38 @@ Two data planes feed one renderer:
   rather than by silence. A bloated palace is rebuilt from its own database into a staging
   copy, verified per collection, and swapped in; each step (`palace-repair-*`,
   `palace-swap-*`, `palace-reclaim`) is logged to `log.jsonl`.
+- **The native memory engine** (since 1.1.54, **shipped off**). It is an in-app
+  replacement for the MemPalace search agents run (`mempalace search` / `wake-up` /
+  `status`).
+  - **Worker.** One lazy `utilityProcess` worker, forked on the first memory request, at
+    below-normal priority. The model is unloaded when idle.
+  - **Index.** One SQLite file (`better-sqlite3`, WAL) with FTS5 plus `sqlite-vec` (`vec0`,
+    cosine). A hybrid search fuses the two by RRF.
+  - **Embeddings.** A single bundled all-MiniLM-L6-v2 (fp32) runs on `onnxruntime-node`, CPU
+    only. It uses its own WordPiece tokenizer, is pinned by SHA-256 and is never downloaded.
+  - **Sources.** An allow-list: each agent's `memory.md` and its direct `agents/<id>/*.md`
+    notes, plus opt-ins in `hive/memory-sources.json`. `board.md` and path escapes are
+    rejected.
+  - **Indexing and compaction.** Chunk-diff ingestion, so an append re-embeds only new
+    chunks. Compaction runs through `VACUUM INTO` and a verified swap.
+  - **Storage.** The index lives in the app's data folder
+    (`<userData>/memory/<hash>.sqlite`). It is disposable, rebuilt from the Markdown, and
+    never touches the palace.
+  - **Access.** Agents reach it through a `mempalace` shim (`hive/bin/memory`) that posts to
+    `/memory/<token>` on the loopback broker. The shim is authenticated by a per-spawn
+    `MEMORY_TOKEN`.
+  - **Modes,** set in `hive/memory-engine.json`: `legacy` (the default; the Python CLI, as
+    before), `shadow` (legacy answers, and the engine logs a redacted comparison), `native`
+    and `fallback-legacy` (an immediate brake). The rollout is staged: legacy → shadow → a
+    per-cohort quality gate on real queries → native.
+  - **Measured against MemPalace,** on frozen copies of a real hive:
+    - **Quality**, over 373 real, labelled searches: NDCG@5 +20.7 points and recall@10 +32.5
+      points overall, and better in every search type.
+    - **Speed**, end to end through the agent's own command: about 120–165 ms against about
+      1.5–1.8 s.
+    - **Storage:** an index of 10.6 MB against an 80 MB palace.
+  - **Until the cutover, MemPalace and its Python CLI are still required.** Legacy is the
+    default and legacy mining is unchanged, so the palace stays current for a rollback.
 
 The renderer is presentation: main remains the sole submission authority, and nothing
 the UI displays can cause or prevent a wake.
