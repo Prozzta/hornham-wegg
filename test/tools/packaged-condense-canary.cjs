@@ -673,11 +673,11 @@ async function main() {
     await openTheConfig(cdp.send);
     log('config opened');
 
-    // Prove it is the 1.1.55 artifact, not a stale build or the live install. The app
+    // Prove it is the 1.1.56 artifact, not a stale build or the live install. The app
     // writes one app-start row per launch; that row is the authoritative statement.
     const start = await waitFor('the app-start row', 60_000, () => rows().find((r) => r.kind === 'app-start') || null);
     check(start.packaged === true, 'runs PACKAGED', `packaged=${start.packaged}`);
-    check(start.version === '1.1.55', 'the artifact reports 1.1.55', `version=${start.version}`);
+    check(start.version === '1.1.56', 'the artifact reports 1.1.56', `version=${start.version}`);
 
     // PASS 1 carries the full ~1.1 MB backlog: this is the dig-out proof.
     await pass(cdp.send, memPath, 'PASS 1 (quiet, full backlog)', { digOut: true });
