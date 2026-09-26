@@ -239,6 +239,33 @@ test('WAKE-155 C2: a genuine task_started between claim and async settle confirm
   assert.ok(f.diags.some((d) => d.stage === 'codex-rollout' && d.confirmed === true));
 });
 
+test('WAKE-155 C2: a start after claim but before settle confirms even though activeSince is later', () => {
+  const c = new WorkerWakeWatchdog();
+  c.noteHook('a', 'Stop', undefined, 1000, true);
+  c.noteDelivery('a', 'm1');
+  const claim = c.claim(fact('a'), 'hook', 'event', 2000);
+  c.settle(claim, 'COMMITTED', 2200, true);
+  // The rollout timestamp and the local active epoch use independent observation paths.
+  // Model the delayed-settle/skew shape that made `at > activeSince` an invalid boundary.
+  c.agents.get('a').activeSince = 2200;
+  assert.ok(c.turnFacts('a').activeSince > 2100, 'the start timestamp is genuinely before settle/activeSince');
+  assert.equal(c.noteProviderTurnStarted('a', 'between-claim-and-settle', 2100), true);
+  assert.equal(c.state('a').provisional, false);
+});
+
+test('WAKE-155 C2: a replayed start for a closed turn cannot confirm a later provisional wake', () => {
+  const c = new WorkerWakeWatchdog();
+  c.noteHook('a', 'Stop', undefined, 1000, true);
+  c.noteDelivery('a', 'm1');
+  c.settle(c.claim(fact('a'), 'hook', 'event', 2000), 'COMMITTED', 2100, true);
+  assert.equal(c.noteProviderTurnStarted('a', 'old-turn', 2200), true);
+  assert.equal(c.noteProviderTurnEnded('a', 'old-turn', 2300), true);
+  c.noteDelivery('a', 'm2');
+  c.settle(c.claim(fact('a'), 'hook', 'event', 2400), 'COMMITTED', 2500, true);
+  assert.equal(c.noteProviderTurnStarted('a', 'old-turn', 2600), false, 'closed turn id is a replay, not confirmation');
+  assert.equal(c.state('a').provisional, true);
+});
+
 test('WAKE-155 CODEX: a previous task_complete that arrives after the claim is NOT a new turn start or a confirmation', async () => {
   const probe = { current: { ok: true, latest: { kind: 'complete', turnId: 'old-turn', at: T('06:27:56.300') } } };
   const f = floor({ probe });

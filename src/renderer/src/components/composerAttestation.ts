@@ -6,7 +6,7 @@ import type { IBuffer } from '@xterm/xterm';
 // isWrapped as the only continuation signal.
 const COMPOSER_LOOKBACK_ROWS = 128;
 const TUI_EDGE = /^[\s|\u2502\u2503\u2551\u2506\u254e]+|[\s|\u2502\u2503\u2551\u2506\u254e]+$/g;
-const PROMPT_MARKER = /^(?:[\s|\u2502\u2503\u2551\u2506\u254e]*)(?:>|\u276f)\s?(.*)$/;
+const PROMPT_MARKER = /^(?:[\s|\u2502\u2503\u2551\u2506\u254e]*)(?:>|\u276f|\u203a)\s?(.*)$/;
 
 function unframeComposerRow(row: string): string {
   return row.replace(TUI_EDGE, '');

@@ -34,7 +34,7 @@ human-interference fail-closed path.
 
 - New regressions fail before C1/C2 for explicit TUI composer rows and a genuine Codex
   `task_started` between claim and settle, respectively.
-- Passed: `node --test test/composer-attestation.test.cjs test/automatic-submit-wiring.test.cjs test/wake-confirm-153.test.cjs test/wake-stall.test.cjs` (122 tests).
+- Passed: `node --test test/composer-attestation.test.cjs test/automatic-submit-wiring.test.cjs test/wake-confirm-153.test.cjs test/wake-stall.test.cjs` (124 tests).
 - Passed: `npm run typecheck`.
 - Required `npm ci` installed dependencies but its concurrent native rebuild saw an
   `node-pty\\build` lock; no process was killed. The normal postinstall patch was then
