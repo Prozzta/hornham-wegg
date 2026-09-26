@@ -26,6 +26,7 @@ import {
 import { join, dirname, isAbsolute } from 'node:path';
 import { homedir } from 'node:os';
 import { spawn, type ChildProcess } from 'node:child_process';
+import { AppendFile, LOG_KEEP_ROTATED, rotatedFiles } from './appendLog';
 import { randomBytes, createHash } from 'node:crypto';
 import {
   DEV_ISOLATION, sanitizeCodexConfigForDev, hookPipeId,
@@ -451,6 +452,26 @@ export class HiveManager {
   /** HOOK-BROKER: the in-process HTTP hook endpoint (HookServer), injected by main. Null in
    *  tests and until wired; every spawn then writes command hooks exactly as before. */
   private hookBroker: HookBroker | null = null;
+  /** LOG-STALL-AV: the kept-open, rotated append files, per hive root (see appendLog.ts). */
+  private readonly appendFiles = new Map<string, AppendFile>();
+  private keepAppendOpen = false;
+  private appendFileFor(path: string, keep: number): AppendFile {
+    let f = this.appendFiles.get(path);
+    if (!f) { f = new AppendFile(path, { keep, keepOpen: this.keepAppendOpen }); this.appendFiles.set(path, f); }
+    return f;
+  }
+  /** The APP keeps the log and ledger descriptors open (no antivirus rescan per row). Off by
+   *  default so a caller that deletes the hive folder (tests) is never blocked by a held file. */
+  keepAppendFilesOpen(on: boolean): void {
+    if (on === this.keepAppendOpen) return;
+    this.closeAppendFiles();
+    this.keepAppendOpen = on;
+  }
+  /** Close the kept-open log and ledger descriptors (quit). Rows are already on disk. */
+  closeAppendFiles(): void {
+    for (const f of this.appendFiles.values()) f.close();
+    this.appendFiles.clear();
+  }
   setHookBroker(broker: HookBroker | null): void {
     this.hookBroker = broker;
   }
@@ -2935,10 +2956,22 @@ export class HiveManager {
    */
   logTail(n = 200): unknown[] {
     const root = this.root();
-    if (!root || !existsSync(join(root, 'log.jsonl'))) return [];
-    const file = join(root, 'log.jsonl');
+    if (!root || n <= 0) return [];
+    const live = join(root, 'log.jsonl');
+    // LOG-STALL-AV: the log rotates, so a tail that the live file cannot fill continues into
+    // the rotated files, newest first. Each is read with the same bounded tail window.
+    const files = [...rotatedFiles(live).map((r) => r.path), ...(existsSync(live) ? [live] : [])];
     const parse = (l: string): unknown => { try { return JSON.parse(l); } catch { return { raw: l }; } };
-    if (n <= 0) return [];
+    let rows: unknown[] = [];
+    for (let i = files.length - 1; i >= 0 && rows.length < n; i--) {
+      rows = [...this.fileTail(files[i], n - rows.length, parse), ...rows];
+    }
+    return rows;
+  }
+
+  /** The last `n` rows of one log file (bounded tail read; the logic logTail always had). */
+  private fileTail(file: string, n: number, parse: (l: string) => unknown): unknown[] {
+    if (n <= 0 || !existsSync(file)) return [];
     try {
       const size = statSync(file).size;
       if (size === 0) return [];
@@ -2986,7 +3019,8 @@ export class HiveManager {
     const root = this.root();
     if (!root) return;
     const line = JSON.stringify({ ts: Date.now(), ...event }) + '\n';
-    try { appendFileSync(join(root, 'log.jsonl'), line, 'utf8'); } catch { /* noop */ }
+    // A kept-open descriptor, rotated at 8 MB: no open/close (so no antivirus rescan) per row.
+    this.appendFileFor(join(root, 'log.jsonl'), LOG_KEEP_ROTATED).append(line);
   }
 
   /**
@@ -3002,8 +3036,8 @@ export class HiveManager {
    * at the hive ROOT, so `mempalace mine` (which only scans per-agent dirs) never
    * ingests it — no palace noise, no MINE_IGNORE entry needed.
    *
-   * Like appendLog: append to disk now (durable immediately), let it ride the
-   * next natural commit. Best-effort — never throws into the beat.
+   * Like appendLog: append to disk now (durable immediately). Best-effort — never throws
+   * into the beat.
    */
   appendCostLedger(sample: AgentUsageSample): void {
     const root = this.root();
@@ -3022,7 +3056,9 @@ export class HiveManager {
       model: sample.model,
       usd: sample.usd
     };
-    try { appendFileSync(join(root, 'cost-ledger.jsonl'), JSON.stringify(row) + '\n', 'utf8'); } catch { /* noop */ }
+    // Kept open and rotated like the log, but every rotated ledger is KEPT: the lifetime cost
+    // is folded from all of them (costLifetime.ts reads across the rotation).
+    this.appendFileFor(join(root, 'cost-ledger.jsonl'), Infinity).append(JSON.stringify(row) + '\n');
   }
 
   // — json + atomic io —

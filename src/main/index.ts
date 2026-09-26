@@ -97,6 +97,7 @@ import { CodexRolloutLifecycleSource } from './codexRolloutLifecycle';
 import { InboxWakeBridge } from './inboxWakeBridge';
 import { WakeStallWatch } from './wakeStall';
 import { newBreadcrumbMemory, shouldLogBreadcrumb } from './wakeBreadcrumb';
+import { newWakeRowState, planWakeRow, takeFolded } from './wakeRowPolicy';
 import { WakeTelemetry } from './wakeTelemetry';
 import { inboxNudgeText } from '../shared/hiveNudge';
 import { fetchHireManifest, readHireManifestFiles } from './hire';
@@ -398,6 +399,10 @@ const codexLifecycle = new CodexRolloutLifecycleSource();
 // hive event log instead, which agents and the human already read, so ONE canary run
 // says which stage is inert. Remove with this branch.
 const wakeDiagSeen = newBreadcrumbMemory();
+// LOG-STALL-AV F3: event-path wake rows are logged on EDGES only (wakeRowPolicy.ts); the folded
+// ones are counted into one `wake-folded` row per minute.
+const wakeRows = newWakeRowState();
+let wakeFoldedMinute = Math.floor(Date.now() / 60_000);
 // WAKE TELEMETRY (D8). Observability only — it counts, it never decides, and the wake path
 // never reads it. See wakeTelemetry.ts.
 const wakeTelemetry = new WakeTelemetry(Date.now());
@@ -426,7 +431,14 @@ function wakeDiag(stage: string, fields: Record<string, unknown>): void {
     // version of it that shipped in 1.1.48 suppressed nothing at all — is in
     // wakeBreadcrumb.ts; this is only the voice.
     if (!shouldLogBreadcrumb(wakeDiagSeen, stage, fields)) return;
-    hive.appendLog({ kind: 'wake', stage, ...fields });
+    const minute = Math.floor(Date.now() / 60_000);
+    if (minute !== wakeFoldedMinute) {
+      const counts = takeFolded(wakeRows);
+      if (counts) hive.appendLog({ kind: 'wake-folded', minute: wakeFoldedMinute, counts });
+      wakeFoldedMinute = minute;
+    }
+    const row = planWakeRow(wakeRows, stage, fields);
+    if (row) hive.appendLog({ kind: 'wake', stage, ...row });
   } catch { /* the diagnosis must never break the path it is watching */ }
 }
 
@@ -592,6 +604,8 @@ const hookServer = new HookServer(
 // HOOK-BROKER: Claude agents POST their hooks to the HookServer in-process (0 processes per
 // hook). The hive asks for a per-spawn URL; with the broker not listening it gets null and
 // writes the command hooks exactly as before.
+// LOG-STALL-AV F1: the app keeps log.jsonl / cost-ledger.jsonl open (closed on quit).
+hive.keepAppendFilesOpen(true);
 hive.setHookBroker({ urlFor: (id) => hookServer.hookUrl(id), mcpFor: (id) => hookServer.mcpEndpoint(id), revoke: (id) => hookServer.revokeHookToken(id) });
 const memory = new MemoryManager(
   () => readConfig().harnessHome,
@@ -6122,7 +6136,7 @@ app.on('will-quit', (e) => {
   if (analyticsFlushed) return;
   analyticsFlushed = true;
   e.preventDefault();
-  const finish = (): void => app.exit(0);
+  const finish = (): void => { try { hive.closeAppendFiles(); } catch { /* rows are on disk */ } app.exit(0); };
   Promise.all([
     Promise.race([
       analytics.endSession(),
