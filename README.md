@@ -23,7 +23,7 @@ and unattended.
 
 <p>
   <a href="./LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-F4D35E.svg?style=flat-square&labelColor=6E1423"></a>
-  <img alt="Version: 1.1.52" src="https://img.shields.io/badge/version-1.1.52-F4D35E.svg?style=flat-square&labelColor=6E1423">
+  <img alt="Version: 1.1.53" src="https://img.shields.io/badge/version-1.1.53-F4D35E.svg?style=flat-square&labelColor=6E1423">
   <img alt="Fork of chaitanyagiri/munder-difflin" src="https://img.shields.io/badge/fork%20of-chaitanyagiri%2Fmunder--difflin-F4F1EA.svg?style=flat-square&labelColor=6E1423">
 </p>
 
@@ -99,7 +99,7 @@ unattended endurance. Three ideas drive it:
   automatic memory condensation keeps each agent's memory bounded instead of growing
   (and costing) forever.
 - **Local-only.** The whole floor lives on your machine: agents are local terminal
-  processes, and the hive — memory, mailboxes, board, log — is a local git repo of
+  processes, and the hive — memory, mailboxes, board, log — is a local folder of
   plain files, not a hosted service. This fork's builds are compiled without the
   upstream analytics key, which makes the analytics module a verified no-op — no
   client, no install id, nothing sent (see [Telemetry](#telemetry)) — because a floor
@@ -157,13 +157,20 @@ wholesale merges. The shape of the line, as evidence for the three ideas above:
   wake event kept); the office floor capped at 30 fps (renderer 40% → 10% of a core
   idle); batched terminal output; and no more Codex transcript replays from terminal
   resizes (27 replays for 11 queued messages → 0).
-- **A floor that doesn't stall itself** (1.1.52, the current release) — hive commits
+- **A floor that doesn't stall itself** (1.1.52) — hive commits
   moved off the main thread (a ~2.1 s freeze per routed message → ~11 ms); agent hooks
   delivered to the app without starting processes (~450 ms → ~1 ms per Claude hook);
   MemPalace mining judged by the daemon's job state, with a bloated palace (673 MB for
   ~30 MB of content) rebuilt, verified row for row and swapped in automatically; and
   Antigravity hooks that actually load, so gates, steers and end-of-turn signals reach
   AGY agents.
+- **Less work for the antivirus** (1.1.53, the current release) — no git in the hive at
+  all (about two commits per message, each about 59 scanned processes, gone); a Claude
+  status line that starts no processes (3.9 → 0 per refresh); `log.jsonl` and the cost
+  ledger kept open and rolled over at 8 MB instead of rescanned on every row (~0.4 s →
+  ~0.01 ms), with wake logging cut to the rows that record a change (27 → 4.5 per
+  message); an active turn that needs the provider's confirmation, so an agent can no
+  longer be stuck "active" by a stale status or a swallowed Enter; and the Ask Me cards.
 
 Every milestone carries a dated human acceptance and evidence tag in the fork's
 internal mission ledger; this README keeps only the shape.
@@ -218,9 +225,10 @@ agent *you* talk to in order to get things done.
 
 1. **You spawn agents** — each is a normal terminal process with its own working
    directory, identity, and provider-specific lifecycle.
-2. **Agents collaborate through the hive** — a local git repo of plain files. They write
-   to their own `outbox/`; the harness's router delivers into recipients' `inbox/`. No
-   agent ever touches git (single-committer design avoids `index.lock` corruption).
+2. **Agents collaborate through the hive** — a local folder of plain files. They write
+   to their own `outbox/`; the harness's router delivers into recipients' `inbox/`. The
+   hive is not a git repository: the harness runs no git there (since 1.1.53), and an
+   existing `hive/.git` from an older version is left untouched.
 3. **The GOD agent runs the floor** — it reads every request, resolves routine ones
    itself, and only escalates *critical* items (spend, destructive ops, scope changes)
    into an approvals queue you act on.
@@ -281,7 +289,9 @@ Two data planes feed one renderer:
   coordinator as the single authority on when an agent may be prompted.
 - **Hook transports.** Each provider reaches the hook server the cheapest way it supports:
   - **Claude** posts to a loopback HTTP route (`/hook/<id>/<token>`), authenticated by a
-    per-spawn token in the URL.
+    per-spawn token in the URL. Its status line is a small script Claude's own shell reads
+    in (`hive/bin/claude-status.sh`), posting to `/status/<id>/<token>` with shell
+    built-ins only: no process per refresh.
   - **Codex** tool hooks are `mcp_tool` hooks into an in-app MCP endpoint (`/mcp/…`); the
     payload is rebuilt from Codex's rollout and named as Codex's own command hooks name it.
   - **Antigravity** observational hooks and its status line go one-way through a small
@@ -290,9 +300,11 @@ Two data planes feed one renderer:
   - Hooks that must answer (a deny, a block, a steer) keep the command shim, and every agent
     falls back to it when the broker is down. A per-minute `hook-transport` row in
     `log.jsonl` shows which route each agent's hooks took.
-- **The hive committer.** The harness is the hive repo's only committer. Commits run in the
-  background: messages that arrive close together share one commit, delivery never waits
-  for git, and the last commit is flushed on quit.
+- **The event log.** `log.jsonl` and `cost-ledger.jsonl` are appended through a descriptor
+  that stays open (an antivirus rescans a file on every open and close) and roll over at
+  8 MB to `log.<stamp>.jsonl` (the last 8 kept; the ledger keeps all). A file that was
+  already oversize is kept whole as `*.legacy-*.jsonl`. The activity feed and the lifetime
+  cost read across the rolled-over files; search them as `log*.jsonl`.
 - **Semantic memory.** `memory.ts` drives the MemPalace CLI and its resident daemon: changed
   memory files are mined incrementally as background daemon jobs, judged by the job's state
   rather than by silence. A bloated palace is rebuilt from its own database into a staging

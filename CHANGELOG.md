@@ -11,6 +11,39 @@ All notable changes to this project are documented here. The format is based on
 > v0.4.5 (below). Earlier 1.1.x releases are described on the
 > [releases page](https://github.com/Prozzta/hornham-wegg/releases).
 
+## [1.1.53] — 2026-09-26
+
+**Cuts the antivirus load of every hive message: no hive git, a status line that starts no
+processes, and a log written without rescans. Also stops agents getting stuck "active".** Source
+`79ee6b91`; rollback: 1.1.52.
+
+### Changed
+
+- **The Claude status line starts no processes.** It used to launch about 4 processes on every
+  refresh. It is now a small script that Claude's own shell reads in, posting to the app over
+  local HTTP (3.9 → 0 processes, 199 → 55 ms). The gauge looks the same.
+- **No git in the hive.** The app no longer commits, initialises or maintains a git repository in
+  the hive folder (it was about 2 commits per message, each around 59 processes plus antivirus
+  scans). An existing `hive/.git` is left untouched.
+- **The log is written without rescans.** `log.jsonl` and `cost-ledger.jsonl` stay open instead
+  of being opened and closed for every row (at 74 MB each open was rescanned for about 0.4 s; a
+  row now costs about 0.01 ms). Both roll over at 8 MB; an existing oversize file is kept whole as
+  `*.legacy-*.jsonl` and never deleted. The wake machinery logs only changes: about 4.5 rows per
+  message instead of 27.
+
+### Fixed
+
+- **Agents no longer stuck "active".** A leftover AGY "running" status just after its Stop no
+  longer re-opens the turn, and an early "idle" is applied a moment later instead of being
+  dropped. A wake that was typed but never became a turn within 60 s (Codex) is announced once
+  more; nothing is typed twice, since unsent text still on the prompt holds the wake for a person.
+  Mail an agent was told about but left in its inbox is announced once more when it goes idle.
+
+### Added
+
+- **Ask Me cards.** An agent's question shows as a card with its options, the recommended one
+  marked, and the answer goes back to the agent.
+
 ## [1.1.52] — 2026-09-26
 
 **Removes the freeze when agents message each other, fixes MemPalace's memory spikes and bloated
