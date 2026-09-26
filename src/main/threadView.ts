@@ -24,6 +24,8 @@ export interface ThreadReceipt {
   textHash: string;
   at: number;
   kind: 'human-ui' | 'human-terminal' | 'machine';
+  /** Monotonic, per-agent terminal receipt number.  This is evidence, not UI state. */
+  terminalWindow?: number;
   consumed?: boolean;
 }
 
@@ -31,8 +33,9 @@ const SEGMENT_BYTES = 1 * 1024 * 1024;
 export const PER_AGENT_CAP = 8 * 1024 * 1024;
 export const GLOBAL_CAP = 128 * 1024 * 1024;
 const MAX_EVENT_TEXT_BYTES = 64 * 1024;
-const RECEIPT_TTL_MS = 2 * 60_000;
-const RECEIPT_LIMIT = 200;
+export const RECEIPT_TTL_MS = 2 * 60_000;
+export const TERMINAL_RECEIPT_WINDOW_MS = 10_000;
+export const RECEIPT_LIMIT = 200;
 
 function safeId(id: string): string {
   if (!/^[a-zA-Z0-9][a-zA-Z0-9_-]{0,127}$/.test(id)) throw new Error('invalid thread agent id');
@@ -47,6 +50,7 @@ function byteTrim(text: string): { text: string; truncated: boolean } {
 
 export class ThreadViewStore {
   private receipts = new Map<string, ThreadReceipt[]>();
+  private terminalReceiptWindows = new Map<string, number>();
   private admitted = new Set<string>();
   private tails = new Map<string, { offset: number; remainder: string }>();
   private totalBytes = 0;
@@ -76,14 +80,21 @@ export class ThreadViewStore {
   recordReceipt(agentId: string, text: string, kind: ThreadReceipt['kind']): ThreadReceipt {
     const now = Date.now();
     const list = (this.receipts.get(agentId) ?? []).filter((r) => now - r.at <= RECEIPT_TTL_MS).slice(-RECEIPT_LIMIT + 1);
-    const receipt = { id: randomUUID(), agentId, textHash: hash(text), at: now, kind };
+    // Terminal input has a deliberately short, numbered evidence window.  A later
+    // provider echo cannot accidentally promote a stale terminal line into Talk.
+    const terminalWindow = kind === 'human-terminal'
+      ? (this.terminalReceiptWindows.get(agentId) ?? 0) + 1
+      : undefined;
+    if (terminalWindow !== undefined) this.terminalReceiptWindows.set(agentId, terminalWindow);
+    const receipt = { id: randomUUID(), agentId, textHash: hash(text), at: now, kind, terminalWindow };
     list.push(receipt); this.receipts.set(agentId, list); return receipt;
   }
 
   /** Matches only a one-time Human receipt. A same-window machine receipt wins. */
   consumeHumanReceipt(agentId: string, text: string, at = Date.now()): ThreadReceipt | undefined {
     const list = this.receipts.get(agentId) ?? [];
-    const matching = list.filter((r) => !r.consumed && r.textHash === hash(text) && Math.abs(at - r.at) <= RECEIPT_TTL_MS);
+    const matching = list.filter((r) => !r.consumed && r.textHash === hash(text)
+      && Math.abs(at - r.at) <= receiptWindowMs(r));
     if (matching.some((r) => r.kind === 'machine')) return undefined;
     const receipt = matching.find((r) => r.kind === 'human-ui') ?? matching.find((r) => r.kind === 'human-terminal');
     if (receipt) receipt.consumed = true;
@@ -95,6 +106,7 @@ export class ThreadViewStore {
     const trimmed = byteTrim(event.text);
     const row: ThreadEvent = { ...event, text: trimmed.text, id: randomUUID(), at: Date.now(), ...(trimmed.truncated ? { truncated: true } : {}) };
     const line = JSON.stringify(row) + '\n';
+    await this.pruneAgent(agentId, Buffer.byteLength(line));
     if (this.totalBytes + Buffer.byteLength(line) > GLOBAL_CAP) await this.pruneGlobal(Buffer.byteLength(line));
     const active = join(dir, 'active.jsonl');
     if ((await stat(active).catch(() => ({ size: 0 }))).size + Buffer.byteLength(line) > SEGMENT_BYTES) {
@@ -163,7 +175,7 @@ export class ThreadViewStore {
   async archive(agentId: string): Promise<void> {
     const dir = this.agentDir(agentId);
     await rm(dir, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });
-    this.receipts.delete(agentId); await this.init();
+    this.receipts.delete(agentId); this.terminalReceiptWindows.delete(agentId); await this.init();
   }
 
   private async writeManifest(agentId: string): Promise<void> {
@@ -197,6 +209,32 @@ export class ThreadViewStore {
       await rm(item.path, { force: true }); this.totalBytes = Math.max(0, this.totalBytes - item.size);
     }
   }
+
+  /** Preserve the active segment and evict this agent's oldest completed history first. */
+  private async pruneAgent(agentId: string, required: number): Promise<void> {
+    const dir = this.agentDir(agentId);
+    const closed: Array<{ path: string; mtimeMs: number; size: number }> = [];
+    let bytes = 0;
+    for (const file of await readdir(dir).catch(() => [] as string[])) {
+      if (!file.endsWith('.jsonl')) continue;
+      const path = join(dir, file); const info = await stat(path).catch(() => undefined);
+      if (!info) continue;
+      bytes += info.size;
+      if (file.startsWith('closed-')) closed.push({ path, mtimeMs: info.mtimeMs, size: info.size });
+    }
+    for (const item of closed.sort((a, b) => a.mtimeMs - b.mtimeMs)) {
+      if (bytes + required <= PER_AGENT_CAP) break;
+      await rm(item.path, { force: true });
+      bytes -= item.size;
+      this.totalBytes = Math.max(0, this.totalBytes - item.size);
+    }
+  }
+}
+
+function receiptWindowMs(receipt: ThreadReceipt): number {
+  return receipt.kind === 'human-terminal' || receipt.kind === 'machine'
+    ? TERMINAL_RECEIPT_WINDOW_MS
+    : RECEIPT_TTL_MS;
 }
 
 function textOf(value: unknown): string {

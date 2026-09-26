@@ -509,6 +509,8 @@ export interface OutcomeRecord {
   agentId: string;
   ptyId: string | null;
   admissionClass: AdmissionClass;
+  /** Exact programmatic payload; main-only observers may classify it, never render it. */
+  text: string;
   outcome: SubmitOutcome;
   at: number;
 }
@@ -746,7 +748,7 @@ export class AutomaticSubmitOwner {
       try {
         this.deps.onOutcome?.({
           requestId: req.requestId, agentId: req.agentId, ptyId,
-          admissionClass: req.admissionClass, outcome, at: settled.at
+          admissionClass: req.admissionClass, text: req.text, outcome, at: settled.at
         });
       } catch { /* diagnostics never decide */ }
       return outcome;
@@ -798,7 +800,7 @@ export class AutomaticSubmitOwner {
       const outcome: SubmitOutcome = { kind: 'HUMAN_HANDLED' };
       this.known.set(held.requestId, { binding: held.binding, promise: Promise.resolve(outcome), settled: { at } });
       try {
-        this.deps.onOutcome?.({ requestId: held.requestId, agentId: held.agentId, ptyId, admissionClass: held.admissionClass, outcome, at });
+        this.deps.onOutcome?.({ requestId: held.requestId, agentId: held.agentId, ptyId, admissionClass: held.admissionClass, text: '', outcome, at });
       } catch { /* diagnostics never decide */ }
     }
     return true;

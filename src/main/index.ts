@@ -535,7 +535,13 @@ const automaticSubmit = new AutomaticSubmitOwner(buildOwnerDeps({
   onOutcome: (r) => {
     // An outcome can raise an INTERFERED hold or settle one: the impact string moves.
     pushAgentImpact();
-    if (r.outcome.kind === 'COMMITTED') return;
+    // A programmatic submit is not Human speech.  Record its exact payload before a
+    // provider transcript can echo it; a same-window matching machine receipt wins
+    // over an identical Human hash, so automation can never be relabelled as Human.
+    if (r.outcome.kind === 'COMMITTED') {
+      threadView.recordReceipt(r.agentId, r.text, 'machine');
+      return;
+    }
     const why = 'reason' in r.outcome ? r.outcome.reason : '';
     console.log(`[auto-submit] ${r.admissionClass} ${r.agentId} on ${r.ptyId ?? '-'}: ${r.outcome.kind} ${why}`);
   }
