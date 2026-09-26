@@ -1126,6 +1126,14 @@ export class HiveManager {
       // type-into-tui (Crush): the bare TUI reads a positional as a Cobra subcommand
       // → `Unknown command`. So DROP the positional and hand the protocol back as
       // seedPrompt; the renderer types it into the TUI after boot (ondev-b).
+      // AGY-STARTUP-TURN: agy's real system channel. The protocol becomes the SYSTEM prompt of
+      // a per-agent custom agent, and agy starts with NO initial prompt, so it comes up idle
+      // (an `-i` prompt is a first USER turn, which AGY runs as a task). Refused (dev build,
+      // not the live hive) or failed: the initial-prompt path below, as before.
+      if (preset.systemPromptChannel === 'agy-custom-agent') {
+        const agent = this.installAgyAgent(meta, prompt);
+        if (agent) return { args: [...preArgs, '--agent', agent], env };
+      }
       if (preset.seedDelivery === 'type-into-tui') return { args: [...preArgs], env, seedPrompt: prompt };
       // If a provider somehow exposes neither a flag nor a positional prompt, spawn bare.
       if (flag) return { args: [...preArgs, flag, prompt], env };
@@ -2336,6 +2344,85 @@ export class HiveManager {
    *  Runtime-scoped by AGENT_ID (the shim no-ops for non-hive agy sessions), so
    *  this global config never disturbs the user's own `agy` usage. Best-effort,
    *  idempotent (only our own group is overwritten). */
+  /** AGY-STARTUP-TURN: the per-agent agy custom agent's name (agy selects it by NAME). */
+  static agyAgentName(agentId: string): string {
+    return `munder-${agentId.toLowerCase().replace(/[^a-z0-9-]/g, '-')}`.slice(0, 64);
+  }
+
+  /** The line that marks an agent.md as ours: only such a file is ever rewritten or removed. */
+  static readonly AGY_AGENT_MARK = 'Written by the Munder Difflin app';
+
+  private agyAgentDir(agentId: string): string {
+    return join(homedir(), '.gemini', 'config', 'agents', HiveManager.agyAgentName(agentId));
+  }
+
+  /** The agent.md for one hive agent: YAML frontmatter + ONE H1 whose body is the hive protocol
+   *  (agy's system prompt for this agent). Shape confirmed on the live CLI (AGY probe,
+   *  2026-09-26): discovered at ~/.gemini/config/agents/<name>/agent.md, selected with
+   *  `--agent <name>`, the body applied as instructions, no turn at start, the global hooks still
+   *  fire, and `--conversation` resume keeps it. Strings are JSON-quoted (valid YAML), and a
+   *  prompt line that starts with `#` is escaped so it cannot open a second section. */
+  static agyAgentMarkdown(meta: { id: string; name: string }, prompt: string): string {
+    const name = HiveManager.agyAgentName(meta.id);
+    return [
+      '---',
+      `name: ${JSON.stringify(name)}`,
+      `description: ${JSON.stringify(`Munder Difflin hive agent ${meta.name} (${meta.id}): its standing hive instructions. ${HiveManager.AGY_AGENT_MARK}; removed when the agent leaves the floor.`)}`,
+      'mainAgent: true',
+      'inheritCustomizations: true',
+      '---',
+      '',
+      `# ${meta.name} (${meta.id}), a Munder Difflin hive agent`,
+      '',
+      prompt.replace(/^#/gm, '\\#'),
+      ''
+    ].join('\n');
+  }
+
+  /** Write (or refresh) this agent's agy custom agent and return its name, or null when the
+   *  global write is refused or fails (the caller then falls back to `-i`). Global config, so
+   *  it goes through `mayWriteGlobalConfig`. Rewritten only when the content changed (a new
+   *  prompt: another version, a renamed agent), via a temp file + rename. */
+  private installAgyAgent(meta: { id: string; name: string }, prompt: string): string | null {
+    if (!this.mayWriteGlobalConfig('Antigravity agent')) return null;
+    const dir = this.agyAgentDir(meta.id);
+    const file = join(dir, 'agent.md');
+    const body = HiveManager.agyAgentMarkdown(meta, prompt);
+    try {
+      if (existsSync(file)) {
+        const cur = readFileSync(file, 'utf8');
+        if (cur === body) return HiveManager.agyAgentName(meta.id);
+        // Someone else's agent under our name: never overwrite it.
+        if (!cur.includes(HiveManager.AGY_AGENT_MARK)) {
+          console.warn(`[hive] ${file} exists and is not ours: agy falls back to an initial prompt`);
+          return null;
+        }
+      }
+      mkdirSync(dir, { recursive: true });
+      writeFileSync(`${file}.tmp`, body, 'utf8');
+      renameSync(`${file}.tmp`, file);
+      return HiveManager.agyAgentName(meta.id);
+    } catch (e) {
+      console.error('[hive] installAgyAgent failed:', e);
+      return null;
+    }
+  }
+
+  /** Remove this agent's agy custom agent when it leaves the floor (killed or archived), so
+   *  they do not pile up in the user's `agy agents`. Only a file we wrote is removed. */
+  removeAgyAgent(agentId: string): void {
+    if (!this.mayWriteGlobalConfig('Antigravity agent removal')) return;
+    const dir = this.agyAgentDir(agentId);
+    const file = join(dir, 'agent.md');
+    try {
+      if (!existsSync(file)) return;
+      if (!readFileSync(file, 'utf8').includes(HiveManager.AGY_AGENT_MARK)) return;
+      rmSync(dir, { recursive: true, force: true });
+    } catch (e) {
+      console.error('[hive] removeAgyAgent failed:', e);
+    }
+  }
+
   private installAgyHooks(): void {
     const root = this.root();
     if (!root) return;

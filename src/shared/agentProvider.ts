@@ -125,6 +125,13 @@ export interface AgentProviderPreset {
    *  takes its initial prompt POSITIONALLY (Codex: `codex "<prompt>"`) and the
    *  injection branch appends it as a quoted trailing arg instead of a flag. */
   initialPromptFlag?: string;
+  /** AGY-STARTUP-TURN (1.1.55): the CLI's real SYSTEM-instruction channel, used instead of
+   *  an initial prompt so the session starts IDLE like Claude's (an initial prompt is a
+   *  first USER turn, which AGY executes as a task). `'agy-custom-agent'` = a per-agent
+   *  Markdown custom agent (`~/.gemini/config/agents/<name>/agent.md`, H1 body = system
+   *  prompt) selected with `agy --agent <name>`. When the global write is refused (a dev
+   *  build, a non-live hive), the spawn falls back to `initialPromptFlag`. */
+  systemPromptChannel?: 'agy-custom-agent';
   /** How the hive protocol seed is delivered for a CLI that takes NEITHER a flag
    *  nor a positional seed. `'type-into-tui'` = the CLI is a bare interactive TUI
    *  that rejects a positional initial prompt (Crush: its first positional is read
@@ -311,7 +318,10 @@ export const AGENT_PROVIDER_PRESETS: AgentProviderPreset[] = [
     hiveAware: false,
     hookBridge: 'agy', // installAgyHooks() → ~/.gemini/.../hooks.json (translating shim)
     canReceiveInbox: true, // via the agy-hook bridge (Stop→drain); verified agy honors hook decisions
-    initialPromptFlag: '-i', // agy --prompt-interactive: orient the session, then continue
+    // The hive protocol is agy's SYSTEM prompt via a per-agent custom agent (`--agent`), so a
+    // spawn starts idle (AGY-STARTUP-TURN). `-i` is only the fallback when that is refused.
+    systemPromptChannel: 'agy-custom-agent',
+    initialPromptFlag: '-i', // fallback only: agy --prompt-interactive (a first USER turn)
     recommendedOrchestratorModel: 'Gemini 3.1 Pro (High)', // agy takes the display-name label
     resumeFlag: '--conversation' // agy: resume a previous conversation by ID
   },

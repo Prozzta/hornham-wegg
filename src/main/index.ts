@@ -807,6 +807,12 @@ function teardownPty(id: string): void {
     if (leftProvider === 'antigravity' && ![...ptyProvider.values()].includes('antigravity')) {
       try { hive.agyAgentsGone(); } catch (e) { console.error('[hive] agyAgentsGone failed:', e); }
     }
+    // AGY-STARTUP-TURN: the agent left the floor (killed or archived): remove its agy custom
+    // agent, unless another PTY of the same agent is still alive (a restart in place spawns
+    // the new one first, and agy may re-read its customizations mid-session).
+    if (leftProvider === 'antigravity' && ![...ptyToAgent.values()].includes(agentId)) {
+      try { hive.removeAgyAgent(agentId); } catch (e) { console.error('[hive] removeAgyAgent failed:', e); }
+    }
     // Drop watchdog state so a dead agent can't get nudged or leak its grace.
     try { workerWake.forget(agentId, id); } catch { /* best-effort */ }
     try { forgetWakeRows(wakeRows, agentId); } catch { /* best-effort */ }
