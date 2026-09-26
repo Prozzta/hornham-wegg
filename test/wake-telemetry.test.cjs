@@ -173,7 +173,8 @@ test('fleet.json carries the floor rollup and each agent its own counters', () =
   const fs = require('node:fs');
   const { join } = require('node:path');
   const index = fs.readFileSync(join(__dirname, '..', 'src/main/index.ts'), 'utf8');
-  assert.match(index, /hive\.writeFleetSnapshot\(\{ ts: now, agents, wake: wakeTelemetry\.snapshot\(now\) \}\)/);
+  // (HEAVY-JOB-SERIALIZE 1.1.55 adds the heavy-lock holders to the same snapshot.)
+  assert.match(index, /hive\.writeFleetSnapshot\(\{ ts: now, agents, wake: wakeTelemetry\.snapshot\(now\)(, heavyLock: [^\n]*)? \}\)/);
   assert.match(index, /wake: wakeTelemetry\.forAgent\(id\)/, 'per-agent counters ride with the row');
   const row = index.slice(index.indexOf('inboxBacklog: hive.inboxBacklog(id)'), index.indexOf('wake: wakeTelemetry.forAgent(id)'));
   assert.ok(row.length < 500, 'and they sit next to the backlog they explain');
