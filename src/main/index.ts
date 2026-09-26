@@ -501,14 +501,14 @@ const providerCapacity = new CapacityRuntime({
 // final check sits next to main's Enter with nothing that can yield between them. See
 // automaticSubmit.ts for the transaction and automaticSubmitWiring.ts for what each of
 // its effects means here.
-const screenReadings = new ScreenReadingBroker((ptyId, requestId, needle) =>
-  ptyManager.sendToOwner(ptyId, 'autoSubmit:readScreen', { requestId, ptyId, needle }));
+const screenReadings = new ScreenReadingBroker((ptyId, requestId, needle, expectedTail) =>
+  ptyManager.sendToOwner(ptyId, 'autoSubmit:readScreen', { requestId, ptyId, needle, expectedTail }));
 const automaticSubmit = new AutomaticSubmitOwner(buildOwnerDeps({
   pty: ptyManager,
   capacity: providerCapacity,
   ptyForAgent: (agentId) => ptyForAgent(agentId),
   providerForPty: (ptyId) => ptyProvider.get(ptyId),
-  requestScreenReading: (ptyId, needle) => screenReadings.request(ptyId, needle),
+  requestScreenReading: (ptyId, needle, expectedTail) => screenReadings.request(ptyId, needle, expectedTail),
   onOutcome: (r) => {
     // An outcome can raise an INTERFERED hold or settle one: the impact string moves.
     pushAgentImpact();

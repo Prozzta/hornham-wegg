@@ -45,7 +45,7 @@ export interface OwnerWiring {
   providerForPty: (ptyId: string) => AgentProvider | undefined;
   /** Ask the renderer that owns this PTY to read its rendered screen. Resolves null when
    *  there is no renderer to ask; may also simply never resolve — the owner times it out. */
-  requestScreenReading: (ptyId: string, needle: string) => Promise<ScreenReading | null>;
+  requestScreenReading: (ptyId: string, needle: string, expectedTail?: string) => Promise<ScreenReading | null>;
   now?: () => number;
   setTimer?: (fn: () => void, ms: number) => unknown;
   onOutcome?: (record: OutcomeRecord) => void;
@@ -92,7 +92,7 @@ export function buildOwnerDeps(w: OwnerWiring): OwnerDeps {
       return state ? state.block : undefined;
     },
     abortCapability: (agentId) => abortCapability(w.ptyForAgent(agentId)),
-    readScreen: (ptyId, needle) => w.requestScreenReading(ptyId, needle),
+    readScreen: (ptyId, needle, expectedTail) => w.requestScreenReading(ptyId, needle, expectedTail),
     capacity: {
       admit: (agentId, workClass) => w.capacity.admit(agentId, workClass),
       revalidate: (claim) => w.capacity.revalidate(claim, claim.target),
@@ -121,7 +121,7 @@ export class ScreenReadingBroker {
    *             there is nobody to hand it to, which resolves null at once.
    */
   constructor(
-    private readonly send: (ptyId: string, requestId: string, needle: string) => boolean,
+    private readonly send: (ptyId: string, requestId: string, needle: string, expectedTail?: string) => boolean,
     /** A request nobody answers is forgotten after this long, so a renderer that went
      *  away cannot grow this map. The OWNER has its own, shorter, timeout and does not
      *  depend on this one. */
@@ -133,12 +133,12 @@ export class ScreenReadingBroker {
     }
   ) {}
 
-  request(ptyId: string, needle: string): Promise<ScreenReading | null> {
+  request(ptyId: string, needle: string, expectedTail?: string): Promise<ScreenReading | null> {
     const requestId = `scr-${(this.seq += 1)}`;
     return new Promise((resolve) => {
       this.pending.set(requestId, resolve);
       let sent = false;
-      try { sent = this.send(ptyId, requestId, needle); } catch { sent = false; }
+      try { sent = this.send(ptyId, requestId, needle, expectedTail); } catch { sent = false; }
       if (!sent) this.settle(requestId, null);
       else this.setTimer(() => this.settle(requestId, null), this.forgetAfterMs);
     });
@@ -148,7 +148,10 @@ export class ScreenReadingBroker {
    *  that is not pending (late, replayed, invented) is dropped. */
   answer(requestId: unknown, reading: unknown): void {
     if (typeof requestId !== 'string') return;
-    this.settle(requestId, isScreenReading(reading) ? { onPromptRow: reading.onPromptRow, screenCount: reading.screenCount } : null);
+    this.settle(requestId, isScreenReading(reading) ? {
+      onPromptRow: reading.onPromptRow, screenCount: reading.screenCount,
+      ...(reading.promptTailMatches === undefined ? {} : { promptTailMatches: reading.promptTailMatches })
+    } : null);
   }
 
   get outstanding(): number {
@@ -167,5 +170,6 @@ export function isScreenReading(v: unknown): v is ScreenReading {
   if (!v || typeof v !== 'object') return false;
   const r = v as Record<string, unknown>;
   return typeof r.onPromptRow === 'boolean'
-    && typeof r.screenCount === 'number' && Number.isInteger(r.screenCount) && r.screenCount >= 0;
+    && typeof r.screenCount === 'number' && Number.isInteger(r.screenCount) && r.screenCount >= 0
+    && (r.promptTailMatches === undefined || typeof r.promptTailMatches === 'boolean');
 }
