@@ -4,15 +4,13 @@ import { PixelButton } from './PixelButton';
 import { PixelBadge } from './PixelBadge';
 import { Icon } from './Icon';
 import { useStore } from '@/store/store';
+import { storedHumanQA, type HumanQAFields } from './humanQuestion';
+import { SafeMarkdown } from './HumanQuestionCard';
 
 /** A card on the task kanban. Mirrors HiveTask in the main/preload process —
  *  re-declared locally so the renderer doesn't reach into the preload package
  *  (same convention as store/config.ts). */
-export interface HumanQA {
-  q: string;
-  a?: string;
-  askedAt?: string;
-  answeredAt?: string;
+export interface HumanQA extends HumanQAFields {
   /** Set when the human dismisses the ask from the ASK ME board WITHOUT
    *  answering — the question stays on the card (history is preserved) but
    *  openQuestion() stops returning it, so the card leaves ASK ME. */
@@ -93,17 +91,14 @@ export function parseTasks(raw: unknown): HiveTask[] {
       priority: typeof t.priority === 'number' ? t.priority : 3,
       createdAt: typeof t.createdAt === 'string' ? t.createdAt : new Date().toISOString(),
       humanQA: Array.isArray(t.humanQA)
+        // F3 (Jim): the entry is kept AS STORED (options, recommended, multi, chosen and any
+        // other field, uncapped), so writing a card back never rewrites its questions; only
+        // the fields this view reads are typed from the validated form, and dismissedAt is
+        // kept (else a dismissed card would resurface on the next poll). The caps and
+        // validation of options apply where a card is rendered (normalizeHumanQA there).
         ? (t.humanQA as unknown[])
-          .filter((e): e is Record<string, unknown> => !!e && typeof e === 'object' && typeof (e as { q?: unknown }).q === 'string')
-          .map((e) => ({
-            q: e.q as string,
-            a: typeof e.a === 'string' ? e.a : undefined,
-            askedAt: typeof e.askedAt === 'string' ? e.askedAt : undefined,
-            answeredAt: typeof e.answeredAt === 'string' ? e.answeredAt : undefined,
-            // Preserve a dismissal across the 5s re-parse, else the card would
-            // resurface on the next poll (openQuestion would see it as open).
-            dismissedAt: typeof e.dismissedAt === 'string' ? e.dismissedAt : undefined
-          }))
+          .map(storedHumanQA)
+          .filter((e): e is NonNullable<typeof e> => e !== null)
         : undefined
     }));
 }
@@ -363,7 +358,7 @@ export function TaskDetail({ task, all, assigneeName, onMove, onAssign, onClose 
                       fontSize: 12, lineHeight: '17px', color: 'var(--cth-ink-900)', whiteSpace: 'pre-wrap'
                     }}>
                       <span style={{ fontFamily: 'var(--cth-font-display)', fontSize: 8, marginRight: 6 }}>Q</span>
-                      {e.q}
+                      <SafeMarkdown source={e.q} />
                     </div>
                     {e.a ? (
                       <div style={{
@@ -372,7 +367,7 @@ export function TaskDetail({ task, all, assigneeName, onMove, onAssign, onClose 
                         fontSize: 12, lineHeight: '17px', color: 'var(--cth-ink-900)', whiteSpace: 'pre-wrap'
                       }}>
                         <span style={{ fontFamily: 'var(--cth-font-display)', fontSize: 8, marginRight: 6 }}>A</span>
-                        {e.a}
+                        <SafeMarkdown source={e.a} />
                       </div>
                     ) : (
                       <div style={{ fontSize: 11, color: 'var(--cth-coral)', fontFamily: 'var(--cth-font-display)' }}>

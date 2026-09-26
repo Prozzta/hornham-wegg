@@ -154,6 +154,13 @@ export interface HumanQA {
   askedAt?: string;
   answeredAt?: string;
   dismissedAt?: string;
+  /** ASKME-REVAMP (optional; a string-only entry still works): choices shown as buttons, */
+  /** the index of the recommended one, whether several may be picked, and the indexes the */
+  /** human picked (written with `a`, which carries the chosen labels and any note). */
+  options?: Array<{ label: string; detail?: string }>;
+  recommended?: number;
+  multi?: boolean;
+  chosen?: number[];
 }
 
 /** A card on the task kanban, persisted to hive/tasks.json. */
