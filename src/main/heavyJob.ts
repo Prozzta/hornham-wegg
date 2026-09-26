@@ -199,6 +199,8 @@ export interface HeavyHolder {
   misses: number;
   /** The last watcher scan saw a heavy process of this holder (for a TTL expiry's log). */
   seenRunning: boolean;
+  /** pid -> createdMs of this holder's job processes seen on earlier scans (Jim: orphans stay attributed). */
+  attributed: Map<number, number>;
 }
 
 /** One process of the listing. `createdMs` (epoch ms) is what the watcher judges by (Jim MF3). */
@@ -265,7 +267,7 @@ export class HeavyJobLock {
       this.log({ kind: 'heavy-lock', action: 'deny', agentId, heavyKind: cls.kind, why: cls.why ?? null, holders: holders.map((h) => ({ agentId: h.agentId, kind: h.kind, since: new Date(h.since).toISOString() })), limit });
       return { allow: false, reason, holders };
     }
-    this.holders.set(agentId, { agentId, kind: cls.kind, command: command.slice(0, 200), since: this.now(), touched: this.now(), calls: new Set([callId]), background, misses: 0, seenRunning: false });
+    this.holders.set(agentId, { agentId, kind: cls.kind, command: command.slice(0, 200), since: this.now(), touched: this.now(), calls: new Set([callId]), background, misses: 0, seenRunning: false, attributed: new Map() });
     this.log({ kind: 'heavy-lock', action: 'acquire', agentId, heavyKind: cls.kind, command: command.slice(0, 200), background, limit });
     this.arm();
     return { allow: true, acquired: true };
@@ -309,12 +311,18 @@ export class HeavyJobLock {
       this.log({ kind: 'heavy-lock', action: 'probe-failed', rows: procs ? procs.length : null });
       return null;
     }
-    const parent = new Map(procs.map((p) => [p.pid, p.parentPid]));
+    const byPid = new Map(procs.map((p) => [p.pid, p]));
     const rootOf = new Map(this.d.roots().map((r) => [r.pid, r.agentId]));
     const ownerOf = (pid: number): string | null => {
-      const seen = new Set<number>(); let cur: number | undefined = parent.get(pid); // start ABOVE the process: a root is not its own descendant
-      seen.add(pid);
-      while (cur !== undefined && !seen.has(cur)) { seen.add(cur); const a = rootOf.get(cur); if (a) return a; cur = parent.get(cur); }
+      const seen = new Set<number>([pid]); let child = byPid.get(pid); // start ABOVE the process: a root is not its own descendant
+      while (child && !seen.has(child.parentPid)) {
+        const up = byPid.get(child.parentPid);
+        // Jim (PID reuse): a "parent" created AFTER its child is a reused PID, not the real parent.
+        if (up && typeof up.createdMs === 'number' && typeof child.createdMs === 'number' && up.createdMs > child.createdMs) return null;
+        const a = rootOf.get(child.parentPid);
+        if (a) return a;
+        seen.add(child.parentPid); child = up;
+      }
       return null;
     };
     const busy = new Set<string>();
@@ -324,7 +332,16 @@ export class HeavyJobLock {
       if (typeof p.createdMs !== 'number') continue;
       const a = ownerOf(p.pid);
       const h = a ? this.holders.get(a) : undefined;
-      if (h && p.createdMs >= h.since - HEAVY_CREATED_SKEW_MS) busy.add(h.agentId);
+      if (h && p.createdMs >= h.since - HEAVY_CREATED_SKEW_MS) { busy.add(h.agentId); h.attributed.set(p.pid, p.createdMs); }
+    }
+    // Jim (orphans): a job detached with & / nohup whose shell has exited loses its parent chain.
+    // A pid attributed to a holder on an earlier scan still counts while it persists with the SAME
+    // creation time (a reused pid has another); pids no longer listed are forgotten.
+    for (const h of this.holders.values()) {
+      for (const [pid, created] of h.attributed) {
+        const p = byPid.get(pid);
+        if (p && p.createdMs === created) busy.add(h.agentId); else h.attributed.delete(pid);
+      }
     }
     return { busy, seen: rootsSeen };
   }

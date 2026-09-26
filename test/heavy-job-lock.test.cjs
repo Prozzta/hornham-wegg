@@ -447,3 +447,39 @@ test('MF4 LIVE (Windows): the real hidden listing returns this node process with
   assert.equal(typeof me.createdMs, 'number', 'the CreatedMs alias reaches the parser');
   assert.ok(Math.abs(me.createdMs - (Date.now() - process.uptime() * 1000)) < 10_000, 'the same clock');
 });
+
+// ── Jim addendum (god andypid): PID reuse on a parent hop; orphans stay attributed ─────────
+
+test('PID REUSE: a "parent" created AFTER its child is a reused pid, so the child is NOT attributed through it', async () => {
+  // pid 10 is the agent's PTY root NOW, but it was created after pid 11, so 11's real parent (an old pid 10) is dead
+  const procs = [{ pid: 10, parentPid: 1, commandLine: 'claude.exe', createdMs: 1_000_500 }, { pid: 11, parentPid: 10, commandLine: 'npm ci', createdMs: 1_000_100 }];
+  const x = lock(1, { roots: () => [{ agentId: 'a', pid: 10 }], probe: async () => procs });
+  x.l.acquire('a', H, 'npm ci', 'c', true);
+  x.tick(HEAVY_SCAN_MS);
+  for (let i = 0; i < HEAVY_SCAN_MISSES; i++) await x.l.scan();
+  assert.equal(x.l.snapshot().length, 0, 'not a descendant: freed');
+  // control: the same tree with the parent created BEFORE the child is attributed
+  const ok = [{ pid: 10, parentPid: 1, commandLine: 'claude.exe', createdMs: 1 }, { pid: 11, parentPid: 10, commandLine: 'npm ci', createdMs: 1_000_100 }];
+  const y = lock(1, { roots: () => [{ agentId: 'a', pid: 10 }], probe: async () => ok });
+  y.l.acquire('a', H, 'npm ci', 'c', true);
+  y.tick(HEAVY_SCAN_MS);
+  for (let i = 0; i < HEAVY_SCAN_MISSES; i++) await y.l.scan();
+  assert.equal(y.l.snapshot().length, 1);
+});
+
+test('ORPHANS: a job detached with & / nohup keeps the slot after its shell exits (attributed on an earlier scan, same createdMs); a reused pid does not', async () => {
+  const root = { pid: 10, parentPid: 1, commandLine: 'claude.exe', createdMs: 1 };
+  const shell = { pid: 11, parentPid: 10, commandLine: 'bash', createdMs: 1_000_050 };
+  const job = { pid: 12, parentPid: 11, commandLine: 'node build.js', createdMs: 1_000_060 };
+  let procs = [root, shell, job];
+  const x = lock(1, { roots: () => [{ agentId: 'a', pid: 10 }], probe: async () => procs });
+  x.l.acquire('a', H, 'npm run build &', 'c', true);
+  x.tick(HEAVY_SCAN_MS);
+  await x.l.scan();
+  procs = [root, job];                               // the shell exited: 12's parent is dead
+  for (let i = 0; i < HEAVY_SCAN_MISSES + 2; i++) await x.l.scan();
+  assert.equal(x.l.snapshot().length, 1, 'the orphaned job still holds the slot');
+  procs = [root, { ...job, createdMs: 1_000_900 }];  // the job exited and pid 12 was reused by something else
+  for (let i = 0; i < HEAVY_SCAN_MISSES; i++) await x.l.scan();
+  assert.equal(x.l.snapshot().length, 0, 'a reused pid is not the job: freed');
+});
