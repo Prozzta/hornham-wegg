@@ -151,6 +151,7 @@ test('THREAD-VIEW preserves a Human admission across Claude meta user records', 
     await store.ingestClaudeLine('michael', JSON.stringify({ type: 'user', timestamp: Date.now(), message: { content: human } }));
     await store.ingestClaudeLine('michael', JSON.stringify({ type: 'user', isMeta: true, message: { content: '<system-reminder>context</system-reminder>' } }));
     await store.ingestClaudeLine('michael', JSON.stringify({ type: 'user', message: { subtype: 'local-command', content: 'ignored local command' } }));
+    await store.ingestClaudeLine('michael', JSON.stringify({ type: 'user', isCompactSummary: true, message: { content: 'ignored compact summary' } }));
     await store.ingestClaudeLine('michael', JSON.stringify({ type: 'assistant', timestamp: Date.now(), message: { content: 'REPLY-AFTER-META' } }));
     assert.deepEqual((await store.list('michael')).map((row) => row.text), ['REPLY-AFTER-META']);
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
@@ -198,6 +199,14 @@ test('THREAD-VIEW tailer starts existing files at EOF but replays a rollout disc
     worker.postMessage({ type: 'poll' });
     for (let i = 0; i < 20 && !received.length; i += 1) await sleep(10);
     assert.deepEqual(received, ['first-after-rollout-appears']);
+
+    received.length = 0;
+    await sleep(20);
+    const nextTranscript = path.join(dir, 'new-session.jsonl');
+    fs.writeFileSync(nextTranscript, 'first-human-before-source-refresh\n');
+    worker.postMessage({ type: 'source', source: { agentId: 'michael', provider: 'claude', file: nextTranscript } });
+    for (let i = 0; i < 20 && !received.length; i += 1) await sleep(10);
+    assert.deepEqual(received, ['first-human-before-source-refresh'], 'a session born after the prior selection replays its first line');
   } finally { await worker.terminate(); fs.rmSync(dir, { recursive: true, force: true }); }
 });
 

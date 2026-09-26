@@ -12,6 +12,7 @@ let source = null;
 const cursors = new Map();
 let rolloutCache = { home: '', file: null, scannedAt: 0 };
 let catchupBytes = 0;
+let sourceSelectedAt = 0;
 
 function newestRollout(codexHome) {
   const now = Date.now();
@@ -72,14 +73,21 @@ parentPort.on('message', (message) => {
   // it never changes the selected source or bypasses its cursor semantics.
   if (message.type === 'poll') { catchupBytes = 0; tailOnce(); return; }
   if (message.type !== 'source') return;
+  const previousSelection = sourceSelectedAt;
   source = message.source && typeof message.source.agentId === 'string' ? message.source : null;
   cursors.clear(); catchupBytes = 0;
   // Existing startup history is not a new conversation. Seed its cursor at
-  // EOF; only a rollout that appears after this selection is replayed from 0.
+  // EOF. A Claude session born since the prior selection has already received
+  // its first Human line, so it is replayed from 0 instead.
   const initial = source && (source.provider === 'codex' ? newestRollout(source.codexHome) : source.file);
   if (initial) {
-    try { cursors.set(initial, { offset: statSync(initial).size, remainder: '' }); } catch { /* writer rotated */ }
+    try {
+      const info = statSync(initial);
+      const offset = previousSelection && info.birthtimeMs > previousSelection ? 0 : info.size;
+      cursors.set(initial, { offset, remainder: '' });
+    } catch { /* writer rotated */ }
   }
+  sourceSelectedAt = Date.now();
   tailOnce();
 });
 setInterval(() => { catchupBytes = 0; tailOnce(); }, 500).unref();

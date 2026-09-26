@@ -389,7 +389,7 @@ export class ThreadViewStore {
 }
 
 function isClaudeMetaUser(row: any): boolean {
-  if (row?.isMeta === true || row?.message?.isMeta === true) return true;
+  if (row?.isMeta === true || row?.message?.isMeta === true || row?.isCompactSummary === true || row?.message?.isCompactSummary === true) return true;
   const subtype = String(row?.subtype ?? row?.message?.subtype ?? '').toLowerCase();
   if (subtype === 'system-reminder' || subtype === 'local-command') return true;
   const content = textOf(row?.message?.content ?? row?.content).trim().toLowerCase();
