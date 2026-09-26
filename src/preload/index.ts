@@ -1314,6 +1314,10 @@ const api = {
    *  archives it automatically via pty:kill; this is the explicit primitive. */
   hiveSetArchived: (id: string, archived: boolean): Promise<{ ok: boolean; error?: string }> =>
     ipcRenderer.invoke('hive:setArchived', id, archived),
+  /** Explicit Human retire: removes the private Talk projection.  Routine PTY
+   * lifecycle archiving never calls this. */
+  threadRetire: (id: string): Promise<{ ok: boolean; error?: string }> =>
+    ipcRenderer.invoke('thread:retire', id),
 
   // ─── Slack integration (Slack message → Michael's queue) ─────────────────────
   /** Register a listener for inbound Slack messages; returns an unsubscribe fn.

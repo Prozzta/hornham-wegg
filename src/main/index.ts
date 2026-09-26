@@ -4147,10 +4147,15 @@ ipcMain.handle('hive:setArchived', (_evt, id: unknown, archived: unknown) => {
   if (typeof id !== 'string') return { ok: false, error: 'invalid id' };
   if (!hive.enabled()) return { ok: false, error: 'hive disabled (no harnessHome)' };
   hive.setArchived(id, archived === true);
-  if (archived === true) {
-    return threadView.archive(id).then(() => ({ ok: true })).catch((e) => ({ ok: false, error: String(e) }));
-  }
+  // Lifecycle archival happens on ordinary PTY exit and startup reconciliation.
+  // It MUST retain private Talk history; only `thread:retire` is a human request
+  // to remove it.
   return { ok: true };
+});
+ipcMain.handle('thread:retire', async (_evt, id: unknown) => {
+  if (typeof id !== 'string' || !id) return { ok: false, error: 'invalid id' };
+  try { await threadView.archive(id); return { ok: true }; }
+  catch (e) { return { ok: false, error: String(e) }; }
 });
 ipcMain.handle('hive:patchAgentRole', (_evt, id: unknown, role: unknown) => {
   if (typeof id !== 'string') return { ok: false, error: 'invalid id' };
@@ -5350,6 +5355,10 @@ registerRealtimeActionIpc({
     hive.setArchived(id, archived);
     try { liveWebContents()?.send(archived ? 'hive:agentArchived' : 'hive:agentSpawned', { id }); } catch { /* window gone */ }
     return { ok: true };
+  },
+  retireThread: async (id) => {
+    try { await threadView.archive(id); return { ok: true }; }
+    catch (e) { return { ok: false, error: String(e) }; }
   },
   // clear_context: hand the text to the renderer's queue so delivery rides every
   // existing gate (idle-only, boot grace, draft/picker safety).

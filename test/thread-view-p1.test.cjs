@@ -43,6 +43,15 @@ test('Michael starts on Talk without terminal resize churn', () => {
   assert.match(talk, /does not mount or[\s\S]*resize an xterm/);
 });
 
+test('THREAD-VIEW preserves history on lifecycle archive and deletes only an explicit Human retire', () => {
+  const main = read('src/main/index.ts');
+  const lifecycle = main.slice(main.indexOf("ipcMain.handle('hive:setArchived'"), main.indexOf("ipcMain.handle('thread:retire'"));
+  assert.doesNotMatch(lifecycle, /threadView\.archive/, 'PTY exit/startup lifecycle must retain Talk');
+  assert.match(main, /ipcMain\.handle\('thread:retire'[\s\S]{0,300}threadView\.archive/, 'only explicit retire may delete Talk');
+  assert.match(read('src/renderer/src/components/AgentDetailPanel.tsx'), /await window\.cth\.threadRetire\(agent\.id\)/);
+  assert.match(read('src/renderer/src/components/FullscreenTerminal.tsx'), /await window\.cth\.threadRetire\(agent\.id\)/);
+});
+
 test('THREAD-VIEW receipt admission is one-time and machine beats Human in its numbered window', () => {
   const { store, dir } = loadThreadStore();
   try {

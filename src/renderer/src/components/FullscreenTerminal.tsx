@@ -927,6 +927,7 @@ function Header({ agent, onEdit }: { agent: Agent; onEdit: () => void }) {
   const onKill = async () => {
     if (!agent.ptyId) return;
     if (!confirm(`Close ${agent.name}? The PTY process will terminate and the agent is archived (kept in history, off the floor).`)) return;
+    await window.cth.threadRetire(agent.id);
     await window.cth.killPty(agent.ptyId);
     disposeTerminal(agent.ptyId);
     // archiveAgent re-homes focus mode to the next agent, and only leaves it when
