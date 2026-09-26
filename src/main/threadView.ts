@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { mkdir, readFile, readdir, rename, rm, stat, writeFile, appendFile, open } from 'node:fs/promises';
-import { basename, join, resolve, sep } from 'node:path';
+import { basename, dirname, join, resolve, sep } from 'node:path';
 
 /** Private, bounded projection for the Human <-> one agent conversation.
  *
@@ -31,6 +31,20 @@ export interface ThreadReceipt {
   consumed?: boolean;
 }
 
+/** Versioned, per-user view preference. It is deliberately persisted beside,
+ * never inside, the private conversation directories so archive may remove the
+ * conversation and preference independently and no event payload shares it. */
+export interface ThreadLayoutV1 {
+  version: 1;
+  preferredView: 'talk' | 'terminal';
+  split: null | {
+    orientation: 'horizontal' | 'vertical';
+    talkDock: 'left' | 'right' | 'top' | 'bottom';
+    ratio: number;
+  };
+  lastSelectedAt: number;
+}
+
 const SEGMENT_BYTES = 1 * 1024 * 1024;
 export const PER_AGENT_CAP = 8 * 1024 * 1024;
 export const GLOBAL_CAP = 128 * 1024 * 1024;
@@ -58,14 +72,18 @@ export class ThreadViewStore {
   private totalBytes = 0;
   private ledgerDirty = false;
   private ledgerTimer: NodeJS.Timeout | undefined;
+  private layouts = new Map<string, ThreadLayoutV1>();
+  private layoutsLoaded = false;
 
   constructor(private readonly root: string) {}
   private agentDir(agentId: string): string { return join(this.root, safeId(agentId)); }
   private manifest(agentId: string): string { return join(this.agentDir(agentId), 'manifest-v1.json'); }
   private ledger(): string { return join(this.root, 'ledger-v1.json'); }
+  private layoutFile(): string { return join(dirname(this.root), 'thread-layout-v1.json'); }
 
   async init(): Promise<void> {
     await mkdir(this.root, { recursive: true });
+    await this.loadLayouts();
     // One startup accounting pass is intentionally allowed; append paths use memory.
     let total = 0;
     for (const entry of await readdir(this.root, { withFileTypes: true })) {
@@ -77,6 +95,19 @@ export class ThreadViewStore {
     }
     this.totalBytes = total;
     await this.flushLedger();
+  }
+
+  async layout(agentId: string, fallback: 'talk' | 'terminal'): Promise<ThreadLayoutV1> {
+    safeId(agentId); await this.loadLayouts();
+    return this.layouts.get(agentId) ?? defaultLayout(fallback);
+  }
+
+  async setLayout(agentId: string, candidate: unknown, fallback: 'talk' | 'terminal'): Promise<ThreadLayoutV1> {
+    safeId(agentId); await this.loadLayouts();
+    const layout = normalizeLayout(candidate, fallback);
+    this.layouts.set(agentId, layout);
+    await this.writeLayouts();
+    return layout;
   }
 
   recordReceipt(agentId: string, text: string, kind: ThreadReceipt['kind']): ThreadReceipt {
@@ -196,7 +227,30 @@ export class ThreadViewStore {
   async archive(agentId: string): Promise<void> {
     const dir = this.agentDir(agentId);
     await rm(dir, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });
-    this.receipts.delete(agentId); this.terminalReceiptWindows.delete(agentId); await this.init();
+    this.receipts.delete(agentId); this.terminalReceiptWindows.delete(agentId);
+    await this.loadLayouts();
+    if (this.layouts.delete(agentId)) await this.writeLayouts();
+    await this.init();
+  }
+
+  private async loadLayouts(): Promise<void> {
+    if (this.layoutsLoaded) return;
+    this.layoutsLoaded = true;
+    const raw = await readFile(this.layoutFile(), 'utf8').catch(() => '');
+    let parsed: unknown; try { parsed = JSON.parse(raw); } catch { return; }
+    const rows = parsed && typeof parsed === 'object' ? (parsed as any).layouts : undefined;
+    if (!rows || typeof rows !== 'object' || Array.isArray(rows)) return;
+    for (const [agentId, candidate] of Object.entries(rows)) {
+      try { this.layouts.set(safeId(agentId), normalizeLayout(candidate, 'terminal')); } catch { /* malformed row is ignored */ }
+    }
+  }
+
+  private async writeLayouts(): Promise<void> {
+    await mkdir(dirname(this.layoutFile()), { recursive: true });
+    const layouts = Object.fromEntries(this.layouts);
+    const tmp = `${this.layoutFile()}.tmp`;
+    await writeFile(tmp, JSON.stringify({ version: 1, layouts }), 'utf8');
+    await rename(tmp, this.layoutFile());
   }
 
   private async writeManifest(agentId: string): Promise<void> {
@@ -256,6 +310,29 @@ function receiptWindowMs(receipt: ThreadReceipt): number {
   return receipt.kind === 'human-terminal' || receipt.kind === 'machine'
     ? TERMINAL_RECEIPT_WINDOW_MS
     : RECEIPT_TTL_MS;
+}
+
+function defaultLayout(preferredView: 'talk' | 'terminal'): ThreadLayoutV1 {
+  return { version: 1, preferredView, split: null, lastSelectedAt: Date.now() };
+}
+
+function normalizeLayout(candidate: unknown, fallback: 'talk' | 'terminal'): ThreadLayoutV1 {
+  const value = candidate && typeof candidate === 'object' ? candidate as Record<string, unknown> : {};
+  const preferredView = value.preferredView === 'talk' || value.preferredView === 'terminal'
+    ? value.preferredView : fallback;
+  const sourceSplit = value.split && typeof value.split === 'object' ? value.split as Record<string, unknown> : undefined;
+  const split = sourceSplit
+    && (sourceSplit.orientation === 'horizontal' || sourceSplit.orientation === 'vertical')
+    && (sourceSplit.talkDock === 'left' || sourceSplit.talkDock === 'right' || sourceSplit.talkDock === 'top' || sourceSplit.talkDock === 'bottom')
+    && typeof sourceSplit.ratio === 'number' && Number.isFinite(sourceSplit.ratio)
+    ? { orientation: sourceSplit.orientation, talkDock: sourceSplit.talkDock, ratio: Math.max(0.25, Math.min(0.75, sourceSplit.ratio)) } as ThreadLayoutV1['split']
+    : null;
+  return {
+    version: 1,
+    preferredView,
+    split,
+    lastSelectedAt: typeof value.lastSelectedAt === 'number' && Number.isFinite(value.lastSelectedAt) ? value.lastSelectedAt : Date.now()
+  };
 }
 
 function receiptExpired(receipt: ThreadReceipt, now: number): boolean {

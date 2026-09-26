@@ -103,6 +103,26 @@ test('THREAD-VIEW starts queued Human UI TTL at COMMIT, not enqueue', () => {
   } finally { Date.now = originalNow; fs.rmSync(dir, { recursive: true, force: true }); }
 });
 
+test('THREAD-VIEW persists a separate validated per-agent view layout and removes it on explicit retire', async () => {
+  const { store, dir } = loadThreadStore();
+  try {
+    const threads = path.join(dir, 'userData', 'threads');
+    const view = new store.ThreadViewStore(threads);
+    await view.init();
+    assert.equal((await view.layout('michael', 'talk')).preferredView, 'talk');
+    const saved = await view.setLayout('michael', {
+      preferredView: 'terminal', split: { orientation: 'vertical', talkDock: 'left', ratio: 99 }, lastSelectedAt: 123
+    }, 'talk');
+    assert.equal(saved.preferredView, 'terminal');
+    assert.equal(saved.split.ratio, 0.75, 'ratios are clamped before persistence');
+    const reloaded = new store.ThreadViewStore(threads);
+    await reloaded.init();
+    assert.equal((await reloaded.layout('michael', 'talk')).preferredView, 'terminal');
+    await reloaded.archive('michael');
+    assert.equal((await reloaded.layout('michael', 'talk')).preferredView, 'talk');
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
 test('THREAD-VIEW uses only a temp userData root and evicts completed per-agent segments at 8 MiB', async () => {
   const { store, dir } = loadThreadStore();
   try {

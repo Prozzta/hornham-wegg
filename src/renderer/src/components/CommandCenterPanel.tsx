@@ -88,6 +88,21 @@ export function CommandCenterPanel({ agent, fullscreen = false }: { agent: Agent
   // Phase 1 decision: Michael opens on the readable Human conversation; other
   // agents keep their existing Terminal default in AgentDetailPanel.
   const [tab, setTab] = useState<CCTab>('talk');
+  // The per-agent layout is private userData state, separate from Talk JSONL and
+  // validated by main. It survives restart without joining roster/hive storage.
+  useEffect(() => {
+    let live = true;
+    void window.cth.threadLayoutGet(agent.id, 'talk').then((layout) => {
+      if (live && layout) setTab(layout.preferredView);
+    }).catch(() => { /* default Talk remains safe */ });
+    return () => { live = false; };
+  }, [agent.id]);
+  const selectTab = (next: CCTab) => {
+    setTab(next);
+    if (next === 'talk' || next === 'terminal') {
+      void window.cth.threadLayoutSet(agent.id, { preferredView: next, split: null, lastSelectedAt: Date.now() }, 'talk');
+    }
+  };
   // The trigger-history ledger has nothing to say until an outside party can
   // reach us, so its tab appears only once an org key or a webhook exists. This
   // is the first config-gated tab in the panel: TABS stays the canonical order
@@ -263,7 +278,7 @@ export function CommandCenterPanel({ agent, fullscreen = false }: { agent: Agent
         {visibleTabs.map((t) => (
           <button
             key={t.key}
-            onClick={() => setTab(t.key)}
+            onClick={() => selectTab(t.key)}
             style={{
               whiteSpace: 'nowrap',
               // grow to share any spare width (so the strip still spans the panel

@@ -88,6 +88,12 @@ export interface ThreadViewEvent {
   source: 'human-ui' | 'human-terminal' | 'claude' | 'codex' | 'humanQA';
   truncated?: boolean;
 }
+export interface ThreadLayoutV1 {
+  version: 1;
+  preferredView: 'talk' | 'terminal';
+  split: null | { orientation: 'horizontal' | 'vertical'; talkDock: 'left' | 'right' | 'top' | 'bottom'; ratio: number };
+  lastSelectedAt: number;
+}
 
 /** A hive message reshaped for the voice read-layer (`hive:messages`). `subject`
  *  and `body` are REDACTED in the main process before crossing this boundary —
@@ -875,6 +881,10 @@ const api = {
   hiveBoard: (): Promise<string> => ipcRenderer.invoke('hive:board'),
   hiveTasks: (): Promise<unknown> => ipcRenderer.invoke('hive:tasks'),
   threadList: (agentId: string): Promise<ThreadViewEvent[]> => ipcRenderer.invoke('thread:list', agentId),
+  threadLayoutGet: (agentId: string, fallback: 'talk' | 'terminal'): Promise<ThreadLayoutV1 | null> =>
+    ipcRenderer.invoke('thread:layoutGet', agentId, fallback),
+  threadLayoutSet: (agentId: string, layout: Partial<ThreadLayoutV1>, fallback: 'talk' | 'terminal'): Promise<ThreadLayoutV1 | null> =>
+    ipcRenderer.invoke('thread:layoutSet', agentId, layout, fallback),
   threadRecordHuman: (agentId: string, text: string, source: 'human-ui' | 'human-terminal'):
     Promise<{ ok: boolean; error?: string; event?: ThreadViewEvent }> => ipcRenderer.invoke('thread:recordHuman', agentId, text, source),
   hiveLog: (n?: number): Promise<unknown[]> => ipcRenderer.invoke('hive:log', n ?? 200),
