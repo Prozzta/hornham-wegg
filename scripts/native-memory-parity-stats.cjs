@@ -64,13 +64,14 @@ function kappa(a, b) {
   return pe === 1 ? 1 : (po - pe) / (1 - pe);
 }
 
-function evaluate({ sheet, key, pub, second = null, seed = 1, gate = -0.05, minCohort = 8 }) {
+function evaluate({ sheet, key, pub, second = null, seed = 1, gate = -0.05, minCohort = 8, exclude = [] }) {
   const labels = {};
   for (const q of sheet.queries) for (const it of q.items) labels[it.item] = it.label;
   const scopeOf = {};
   for (const r of pub.results) for (const [i, x] of r.legacy.entries()) scopeOf[`${r.qid}|${i + 1}`] = x.scope;
   const rows = [];
   for (const q of key) {
+    if (exclude.includes(q.qid)) continue;   // reported, never scored (e.g. an extraction artifact)
     const items = q.items.map((it) => ({ gain: labels[it.item], legacyRank: it.legacyRank, nativeRank: it.nativeRank, excluded: it.legacyRank !== null && it.nativeRank === null && scopeOf[`${q.qid}|${it.legacyRank}`] === 'excluded' }));
     if (items.some((it) => it.gain === null || it.gain === undefined)) continue;   // unlabelled
     rows.push({ qid: q.qid, cohort: q.cohort.replace(/\+stale$/, ''), raw: perQuery(items, false), adjusted: perQuery(items, true) });
@@ -85,15 +86,20 @@ function evaluate({ sheet, key, pub, second = null, seed = 1, gate = -0.05, minC
         const bs = pairedBootstrap(diffs, 10000, seed);
         m[metric] = bs;
       }
-      const gated = name === 'overall' || rs.length >= minCohort;
+      // A query with NO relevant item in the pool has no NDCG/recall (nothing to find: the
+      // no-match cohort, by design). Such queries are reported, not scored, so a cohort is gated
+      // on the queries that CAN be scored, never on its raw size.
+      const scored = Math.min(m.ndcg5 ? m.ndcg5.n : 0, m.recall10 ? m.recall10.n : 0);
+      const gated = name === 'overall' || scored >= minCohort;
       m.n = rs.length;
+      m.scored = scored;
       m.gated = gated;
       m.pass = !gated ? null : ['ndcg5', 'recall10'].every((k) => m[k] && m[k].lo >= gate);
       out[name] = m;
     }
     return out;
   };
-  const result = { labelledQueries: rows.length, gate: { ciLowerBound: gate, minCohort }, adjusted: summarise('adjusted'), raw: summarise('raw') };
+  const result = { labelledQueries: rows.length, excluded: exclude, gate: { ciLowerBound: gate, minCohort }, adjusted: summarise('adjusted'), raw: summarise('raw') };
   result.pass = result.adjusted.overall.pass === true && Object.values(result.adjusted).every((c) => c.pass !== false);
   if (second) {
     const b = {};
@@ -108,7 +114,7 @@ module.exports = { dcg, ndcgAt, recallAt, perQuery, pairedBootstrap, kappa, eval
 if (require.main === module) {
   const arg = (k) => { const i = process.argv.indexOf(k); return i > 0 ? process.argv[i + 1] : null; };
   const read = (f) => JSON.parse(fs.readFileSync(f, 'utf8'));
-  const res = evaluate({ sheet: read(arg('--labels')), key: read(arg('--key')), pub: read(arg('--public')), second: arg('--second') ? read(arg('--second')) : null, seed: Number(arg('--seed') || 1) });
+  const res = evaluate({ sheet: read(arg('--labels')), key: read(arg('--key')), pub: read(arg('--public')), second: arg('--second') ? read(arg('--second')) : null, seed: Number(arg('--seed') || 1), exclude: (arg('--exclude') || '').split(',').filter(Boolean) });
   console.log(JSON.stringify(res, null, 1));
   process.exitCode = res.pass ? 0 : 1;
 }

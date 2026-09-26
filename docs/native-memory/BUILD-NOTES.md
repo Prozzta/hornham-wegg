@@ -143,7 +143,34 @@ All measurements were taken on **copies**. The live palace, the installed app an
   - `label-sheet-PHYLLIS-20pct.json` (219 items);
   - `spotcheck-HUMAN.json`.
   - The engine key is in `builder-only/`.
-- **Scoring** is `scripts/native-memory-parity-stats.cjs`: NDCG@5, recall@10, a paired bootstrap, the 95% CI lower bound ≥ −5 pts overall and per cohort with n ≥ 8, and kappa. **The gate is scored when the labels are in.**
+- **Scoring** is `scripts/native-memory-parity-stats.cjs`: NDCG@5, recall@10, a paired bootstrap (10,000 resamples), the 95% CI lower bound ≥ −5 pts overall and per cohort, and kappa.
+  - A cohort is gated only on queries that *can* be scored. A query with no relevant item has no NDCG/recall; that is the no-match cohort by design.
+
+**Gate 4 result** (Jim primary 54/54, 1,049 items; Phyllis 20%, 219 items)
+- **Excluded, not scored: `r01`.** It is an extraction artifact, not a real intent: runbook text inside a Jim command that merely quoted a search. The real intent there is `r02`. The other 5 real intents are genuine. That leaves 53 queries, 43 of them scorable.
+- **Kappa, Jim vs Phyllis: 0.478** (moderate; above god's 0.4 floor).
+- **Scope-adjusted, native minus legacy, mean [95% CI], in points:**
+
+| Cohort | n (scored) | NDCG@5 | recall@10 | Gate (lower bound ≥ −5) |
+|---|---|---|---|---|
+| **overall** | 53 (43) | **+15.3 [+4.5, +26.6]** | **+24.4 [+10.6, +38.3]** | **pass** |
+| exact-identifier | 9 (9) | +45.0 [+16.4, +72.4] | +62.3 [+32.3, +87.1] | pass |
+| semantic | 12 (11) | −4.6 [−20.3, +11.8] | +14.3 [−3.7, +36.2] | **fail** (lower bound) |
+| wing-scoped | 8 (8) | +10.7 [−12.5, +33.9] | +6.9 [−26.4, +40.6] | **fail** (lower bound) |
+| punctuation | 8 (8) | +24.3 [−1.0, +48.8] | +28.5 [−12.5, +58.3] | **fail** (lower bound) |
+| stale | 8 (7) | +3.6 [−8.9, +17.9] | +6.9 [−10.1, +23.9] | not gated (7 < 8 scorable) |
+| no-match | 8 (0) | n/a | n/a | not gated (nothing relevant to find, by design) |
+
+- The raw variant (MINE-SCOPE hits kept in the pool) gives the same verdicts; overall it is NDCG@5 +12.0 [+0.9, +23.7] and recall@10 +19.6 [+5.8, +33.3].
+- **Plainly: the gate as specified FAILS**, on the per-cohort lower bound for semantic, wing-scoped and punctuation.
+  - Overall, native is **significantly better** than legacy on both metrics: both CI lower bounds are above zero.
+  - No cohort shows a significant regression: every CI contains zero or is above it.
+  - The failing cohorts fail on CI *width* (±20–30 pts at n = 8–12), not on a worse estimate. Only semantic NDCG@5 has a negative point estimate (−4.6), and its recall@10 is +14.3.
+  - Certifying ≥ −5 per cohort at this variance would need roughly 5–10× more queries per cohort.
+  - **Decision for god, Jim and the Human:**
+    - (a) more queries in the failing cohorts;
+    - (b) accept on the overall result plus no cohort regression, with gate 6's shadow re-run on real queries as the confirmation;
+    - (c) another rule.
 
 ## Rollback (1.1.54 → 1.1.53) and why it is safe
 
@@ -172,6 +199,6 @@ All measurements were taken on **copies**. The live palace, the installed app an
 
 ## Open
 
-1. **Gate 4 scoring:** Jim's labels, Phyllis's 20%, the Human's 10-query spot-check, then the stats run.
+1. **Gate 4:** scored; it FAILS on the per-cohort lower bound (semantic, wing-scoped, punctuation) while the overall result is significantly better. A decision is needed (see above). The Human spot-check (10 queries) is pending.
 2. **Opt-ins:** whether the 2 nested deliverables and any top-level notes join the allow-list (god and the owners).
 3. **Not covered on this host:** the mac and Linux artifact smokes; the Defender/BitDefender install-time scan observation.

@@ -515,3 +515,23 @@ test('ALLOW-LIST: a DIRECTORY named like a Markdown file is not a source', () =>
   const root = hive({ 'agents/a1/memory.md': 'm', 'agents/a1/notes.md/inner.txt': 'x' });
   assert.deepEqual(discoverSources(root).eligible.map((e) => e.path), ['agents/a1/memory.md']);
 });
+
+test('PARITY STATS: a cohort whose queries have no relevant item (no-match) is reported, not gated; excluded queries are not scored', () => {
+  const S = require(path.join(REPO, 'scripts', 'native-memory-parity-stats.cjs'));
+  const sheet = { queries: [] }; const key = []; const pub = { results: [] };
+  for (let i = 1; i <= 9; i++) {
+    const qid = `n${i}`;
+    sheet.queries.push({ qid, items: [{ item: `${qid}-A`, label: 0 }, { item: `${qid}-B`, label: 0 }] });
+    key.push({ qid, cohort: 'no-match', items: [{ item: `${qid}-A`, legacyRank: 1, nativeRank: null }, { item: `${qid}-B`, legacyRank: null, nativeRank: 1 }] });
+    pub.results.push({ qid, legacy: [{ scope: 'in-scope' }] });
+  }
+  sheet.queries.push({ qid: 's1', items: [{ item: 's1-A', label: 2 }] });
+  key.push({ qid: 's1', cohort: 'semantic', items: [{ item: 's1-A', legacyRank: 1, nativeRank: 1 }] });
+  pub.results.push({ qid: 's1', legacy: [{ scope: 'in-scope' }] });
+  const r = S.evaluate({ sheet, key, pub, exclude: ['n9'] });
+  assert.equal(r.labelledQueries, 9, 'n9 excluded');
+  assert.deepEqual(r.excluded, ['n9']);
+  assert.equal(r.adjusted['no-match'].scored, 0);
+  assert.equal(r.adjusted['no-match'].gated, false);
+  assert.equal(r.adjusted['no-match'].pass, null);
+});
