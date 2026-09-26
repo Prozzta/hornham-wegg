@@ -79,6 +79,16 @@ export interface HiveMessage {
   created_at: string;
 }
 
+/** Private THREAD-VIEW projection; raw provider files never cross this bridge. */
+export interface ThreadViewEvent {
+  id: string;
+  at: number;
+  speaker: 'human' | 'agent';
+  text: string;
+  source: 'human-ui' | 'human-terminal' | 'claude' | 'codex' | 'humanQA';
+  truncated?: boolean;
+}
+
 /** A hive message reshaped for the voice read-layer (`hive:messages`). `subject`
  *  and `body` are REDACTED in the main process before crossing this boundary —
  *  the renderer never receives a raw body or a secret. Mirror of `VoiceMessage`
@@ -864,6 +874,9 @@ const api = {
     ipcRenderer.invoke('hive:setAgentHold', id, hold),
   hiveBoard: (): Promise<string> => ipcRenderer.invoke('hive:board'),
   hiveTasks: (): Promise<unknown> => ipcRenderer.invoke('hive:tasks'),
+  threadList: (agentId: string): Promise<ThreadViewEvent[]> => ipcRenderer.invoke('thread:list', agentId),
+  threadRecordHuman: (agentId: string, text: string, source: 'human-ui' | 'human-terminal'):
+    Promise<{ ok: boolean; error?: string; event?: ThreadViewEvent }> => ipcRenderer.invoke('thread:recordHuman', agentId, text, source),
   hiveLog: (n?: number): Promise<unknown[]> => ipcRenderer.invoke('hive:log', n ?? 200),
   hiveMemory: (id: string): Promise<string> => ipcRenderer.invoke('hive:memory', id),
   hiveInbox: (id: string): Promise<HiveMessage[]> => ipcRenderer.invoke('hive:inbox', id),

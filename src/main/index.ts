@@ -42,6 +42,7 @@ import {
   getLogGraph, getCommitFiles, getFileAtRev, compareRefs, listWorktrees, checkoutRef
 } from './git';
 import { HiveManager, type AgentMeta, type HiveMessage, type HiveTask } from './hive';
+import { ThreadViewStore, threadRoot } from './threadView';
 import { HookServer } from './hooks';
 import { CapacityRuntime } from './capacityRuntime';
 import { CapacityStore, capacityStorePath } from './capacityPersistence';
@@ -352,6 +353,10 @@ const hive = new HiveManager(
 );
 // #7C — operator control state (pause/gate/steer/halt), read by the HookServer
 // when deciding hook returns.
+// Private Human↔agent conversation projection. userData is selected before this
+// module reaches HiveManager, so this can never point at the git-backed hive.
+const threadView = new ThreadViewStore(threadRoot(app.getPath('userData')));
+void threadView.init().catch((e) => console.error('[thread-view] init failed:', e));
 const control = new ControlRegistry();
 // Stage 7A — the live observability tap. Receives Claude Code's first-party OTel
 // over loopback OTLP/JSON and exposes the locked usage-provider seam. resolveCwd
@@ -4082,6 +4087,18 @@ ipcMain.handle('hive:requestInboxWake', (_evt, id: unknown) => {
 ipcMain.handle('hive:messages', (_evt, opts: unknown) =>
   hive.voiceMessages(opts && typeof opts === 'object' ? (opts as Parameters<typeof hive.voiceMessages>[0]) : {})
 );
+// THREAD-VIEW P1: renderer sees only the normalized private projection. It never
+// receives raw provider rollout/transcript files or tool/system records.
+ipcMain.handle('thread:list', async (_evt, id: unknown) =>
+  typeof id === 'string' ? threadView.list(id) : []
+);
+ipcMain.handle('thread:recordHuman', async (_evt, id: unknown, text: unknown, source: unknown) => {
+  if (typeof id !== 'string' || typeof text !== 'string' || !text.trim()) return { ok: false, error: 'invalid thread message' };
+  const kind = source === 'human-terminal' ? 'human-terminal' : 'human-ui';
+  threadView.recordReceipt(id, text, kind);
+  const event = await threadView.append(id, { speaker: 'human', text, source: kind });
+  return { ok: true, event };
+});
 ipcMain.handle('hive:send', (_evt, partial: Partial<HiveMessage>, from: unknown) => {
   if (!hive.enabled()) return { ok: false, error: 'hive disabled (no harnessHome)' };
   const msg = hive.send(partial ?? {}, typeof from === 'string' ? from : 'system');
@@ -4111,6 +4128,9 @@ ipcMain.handle('hive:setArchived', (_evt, id: unknown, archived: unknown) => {
   if (typeof id !== 'string') return { ok: false, error: 'invalid id' };
   if (!hive.enabled()) return { ok: false, error: 'hive disabled (no harnessHome)' };
   hive.setArchived(id, archived === true);
+  if (archived === true) {
+    return threadView.archive(id).then(() => ({ ok: true })).catch((e) => ({ ok: false, error: String(e) }));
+  }
   return { ok: true };
 });
 ipcMain.handle('hive:patchAgentRole', (_evt, id: unknown, role: unknown) => {
