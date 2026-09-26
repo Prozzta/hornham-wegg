@@ -896,9 +896,17 @@ export class HookServer {
     // (Claude http, Codex mcp, the AGY shim's deny translation). A subagent's call counts as its
     // agent's. Settings "Heavy jobs at once" = Off makes this do nothing.
     if (event === 'PreToolUse' && agentId && this.heavyLock) {
+      // Jim N1: a DEGRADED Codex hook (rebuilt from the rollout tail) may carry no tool input:
+      // it cannot be classified, so it is allowed and logged.
+      if (p.payload_degraded === true && commandFromToolInput(p.tool_input) === null) {
+        try { this.hive.appendLog({ kind: 'heavy-lock', action: 'degraded', agentId, tool: p.tool_name ?? null }); } catch { /* best effort */ }
+      }
       const cls = classifyHeavy(p.tool_name, p.tool_input);
       if (cls.heavy) {
-        const d = this.heavyLock.acquire(agentId, cls, commandFromToolInput(p.tool_input) ?? '', HookServer.heavyCallId(p), isBackground(p.tool_input));
+        // A call whose PostToolUse may not pair back (Codex's mcp hooks can arrive degraded) is
+        // freed like a background one: by the process check, PTY exit or the TTL (Jim N1).
+        const unpaired = p.transport === 'mcp' || p.payload_degraded === true;
+        const d = this.heavyLock.acquire(agentId, cls, commandFromToolInput(p.tool_input) ?? '', HookServer.heavyCallId(p), isBackground(p.tool_input) || unpaired);
         if (!d.allow) {
           this.emitControl(agentId, p.tool_name, d.reason);
           this.emit(agentId, event, p);

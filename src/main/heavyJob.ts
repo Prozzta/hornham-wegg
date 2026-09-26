@@ -180,6 +180,8 @@ export interface HeavyHolder {
   background: boolean;
   /** Consecutive watcher scans that found no heavy process of this holder. */
   misses: number;
+  /** The last watcher scan saw a heavy process of this holder (for a TTL expiry's log). */
+  seenRunning: boolean;
 }
 
 export interface ProcRow { pid: number; parentPid: number; commandLine: string }
@@ -223,7 +225,9 @@ export class HeavyJobLock {
   /** PreToolUse: a heavy call from `agentId`. Take a slot, share the agent's own, or deny. */
   acquire(agentId: string, cls: HeavyClass, command: string, callId: string, background: boolean): HeavyDecision {
     const limit = this.d.limit();
-    if (limit === 'off' || !cls.heavy || !cls.kind) return { allow: true, acquired: false };
+    if (!cls.heavy || !cls.kind) return { allow: true, acquired: false };
+    // Off: no limit, but the heavy call is still visible (god: log 'heavy (unlimited)').
+    if (limit === 'off') { this.log({ kind: 'heavy-lock', action: 'unlimited', agentId, heavyKind: cls.kind, why: cls.why ?? null }); return { allow: true, acquired: false }; }
     this.expire();
     const mine = this.holders.get(agentId);
     if (mine) {
@@ -236,11 +240,12 @@ export class HeavyJobLock {
     if (this.holders.size >= limit) {
       const holders = [...this.holders.values()];
       const who = holders.map((h) => `${h.agentId} (${h.kind}: ${h.command.slice(0, 80)}, since ${new Date(h.since).toISOString().slice(11, 19)}Z)`).join('; ');
-      const reason = `Denied by HEAVY-JOB-LOCK: the machine allows ${limit} heavy job${limit === 1 ? '' : 's'} at once and ${holders.length === 1 ? 'it is' : 'they are'} held by ${who}. Wait until a slot is released (when that job finishes, or after ${Math.round(HEAVY_TTL_MS / 60_000)} min), or ask god. Light work (single test files, reads, edits) is not limited.`;
-      this.log({ kind: 'heavy-lock', action: 'deny', agentId, heavyKind: cls.kind, command: command.slice(0, 200), holders: holders.map((h) => h.agentId), limit });
+      const reason = `Denied by HEAVY-JOB-LOCK: the machine allows ${limit} heavy job${limit === 1 ? '' : 's'} at once and ${holders.length === 1 ? 'it is' : 'they are'} held by ${who}. Do not retry this or a variant of it now: carry on with light work (single test files, reads, edits are not limited) and run it later, once a slot is free (when that job finishes, or after ${Math.round(HEAVY_TTL_MS / 60_000)} min at most), or ask god to schedule it.`;
+      // Jim N3: the denied command's CLASS is logged, not the command itself.
+      this.log({ kind: 'heavy-lock', action: 'deny', agentId, heavyKind: cls.kind, why: cls.why ?? null, holders: holders.map((h) => ({ agentId: h.agentId, kind: h.kind, since: new Date(h.since).toISOString() })), limit });
       return { allow: false, reason, holders };
     }
-    this.holders.set(agentId, { agentId, kind: cls.kind, command: command.slice(0, 200), since: this.now(), touched: this.now(), calls: new Set([callId]), background, misses: 0 });
+    this.holders.set(agentId, { agentId, kind: cls.kind, command: command.slice(0, 200), since: this.now(), touched: this.now(), calls: new Set([callId]), background, misses: 0, seenRunning: false });
     this.log({ kind: 'heavy-lock', action: 'acquire', agentId, heavyKind: cls.kind, command: command.slice(0, 200), background, limit });
     this.arm();
     return { allow: true, acquired: true };
@@ -251,7 +256,37 @@ export class HeavyJobLock {
   callDone(agentId: string, callId: string): void {
     const h = this.holders.get(agentId);
     if (!h || !h.calls.delete(callId)) return;
-    if (!h.calls.size && !h.background) this.release(agentId, 'posttool');
+    if (h.calls.size || h.background) return;
+    // Jim N2: a foreground call can return (a timeout, a detached child) while its heavy job
+    // lives on. ONE quick descendant check before releasing: a heavy child keeps the slot and
+    // turns the holder into a background one (the watcher then frees it when the child exits).
+    if (this.d.probe && this.d.roots) {
+      void this.heavyAgents().then((busy) => {
+        const cur = this.holders.get(agentId);
+        if (!cur || cur.calls.size || cur.background) return;
+        if (busy?.has(agentId)) { cur.background = true; cur.seenRunning = true; this.log({ kind: 'heavy-lock', action: 'orphan-kept', agentId, heavyKind: cur.kind }); this.arm(); return; }
+        this.release(agentId, 'posttool');
+      });
+      return;
+    }
+    this.release(agentId, 'posttool');
+  }
+
+  /** The agents that have a heavy-classified process under their PTY now (one probe), or null. */
+  private async heavyAgents(): Promise<Set<string> | null> {
+    if (!this.d.probe || !this.d.roots) return null;
+    let procs: ProcRow[];
+    try { procs = await this.d.probe(); } catch { return null; }
+    const parent = new Map(procs.map((p) => [p.pid, p.parentPid]));
+    const rootOf = new Map(this.d.roots().map((r) => [r.pid, r.agentId]));
+    const ownerOf = (pid: number): string | null => {
+      const seen = new Set<number>(); let cur: number | undefined = pid;
+      while (cur !== undefined && !seen.has(cur)) { seen.add(cur); const a = rootOf.get(cur); if (a) return a; cur = parent.get(cur); }
+      return null;
+    };
+    const busy = new Set<string>();
+    for (const p of procs) if (classifyCommand(p.commandLine).heavy) { const a = ownerOf(p.pid); if (a) busy.add(a); }
+    return busy;
   }
 
   /** The holder's PTY exited: its jobs are gone with it. */
@@ -259,7 +294,7 @@ export class HeavyJobLock {
     if (this.holders.has(agentId)) this.release(agentId, 'pty-exit');
   }
 
-  private release(agentId: string, reason: 'posttool' | 'process-exit' | 'pty-exit' | 'ttl'): void {
+  private release(agentId: string, reason: 'posttool' | 'process-exit' | 'pty-exit' | 'ttl' | 'expired-still-running'): void {
     const h = this.holders.get(agentId);
     if (!h) return;
     this.holders.delete(agentId);
@@ -269,7 +304,8 @@ export class HeavyJobLock {
 
   private expire(): void {
     const t = this.now();
-    for (const h of [...this.holders.values()]) if (t - h.touched >= HEAVY_TTL_MS) this.release(h.agentId, 'ttl');
+    // Jim N5: a TTL expiry while the watcher last SAW the job running is logged distinctly.
+    for (const h of [...this.holders.values()]) if (t - h.touched >= HEAVY_TTL_MS) this.release(h.agentId, h.seenRunning ? 'expired-still-running' : 'ttl');
   }
 
   /** The watcher runs only while a slot is held: TTL expiry for everyone, and a process check
@@ -283,20 +319,13 @@ export class HeavyJobLock {
   async scan(): Promise<void> {
     this.expire();
     const bg = [...this.holders.values()].filter((h) => h.background);
+    // God: the hidden process listing runs ONLY while a background holder exists.
     if (!bg.length || !this.d.probe || !this.d.roots) return;
-    let procs: ProcRow[];
-    try { procs = await this.d.probe(); } catch { return; }
-    const parent = new Map(procs.map((p) => [p.pid, p.parentPid]));
-    const rootOf = new Map(this.d.roots().map((r) => [r.pid, r.agentId]));
-    const ownerOf = (pid: number): string | null => {
-      const seen = new Set<number>(); let cur: number | undefined = pid;
-      while (cur !== undefined && !seen.has(cur)) { seen.add(cur); const a = rootOf.get(cur); if (a) return a; cur = parent.get(cur); }
-      return null;
-    };
-    const busy = new Set<string>();
-    for (const p of procs) if (classifyCommand(p.commandLine).heavy) { const a = ownerOf(p.pid); if (a) busy.add(a); }
+    const busy = await this.heavyAgents();
+    if (!busy) return;
     for (const h of bg) {
-      if (busy.has(h.agentId)) { h.misses = 0; continue; }
+      if (busy.has(h.agentId)) { h.misses = 0; h.seenRunning = true; continue; }
+      h.seenRunning = false;
       h.misses++;
       if (h.misses >= HEAVY_SCAN_MISSES) { h.background = false; if (!h.calls.size) this.release(h.agentId, 'process-exit'); }
     }

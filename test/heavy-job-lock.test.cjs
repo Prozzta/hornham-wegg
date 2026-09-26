@@ -39,7 +39,9 @@ const LIGHT = [
   'node --test test/one.test.cjs', 'node --test test/a.test.cjs test/b.test.cjs', 'node --test --test-name-pattern "x y" test/a.test.cjs',
   'echo npm ci', 'grep "npm ci" README.md', 'git commit -m "run npm ci then npm run build"', 'cat package.json', 'npm run -s typecheck',
   'npx tsc --noEmit -p tsconfig.node.json', 'vitest run src/a.test.ts', 'node scripts/release-markers.cjs node_modules resources/models',
-  'git log --oneline -3', 'ls node_modules', 'node -e "console.log(1)"', 'npm view electron version', ''
+  'git log --oneline -3', 'ls node_modules', 'node -e "console.log(1)"', 'npm view electron version', '',
+  // Jim N4: the patterns audits actually run
+  'node --test test/a.cjs test/b.cjs', 'node C:/Users/x/scratch/xmut.cjs', 'git -C C:/Dunder/_work/wt diff --stat', 'npm run typecheck'
 ];
 
 test('CLASSIFIER: every heavy command in the corpus is heavy, with its kind', () => {
@@ -90,7 +92,12 @@ test('N=1: the first heavy job takes the slot; another agent is DENIED naming th
   const d = x.l.acquire('jim', H, 'npm ci', 'j1', false);
   assert.equal(d.allow, false);
   assert.match(d.reason, /^Denied by HEAVY-JOB-LOCK: the machine allows 1 heavy job at once and it is held by andy \(suite: node --test test\/\*\.test\.cjs, since \d\d:\d\d:\d\dZ\)/);
-  assert.match(d.reason, /Light work \(single test files, reads, edits\) is not limited/);
+  // Jim N3: it says what to do instead, so agents do not retry variants.
+  assert.match(d.reason, /Do not retry this or a variant of it now: carry on with light work \(single test files, reads, edits are not limited\) and run it later, once a slot is free .* or ask god to schedule it\./);
+  const denyRow = x.logs.find((r) => r.action === 'deny');
+  assert.equal(denyRow.command, undefined, 'the denied command itself is not logged');
+  assert.equal(denyRow.heavyKind, 'suite');
+  assert.equal(denyRow.holders[0].agentId, 'andy', 'the holder is in the deny row');
   assert.deepEqual(x.l.acquire('andy', H, 'npm run build', 'c2', false), { allow: true, acquired: false }, 're-entrant');
   x.l.callDone('andy', 'c1');
   assert.equal(x.l.snapshot().length, 1, 'still one call running');
@@ -224,4 +231,55 @@ test('CONFIG + SETTINGS: default 1; the Autonomy & Budgets section offers Off an
   assert.match(ui, /Heavy jobs at once/);
   assert.match(ui, /<option value="off">Off<\/option>/);
   assert.match(ui, /updateConfig\(\{ heavyJobsAtOnce: next \}/);
+});
+
+// ── god andyheavyok + Jim heavynote ──────────────────────────────────────────────────────
+
+test('OFF (god): never denies, but a heavy call is still LOGGED as unlimited', () => {
+  const x = lock('off');
+  x.l.acquire('a', H, 'npm ci', '1', false);
+  assert.deepEqual(x.logs.map((r) => r.action), ['unlimited']);
+  assert.equal(x.l.snapshot().length, 0);
+});
+
+test('Jim N2: a foreground call whose heavy job outlives it (a detached child) KEEPS the slot after one descendant check; freed later by the watcher', async () => {
+  let procs = [{ pid: 10, parentPid: 1, commandLine: 'bash' }, { pid: 11, parentPid: 10, commandLine: 'npm run build' }];
+  const x = lock(1, { roots: () => [{ agentId: 'a', pid: 10 }], probe: async () => procs });
+  x.l.acquire('a', H, 'npm run build', '1', false);
+  x.l.callDone('a', '1');
+  await new Promise((r) => setImmediate(r));
+  assert.equal(x.l.snapshot().length, 1, 'an orphaned heavy child keeps the slot');
+  assert.equal(x.l.snapshot()[0].background, true);
+  assert.ok(x.logs.some((r) => r.action === 'orphan-kept'));
+  procs = [procs[0]];
+  for (let i = 0; i < HEAVY_SCAN_MISSES; i++) await x.l.scan();
+  assert.equal(x.l.snapshot().length, 0);
+  // and with no heavy child the foreground call frees it after the one check
+  const y = lock(1, { roots: () => [{ agentId: 'b', pid: 20 }], probe: async () => [{ pid: 20, parentPid: 1, commandLine: 'bash' }] });
+  y.l.acquire('b', H, 'npm ci', '1', false);
+  y.l.callDone('b', '1');
+  await new Promise((r) => setImmediate(r));
+  assert.equal(y.l.snapshot().length, 0);
+  assert.equal(y.logs.at(-1).reason, 'posttool');
+});
+
+test('Jim N5: a TTL expiry while the watcher last SAW the job running logs expired-still-running (not a silent ttl)', async () => {
+  const x = lock(1, { roots: () => [{ agentId: 'a', pid: 10 }], probe: async () => [{ pid: 11, parentPid: 10, commandLine: 'node --test test/*.test.cjs' }] });
+  x.l.acquire('a', H, 'node --test test/*.test.cjs', '1', true);
+  await x.l.scan();
+  x.tick(HEAVY_TTL_MS);
+  x.l.snapshot();
+  assert.equal(x.logs.at(-1).reason, 'expired-still-running');
+});
+
+test('Jim N1 (HOOK): a CODEX (mcp) heavy call is left for the watcher (its PostToolUse may not pair back); a DEGRADED call with no input is allowed and logged', async (t) => {
+  const { s, l } = await server(t, 1);
+  s.handle({ agent_id: 'a1', hook_event_name: 'PreToolUse', tool_name: 'Bash', tool_input: { command: 'npm ci' }, transport: 'mcp' });
+  assert.equal(l.snapshot()[0].background, true, 'unpaired: freed by the process check / PTY / TTL');
+  s.handle({ agent_id: 'a1', hook_event_name: 'PostToolUse', tool_name: 'Bash', tool_input: { command: 'npm ci' }, transport: 'mcp' });
+  assert.equal(l.snapshot().length, 1, 'a Codex PostToolUse does not free it');
+  const r = s.handle({ agent_id: 'a2', hook_event_name: 'PreToolUse', tool_name: 'Bash', payload_degraded: true, transport: 'mcp' });
+  assert.equal(r.hookSpecificOutput?.permissionDecision, undefined, 'degraded: allowed');
+  const log = fs.readFileSync(path.join(s.hive?.root?.() ?? '', 'log.jsonl'), 'utf8');
+  assert.match(log, /"kind":"heavy-lock","action":"degraded","agentId":"a2"/);
 });
