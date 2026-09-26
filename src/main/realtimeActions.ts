@@ -76,8 +76,6 @@ export interface RealtimeActionDeps {
   controlAutoDelivery(agentId: string, paused: boolean): void;
   controlGateTool(agentId: string, tool: string, on: boolean): void;
   setArchived(agentId: string, archived: boolean): { ok: boolean; error?: string };
-  /** Explicit, human-confirmed voice archive only; routine lifecycle archival does not erase Talk. */
-  retireThread?(agentId: string): Promise<{ ok: boolean; error?: string }>;
   /** clear_context: push text into the agent's renderer message queue, so
    *  delivery rides EVERY existing gate (idle-only, boot grace, draft/picker
    *  safety, auto-delivery pause). */
@@ -569,10 +567,9 @@ function buildClearContext(deps: RealtimeActionDeps, r: ResolvedAgent): () => Pr
 function buildArchive(deps: RealtimeActionDeps, r: ResolvedAgent): () => Promise<string> {
   return async () => {
     const res = deps.setArchived(r.id, true);
-    if (res.ok) await deps.retireThread?.(r.id);
     attribute(deps, 'archive', r.id);
     return res.ok
-      ? `Archived ${r.name} — off the floor. Their private Talk history was removed; unarchive does not restore it.`
+      ? `Archived ${r.name} — off the floor, history kept. Say unarchive to bring them back.`
       : `Couldn't archive ${r.name}: ${res.error || 'unknown error'}.`;
   };
 }
@@ -624,7 +621,7 @@ function proposeDestructive(deps: RealtimeActionDeps, verb: string, a: Record<st
     const consequence = verb === 'clear_context'
       ? `That wipes ${r.name}'s working memory of the current conversation.`
       : verb === 'archive'
-        ? `That takes ${r.name} off the floor and permanently removes their private Talk history.`
+        ? `That takes ${r.name} off the floor (history kept).`
         : `That's destructive.`;
     return {
       ok: true,

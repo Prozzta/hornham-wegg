@@ -442,8 +442,6 @@ export interface OwnerDeps {
   setTimer: (fn: () => void, ms: number) => unknown;
   /** Told of every settled outcome. Diagnostics and UI; never a decision input. */
   onOutcome?: (record: OutcomeRecord) => void;
-  /** Main-only classification hook; it never changes delivery or outcome semantics. */
-  onCommitted?: (agentId: string, text: string) => void;
 }
 
 // ─── Requests and outcomes ────────────────────────────────────────────────────────────
@@ -754,9 +752,6 @@ export class AutomaticSubmitOwner {
       if (outcome.kind !== 'COMMITTED' && outcome.kind !== 'INTERFERED'
         && this.known.get(req.requestId)?.promise === promise) {
         this.known.delete(req.requestId);
-      }
-      if (outcome.kind === 'COMMITTED') {
-        try { this.deps.onCommitted?.(req.agentId, req.text); } catch { /* projection cannot affect a sent turn */ }
       }
       try {
         this.deps.onOutcome?.({

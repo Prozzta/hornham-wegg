@@ -1,8 +1,7 @@
-import { app, BrowserWindow, clipboard, dialog, ipcMain, Menu, MessageChannelMain, powerMonitor, powerSaveBlocker, screen, shell, Notification, utilityProcess, type MessagePortMain, type WebContents } from 'electron';
+import { app, BrowserWindow, clipboard, dialog, ipcMain, Menu, powerMonitor, powerSaveBlocker, screen, shell, Notification, utilityProcess } from 'electron';
 import { NativeMemoryWiring, toUnpacked } from './nativeMemory/mainWiring';
 import type { WorkerHandle } from './nativeMemory/service';
 import { spawn } from 'node:child_process';
-import { Worker } from 'node:worker_threads';
 import {
   rmSync, existsSync, readFileSync, readdirSync, statSync, cpSync, writeFileSync,
   unlinkSync, mkdirSync, renameSync, createWriteStream, copyFileSync, lstatSync,
@@ -43,7 +42,6 @@ import {
   getLogGraph, getCommitFiles, getFileAtRev, compareRefs, listWorktrees, checkoutRef
 } from './git';
 import { HiveManager, type AgentMeta, type HiveMessage, type HiveTask } from './hive';
-import { ThreadViewStore, threadRoot } from './threadView';
 import { HookServer } from './hooks';
 import { HeavyJobLock, heavyLimit, probeProcesses } from './heavyJob';
 import { CapacityRuntime } from './capacityRuntime';
@@ -355,88 +353,6 @@ const hive = new HiveManager(
 );
 // #7C — operator control state (pause/gate/steer/halt), read by the HookServer
 // when deciding hook returns.
-// Private Human↔agent conversation projection. userData is selected before this
-// module reaches HiveManager, so this can never point at the git-backed hive.
-class ThreadEventChannel {
-  private port: MessagePortMain | undefined;
-  private ownerId: number | undefined;
-  attach(contents: WebContents, replace = false): void {
-    if (contents.isDestroyed() || (!replace && this.ownerId === contents.id && this.port)) return;
-    try { this.port?.close(); } catch { /* previous renderer closed */ }
-    const { port1, port2 } = new MessageChannelMain();
-    this.port = port1; this.ownerId = contents.id;
-    contents.once('destroyed', () => {
-      if (this.ownerId !== contents.id) return;
-      try { this.port?.close(); } catch { /* already closed */ }
-      this.port = undefined; this.ownerId = undefined;
-    });
-    try { contents.postMessage('thread:port', null, [port2]); }
-    catch { try { port1.close(); } catch { /* no receiver */ } this.port = undefined; this.ownerId = undefined; }
-  }
-  publish(agentId: string, event: import('./threadView').ThreadEvent): void {
-    const contents = liveWebContents();
-    if (!contents) return;
-    this.attach(contents);
-    try { this.port?.postMessage({ agentId, event }); }
-    catch { this.port = undefined; this.ownerId = undefined; }
-  }
-}
-
-type ThreadTailSource =
-  | { agentId: string; provider: 'claude'; file: string }
-  | { agentId: string; provider: 'codex'; codexHome: string };
-
-/** The sidecar owns transcript/rollout filesystem reads. Main receives a bounded
- * line batch and remains the sole receipt-admission/private-storage owner. */
-class ThreadTailWorker {
-  private readonly worker = new Worker(join(__dirname, 'thread-tail-worker.cjs'));
-  private sourceKey = '';
-  private processing = Promise.resolve();
-  constructor(private readonly consume: (source: ThreadTailSource, lines: string[]) => Promise<void>) {
-    this.worker.unref();
-    this.worker.on('message', (message: unknown) => {
-      const row = message as { type?: unknown; agentId?: unknown; provider?: unknown; lines?: unknown };
-      if (row?.type !== 'lines' || typeof row.agentId !== 'string' || (row.provider !== 'claude' && row.provider !== 'codex') || !Array.isArray(row.lines)) return;
-      const lines = row.lines.filter((line): line is string => typeof line === 'string').slice(0, 256);
-      const source = row.provider === 'codex'
-        ? { agentId: row.agentId, provider: 'codex', codexHome: '' } as ThreadTailSource
-        : { agentId: row.agentId, provider: 'claude', file: '' } as ThreadTailSource;
-      this.processing = this.processing.then(() => this.consume(source, lines)).catch((e) => console.error('[thread-view] ingest failed:', e));
-    });
-    this.worker.on('error', (e) => console.error('[thread-view] tail worker failed:', e));
-  }
-  setSource(source: ThreadTailSource | null): void {
-    const key = source ? JSON.stringify(source) : '';
-    if (key === this.sourceKey) return;
-    this.sourceKey = key;
-    this.worker.postMessage({ type: 'source', source });
-  }
-}
-
-const threadEvents = new ThreadEventChannel();
-const threadView = new ThreadViewStore(threadRoot(app.getPath('userData')), (agentId, event) => threadEvents.publish(agentId, event));
-void threadView.init().catch((e) => console.error('[thread-view] init failed:', e));
-const threadTailer = new ThreadTailWorker(async (source, lines) => {
-  for (const line of lines) {
-    if (source.provider === 'codex') await threadView.ingestCodexLine(source.agentId, line);
-    else await threadView.ingestClaudeLine(source.agentId, line);
-  }
-});
-// Registry selection is cheap main-owned state. The worker does every directory
-// walk/stat/open/read and emits bounded complete-line batches from each 64 KiB tick.
-function refreshMichaelThreadSource(): void {
-  const registry = hive.registry();
-  const id = registry.godId;
-  if (!id) return threadTailer.setSource(null);
-  const provider = String(registry.agents[id]?.provider ?? 'claude').toLowerCase();
-  if (provider === 'codex') {
-    const home = readConfig().harnessHome;
-    return threadTailer.setSource(home ? { agentId: id, provider: 'codex', codexHome: join(home, 'agents', id, '.codex') } : null);
-  }
-  const file = hookServer.transcriptPath(id);
-  threadTailer.setSource(file ? { agentId: id, provider: 'claude', file } : null);
-}
-setInterval(() => { try { refreshMichaelThreadSource(); } catch (e) { console.error('[thread-view] source refresh failed:', e); } }, 500).unref();
 const control = new ControlRegistry();
 // Stage 7A — the live observability tap. Receives Claude Code's first-party OTel
 // over loopback OTLP/JSON and exposes the locked usage-provider seam. resolveCwd
@@ -594,7 +510,6 @@ const automaticSubmit = new AutomaticSubmitOwner(buildOwnerDeps({
   ptyForAgent: (agentId) => ptyForAgent(agentId),
   providerForPty: (ptyId) => ptyProvider.get(ptyId),
   requestScreenReading: (ptyId, needle, expectedTail) => screenReadings.request(ptyId, needle, expectedTail),
-  onCommitted: (agentId, text) => threadView.commitSubmission(agentId, text),
   onOutcome: (r) => {
     // An outcome can raise an INTERFERED hold or settle one: the impact string moves.
     pushAgentImpact();
@@ -4192,33 +4107,6 @@ ipcMain.handle('hive:requestInboxWake', (_evt, id: unknown) => {
 ipcMain.handle('hive:messages', (_evt, opts: unknown) =>
   hive.voiceMessages(opts && typeof opts === 'object' ? (opts as Parameters<typeof hive.voiceMessages>[0]) : {})
 );
-// THREAD-VIEW P1: renderer sees only the normalized private projection. It never
-// receives raw provider rollout/transcript files or tool/system records.
-ipcMain.handle('thread:list', async (_evt, id: unknown) =>
-  typeof id === 'string' ? threadView.list(id) : []
-);
-ipcMain.on('thread:portReady', (event) => threadEvents.attach(event.sender, true));
-ipcMain.handle('thread:layoutGet', async (_evt, id: unknown, fallback: unknown) =>
-  typeof id === 'string' ? threadView.layout(id, fallback === 'terminal' ? 'terminal' : 'talk') : null
-);
-ipcMain.handle('thread:layoutSet', async (_evt, id: unknown, layout: unknown, fallback: unknown) =>
-  typeof id === 'string' ? threadView.setLayout(id, layout, fallback === 'terminal' ? 'terminal' : 'talk') : null
-);
-ipcMain.handle('thread:sweepOrphans', async () => {
-  if (!hive.enabled()) return { ok: false, error: 'hive disabled (no registry)' };
-  try {
-    const sweepStartedAt = Date.now();
-    const removed = await threadView.sweepOrphans((id) => Boolean(hive.registry().agents[id]), sweepStartedAt);
-    return { ok: true, removed };
-  } catch (e) { return { ok: false, error: String(e) }; }
-});
-ipcMain.handle('thread:recordHuman', async (_evt, id: unknown, text: unknown, source: unknown) => {
-  if (typeof id !== 'string' || typeof text !== 'string' || !text.trim()) return { ok: false, error: 'invalid thread message' };
-  const kind = source === 'human-terminal' ? 'human-terminal' : 'human-ui';
-  threadView.recordReceipt(id, text, kind);
-  const event = await threadView.append(id, { speaker: 'human', text, source: kind });
-  return { ok: true, event };
-});
 ipcMain.handle('hive:send', (_evt, partial: Partial<HiveMessage>, from: unknown) => {
   if (!hive.enabled()) return { ok: false, error: 'hive disabled (no harnessHome)' };
   const msg = hive.send(partial ?? {}, typeof from === 'string' ? from : 'system');
@@ -4248,15 +4136,7 @@ ipcMain.handle('hive:setArchived', (_evt, id: unknown, archived: unknown) => {
   if (typeof id !== 'string') return { ok: false, error: 'invalid id' };
   if (!hive.enabled()) return { ok: false, error: 'hive disabled (no harnessHome)' };
   hive.setArchived(id, archived === true);
-  // Lifecycle archival happens on ordinary PTY exit and startup reconciliation.
-  // It MUST retain private Talk history; only `thread:retire` is a human request
-  // to remove it.
   return { ok: true };
-});
-ipcMain.handle('thread:retire', async (_evt, id: unknown) => {
-  if (typeof id !== 'string' || !id) return { ok: false, error: 'invalid id' };
-  try { await threadView.archive(id); return { ok: true }; }
-  catch (e) { return { ok: false, error: String(e) }; }
 });
 ipcMain.handle('hive:patchAgentRole', (_evt, id: unknown, role: unknown) => {
   if (typeof id !== 'string') return { ok: false, error: 'invalid id' };
@@ -5456,10 +5336,6 @@ registerRealtimeActionIpc({
     hive.setArchived(id, archived);
     try { liveWebContents()?.send(archived ? 'hive:agentArchived' : 'hive:agentSpawned', { id }); } catch { /* window gone */ }
     return { ok: true };
-  },
-  retireThread: async (id) => {
-    try { await threadView.archive(id); return { ok: true }; }
-    catch (e) { return { ok: false, error: String(e) }; }
   },
   // clear_context: hand the text to the renderer's queue so delivery rides every
   // existing gate (idle-only, boot grace, draft/picker safety).
