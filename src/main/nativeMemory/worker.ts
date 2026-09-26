@@ -112,7 +112,7 @@ export async function runWorker(cfg: WorkerConfig, port: Port, deps: { Database:
     };
     switch (m.op) {
       case 'search':
-        guard(engine.search({ query: String(a.query ?? ''), wing: (a.wing as string) ?? null, room: (a.room as string) ?? null, results: Number(a.results ?? 5), since: (a.since as string) ?? null, before: (a.before as string) ?? null }), (r) => ({ exit: r.exit, text: r.text, json: r.json }));
+        guard(engine.search({ query: String(a.query ?? ''), wing: (a.wing as string) ?? null, room: (a.room as string) ?? null, results: Number(a.results ?? 5), since: (a.since as string) ?? null, before: (a.before as string) ?? null, caller: (a.caller as string) ?? null }), (r) => ({ exit: r.exit, text: r.text, json: r.json }));
         break;
       case 'hits':
         guard(engine.searchHits({ query: String(a.query ?? ''), wing: (a.wing as string) ?? null, results: Number(a.results ?? 10) }), (h) => {

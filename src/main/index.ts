@@ -639,6 +639,8 @@ const memory = new MemoryManager(
 // NATIVE-MEMORY (1.1.54): the MemPalace replacement. Default mode `legacy` makes this inert:
 // no worker, no token, no PATH change, the /memory route answers 404. Past legacy, the engine
 // runs in a utility process forked on the first memory request (never at start-up).
+/** NATIVE-WAKEUP-EMPTY-INDEX (a): the spec's lazy-fork floor after the first window is idle. */
+const NATIVE_MEMORY_PREWARM_DELAY_MS = 30_000;
 const nativeMemory = new NativeMemoryWiring({
   hiveRoot: () => hive.root(),
   palacePath: () => memory.palacePath(),
@@ -6153,6 +6155,15 @@ app.whenReady().then(() => {
   // off, the app keeps Electron's default menu — zero behavior change.
   if (readConfig().multiWindow) installAppMenu();
   createWindow();
+  // NATIVE-WAKEUP-EMPTY-INDEX (a): in NATIVE mode, fork the memory worker (its below-normal
+  // startup backfill fills the index) 30 s after the first window finished loading, the spec's
+  // lazy rule ("no earlier than 30 seconds after the first window becomes idle"), so an agent's
+  // first task-start wake-up does not meet an empty index. The mode is read at fire time; any
+  // other mode does nothing. A first memory request before then forks it as always.
+  mainWindow?.webContents.once('did-finish-load', () => {
+    const t = setTimeout(() => { try { nativeMemory.prewarm(); } catch (e) { console.error('[native-memory] prewarm failed:', e); } }, NATIVE_MEMORY_PREWARM_DELAY_MS);
+    t.unref?.();
+  });
   // Auto-start the Slack webhook server when configured. Best-effort: a tunnel
   // failure (offline) is logged, not fatal. The tunnel URL is ephemeral and
   // changes per restart, so the user re-pastes it via Settings → Start.

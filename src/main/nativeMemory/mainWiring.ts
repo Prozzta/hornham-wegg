@@ -121,6 +121,18 @@ export class NativeMemoryWiring {
     return env;
   }
 
+  /** NATIVE-WAKEUP-EMPTY-INDEX (a), god: when the mode is NATIVE, fork the worker (its below-normal
+   *  startup backfill runs; the model loads at the first embed) instead of waiting for the first
+   *  request, so the first task-start wake-up does not meet an empty index. main calls it no
+   *  earlier than 30 s after the first window finished loading (the spec's lazy rule). Legacy,
+   *  shadow and fallback-legacy: nothing (legacy keeps its zero-startup-work contract). */
+  prewarm(): boolean {
+    if (this.mode() !== 'native') return false;
+    const ok = this.client.prewarm();
+    this.d.log({ kind: 'native-memory-prewarm', forked: ok });
+    return ok;
+  }
+
   agentExited(agentId: string): void {
     this.tokens.revoke(agentId);
   }

@@ -56,7 +56,9 @@ export interface EngineDeps {
 
 interface Task { priority: number; seq: number; run: () => Promise<void> }
 
-export interface SearchArgs { query: string; wing?: string | null; room?: string | null; results?: number; since?: string | null; before?: string | null }
+export interface SearchArgs { query: string; wing?: string | null; room?: string | null; results?: number; since?: string | null; before?: string | null;
+  /** The asking agent's own wing (from its MEMORY_TOKEN): never a filter, only a backfill hint. */
+  caller?: string | null }
 export interface EngineReply { exit: number; text: string; json?: unknown }
 
 export class MemoryEngine {
@@ -74,6 +76,15 @@ export class MemoryEngine {
   private backfilling: Promise<{ discovery: Discovery; embedded: number; removed: number }> | null = null;
   /** Paths whose ingest failed, with the error (the migration report's "failed"). */
   readonly failed = new Map<string, string>();
+  /** NATIVE-WAKEUP-EMPTY-INDEX (b): wings a caller asked about. A backfill in progress takes their
+   *  sources NEXT (checked before every source), so an agent's own memory is indexed first even
+   *  when the backfill had already started without it (e.g. at app start). */
+  private readonly preferredWings = new Set<string>();
+
+  /** Mark a caller's wing as wanted: the running (or next) backfill indexes it first. */
+  preferWing(wing: string | null | undefined): void {
+    if (typeof wing === 'string' && /^[A-Za-z0-9._-]{1,120}$/.test(wing)) this.preferredWings.add(wing);
+  }
   stats = { embedded: 0, embedMs: 0, searches: 0 };
 
   constructor(private readonly d: EngineDeps) {
@@ -124,6 +135,8 @@ export class MemoryEngine {
   // — requests —
 
   search(a: SearchArgs): Promise<EngineReply> {
+    // (b) The wing searched, else the caller's own, is wanted: index it first.
+    this.preferWing(a.wing ?? a.caller ?? null);
     return this.enqueue(PRIORITY.search, async () => {
       this.stats.searches++;
       const sinceMs = a.since ? Date.parse(a.since) : null;
@@ -143,6 +156,8 @@ export class MemoryEngine {
   }
 
   wakeUp(wing: string | null): Promise<EngineReply> {
+    // (b) A wake-up is the caller's (or an explicit) wing: index it first.
+    this.preferWing(wing);
     return this.enqueue(PRIORITY.wake, async () => {
       let identity: string | null = null;
       if (wing && /^[A-Za-z0-9._-]+$/.test(wing)) {
@@ -213,7 +228,13 @@ export class MemoryEngine {
       for (const path of this.d.store.sourceShas().keys()) {
         if (!wanted.has(path)) { await this.enqueue(PRIORITY.backfill, async () => this.d.store.removeSource(path)); removed++; }
       }
-      for (const e of discovery.eligible) embedded += await this.ingestEntry(e, PRIORITY.backfill);
+      // (b) Before EACH source, a preferred wing (a caller that asked meanwhile) goes first.
+      const remaining = [...discovery.eligible];
+      while (remaining.length) {
+        const i = Math.max(0, remaining.findIndex((x) => this.preferredWings.has(x.wing)));
+        const [e] = remaining.splice(i, 1);
+        embedded += await this.ingestEntry(e, PRIORITY.backfill);
+      }
       this.d.log?.({ kind: 'native-memory-backfill', eligible: discovery.eligible.length, embedded, removed, failed: this.failed.size });
       return { discovery, embedded, removed };
     })().finally(() => { this.backfilling = null; });
