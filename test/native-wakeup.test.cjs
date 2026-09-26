@@ -203,3 +203,31 @@ test('B4 (Jim, optional pin): a bad wing name is never recorded as preferred', (
   eng.preferWing('a3');
   assert.deepEqual([...eng.preferredWings], ['a3']);
 });
+
+// ── Jim N1 re-check pins (god andyw34): W3 waiters are woken when their wing finishes; W4 the
+//    in-flight source counts as pending ──────────────────────────────────────────────────
+
+test('W3: a wake-up returns as soon as ITS wing is committed, BEFORE the rest of the backfill ends (waiters are woken per wing, not at backfill end)', async () => {
+  const big = Array.from({ length: 30 }, (_, i) => `## part ${i}\n${'word '.repeat(150)}`).join('\n\n');
+  const root = hive({ 'agents/a1/memory.md': '# a1\nsmall first', 'agents/a2/memory.md': big, 'agents/a3/memory.md': '# a3\nOWN WING NOTES' });
+  const store = committingStore();
+  const eng = slowEngine(root, store, { embedMs: 30, wakeWaitMs: 20_000 });
+  let backfillDone = false;
+  const bf = eng.backfill().then((r) => { backfillDone = true; return r; });
+  const r = await eng.wakeUp('a3');            // a1 is in flight; a3 is preferred next, then the big a2
+  assert.match(r.text, /OWN WING NOTES/);
+  assert.equal(backfillDone, false, 'answered while the big a2 was still being indexed');
+  await bf;
+});
+
+test('W4: a wake-up arriving while its wing\'s LAST source is in flight waits for that commit (the in-flight source counts as pending)', async () => {
+  const big = Array.from({ length: 20 }, (_, i) => `## part ${i}\nOWN ${'word '.repeat(150)}`).join('\n\n');
+  const root = hive({ 'agents/a3/memory.md': big });
+  const store = committingStore();
+  const eng = slowEngine(root, store, { embedMs: 20, wakeWaitMs: 20_000 });
+  const bf = eng.backfill();                    // a3 (its only source) is taken at once: in flight
+  const r = await eng.wakeUp('a3');
+  assert.ok(store.committed.some((c) => c.wing === 'a3'), 'the source was committed before the answer');
+  assert.match(r.text, /OWN/, 'the answer carries it (not an empty early answer)');
+  await bf;
+});
