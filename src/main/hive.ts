@@ -2366,7 +2366,7 @@ export class HiveManager {
     const name = HiveManager.agyAgentName(meta.id);
     return [
       '---',
-      `name: ${JSON.stringify(name)}`,
+      `name: ${name}`, // [a-z0-9-] only: plain YAML, exactly the probe-verified form
       `description: ${JSON.stringify(`Munder Difflin hive agent ${meta.name} (${meta.id}): its standing hive instructions. ${HiveManager.AGY_AGENT_MARK}; removed when the agent leaves the floor.`)}`,
       'mainAgent: true',
       'inheritCustomizations: true',

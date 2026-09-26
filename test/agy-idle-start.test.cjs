@@ -46,7 +46,7 @@ test('AGY spawns IDLE: `--agent munder-<id>` and NO initial prompt; the protocol
   assert.ok(i >= 0, `--agent passed: ${JSON.stringify(inj.args)}`);
   assert.equal(inj.args[i + 1], 'munder-phyllis-mu11xldm');
   const md = fs.readFileSync(agentFile(s.home, 'phyllis-mu11xldm'), 'utf8');
-  assert.match(md, /^---\nname: "munder-phyllis-mu11xldm"\ndescription: ".*Written by the Munder Difflin app.*"\nmainAgent: true\ninheritCustomizations: true\n---\n\n# Phyllis \(phyllis-mu11xldm\), a Munder Difflin hive agent\n\n/);
+  assert.match(md, /^---\nname: munder-phyllis-mu11xldm\ndescription: ".*Written by the Munder Difflin app.*"\nmainAgent: true\ninheritCustomizations: true\n---\n\n# Phyllis \(phyllis-mu11xldm\), a Munder Difflin hive agent\n\n/);
   assert.match(md, /HIVE PROTOCOL/);
   assert.match(md, /You are "Phyllis" \(phyllis-mu11xldm\)/);
   assert.equal((md.match(/^# /gm) || []).length, 1, 'exactly ONE H1 section');
@@ -67,7 +67,7 @@ test('AGY custom agent: rewritten only when the prompt changes (temp + rename); 
 
 test('AGY custom agent: YAML-safe (JSON-quoted strings) and a prompt line starting with # cannot open a second section', () => {
   const md = HiveManager.agyAgentMarkdown({ id: 'x1', name: 'Odd: "name"' }, 'line one\n# not a heading\n## neither');
-  assert.match(md, /^name: "munder-x1"$/m);
+  assert.match(md, /^name: munder-x1$/m);
   assert.match(md, /^description: "Munder Difflin hive agent Odd: \\"name\\" \(x1\): /m);
   assert.equal((md.match(/^# /gm) || []).length, 1);
   assert.match(md, /^\\# not a heading$/m);
